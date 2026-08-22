@@ -20,9 +20,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
-from triton.language import target_info
 
-from freetoken.utils.arch import is_rocm, is_sm90_supported
+from triton.language import target_info
+from triton.runtime.jit import constexpr_function
+
+from freetoken.utils.arch import is_sm90_supported
 
 SILU = 0
 GELU = 1
@@ -49,10 +51,17 @@ def _pdl_supported() -> bool:
     return is_sm90_supported()
 
 
+@constexpr_function
+def _fast_tanh_cx():
+    """Compile-time: can the target issue ``tanh.approx.f32``? It is an sm_75+
+    instruction and pre-Turing ptxas rejects the whole module ("Feature 'tanh' requires
+    .target sm_75 or higher"), so older cards take the libdevice fallback below. Resolved
+    from the compilation target like :mod:`freetoken.kernel.triton.e4m3_compat` does."""
+    return target_info.cuda_capability_geq(7, 5)
+
+
 @triton.jit
 def _fast_tanh(x):
-    if target_info.is_hip():
-        return libdevice.tanh(x)
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
     return tl.inline_asm_elementwise(
         "tanh.approx.f32 $0, $1;", "=f,f", [x],
@@ -62,8 +71,6 @@ def _fast_tanh(x):
 
 @triton.jit
 def _fast_ex2(x):
-    if target_info.is_hip():
-        return libdevice.exp2(x)
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
     return tl.inline_asm_elementwise(
         "ex2.approx.f32 $0, $1;", "=f,f", [x],
@@ -103,9 +110,13 @@ def _act_and_mul_kernel(
     if ACT == 0:  # SILU: x / (1 + exp(-x)) via ex2.approx
         act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
         y = act * up
-    elif ACT == 2:  # GELU_TANH via tanh.approx
+    elif ACT == 2:  # GELU_TANH via tanh.approx (sm_75+), else libdevice
         inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-        act = 0.5 * gate * (1.0 + _fast_tanh(inner))
+        if _fast_tanh_cx():
+            tanh_inner = _fast_tanh(inner)
+        else:
+            tanh_inner = libdevice.tanh(inner)
+        act = 0.5 * gate * (1.0 + tanh_inner)
         y = act * up
     elif ACT == 3:  # SWIGLUOAI: clamped gate/up, sigmoid(alpha*gate), (up + 1) bias
         gate = tl.minimum(gate, limit)
@@ -146,9 +157,8 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
-        **({} if is_rocm() else {"launch_pdl": pdl}),
     )
     return out
 
