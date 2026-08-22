@@ -690,26 +690,10 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
 
     cpu_g, pcie_g = entry["cpu_moe_gbs"], entry["pcie_gather_gbs"]
     if cpu_g is not None and pcie_g:  # pcie_g truthy also rules out a div-by-zero
-        entry["ratio"] = round(cpu_g / pcie_g, 3)
-        # Worst/best case ratio actually observed. A format whose spread straddles the
-        # threshold gets a different verdict run to run (mxfp4 was measured anywhere from
-        # 19 to 71 GB/s on one machine, flipping hybrid<->offload), and a single number
-        # hides that entirely. Report the interval and only commit when it clears.
-        cbs = entry.get("cpu_moe_gbs_runs") or [cpu_g]
-        pbs = entry.get("pcie_gather_gbs_runs") or [pcie_g]
-        pick, confident, (lo, hi) = verdict(cbs, pbs, threshold)
-        entry["ratio_range"] = [round(lo, 3), round(hi, 3)]
-        entry["reps"] = reps
-        entry["confident"] = confident
-        entry["recommended"] = pick
-        if not confident:
-            _note(entry, f"ratio spans the {threshold}x threshold across {reps} runs "
-                         f"({lo:.2f}-{hi:.2f}x): too noisy to call, resolving to offload. "
-                         f"Confirm with an end-to-end tokens/s comparison before "
-                         f"forcing --moe-backend hybrid.")
-        # Both sides work standalone -> also measure them contended (concurrently). This
-        # pair sets the hybrid backend's fetch split (load_hybrid_fetch_fraction); the
-        # hybrid-vs-offload verdict above stays on the standalone numbers.
+        # Measure the contended pair FIRST: that is the regime the verdict is about.
+        # Hybrid decode never runs the CPU GEMV alone -- it runs concurrently with the
+        # PCIe gather and the two fight over the same host DRAM, and not symmetrically
+        # (bf16 CPU 71.9 -> 66.8 GB/s while the gather it competed with lost ~40%).
         try:
             o = measure_overlap_bw(fmt, wl, device, cpu_threads)
             entry["cpu_moe_overlap_gbs"] = round(o["cpu_gbs"], 2)
@@ -719,6 +703,36 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
             _note(entry, f"overlap bench unavailable ({e})")
         finally:
             torch.cuda.empty_cache()
+
+        c_ov, p_ov = entry["cpu_moe_overlap_gbs"], entry["pcie_gather_overlap_gbs"]
+        if c_ov is not None and p_ov:
+            cpu_d, pcie_d = c_ov, p_ov
+            entry["verdict_source"] = "overlapped"
+        else:
+            # The overlap bench is the one that can fail on its own (it needs both paths
+            # live at once); fall back rather than lose the recommendation entirely.
+            cpu_d, pcie_d = cpu_g, pcie_g
+            entry["verdict_source"] = "standalone"
+            _note(entry, "verdict from the standalone bandwidths: the contended "
+                         "measurement was unavailable")
+        entry["ratio"] = round(cpu_d / pcie_d, 3)
+        # Confidence comes from the repeated *standalone* runs (the contended pair is
+        # measured once): carry their relative spread onto the decision ratio, so a
+        # format that is unstable standalone is still reported as unstable here.
+        cbs = entry.get("cpu_moe_gbs_runs") or [cpu_g]
+        pbs = entry.get("pcie_gather_gbs_runs") or [pcie_g]
+        _, _, (s_lo, s_hi) = verdict(cbs, pbs, threshold)
+        s_mid = (cpu_g / pcie_g) or 1.0
+        lo, hi = entry["ratio"] * (s_lo / s_mid), entry["ratio"] * (s_hi / s_mid)
+        entry["ratio_range"] = [round(lo, 3), round(hi, 3)]
+        entry["reps"] = reps
+        entry["confident"] = bool(lo > threshold or hi <= threshold)
+        entry["recommended"] = (recommend(cpu_d, pcie_d, threshold)
+                                if entry["confident"] else "offload")
+        if not entry["confident"]:
+            _note(entry, f"ratio spans the {threshold}x threshold across {reps} runs "
+                         f"({lo:.2f}-{hi:.2f}x): too noisy to call, resolving to offload. "
+                         f"Confirm with `ft bench decode` before forcing hybrid.")
     else:
         # No CPU-vs-PCIe pair to compare (no CPU path, or a bench failed): offload is the
         # backend that always works, so it's the safe call absent evidence for hybrid.
@@ -858,6 +872,8 @@ def _gbs(x) -> str:
 def _print_kernels(kernels: dict, iw: int) -> None:
     print(f"    {'format':<8} {'expert':>9} {'CPU-MoE':>13} {'PCIe-gather':>13} "
           f"{'CPU/PCIe':>9}  backend")
+    print("    (bandwidth columns are standalone; the ratio and backend come from the "
+          "contended pair)")
     for fmt, e in kernels.items():
         disp = _FORMAT_DISPLAY.get(fmt, fmt)
         eb = f"{e['expert_bytes'] / 2**20:.2f} MB" if e["expert_bytes"] else "n/a"
@@ -873,8 +889,9 @@ def _print_kernels(kernels: dict, iw: int) -> None:
                   f"{max(e['cpu_moe_gbs_runs']):.1f}, ratio {rr[0]:.2f}-{rr[1]:.2f}x")
         c_ov, p_ov = e.get("cpu_moe_overlap_gbs"), e.get("pcie_gather_overlap_gbs")
         if c_ov and p_ov:
+            src = " <- ratio measured here" if e.get("verdict_source") == "overlapped" else ""
             print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
-                  f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses")
+                  f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses{src}")
         if e.get("isa_sweep"):
             tiers = sorted(e["isa_sweep"].items(), key=lambda kv: -kv[1])
             for i, (k, v) in enumerate(tiers):
