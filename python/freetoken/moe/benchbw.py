@@ -1170,18 +1170,15 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
     p.add_argument("--pcie-mib", type=_positive_int, default=256, help="linear PCIe copy size in MiB")
     p.add_argument("--pcie-iters", type=_positive_int, default=30, help="linear PCIe copies to time")
-<<<<<<< HEAD
     p.add_argument("--reps", type=_positive_int, default=3,
                    help="repeat each kernel measurement this many times; the verdict uses "
                         "the median and is withheld when the spread straddles --threshold "
                         "(default 3)")
-=======
     p.add_argument("--production-banks", action="store_true",
                    help="allocate the synthetic banks the way the model loaders do "
                         "(mmap -> fill -> cudaHostRegister) instead of cudaHostAlloc. "
                         "Needed to see NUMA placement / huge-page effects, but the pages "
                         "cannot be released, so every format's banks stay resident")
->>>>>>> bench/production-allocator
     p.add_argument("--kernel-cpu-iters", type=_positive_int, default=64,
                    help="CPU MoE decode steps to time")
     p.add_argument("--kernel-pcie-iters", type=_positive_int, default=20,
@@ -1201,11 +1198,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
             dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
             cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
             kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,
-<<<<<<< HEAD
-            reps=ns.reps,
-=======
-            production_banks=ns.production_banks,
->>>>>>> bench/production-allocator
+            reps=ns.reps, production_banks=ns.production_banks,
         )
     except (RuntimeError, OSError) as e:
         print(f"error: {e}")
