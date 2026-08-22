@@ -992,10 +992,7 @@ def _print_kernels(kernels: dict, iw: int) -> None:
         if c_ov and p_ov:
             src = " <- ratio measured here" if e.get("verdict_source") == "overlapped" else ""
             print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
-<<<<<<< HEAD
                   f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses{src}")
-=======
-                  f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses")
         sc = e.get("cpu_moe_step_cost")
         if sc:
             print(f"       cpu step: {sc['fixed_ms']:.2f} ms fixed + "
@@ -1006,7 +1003,6 @@ def _print_kernels(kernels: dict, iw: int) -> None:
             lo, hi = gm[0], gm[-1]
             print(f"       gather scales linearly: {lo['bw_gbs']:.1f} GB/s at "
                   f"{lo['misses']} miss -> {hi['bw_gbs']:.1f} GB/s at {hi['misses']}")
->>>>>>> bench/miss-rate-crossover
         if e.get("isa_sweep"):
             tiers = sorted(e["isa_sweep"].items(), key=lambda kv: -kv[1])
             for i, (k, v) in enumerate(tiers):
