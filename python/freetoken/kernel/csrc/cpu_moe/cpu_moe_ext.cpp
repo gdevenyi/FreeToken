@@ -1235,6 +1235,7 @@ fp8dot_fn select_fp8dot() {
 #endif
   (void)t;
   return dot_fp8_block_scalar;
+}
 
 // ---------------------- ds_fp4 W4A8 (VNNI) ----------------------
 // Same trick as the nvfp4 W4A8 path above, and for the same reason: ds_fp4's bank is
