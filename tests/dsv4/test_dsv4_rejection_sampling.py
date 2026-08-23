@@ -15,7 +15,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.models.deepseek_v4.dspark import rejection_accept
+from freetoken.models.deepseek_v4.dspark import (
+    rejection_accept,
+    rejection_accept_device,
+    sampling_probs,
+)
 
 VOCAB = 6
 
@@ -157,3 +161,53 @@ class TestDegenerateInputs:
         )
         assert n_acc == 0
         assert tok in (0, 1), "the fallback must still draw from the target's support"
+
+
+class TestDeviceResidentAcceptance:
+    def test_full_acceptance_and_bonus_stay_exact(self):
+        q = torch.zeros(2, VOCAB)
+        q[0, 1] = 1.0
+        q[1, 2] = 1.0
+        p = torch.zeros(3, VOCAB)
+        p[0, 1] = 1.0
+        p[1, 2] = 1.0
+        p[2, 4] = 1.0
+        got = rejection_accept_device(
+            torch.tensor([1, 2]), q, p, generator=torch.Generator().manual_seed(0)
+        )
+        assert got == (2, 4)
+
+    def test_rejection_recovers_from_the_target_residual(self):
+        q = torch.zeros(1, VOCAB)
+        q[0, 0] = 1.0
+        p = torch.zeros(2, VOCAB)
+        p[0, 3] = 1.0
+        p[1, 4] = 1.0
+        got = rejection_accept_device(
+            torch.tensor([0]), q, p, generator=torch.Generator().manual_seed(0)
+        )
+        assert got == (0, 3)
+
+    def test_zero_width_draws_the_target_bonus(self):
+        p = torch.zeros(1, VOCAB)
+        p[0, 5] = 1.0
+        got = rejection_accept_device(
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, VOCAB),
+            p,
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert got == (0, 5)
+
+    def test_accepted_length_and_bonus_share_one_host_transfer(self):
+        import inspect
+
+        body = inspect.getsource(rejection_accept_device)
+        assert 'torch.stack((n_acc_device, bonus_device.to(torch.int64))).to(' in body
+        assert ".item()" not in body
+
+
+def test_temperature_one_probabilities_equal_the_direct_softmax():
+    logits = torch.tensor([[1.0, -2.0, 3.0, 0.5]])
+    got = sampling_probs(logits, temperature=1.0, top_p=1.0, top_k=-1)
+    assert torch.equal(got, torch.softmax(logits.float(), dim=-1))
