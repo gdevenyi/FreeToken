@@ -52,30 +52,22 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
         _detach_process_group()
     from freetoken.tokenizer import tokenize_worker
 
-    ack_queue = kwargs.get("ack_queue")
-    try:
-        tokenize_worker(**kwargs)
-    except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
-        # Same contract as _run_scheduler: without this, a tokenizer/detokenizer that dies
-        # before its ready ack reaches the parent only as a dead process, so the supervisor
-        # reports the generic "backend worker freetoken-detokenizer-0 exited during load" and
-        # the real cause (an unreadable tokenizer.json, a missing checkpoint file, a ZMQ bind
-        # clash) is lost. The traceback still prints and the process still exits non-zero.
-        if ack_queue is not None:
-            _report_startup_error(ack_queue, exc)
-        raise
+    tokenize_worker(**kwargs)
+
+
+def _configure_worker_tqdm_lock() -> None:
+    import threading
+
+    from tqdm import tqdm
+
+    tqdm.set_lock(threading.RLock())
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
 
-    # published (not bound) here: the engine binds it after the allocator setup
-    from freetoken.gpu_select import set_assigned_gpu
-
-    # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
-    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
-    set_assigned_gpu(targets[args.tp_info.rank])
+    _configure_worker_tqdm_lock()
 
     import torch
     from freetoken.scheduler import Scheduler
@@ -108,10 +100,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             try:
                 from freetoken.kvcache.cache_status import compute_cache_status_meta
 
-                meta = compute_cache_status_meta(scheduler.engine)
-                # the parent must not touch CUDA to learn this
-                meta["gpus"] = scheduler.gpus
-                ack_queue.put(("meta", meta))
+                ack_queue.put(("meta", compute_cache_status_meta(scheduler.engine)))
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")
@@ -148,19 +137,6 @@ def launch_server(
     )
     logger = init_logger(__name__, "initializer")
 
-    if server_args.gpu:
-        # resolve here so a typo is one clear error before any worker spawns
-        from freetoken.gpu_select import resolve_gpu_uuids
-
-        try:
-            server_args = replace(server_args, gpu_assigned=resolve_gpu_uuids(server_args.gpu))
-        except ValueError as exc:
-            raise SystemExit(f"{prog or 'ft serve'}: error: {exc}") from exc
-        logger.info(
-            f"--gpu {','.join(server_args.gpu)} -> "
-            f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
-        )
-
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp
 
@@ -194,7 +170,6 @@ def launch_server(
                 "backend_addr": server_args.zmq_backend_addr,
                 "frontend_addr": server_args.zmq_frontend_addr,
                 "local_bs": 1,
-                "mm": server_args.mm,
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
                 "ack_queue": ack_queue,
@@ -214,7 +189,6 @@ def launch_server(
                     "backend_addr": server_args.zmq_backend_addr,
                     "frontend_addr": server_args.zmq_frontend_addr,
                     "local_bs": 1,
-                    "mm": server_args.mm,
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "ack_queue": ack_queue,
