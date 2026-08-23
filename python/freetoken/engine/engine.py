@@ -181,16 +181,16 @@ def _validate_kv_cache_dtype(config, model_config) -> None:
     """
     name = getattr(config, "kv_cache_dtype", "auto")
     dsv4_args = getattr(model_config, "dsv4_args", None)
-    # Stamp the args here, at config resolution, not when the pool is built: the cost model
-    # reads this to size the KV budget, and --moe-cache-auto divides that budget to pick the
-    # expert-cache size well before any pool exists. Setting it later leaves the auto-sizer
-    # working from bf16 bytes and the 8-bit saving never reaches the expert cache.
-    if dsv4_args is not None:
-        dsv4_args.kv_quant = name != "auto"
-    if name == "auto":
-        return
 
     if dsv4_args is not None:
+        # Stamp the args here, at config resolution, not when the pool is built: the cost
+        # model reads this to size the KV budget, and --moe-cache-auto divides that budget
+        # to pick the expert-cache size well before any pool exists. Setting it later
+        # leaves the auto-sizer working from bf16 bytes and the saving never lands.
+        dsv4_args.kv_quant = name != "auto"
+        if name == "auto":
+            return
+
         from freetoken.kvcache.dsv4_kv_quant import BLOCK as DSV4_BLOCK
 
         if name != "fp8_e4m3":
@@ -210,6 +210,8 @@ def _validate_kv_cache_dtype(config, model_config) -> None:
             )
         return
 
+    # Non-DSV4 pools: key off the resolved spec rather than the flag string, so a config
+    # that carries only kv_quant still gets checked.
     quant = getattr(config, "kv_quant", None)
     if quant is None or not quant.enabled:
         return
