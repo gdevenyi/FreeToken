@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.e4m3_compat import round_e4m3
+
 
 @triton.jit
 def _store_kv_quant_kernel(
@@ -70,6 +72,14 @@ def _store_kv_quant_kernel(
             # float->int cast truncates.
             q = tl.where(q >= 0, tl.floor(q + 0.5), tl.ceil(q - 0.5))
             q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
+        else:
+            # Same reason as the int branch: the cast below does not round to nearest.
+            # triton lowers fp32 -> float8e4nv as a double-round (fp32 -> fp16 RTZ ->
+            # e4m3), so a value just above a grid midpoint collapses onto the midpoint
+            # and ties to even, always downward. round_e4m3 puts the value on the grid
+            # in fp32 first, after which the cast is exact. Without this the store
+            # disagrees with the torch reference on ~0.4% of elements.
+            q = round_e4m3(tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG))
 
         tl.store(
             dst_ptr + slot * stride_ct + head * stride_ch + offs,
