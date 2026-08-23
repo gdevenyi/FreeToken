@@ -57,13 +57,13 @@ def _index_bytes(args) -> int:
 
 def _state_bytes(args, ratio: int) -> int:
     overlap = 1 if ratio == 4 else 0
-    return 2 * (1 + overlap) * args.head_dim * _FP32_BYTES
+    return 2 * (1 + overlap) * args.head_dim * _BF16_BYTES
 
 
 def _idx_state_bytes(args) -> int:
     # Indexer compressor (ratio-4 only): same ring geometry as the attention
     # compress-state ring but keyed on ``index_head_dim`` (overlap always True).
-    return 2 * 2 * args.index_head_dim * _FP32_BYTES
+    return 2 * 2 * args.index_head_dim * _BF16_BYTES
 
 
 def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:

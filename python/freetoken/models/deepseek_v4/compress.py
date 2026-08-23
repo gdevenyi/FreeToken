@@ -325,16 +325,18 @@ class Compressor(nn.Module):
 
         if overlap:
             wslot = (ratio + idx_mod).view(B, 1)  # per-row B-half slot
-            ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv)
-            ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score)
+            # The ring's dtype drives: scatter_ requires src and self to match, and kv/score
+            # arrive fp32 from bf16_linear_fp32.
+            ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv.to(ks.dtype))
+            ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score.to(ss.dtype))
             kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
             score_eff = torch.cat([ss[:, :ratio, :d], ss[:, ratio:, d:]], dim=1)
             compressed = gated_pool(kv_eff, score_eff, dtype)
             ks[:, :ratio] = torch.where(should, ks[:, ratio:], ks[:, :ratio])
             ss[:, :ratio] = torch.where(should, ss[:, ratio:], ss[:, :ratio])
         else:
-            ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv)
-            ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score)
+            ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv.to(ks.dtype))
+            ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score.to(ss.dtype))
             compressed = gated_pool(ks, ss, dtype)
         # Persist the advanced carry block to THIS token's page (per row, disjoint blocks); the
         # next step reads it from here. Within a page prev==cur, so this is a self-consistent roll.

@@ -108,7 +108,7 @@ class CompressStateRing:
         overlap: bool,
         head_dim: int,
         device: torch.device,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.ring_size = ring_size
         self.head_dim = head_dim
@@ -133,7 +133,7 @@ class CompressStateRing:
 
     def set(self, state_loc: torch.Tensor, kv_score: torch.Tensor) -> None:
         """Scatter ``kv_score`` rows to ``state_loc`` then re-clear the scratch row."""
-        self.buffer[state_loc] = kv_score
+        self.buffer[state_loc] = kv_score.to(self.buffer.dtype)
         self._clear_scratch()
 
     def get_blocks(self, page_base: torch.Tensor) -> torch.Tensor:
@@ -147,7 +147,7 @@ class CompressStateRing:
         """Batched per-row carry-block write: ``buffer[base+arange(ring_size)] = blocks[row]``.
         ``page_base`` ``[B]``, ``blocks`` ``[B, ring_size, 2*item]``. Re-clears scratch."""
         rows = page_base[:, None] + torch.arange(self.ring_size, device=page_base.device)
-        self.buffer[rows] = blocks
+        self.buffer[rows] = blocks.to(self.buffer.dtype)
         self._clear_scratch()
 
 
