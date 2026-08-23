@@ -167,14 +167,49 @@ def _resolve_auto_attention_backend(
 
 
 def _validate_kv_cache_dtype(config, model_config) -> None:
-    """Gate --kv-cache-dtype against what the quantized path actually implements.
+    """Gate --kv-cache-dtype against what each 8-bit path actually implements.
 
-    8-bit KV storage lives in the triton attention kernels and the MHA/hybrid-SWA pools.
-    Every other backend reads the KV slabs through its own kernels (flashinfer's
-    ``kv_data_type``, trtllm's fp8 path) which this has not been wired into, and the
-    MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations here,
-    at config time, rather than letting a wrong-dtype tensor reach a kernel.
+    Two implementations share this flag and neither covers the other's pools:
+
+    * DeepSeek-V4 -- the window/compressed pools and the two sparse-attention kernels
+      that read them. fp8 only, and it needs native fp8 to load a float8 pointer.
+    * everything else -- the triton attention kernels over the MHA / hybrid-SWA pools,
+      q8_0 or fp8_e4m3.
+
+    Route on the pool family and apply that side's checks. A model served by neither is
+    rejected here, at config time, rather than letting a wrong-dtype tensor reach a kernel.
     """
+    name = getattr(config, "kv_cache_dtype", "auto")
+    dsv4_args = getattr(model_config, "dsv4_args", None)
+    # Stamp the args here, at config resolution, not when the pool is built: the cost model
+    # reads this to size the KV budget, and --moe-cache-auto divides that budget to pick the
+    # expert-cache size well before any pool exists. Setting it later leaves the auto-sizer
+    # working from bf16 bytes and the 8-bit saving never reaches the expert cache.
+    if dsv4_args is not None:
+        dsv4_args.kv_quant = name != "auto"
+    if name == "auto":
+        return
+
+    if dsv4_args is not None:
+        from freetoken.kvcache.dsv4_kv_quant import BLOCK as DSV4_BLOCK
+
+        if name != "fp8_e4m3":
+            raise ValueError(
+                f"--kv-cache-dtype {name} is not implemented for DeepSeek-V4 KV pools; "
+                "they store fp8 only. Use fp8_e4m3, or auto."
+            )
+        if dsv4_args.head_dim % DSV4_BLOCK:
+            raise ValueError(
+                f"--kv-cache-dtype {name} needs head_dim to be a multiple of {DSV4_BLOCK}, "
+                f"the quantization block; this checkpoint has {dsv4_args.head_dim}."
+            )
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+            raise ValueError(
+                f"--kv-cache-dtype {name} needs native fp8 (sm_89 or newer): below that a "
+                "float8 pointer is illegal inside a triton kernel. Use --kv-cache-dtype auto."
+            )
+        return
+
     quant = getattr(config, "kv_quant", None)
     if quant is None or not quant.enabled:
         return
