@@ -36,10 +36,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # The request's stop strings (None when it has none), so the detokenizer can hold back
     # a trailing partial-stop prefix instead of streaming it and then needing to retract.
     stop_strs: list[str] | None = None
-    # Keep the matched stop string in the output (SamplingParams.include_stop_str_in_output).
-    keep_stop_str: bool = False
-    # Decode this request with skip_special_tokens (SamplingParams.skip_special_tokens).
-    skip_special_tokens: bool = False
+    # Sampled-token logprobs (None unless the request asked): the chosen token's raw
+    # logprob and the top alternatives, already cut to this request's top_logprobs.
+    chosen_logprob: float | None = None
+    top_ids: list[int] | None = None
+    top_logprobs: list[float] | None = None
     # KV page-pool usage snapshot at this step (not-evictable used/total), passed
     # through to the frontend for the shell status bar. 0/0 for owned-KV models.
     kv_used_pages: int = 0
@@ -76,7 +77,6 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
-    images: List[bytes] | None = None
 
 
 @dataclass

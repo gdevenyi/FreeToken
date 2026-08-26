@@ -10,8 +10,8 @@ if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
-    from freetoken.kvcache.kv_host_offload import KVHostOffloader
     from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.moe import BaseMoeBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 
@@ -25,44 +25,14 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
-    # ---- logits processors (engine/sample.py), all off by default ----
-    # min_p: drop tokens whose probability is below min_p x the top probability.
-    min_p: float = 0.0
-    # OpenAI presence/frequency penalties over the generated tokens; repetition_penalty is the
-    # HF/vLLM multiplicative penalty over prompt + generated tokens (1.0 = off). The sampler
-    # keeps their state on the device (Req.output_token_counts, Req.prompt_token_mask).
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    repetition_penalty: float = 1.0
-    # OpenAI logit_bias as [[token id, bias], ...] (clamped to [-100, 100] by the API). A list,
-    # not a dict: the messages cross process boundaries as msgpack, which refuses int map keys.
-    logit_bias: list[list[float]] | None = None
-    # No EOS / stop token before this many generated tokens (vLLM min_tokens, SGLang
-    # min_new_tokens). The scheduler fills min_tokens_stop_ids with the ids to mask.
-    min_tokens: int = 0
-    min_tokens_stop_ids: list[int] = field(default_factory=list)
-    # Extra token ids that end generation with finish_reason "stop" (vLLM stop_token_ids).
-    stop_token_ids: list[int] = field(default_factory=list)
-    # Keep the matched stop string in the output instead of trimming it (vLLM
-    # include_stop_str_in_output, SGLang no_stop_trim).
-    include_stop_str_in_output: bool = False
-    # Decode with skip_special_tokens. Off by default here: the reasoning and tool parsers
-    # consume the <think>/tool tags from the decoded text.
-    skip_special_tokens: bool = False
+    # Sampled-token logprobs (OpenAI `logprobs`/`top_logprobs`): when on, the sampler
+    # reports the chosen token's raw (pre-temperature) logprob and top-k alternatives.
+    logprobs: bool = False
+    top_logprobs: int = 0
 
     @property
     def is_greedy(self) -> bool:
-        return self.temperature <= 0.0 or self.top_k == 1
-
-    @property
-    def needs_logits_processing(self) -> bool:
-        # the penalties are not LogitsPlan work: the sampler applies them from its own
-        # device-side state (Sampler.prepare's penalties).
-        return bool(
-            self.min_p > 0.0
-            or self.logit_bias
-            or self.min_tokens > 0
-        )
+        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
 
 
 @dataclass(eq=False)
@@ -74,10 +44,9 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
-    # per-item processor outputs and the tokenizer's precomputed mrope rows and delta
-    mm_items: list | None = None
-    mrope_positions_full: torch.Tensor | None = None  # [3, prompt_len] int32, CPU
-    mrope_delta: int = 0
+    # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
+    # hidden]) scattered at image-token positions during this request's prefill.
+    mm_embeds: torch.Tensor | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -99,9 +68,6 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
-    output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
-    # [vocab] bool on the device: the prompt's ids, for repetition_penalty. Built once.
-    prompt_token_mask: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -154,8 +120,6 @@ class Batch:
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
-    # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
-    mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
     # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
     # decode to gather/scatter recurrent+conv state without host-side loops (so the
@@ -173,14 +137,8 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
+    # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
-    mm_rows: torch.Tensor | None = field(default=None, init=False)
-    # per batch token, the end (exclusive, in its request) of the image span holding it, 0 for text: the block a bidirectional layer attends within
-    mm_block_ends: torch.Tensor | None = field(default=None, init=False)
-    # this chunk's cache-miss items to encode and the gather plan [(uid, hash, row_lo, row_hi, n, pos), ...] in scatter order
-    mm_encoder_jobs: list | None = field(default=None, init=False)
-    mm_gather_plan: list | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the
@@ -201,9 +159,6 @@ class Batch:
     def is_decode(self) -> bool:
         return self.phase == "decode"
 
-    def get_attn_positions(self) -> torch.Tensor:
-        return self.mrope_positions if self.mrope_positions is not None else self.positions
-
     @property
     def size(self) -> int:
         return len(self.reqs)
@@ -219,11 +174,9 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
+    moe_backend: BaseMoeBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
-    # KV host offload (--kv-host-pages): the QSA backend's logical->physical page bridge.
-    # Set by the engine before create_attention_backend; None when disabled.
-    kv_offloader: KVHostOffloader | None = None
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None

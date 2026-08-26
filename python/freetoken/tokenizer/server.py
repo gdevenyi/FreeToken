@@ -24,7 +24,6 @@ from freetoken.message import (
     UserMsg,
     UserReply,
 )
-from freetoken.mm.config import MultimodalConfig
 from freetoken.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
@@ -81,34 +80,22 @@ def _send_generation_replies(
     _put_user_replies(send_frontend, terminal_errors)
 
 
-def _reasoning_end_id(tokenizer) -> int | None:
-    """The id of the reasoning end tag when the vocabulary has one (``</think>`` for the
-    Qwen / DeepSeek / GLM families), else None. Only used to count reasoning tokens."""
-    for tag in ("</think>", "<|end_of_thinking|>"):
-        try:
-            tid = tokenizer.convert_tokens_to_ids(tag)
-        except Exception:  # noqa: BLE001 -- a tokenizer without the tag answers unk or raises
-            continue
-        if isinstance(tid, int) and tid >= 0 and tid != getattr(tokenizer, "unk_token_id", -1):
-            return tid
-    return None
-
-
 def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[UserMsg], List[UserReply]]:
+) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
     """
-    backend: List[UserMsg] = []
+    ok_msgs: List[TokenizeMsg] = []
+    ok_tensors: List[torch.Tensor] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            user_msg = tokenize_manager.tokenize([msg])[0]
+            tokens = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -122,7 +109,7 @@ def _tokenize_requests(
             continue
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
-        if user_msg.input_ids.numel() == 0:
+        if tokens.numel() == 0:
             errors.append(
                 UserReply(
                     uid=msg.uid,
@@ -132,8 +119,9 @@ def _tokenize_requests(
                 )
             )
             continue
-        backend.append(user_msg)
-    return backend, errors
+        ok_msgs.append(msg)
+        ok_tensors.append(tokens)
+    return ok_msgs, ok_tensors, errors
 
 
 @torch.inference_mode()
@@ -148,7 +136,6 @@ def tokenize_worker(
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
-    mm: MultimodalConfig | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
@@ -157,16 +144,12 @@ def tokenize_worker(
     tokenizer = load_tokenizer(tokenizer_path)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
-    from freetoken.mm.processor import get_mm_processor
-
-    from .detokenize import DetokenizeManager
+    from .detokenize import DetokenizeManager, build_logprobs_entry
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
+    tokenize_manager = TokenizeManager(tokenizer)
     detokenize_manager = DetokenizeManager(
-        tokenizer,
-        load_eos_token_ids(tokenizer_path, tokenizer),
-        think_end_id=_reasoning_end_id(tokenizer),
+        tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
 
     if ack_queue is not None:
@@ -224,7 +207,7 @@ def tokenize_worker(
             )
             sampled_replies: List[UserReply] = []
             if len(detokenize_msg) > 0:
-                replies, reasoning_counts = detokenize_manager.detokenize_with_meta(detokenize_msg)
+                replies = detokenize_manager.detokenize(detokenize_msg)
                 sampled_replies = [
                     UserReply(
                         uid=msg.uid,
@@ -232,7 +215,6 @@ def tokenize_worker(
                         finished=msg.finished,
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
-                        reasoning_tokens=reasoning_tokens,
                         completion_tokens_delta=1,
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
@@ -241,10 +223,21 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        # Stop-string trimming can hide final visible text; keep one logprob
+                        # entry per sampled token.
+                        logprobs=(
+                            build_logprobs_entry(
+                                detokenize_manager.tokenizer,
+                                msg.next_token,
+                                msg.chosen_logprob,
+                                msg.top_ids,
+                                msg.top_logprobs,
+                            )
+                            if msg.chosen_logprob is not None
+                            else None
+                        ),
                     )
-                    for msg, reply, reasoning_tokens in zip(
-                        detokenize_msg, replies, reasoning_counts, strict=True
-                    )
+                    for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]
 
             # An error reply and a client abort are both terminal for their uid, and neither
@@ -265,12 +258,18 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger)
+                ok_msgs, ok_tensors, errors = _tokenize_requests(
+                    tokenize_manager, tokenize_msg, logger
+                )
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
-                if backend:
+                if ok_msgs:
+                    backend = [
+                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
+                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                    ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
