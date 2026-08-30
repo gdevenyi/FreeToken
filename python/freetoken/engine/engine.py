@@ -38,7 +38,8 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, gdn_prefill_workspace_bytes,
+    state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -594,6 +595,9 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        # reserve the GDN prefill transient (chunk recurrent states + v_new); without
+        # it long prefills OOM inside the GDN kernel when memory_ratio packs the pools
+        available_memory -= gdn_prefill_workspace_bytes(config)
         if self.spec is not None:
             # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
             spec_fixed, draft_page = self._spec_budget(config)
@@ -795,6 +799,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += gdn_prefill_workspace_bytes(config)  # GDN prefill transient
         spec_fixed, draft_page = self._spec_budget(config)
         fixed_cache_size += spec_fixed
         cache_per_page += draft_page
