@@ -587,6 +587,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
 
+    # Logprob entries are collected only on the passthrough path: with a reasoning
+    # parser or tool parsing active, text can be hidden, held back, or reclassified,
+    # so an entry could come to describe a token that never reaches visible content.
+    # The API layer fail-closes those request combinations; this guard is the
+    # structural half of the contract — a hidden-token entry must never ride a
+    # later visible delta, whatever the caller.
+    collect_logprobs = reasoning_parser is None and tool_parser is None and not parse_tools
+
     # Streaming tool-call assembly: detectors emit fragments (name first, then
     # argument diffs); they accumulate here and the call is emitted complete when
     # the next call starts, trailing text arrives, or the stream ends.
@@ -667,7 +675,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
-        if getattr(ack, "logprobs", None) is not None:
+        if collect_logprobs and getattr(ack, "logprobs", None) is not None:
             pending_logprobs.append(ack.logprobs)
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:

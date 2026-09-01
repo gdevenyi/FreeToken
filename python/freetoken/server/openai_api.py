@@ -153,6 +153,32 @@ def register_openai_routes(
         )])
 
 
+def _chat_logprobs_conflict(req: ChatCompletionRequest, state: Any) -> str | None:
+    """Fail-close chat logprobs when a semantic parsing layer can hide or reclassify
+    generated tokens. A reasoning parser routes tokens out of visible content (and its
+    stream buffering re-chunks text), and tool parsing consumes tokens into tool_calls,
+    so logprob entries could not be aligned 1:1 with visible content tokens — and hidden
+    reasoning-token strings must never surface through logprobs entries. The raw
+    /v1/completions path has no semantic layer and keeps full logprobs support."""
+    if not req.logprobs:
+        return None
+    if getattr(state.config, "reasoning_parser", None):
+        return (
+            "logprobs on /v1/chat/completions are not supported when the server runs a "
+            "reasoning parser: reasoning tokens are hidden from message content, so "
+            "logprob entries cannot be aligned with it. Use /v1/completions for raw "
+            "token logprobs."
+        )
+    if _should_parse_tools(req):
+        return (
+            "logprobs with tool parsing on /v1/chat/completions are not supported: "
+            "tool-call tokens are consumed into tool_calls, so logprob entries cannot "
+            "be aligned with message content. Send tool_choice='none' or use "
+            "/v1/completions for raw token logprobs."
+        )
+    return None
+
+
 async def handle_chat_completion(
     req: ChatCompletionRequest,
     request: Request | None,
@@ -166,6 +192,9 @@ async def handle_chat_completion(
     logprobs_error = chat_logprobs_error(req)
     if logprobs_error is not None:
         return create_error_response(logprobs_error, param="top_logprobs")
+    logprobs_conflict = _chat_logprobs_conflict(req, state)
+    if logprobs_conflict is not None:
+        return create_error_response(logprobs_conflict, param="logprobs")
     if _response_format_unsupported(req.response_format):
         return create_error_response(
             "response_format json_object/json_schema is not supported (no constrained decoding)",

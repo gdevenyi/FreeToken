@@ -247,11 +247,45 @@ def test_logprobs_validation_errors() -> None:
     assert completion_echo.status_code == 400
 
 
-def test_reasoning_logprob_is_carried_to_next_content_delta() -> None:
-    reasoning_entry = entry(1, "thought", -0.1)
+def test_chat_logprobs_fail_closed_under_semantic_parsing() -> None:
+    # A server-side reasoning parser hides <think> tokens from message content, so
+    # logprob entries cannot be aligned with it: reject up front, stream and
+    # non-stream alike, before any engine work is submitted.
+    with_parser = FakeState([], reasoning_parser="qwen3")
+    for stream in (False, True):
+        resp = run(
+            handle_chat_completion(chat_request(logprobs=True, stream=stream), None, with_parser, {})
+        )
+        assert resp.status_code == 400
+        assert json.loads(resp.body)["error"]["param"] == "logprobs"
+
+    # Tool parsing consumes tokens into tool_calls -- same conflict.
+    tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+    tools_resp = run(
+        handle_chat_completion(chat_request(logprobs=True, tools=[tool]), None, FakeState([]), {})
+    )
+    assert tools_resp.status_code == 400
+    assert json.loads(tools_resp.body)["error"]["param"] == "logprobs"
+
+    # tool_choice="none" disables parsing, so logprobs stay available.
+    ok = run(
+        handle_chat_completion(
+            chat_request(logprobs=True, tools=[tool], tool_choice="none"),
+            None,
+            FakeState([reply("Hi", finished=True, logprobs=entry(1, "Hi", -0.1))]),
+            {},
+        )
+    )
+    assert ok["choices"][0]["logprobs"]["content"][0]["token"] == "Hi"
+
+
+def test_reasoning_logprob_is_not_carried_to_content_delta() -> None:
+    # The generation-layer guard behind the API fail-close: even when a caller
+    # bypasses request validation, a hidden reasoning token's entry is dropped,
+    # never attached to a later visible delta (where its token string would leak).
     state = FakeState(
         [
-            reply("<think>thought</think>", logprobs=reasoning_entry),
+            reply("<think>thought</think>", logprobs=entry(1, "thought", -0.1)),
             reply("answer", finished=True),
         ],
         reasoning_parser="qwen3",
@@ -267,7 +301,7 @@ def test_reasoning_logprob_is_carried_to_next_content_delta() -> None:
         and event["choices"]
         and event["choices"][0]["delta"].get("content") == "answer"
     )
-    assert content_choice["logprobs"]["content"][0]["token"] == "thought"
+    assert "logprobs" not in content_choice
 
 
 async def _collect(iterator):
