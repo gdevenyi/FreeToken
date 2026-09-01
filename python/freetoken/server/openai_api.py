@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -23,7 +24,6 @@ from .api_models import (
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
-    DEFAULT_MAX_OUTPUT_TOKENS,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -39,6 +39,8 @@ from .generation import (
     resolve_sampling,
     submit_generation,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -59,17 +61,14 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
-    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
-    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import apply_default_thinking_mode, effort_toggle_kwargs
+    from .model_meta import effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
-    ctk = apply_default_thinking_mode(ctk, default_thinking_mode)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -80,9 +79,6 @@ def chat_request_to_genspec(
             ignore_eos=req.ignore_eos,
             model_sampling=model_sampling,
             stop=req.stop,
-            default_max_tokens=default_max_tokens,
-            presence_penalty=req.presence_penalty,
-            frequency_penalty=req.frequency_penalty,
         ),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
@@ -150,38 +146,64 @@ def register_openai_routes(
             default_reasoning_effort=default_effort,
         )])
 
-    @app.get("/v1/models/{model_id:path}")
-    async def v1_model(model_id: str):
-        """Retrieve metadata for the currently served model.
 
-        OpenAI-compatible clients may use this endpoint to validate a model
-        name before sending completion requests.
-        """
-        if not model_id:
-            # The :path converter also matches "/v1/models/", which used to redirect to the list.
-            return await v1_models()
-        state = get_state()
-        served_model_id = _served_model_name(state)
+# How often a non-streaming handler looks at the transport while the engine
+# generates. The streaming path checks per chunk; one second bounds an abandoned
+# request's extra decode work without measurable polling overhead.
+_DISCONNECT_POLL_SECONDS = 1.0
 
-        if model_id != served_model_id:
-            return create_error_response(
-                f"The model '{model_id}' does not exist",
-                status_code=404,
-                err_type="invalid_request_error",
-                param="model",
-                code="model_not_found",
-            )
 
-        ctx = _model_context_length(state)
-        efforts, default_effort = await _effort_fields(state)
-        return ModelCard(
-            id=served_model_id,
-            root=state.config.model_path,
-            max_model_len=ctx,
-            context_length=ctx,
-            supported_reasoning_efforts=efforts,
-            default_reasoning_effort=default_effort,
-        )
+async def _await_watching_disconnect(awaitable, request: Request | None, state: Any, uid: int):
+    """Run an in-flight generation awaitable while watching the transport — the
+    non-streaming twin of stream_with_cancellation. Returns the awaitable's result,
+    or None when the client disconnected first: the same shielded abort_user is
+    delivered so an abandoned request stops burning decode slots instead of running
+    to max_tokens (with --max-running-requests 1 that is a full outage for its
+    remaining budget)."""
+    gen = asyncio.ensure_future(awaitable)
+    if request is None:
+        return await gen
+    try:
+        while True:
+            done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
+            if done:
+                return gen.result()
+            if await request.is_disconnected():
+                break
+    except asyncio.CancelledError:
+        # The handler itself was cancelled (server shutdown): deliver the abort,
+        # then let the cancellation propagate — mirrors stream_with_cancellation.
+        try:
+            await asyncio.shield(state.abort_user(uid))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to deliver abort for user %s", uid)
+        gen.cancel()
+        raise
+    # Client gone. Claim + AbortMsg first (abort_user is a no-op once the ack
+    # loop's own cleanup has run), then wind down the drain task; its result is
+    # undeliverable either way.
+    try:
+        await asyncio.shield(state.abort_user(uid))
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to deliver abort for user %s", uid)
+    gen.cancel()
+    try:
+        await gen
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — the response is undeliverable, only cleanup matters
+        pass
+    return None
+
+
+def _client_disconnected_response() -> JSONResponse:
+    # 499 — nginx's "client closed request". The client is gone; this status is
+    # for the access log, not the wire.
+    return create_error_response(
+        "client disconnected before the response was ready",
+        status_code=499,
+        err_type="client_disconnected",
+    )
 
 
 async def handle_chat_completion(
@@ -219,15 +241,7 @@ async def handle_chat_completion(
             )
 
     try:
-        default_max_tokens = (
-            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
-        )
-        spec = chat_request_to_genspec(
-            req,
-            model_sampling,
-            default_max_tokens=default_max_tokens,
-            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
-        )
+        spec = chat_request_to_genspec(req, model_sampling)
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -238,10 +252,7 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    try:
-        uid = await submit_generation(spec, state)
-    except GenerationError as exc:
-        return create_error_response(str(exc), code=exc.code)
+    uid = await submit_generation(spec, state)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
@@ -250,9 +261,13 @@ async def handle_chat_completion(
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        result = await _await_watching_disconnect(
+            generate_full(uid, spec, state, source="/v1/chat/completions"), request, state, uid
+        )
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
+    if result is None:
+        return _client_disconnected_response()
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
     if result.reasoning:
         message["reasoning_content"] = result.reasoning
@@ -287,11 +302,7 @@ async def stream_chat_completion_chunks(
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
-        spec = chat_request_to_genspec(
-            req,
-            {},
-            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
-        )
+        spec = chat_request_to_genspec(req, {})
     yield _sse(
         _chat_chunk(
             req,
@@ -441,10 +452,7 @@ async def handle_completion(
     if unsupported is not None:
         return create_error_response(unsupported)
     try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
-        default_max_tokens = (
-            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
-        )
-        _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
+        _resolve_sampling(req, model_sampling)
     except ValueError as exc:
         return create_error_response(str(exc), param="max_tokens")
 
@@ -455,9 +463,7 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                req, model_sampling, default_max_tokens=default_max_tokens
-            ))
+            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -470,28 +476,30 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(
-                uid=uid,
-                text=prompt,
-                sampling_params=_resolve_sampling(
-                    req, model_sampling, default_max_tokens=default_max_tokens
-                ),
-            )
-        )
-        text = ""
-        finish_reason = "stop"
-        async for ack in state.wait_for_ack(uid):
-            if getattr(ack, "error", None):
-                return create_error_response(ack.error)
-            prompt_tokens += ack.prompt_tokens_delta
-            completion_tokens += ack.completion_tokens_delta
-            cached_tokens += ack.cached_tokens
-            text += ack.incremental_output
-            if ack.finished:
-                finish_reason = getattr(ack, "finish_reason", None) or "stop"
-                break
-        choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
+        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
+
+        async def _drain_one(uid: int = uid, index: int = index):
+            nonlocal prompt_tokens, completion_tokens, cached_tokens
+            text = ""
+            finish_reason = "stop"
+            async for ack in state.wait_for_ack(uid):
+                if getattr(ack, "error", None):
+                    return create_error_response(ack.error)
+                prompt_tokens += ack.prompt_tokens_delta
+                completion_tokens += ack.completion_tokens_delta
+                cached_tokens += ack.cached_tokens
+                text += ack.incremental_output
+                if ack.finished:
+                    finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                    break
+            return {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None}
+
+        choice = await _await_watching_disconnect(_drain_one(), request, state, uid)
+        if choice is None:
+            return _client_disconnected_response()
+        if isinstance(choice, JSONResponse):
+            return choice
+        choices.append(choice)
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex}",
@@ -585,7 +593,6 @@ def create_error_response(
 def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
-    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> SamplingParams:
     return resolve_sampling(
         temperature=req.temperature,
@@ -595,9 +602,6 @@ def _resolve_sampling(
         ignore_eos=req.ignore_eos,
         model_sampling=model_sampling,
         stop=req.stop,
-        default_max_tokens=default_max_tokens,
-        presence_penalty=req.presence_penalty,
-        frequency_penalty=req.frequency_penalty,
     )
 
 
@@ -749,31 +753,10 @@ def _served_model_name(state: Any) -> str:
 
 
 def _model_context_length(state: Any) -> int | None:
-    """The usable context: ``min(model ceiling, allocated KV tokens)``.
-
-    This is the clamp the engine already applies to its own ``max_seq_len`` (Engine.__init__,
-    and again in _refresh_seq_state after a rebuild), and therefore the limit the scheduler
-    admits against. The frontend process holds an unclamped ServerArgs copy, so publishing
-    ``config.max_seq_len`` here advertised the model's positional ceiling instead -- e.g. 262144
-    against a 178176-token pool, so the engine and this route disagreed about one quantity.
-
-    `ft launch` reads this to size each agent's context window (opencode's ``limit.context``,
-    codex's ``context_window``, ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``), so overstating it stops
-    those agents compacting before the KV pool runs out.
-    """
+    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
+    read this once at startup."""
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None
-    if value <= 0:
-        return None
-    try:
-        # Local import: api_server imports this module, so a module-level one would cycle.
-        from .api_server import kv_pool_geometry
-
-        num_pages, page_size = kv_pool_geometry(state)
-        kv_tokens = num_pages * page_size
-    except Exception:  # noqa: BLE001
-        kv_tokens = 0
-    # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.
-    return min(value, kv_tokens) if kv_tokens > 0 else value
+    return value if value > 0 else None
