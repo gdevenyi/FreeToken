@@ -31,8 +31,6 @@ from .mha_pool import MHAKVCache
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
 _INDEX_DTYPE_BYTES = 2
-# t/h/w int32 rope position kept per KV slot on mrope models
-_ROPE_POS_BYTES = 3 * 4
 
 
 class QSAKVCache(MHAKVCache):
@@ -65,7 +63,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
-        mrope: bool = False,
+        kv_quant: str = "none",
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -92,7 +90,6 @@ class QSAKVCache(MHAKVCache):
         self._ring_capacity = ring_capacity
         self._index_dtype = dtype
         self._page_size = page_size
-        self._mrope = mrope
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
@@ -102,6 +99,14 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            # "fp8" quantizes ONLY the KV tiers: codes + one scale per (slot, kv_head)
+            # replace the bf16 K/V, and store_kv's fused writer replaces the
+            # separate qsa_store_rows. The three index tiers below stay bf16 no matter
+            # what is asked for -- block selection reads a different tensor
+            # (models/qwen3_8_flash_next.py builds index_k in the engine dtype), so
+            # --kv-cache-dtype fp8 leaves retrieval quality, and the score kernel's
+            # dtype asserts, untouched.
+            kv_quant=kv_quant,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -109,8 +114,11 @@ class QSAKVCache(MHAKVCache):
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
-        # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
-        self._kv_buffer.zero_()
+        # unmasked read finite instead of model-poisoning. One memset per (re)allocation,
+        # through the byte view so it works whether the slab holds bf16 values or e4m3
+        # codes -- a memset is the one op both representations support, and the codes
+        # live in bytes on every architecture (kv_quant.kv_codes_dtype).
+        self._kv_buffer.view(torch.uint8).zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -132,12 +140,6 @@ class QSAKVCache(MHAKVCache):
             dtype=self._index_dtype,
             device=self._device,
         )
-        # 3-axis rope position of every stored token: a compressed group ropes at its first token, which under mrope is not derivable from the logical position
-        self._rope_positions = (
-            torch.zeros(num_pages * self._page_size, 3, dtype=torch.int32, device=self._device)
-            if self._mrope
-            else None
-        )
 
     def rebuild(self, num_pages: int) -> None:
         # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
@@ -147,7 +149,6 @@ class QSAKVCache(MHAKVCache):
         # cannot drop a live request's pending members.
         self._cmp_k_buffer = None
         self._pending_ring = None
-        self._rope_positions = None
         super().rebuild(num_pages)
         self._zero_kv_slabs()
         try:
@@ -156,6 +157,9 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            # Same reason as above on an fp8 pool: a grown K/V slab whose scales are gone
+            # would serve quantized rows at the wrong scale rather than fail.
+            self._scale_buffer = None
             raise
 
     @classmethod
@@ -174,8 +178,6 @@ class QSAKVCache(MHAKVCache):
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
                 fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
-                if config.model_config.model_is_mrope:
-                    per_token += _ROPE_POS_BYTES
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
@@ -189,7 +191,7 @@ class QSAKVCache(MHAKVCache):
             * self._index_head_dim
             * self._index_dtype.itemsize
         )
-        return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
+        return kv + slab // tokens, swa
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""
@@ -198,12 +200,6 @@ class QSAKVCache(MHAKVCache):
     def pending_ring(self, slot: int) -> torch.Tensor:
         """One sparse layer's pending ring: ``[num_req_slots, ring_capacity, index_head_dim]``."""
         return self._pending_ring[:, slot]
-
-    @property
-    def rope_positions(self) -> torch.Tensor:
-        """``[num_tokens, 3]`` int32 t/h/w rope position per KV slot (written by the QSA backend)."""
-        assert self._rope_positions is not None, "rope positions are only kept on mrope models"
-        return self._rope_positions
 
     @property
     def cmp_scratch_base(self) -> int:
