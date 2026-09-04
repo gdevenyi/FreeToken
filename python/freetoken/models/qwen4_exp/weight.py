@@ -264,7 +264,9 @@ def iter_weights(
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
-    config = parse_config(hf_config)
+    # The sharding geometry needs the parsed config; TP=1 never shards, so keep the plain path free
+    # of a parse (synthetic test checkpoints carry no model_type).
+    config = parse_config(hf_config) if tp.size > 1 else None
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
