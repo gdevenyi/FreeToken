@@ -240,6 +240,48 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     return shard_tensor(name, t, rank=rank, world_size=world, num_kv_heads=None)
 
 
+# Load-time per-tensor FP8 (attn_quant == "fp8_dynamic", layers/fp8_dynamic.py): these keep
+# their name and gain a sibling ``weight_scale``; GDN ``in_proj`` splits into the fp8
+# ``in_proj_qkvz`` and the bf16 ``in_proj_ba`` (the gate projections stay bf16, as in the
+# block-fp8 checkpoints and in sglang / vLLM).
+_FP8_DENSE_SUFFIXES = (
+    ".self_attn.qkv_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".linear_attn.out_proj.weight",
+)
+_E4M3_MAX = 448.0
+
+
+def _quantize_per_tensor(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(e4m3 weight, fp32 scale ())`` with ``w ~= weight * scale``."""
+    w = w.float()
+    scale = (w.abs().amax() / _E4M3_MAX).clamp_min(1e-12)
+    return (w / scale).clamp_(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), scale.reshape(())
+
+
+def _fp8_dense(
+    name: str, t: torch.Tensor, config, world: int
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """The (already sharded) dense tensor as the fp8_dynamic model expects it."""
+    if name.endswith(".linear_attn.in_proj.weight"):
+        g = config.linear_attention_group()
+        nk = div_even(g.num_key_heads, world, allow_replicate=True)
+        nv = div_even(g.num_value_heads, world, allow_replicate=True)
+        qkvz = 2 * nk * g.key_head_dim + 2 * nv * g.value_head_dim  # [q | k | v | z] local rows
+        assert t.shape[0] == qkvz + 2 * nv, (name, t.shape, qkvz, nv)
+        base = name[: -len("in_proj.weight")]
+        w8, scale = _quantize_per_tensor(t[:qkvz])
+        yield base + "in_proj_qkvz.weight", w8
+        yield base + "in_proj_qkvz.weight_scale", scale
+        yield base + "in_proj_ba.weight", t[qkvz:].contiguous()
+    elif name.endswith(_FP8_DENSE_SUFFIXES):
+        w8, scale = _quantize_per_tensor(t)
+        yield name, w8
+        yield name[: -len("weight")] + "weight_scale", scale
+    else:
+        yield name, t
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -258,15 +300,26 @@ def iter_weights(
     if not include_non_moe:
         return
 
+    from freetoken.models.config import fp8_dense_enabled
+
     from .config import parse_config
 
     tp = get_tp_info()
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
-    # The sharding geometry needs the parsed config; TP=1 never shards, so keep the plain path free
-    # of a parse (synthetic test checkpoints carry no model_type).
-    config = parse_config(hf_config) if tp.size > 1 else None
+    # The sharding geometry (and the fp8 split) need the parsed config; TP=1 bf16 never does, so
+    # keep that path free of a parse (synthetic test checkpoints carry no model_type).
+    config = parse_config(hf_config) if tp.size > 1 or fp8_dense_enabled() else None
+    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+
+    def emit(name: str, tensor: torch.Tensor):
+        tensor = _shard(name, tensor, config, tp.rank, tp.size)
+        if fp8:
+            yield from _fp8_dense(name, tensor, config, tp.size)
+        else:
+            yield name, tensor
+
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -283,10 +336,10 @@ def iter_weights(
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, _shard(name, tensor, config, tp.rank, tp.size)
+                    yield from emit(name, tensor)
                 else:
                     for fused_name, fused_tensor in fused:
-                        yield fused_name, _shard(fused_name, fused_tensor, config, tp.rank, tp.size)
+                        yield from emit(fused_name, fused_tensor)
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
