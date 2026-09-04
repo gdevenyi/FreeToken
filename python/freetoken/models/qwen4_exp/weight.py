@@ -47,7 +47,8 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+# ``.weight_scale_inv`` is the 128x128 block-FP8 reciprocal scale (see _load_maybe_block_fp8).
+_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -119,6 +120,22 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.startswith("language_model."):
         return "model." + raw_name[len("language_model.") :]
     return raw_name
+
+
+def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
+    """Load ``raw_name``, dequantizing 128x128 block-FP8 to bf16 when a sibling
+    ``.weight_scale_inv`` sits in the same shard (community MIXED_PRECISION builds store the
+    dense attn/GDN projections that way); plain bf16 passes through unchanged."""
+    tensor = f.get_tensor(raw_name)
+    if raw_name.endswith(".weight"):
+        base = raw_name[: -len(".weight")]
+        if base + ".weight_scale_inv" in keyset:
+            from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+            return dequant_block_fp8(tensor, f.get_tensor(base + ".weight_scale_inv")).to(
+                torch.bfloat16
+            )
+    return tensor
 
 
 def _try_fuse(
@@ -231,11 +248,12 @@ def iter_weights(
         disable=not tp.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            keyset = set(f.keys())
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
+                tensor = _load_maybe_block_fp8(f, raw_name, keyset)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete

@@ -168,6 +168,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
             assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
             expert_quant = "fp8_block"
             attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "mixed_precision":
+            # modelopt MIXED_PRECISION (upstream PR #320): the per-module algo lives in
+            # ``quantized_layers``. Community NVFP4-FP8 builds keep NVFP4 routed experts
+            # (read natively by the offload cache) and store the dense attn/GDN projections
+            # as 128x128 block-FP8, which weight.py dequantizes to bf16 at load.
+            quantized = get("quantized_layers") or {}
+            experts_nvfp4 = any(
+                ".mlp.experts" in str(module)
+                and str((spec or {}).get("quant_algo", "")).upper() == "NVFP4"
+                for module, spec in quantized.items()
+            )
+            expert_quant = "nvfp4" if experts_nvfp4 else "none"
+            attn_quant = dense_quant = lm_head_quant = "none"
         else:
             is_fp4 = "fp4" in algo
             ignore = list(get("ignore") or [])
