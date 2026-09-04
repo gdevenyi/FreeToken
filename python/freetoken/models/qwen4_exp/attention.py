@@ -28,8 +28,11 @@ from freetoken.layers import (
     LinearReplicated,
 )
 from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
+from freetoken.models.quant_linear import make_col_merged_quant, make_replicated_quant
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import div_even, nvtx_annotate
+
+from .config import dense_quant_mode
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -137,11 +140,18 @@ class Qwen4ExpAttention(BaseOP):
         self._local_kv_dim = self._local_num_kv * self.head_dim
         self._qkv_split = [self._local_qo_dim * 2, self._local_kv_dim, self._local_kv_dim]
         qkv_sizes = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        if config.attn_quant == "fp8_dynamic":  # load-time per-tensor FP8, W8A8 GEMMs
+        mode = dense_quant_mode(config)
+        if mode == "fp8_dynamic":  # load-time per-tensor FP8, W8A8 GEMMs
             self.qkv_proj = Fp8DynamicColMerged(
                 config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split
             )
             self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size)
+        elif mode == "fp8_block":
+            # checkpoint-declared 128x128 block-FP8 dense (modelopt FP8_PB_WO, upstream PR
+            # #392): the Fp8Block linears consume the weight + weight_scale_inv directly.
+            # TP=1 only (dense_quant_mode dequantizes under TP>1).
+            self.qkv_proj = make_col_merged_quant("none", mode, config.hidden_size, qkv_sizes)
+            self.o_proj = make_replicated_quant("none", mode, self.qo_attn_dim, config.hidden_size)
         else:
             self.qkv_proj = LinearColParallelMerged(
                 config.hidden_size, qkv_sizes, has_bias=False, local_output_sizes=self._qkv_split

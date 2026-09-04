@@ -126,6 +126,26 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
+_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
+
+
+def dense_quant_mode(config: ModelConfig) -> str:
+    """``attn_quant`` as the model and the weight loader must build it on THIS rank.
+
+    A checkpoint-declared block-FP8 dense (``fp8_block``) has no tensor-parallel linears, so
+    under TP>1 it is dequantized to bf16 at load and built as the bf16 TP path (``none``).
+    Called after the TP info is set (model build, ``iter_weights``); ``parse_config`` itself
+    may run in the frontend before that."""
+    if config.attn_quant == "fp8_block":
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+        if tp is not None and tp.size > 1:
+            return "none"
+    return config.attn_quant
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
@@ -170,18 +190,30 @@ def parse_config(hf_config: Any) -> ModelConfig:
             expert_quant = "fp8_block"
             attn_quant = dense_quant = lm_head_quant = "none"
         elif algo == "mixed_precision":
-            # modelopt MIXED_PRECISION (upstream PR #320): the per-module algo lives in
-            # ``quantized_layers``. Community NVFP4-FP8 builds keep NVFP4 routed experts
-            # (read natively by the offload cache) and store the dense attn/GDN projections
-            # as 128x128 block-FP8, which weight.py dequantizes to bf16 at load.
+            # modelopt MIXED_PRECISION (upstream PR #320 / #392): the quant algo is declared per
+            # module in ``quantized_layers``. The community NVFP4-FP8 build of
+            # Qwen3.8-Flash-Next quantizes the routed experts to NVFP4 (read natively by the
+            # offload cache) and the dense attn/GDN projections to 128x128 block-FP8, declared
+            # per module as ``FP8_PB_WO``.
             quantized = get("quantized_layers") or {}
             experts_nvfp4 = any(
                 ".mlp.experts" in str(module)
                 and str((spec or {}).get("quant_algo", "")).upper() == "NVFP4"
                 for module, spec in quantized.items()
             )
+            # The same map declares the dense attn/GDN projections as FP8_PB_WO
+            # (per-block, weight-only FP8 with a ``weight_scale_inv`` sibling). Serve
+            # them natively instead of dequantizing at load: the four-way in_proj fusion
+            # splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM (see gdn.py), which
+            # halves the dense bytes read on every decode step.
+            dense_block_fp8 = any(
+                ".mlp.experts" not in str(module)
+                and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
+                for module, spec in quantized.items()
+            )
             expert_quant = "nvfp4" if experts_nvfp4 else "none"
-            attn_quant = dense_quant = lm_head_quant = "none"
+            attn_quant = "fp8_block" if dense_block_fp8 else "none"
+            dense_quant = lm_head_quant = "none"
         else:
             is_fp4 = "fp4" in algo
             ignore = list(get("ignore") or [])
@@ -198,9 +230,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
             attn_quant = _quant(f"{prefix}.self_attn.q_proj")
             lm_head_quant = _quant("lm_head")
 
-    if attn_quant == "none" and fp8_dense_enabled():
-        # bf16 attention / GDN projections quantized at load: per-tensor e4m3 weights,
-        # W8A8 through cuBLASLt (layers/fp8_dynamic.py; the loader emits the fp8 tensors)
+    # FREETOKEN_FP8_DENSE=1 wins over a checkpoint-declared block-FP8 dense: the block-FP8
+    # weights are dequantized at load and re-quantized per tensor, so the W8A8 _scaled_mm
+    # path (faster than the Triton block kernels on sm_89, and TP-capable) serves them.
+    if attn_quant in ("none", "fp8_block") and fp8_dense_enabled():
         attn_quant = "fp8_dynamic"
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")

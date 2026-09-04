@@ -102,8 +102,11 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
-def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
+def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ``keep_scale_inv`` retains the block-FP8 ``weight_scale_inv`` tensors, which the
+    fp8 linears need alongside their weight; they are dropped otherwise."""
     if raw_name.startswith("mtp."):
         return None
     if raw_name.startswith(("model.visual.", "visual.")):
@@ -115,7 +118,9 @@ def _rename(raw_name: str) -> str | None:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
-    if raw_name.endswith(_SCALE_SUFFIXES):
+    if raw_name.endswith(_SCALE_SUFFIXES) and not (
+        keep_scale_inv and raw_name.endswith(".weight_scale_inv")
+    ):
         return None
     if raw_name.startswith("model.language_model."):
         return "model." + raw_name[len("model.language_model.") :]
@@ -141,10 +146,11 @@ def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
 
 
 def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
+    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]],
+    table: dict[str, tuple[tuple[str, ...], int]] | None = None,
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
     """Buffer a fusion part; return the merged ``(name, tensor)`` once all parts arrive, ``()`` while incomplete, ``None`` if ``name`` is not a fusion part."""
-    for fused_suffix, (parts, pad_to) in _FUSIONS.items():
+    for fused_suffix, (parts, pad_to) in (table or _FUSIONS).items():
         for idx, part in enumerate(parts):
             if not name.endswith(part):
                 continue
@@ -258,6 +264,69 @@ def _fp8_dense(
         yield name, t
 
 
+# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
+_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
+
+# Serving the dense side natively as block-FP8 changes which buffers the model expects:
+# the four-way in_proj fusion splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM
+# (see gdn.py), and each fp8 group fuses its ``weight_scale_inv`` on the same axis as its
+# ``weight``. Every fp8 part is a whole number of 128-row blocks, so the per-block scales
+# concatenate exactly alongside the rows they describe.
+_BLOCK_FP8_FUSE: dict[str, tuple[str, ...]] = {
+    ".self_attn.qkv_proj": (
+        ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj",
+    ),
+    ".linear_attn.in_proj_qkvz": (
+        ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+    ),
+}
+_BLOCK_BF16_FUSE: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_ba": (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
+}
+_BLOCK_FP8_KINDS = (".weight", ".weight_scale_inv")
+
+
+def _block_fp8_fusions() -> dict[str, tuple[tuple[str, ...], int]]:
+    """``_FUSIONS`` with the two attention groups replaced by their block-FP8 split."""
+    table = {
+        key: val
+        for key, val in _FUSIONS.items()
+        if key not in (".self_attn.qkv_proj.weight", ".linear_attn.in_proj.weight")
+    }
+    for fused, parts in _BLOCK_FP8_FUSE.items():
+        for kind in _BLOCK_FP8_KINDS:
+            table[fused + kind] = (tuple(part + kind for part in parts), 0)
+    for fused, parts in _BLOCK_BF16_FUSE.items():
+        table[fused + ".weight"] = (tuple(part + ".weight" for part in parts), 0)
+    return table
+
+
+_FUSIONS_BLOCK_FP8 = _block_fp8_fusions()
+
+
+def _dense_is_block_fp8(model_path: str) -> bool:
+    """True when the checkpoint DECLARES its dense (non-expert) modules per-block
+    weight-only FP8 -- exactly when config.py sets ``attn_quant="fp8_block"``.
+
+    Both sides read the same declaration, so the buffers emitted here always match the
+    modules the model built. A checkpoint carrying ``weight_scale_inv`` WITHOUT declaring
+    it falls through to ``_load_maybe_block_fp8`` and is dequantized to bf16 as before.
+    """
+    try:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as fh:
+            quant = json.load(fh).get("quantization_config") or {}
+    except (OSError, ValueError):
+        return False
+    algo = str(quant.get("quant_algo") or quant.get("quant_method") or "").lower()
+    if algo != "mixed_precision":
+        return False
+    return any(
+        ".mlp.experts" not in str(module)
+        and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
+        for module, spec in (quant.get("quantized_layers") or {}).items()
+    )
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -283,22 +352,30 @@ def iter_weights(
 
     from freetoken.models.config import fp8_dense_enabled
 
-    from .config import parse_config
+    from .config import dense_quant_mode, parse_config
 
     tp = get_tp_info()
     # The sharding geometry (and the fp8 split) need the HF config; TP=1 bf16 never does, so
     # keep that path free of a config load (synthetic test checkpoints carry no model_type).
     config = (
         parse_config(cached_load_hf_config(model_path))
-        if tp.size > 1 or fp8_dense_enabled()
+        if tp.size > 1 or fp8_dense_enabled() or _dense_is_block_fp8(model_path)
         else None
     )
-    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+    mode = "none" if config is None else dense_quant_mode(config)
+    fp8 = mode == "fp8_dynamic"
+    # Checkpoint-declared block-FP8 dense served natively (TP=1; upstream PR #392): keep the
+    # fp8 weights + weight_scale_inv and fuse on the split table. Anything else keeps the
+    # dequant path (and, under fp8_dynamic, re-quantizes per tensor after sharding).
+    block_fp8 = mode == "fp8_block"
+    fusions = _FUSIONS_BLOCK_FP8 if block_fp8 else _FUSIONS
     if fp8:
         logger.info(
             "qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), "
             "FREETOKEN_FP8_DENSE=1"
         )
+    elif block_fp8:
+        logger.info("qwen4_exp dense projections: checkpoint block-FP8 served natively")
 
     def emit(name: str, tensor: torch.Tensor):
         tensor = _shard(name, tensor, config, tp.rank, tp.size)
@@ -316,11 +393,15 @@ def iter_weights(
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             keyset = set(f.keys())
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, keep_scale_inv=block_fp8)
                 if name is None:
                     continue
-                tensor = _load_maybe_block_fp8(f, raw_name, keyset)
-                fused = _try_fuse(name, tensor, fuse_buf)
+                tensor = (
+                    f.get_tensor(raw_name)
+                    if block_fp8
+                    else _load_maybe_block_fp8(f, raw_name, keyset)
+                )
+                fused = _try_fuse(name, tensor, fuse_buf, fusions)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         name, tensor = fused
