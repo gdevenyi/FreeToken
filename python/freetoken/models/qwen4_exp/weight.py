@@ -349,6 +349,11 @@ def iter_weights(
                         yield from emit(fused_name, fused_tensor)
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    if fp8 and device.type == "cuda":
+        # The bf16 originals and fp32 temporaries of the quantization sit in the caching
+        # allocator; hand them back so the expert-cache planner (free VRAM after load) sees
+        # the halved dense footprint instead of the slack.
+        torch.cuda.empty_cache()
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
