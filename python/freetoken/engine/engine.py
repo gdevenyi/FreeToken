@@ -487,6 +487,12 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        if config.num_page_override is not None:
+            # --num-pages / --num-tokens is a requirement, not a floor: plan the expert fill
+            # against the KV the pool will actually allocate, or the two together overrun
+            # the budget and the pool OOMs after the experts are already resident.
+            kv_reserve_tokens = max(kv_reserve_tokens, config.num_page_override * page_tokens)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -497,7 +503,7 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )

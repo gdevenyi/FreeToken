@@ -295,6 +295,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        num_page_override = None
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -332,6 +333,28 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
     assert (size, pages, overlap) == expected
+
+    # --num-pages / --num-tokens: the plan must reserve the requested KV (not the 0-token
+    # floor) so the expert fill leaves room for the pages the pool will actually allocate.
+    class Override(StubConfig):
+        num_page_override = 20
+        moe_prefill_overlap = False  # floor of num_experts slots, so the KV reserve can bite
+
+    class NoOverride(Override):
+        num_page_override = None
+
+    class BigBanks:  # 1.3 MB per expert slot: 8 slots do not fit the 8 MB budget
+        quant_format = "bf16"
+        sources = {
+            "gate_up": [torch.zeros(4, 325, 1000, dtype=torch.float16)] * 2,
+            "down": [torch.zeros(4, 1000, 325, dtype=torch.float16)] * 2,
+        }
+
+    size_n, pages_n, _ = engine._resolve_auto_moe_cache_size(NoOverride(), BigBanks())
+    size_o, pages_o, _ = engine._resolve_auto_moe_cache_size(Override(), BigBanks())
+    assert pages_n < 20 <= pages_o and size_o < size_n
+    budget = int(0.9 * 10_000_000) - 1_000_000 - fixed
+    assert size_o * expert_bytes_per_slot(BigBanks.sources) + 20 * cache_per_page <= budget
 
 
 # ---------------------------------------------------------------------------
