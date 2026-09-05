@@ -357,6 +357,7 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        finished = False
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
@@ -364,12 +365,18 @@ class FrontendManager:
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
                 yield chunk
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(self.abort_user(uid))
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to deliver abort for user %s", uid)
-            raise
+            finished = True
+        finally:
+            # Two ways the client goes away: CancelledError while this generator awaits
+            # the next chunk, or GeneratorExit when Starlette closes the response body
+            # while the generator is suspended at the yield (the common case with a
+            # keep-alive client such as openai-python: the socket is gone, no
+            # CancelledError ever reaches this frame). Either way the request must stop.
+            if not finished:
+                try:
+                    await asyncio.shield(self.abort_user(uid))
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to deliver abort for user %s", uid)
 
     async def abort_user(self, uid: int):
         claimed = self.event_map.pop(uid, None) is not None

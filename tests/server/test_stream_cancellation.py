@@ -75,6 +75,31 @@ def test_cancellation_sends_one_abort_and_cleans_maps_inline():
     asyncio.run(run())
 
 
+def test_body_close_at_the_yield_sends_one_abort():
+    """Starlette closes the response body when the socket goes away while this generator
+    is suspended at its yield (keep-alive clients such as openai-python): no
+    CancelledError reaches the frame, so the abort has to come from the close."""
+
+    async def run():
+        state = _state()
+        state.abort_user = lambda request_uid: FrontendManager.abort_user(state, request_uid)
+
+        async def chunks():
+            yield b"a"
+            yield b"b"  # pragma: no cover
+
+        gen = FrontendManager.stream_with_cancellation(state, chunks(), _Request(), 7)
+        assert await gen.__anext__() == b"a"  # suspended at the yield now
+        await gen.aclose()
+
+        assert len(state.sent) == 1
+        assert isinstance(state.sent[0], AbortMsg)
+        assert state.sent[0].uid == 7
+        assert state.stats.aborts == [7]
+
+    asyncio.run(run())
+
+
 def test_abort_delivery_failure_preserves_cancellation():
     async def boom(msg):
         raise RuntimeError("zmq down")
