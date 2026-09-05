@@ -121,3 +121,64 @@ def test_quant_per_tensor_zero_input_is_finite():
         torch.zeros(16, 128, device="cuda", dtype=torch.bfloat16)
     )
     assert torch.isfinite(scale).item() and (x8.float() == 0).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("n", [4096, 16384, 20480, 81920, 200000])
+def test_split_quant_path_agrees_with_the_single_program_one(n: int):
+    """The two-launch path above _SPLIT_MIN_ELEMENTS must quantize bit for bit like the
+    one-program kernel: same amax (max is exact under any grouping), same arithmetic."""
+    import freetoken.layers.fp8_dynamic as m
+
+    torch.manual_seed(0)
+    x = (torch.randn(n, device="cuda") * 3.0).to(torch.bfloat16)
+    got8, got_scale = m.quant_per_tensor(x)
+    ref8 = torch.empty_like(x, dtype=m.FP8)
+    ref_scale = torch.empty((), dtype=torch.float32, device="cuda")
+    m._quant_fused_kernel[(1,)](x, ref8, ref_scale, n, BLOCK=m._BLOCK, num_warps=8)
+    assert torch.equal(got_scale, ref_scale)
+    assert torch.equal(got8.view(torch.uint8), ref8.view(torch.uint8))
+
+
+def test_hyper_connection_linears_go_fp8_under_the_dense_flag(monkeypatch):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers import LinearReplicated
+    from freetoken.layers.fp8_dynamic import Fp8DynamicLinear
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.hc import GatedResidual
+
+    from .common import toy_hf_config
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    assert isinstance(
+        GatedResidual(parse_config(toy_hf_config())).input_mix_weight_up, LinearReplicated
+    )
+    monkeypatch.setenv("FREETOKEN_FP8_DENSE", "1")
+    config = parse_config(toy_hf_config())
+    for hc in (GatedResidual(config), GatedResidual(config, use_combine=False)):
+        for op in vars(hc).values():
+            if isinstance(op, (LinearReplicated, Fp8DynamicLinear)):
+                assert isinstance(op, Fp8DynamicLinear)
+                assert set(op.state_dict()) == {"weight", "weight_scale"}
+
+
+def test_reader_quantizes_the_hc_mixers_and_gates_lm_head_separately():
+    cfg = _cfg()
+    t = torch.randn(64, 32, dtype=torch.bfloat16)
+    for name in (
+        "x.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+        "x.mlp_hyper_connection.input_mix_weight_up.weight",
+        "model.hyper_connection_mixer.input_mix_weight_down.weight",
+    ):
+        out = dict(_fp8_dense(name, t, cfg, 1))
+        assert sorted(out) == [name, name[: -len("weight")] + "weight_scale"]
+        assert out[name].dtype == torch.float8_e4m3fn
+    # lm_head only under its own flag, and then without pulling in the dense rewrites
+    assert list(dict(_fp8_dense("lm_head.weight", t, cfg, 1))) == ["lm_head.weight"]
+    out = dict(_fp8_dense("lm_head.weight", t, cfg, 1, dense=False, lm_head=True))
+    assert sorted(out) == ["lm_head.weight", "lm_head.weight_scale"]
+    assert out["lm_head.weight"].dtype == torch.float8_e4m3fn
+    passthrough = dict(_fp8_dense("x.self_attn.qkv_proj.weight", t, cfg, 1,
+                                  dense=False, lm_head=True))
+    assert list(passthrough) == ["x.self_attn.qkv_proj.weight"]

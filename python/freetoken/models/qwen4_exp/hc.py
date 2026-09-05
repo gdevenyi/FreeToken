@@ -21,6 +21,7 @@ from freetoken.kernel.triton.hc import (
     hc_silu,
 )
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers.fp8_dynamic import Fp8DynamicLinear
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -86,6 +87,8 @@ class GatedResidual(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, use_combine: bool = True) -> None:
+        from .config import dense_quant_mode
+
         args = config.qwen4_args
         self.hc_count = args.hc_count
         self.hidden_size = args.hidden_size
@@ -93,16 +96,25 @@ class GatedResidual(BaseOP):
         self.use_combine = use_combine
         width = args.ple_state_width
         self.hc_norm = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
+        # The mixer weights are REPLICATED on every rank and re-read every step (1.3 GB per
+        # step per rank at the shipping geometry -- the largest bf16 block left on the decode
+        # path), so they follow the dense projections into per-tensor FP8 under
+        # FREETOKEN_FP8_DENSE=1. Both operands of both GEMMs are 16-aligned by construction.
+        def linear(isize: int, osize: int):
+            if dense_quant_mode(config) == "fp8_dynamic":
+                return Fp8DynamicLinear(isize, osize)
+            return LinearReplicated(isize, osize, has_bias=False)
+
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
+            self.input_mix_weight_down_block_inject = linear(
+                width, self.lowrank + self.hc_count + self.pad_size
             )
         else:
             self.pad_size = 0
-            self.input_mix_weight_down = LinearReplicated(width, self.lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(self.lowrank, width, has_bias=False)
+            self.input_mix_weight_down = linear(width, self.lowrank)
+        self.input_mix_weight_up = linear(self.lowrank, width)
 
     def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""
