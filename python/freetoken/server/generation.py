@@ -418,9 +418,14 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    default_max_tokens: int | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
-    filling unspecified fields from the checkpoint's recommended defaults."""
+    filling unspecified fields from the checkpoint's recommended defaults.
+
+    ``default_max_tokens`` is the operator's ``--max-output-tokens`` for a request that omits
+    one. Without it every protocol silently falls back to the 32k constant, which is what the
+    flag is supposed to replace."""
 
     def pick(value, key, framework):
         return value if value is not None else model_sampling.get(key, framework)
@@ -443,7 +448,9 @@ def resolve_sampling(
         raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {resolved_top_k}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        max_tokens=(default_max_tokens or DEFAULT_MAX_OUTPUT_TOKENS)
+        if max_tokens is None
+        else max_tokens,
         temperature=resolved_temperature,
         top_k=resolved_top_k,
         top_p=resolved_top_p,
