@@ -67,6 +67,14 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
         def v_cache(self, layer_id):
             return self.v
 
+        # A 16-bit pool answers None here. The backend reads it on every path since the
+        # fp8 store landed, so the double answers it too.
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
     kv_cache = FakeKVCache()
     monkeypatch.setattr(
         "freetoken.attention.triton.get_global_ctx",
@@ -635,6 +643,14 @@ def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
 
         def v_cache(self, layer_id):
             return self.v
+
+        # A 16-bit pool answers None here. The backend reads it on every path since the
+        # fp8 store landed, so the double answers it too.
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
 
     device = torch.device("cuda")
     head_dim = 256
