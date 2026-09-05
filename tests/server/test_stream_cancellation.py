@@ -111,6 +111,32 @@ def test_http_disconnect_on_the_receive_channel_aborts_the_stream():
     asyncio.run(run())
 
 
+def test_abort_is_sent_even_after_wait_for_ack_cleaned_the_maps():
+    """On a disconnect the CancelledError unwinds from wait_for_ack outwards, so its finally
+    has already popped ack_map/event_map when stream_with_cancellation aborts: the abort
+    must not be keyed on those maps (it was, and no AbortMsg was ever sent)."""
+
+    async def run():
+        state = _state()
+        state.abort_user = lambda request_uid: FrontendManager.abort_user(state, request_uid)
+
+        async def acks_then_cancel():
+            yield b"a"
+            state.ack_map.pop(7, None)   # what wait_for_ack's finally does on the way out
+            state.event_map.pop(7, None)
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in FrontendManager.stream_with_cancellation(state, acks_then_cancel(), _Request(), 7):
+                pass
+        assert len(state.sent) == 1 and isinstance(state.sent[0], AbortMsg) and state.sent[0].uid == 7
+        # and still exactly once
+        await FrontendManager.abort_user(state, 7)
+        assert len(state.sent) == 1
+
+    asyncio.run(run())
+
+
 def test_body_close_at_the_yield_sends_one_abort():
     """Starlette closes the response body when the socket goes away while this generator
     is suspended at its yield (keep-alive clients such as openai-python): no

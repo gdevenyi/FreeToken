@@ -369,7 +369,7 @@ class FrontendManager:
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         finished = False
-        gone = asyncio.create_task(self._client_gone(request))
+        gone = asyncio.create_task(FrontendManager._client_gone(request))  # not self.: the tests stub self
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
@@ -392,10 +392,20 @@ class FrontendManager:
                     logger.exception("Failed to deliver abort for user %s", uid)
 
     async def abort_user(self, uid: int):
-        claimed = self.event_map.pop(uid, None) is not None
-        self.ack_map.pop(uid, None)
-        if not claimed:
+        # Idempotent per uid, but NOT keyed on event_map: wait_for_ack's finally pops the
+        # maps when the consumer's generator chain is closed, and on a client disconnect
+        # that finally runs BEFORE this call (the CancelledError unwinds from the innermost
+        # await outwards), so a claim on event_map found nothing and no AbortMsg was ever
+        # sent -- the request kept decoding to max_tokens. Callers only reach here for a
+        # stream that did not finish; the scheduler acks an abort for a uid it no longer has.
+        aborted = self.__dict__.setdefault("_aborted_uids", set())
+        if uid in aborted:
             return
+        if len(aborted) > 65536:
+            aborted.clear()
+        aborted.add(uid)
+        self.event_map.pop(uid, None)
+        self.ack_map.pop(uid, None)
         await asyncio.sleep(0.1)
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
