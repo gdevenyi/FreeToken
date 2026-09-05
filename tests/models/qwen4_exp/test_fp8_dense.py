@@ -174,3 +174,16 @@ def test_reader_quantizes_the_hc_mixers():
         out = dict(_fp8_dense(name, t, cfg, 1))
         assert sorted(out) == [name, name[: -len("weight")] + "weight_scale"]
         assert out[name].dtype == torch.float8_e4m3fn
+
+
+def test_reader_gates_lm_head_behind_its_own_flag():
+    cfg = _cfg()
+    t = torch.randn(64, 32, dtype=torch.bfloat16)
+    assert list(dict(_fp8_dense("lm_head.weight", t, cfg, 1))) == ["lm_head.weight"]
+    out = dict(_fp8_dense("lm_head.weight", t, cfg, 1, dense=False, lm_head=True))
+    assert sorted(out) == ["lm_head.weight", "lm_head.weight_scale"]
+    assert out["lm_head.weight"].dtype == torch.float8_e4m3fn
+    # the lm_head flag alone must not pull in the dense rewrites
+    passthrough = dict(_fp8_dense("x.self_attn.qkv_proj.weight", t, cfg, 1,
+                                  dense=False, lm_head=True))
+    assert list(passthrough) == ["x.self_attn.qkv_proj.weight"]
