@@ -117,6 +117,7 @@ async def handle_anthropic_messages(
             req, model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
             default_max_tokens=getattr(state.config, "max_output_tokens", None),
+            thinking=getattr(state.config, "thinking", None),
         )
         uid = await submit_generation(spec, state)
     except ValueError as exc:
@@ -150,7 +151,8 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
         messages, template_tools, _, ctk = convert_anthropic_prompt(
-            req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+            req, reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            thinking=getattr(state.config, "thinking", None),
         )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
@@ -179,6 +181,7 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
+    thinking: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
@@ -288,7 +291,7 @@ def convert_anthropic_prompt(
     # Native extended-thinking toggle -> template kwargs, broadcast in every
     # spelling the ecosystem's templates read (a bare enable_thinking bool is
     # inert for templates that read a different knob, e.g. M3's thinking_mode).
-    from .model_meta import thinking_toggle_kwargs
+    from .model_meta import thinking_override_kwargs, thinking_toggle_kwargs
 
     ctk: dict[str, Any] = {}
     if req.thinking:
@@ -296,6 +299,7 @@ def convert_anthropic_prompt(
             ctk = thinking_toggle_kwargs(True)
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
+    ctk = thinking_override_kwargs(thinking, ctk)
 
     return render_messages(messages), template_tools, parser_tools, ctk
 
@@ -305,9 +309,10 @@ def convert_anthropic_to_genspec(
     model_sampling: dict[str, Any],
     reasoning_parser: str | None = None,
     default_max_tokens: int | None = None,
+    thinking: str | None = None,
 ) -> GenSpec:
     messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
-        req, reasoning_parser=reasoning_parser
+        req, reasoning_parser=reasoning_parser, thinking=thinking
     )
     return GenSpec(
         messages=messages,
