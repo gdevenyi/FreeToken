@@ -167,6 +167,7 @@ async def handle_responses(
                 and req.timings_per_token
                 and getattr(state.config, "enable_timings_report", False)
             ),
+            thinking=getattr(state.config, "thinking", None),
         )
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
@@ -209,6 +210,7 @@ def convert_responses_to_genspec(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
     timings_per_token: bool = False,
+    thinking: str | None = None,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -251,11 +253,12 @@ def convert_responses_to_genspec(
     else:
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    from .model_meta import effort_toggle_kwargs
+    from .model_meta import effort_toggle_kwargs, thinking_override_kwargs
 
     ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
+    ctk = thinking_override_kwargs(thinking, ctk)
 
     return GenSpec(
         messages=render_messages(messages),
