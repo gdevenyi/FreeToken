@@ -66,14 +66,16 @@ def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    thinking: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import effort_toggle_kwargs
+    from .model_meta import effort_toggle_kwargs, thinking_override_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    ctk = thinking_override_kwargs(thinking, ctk)
     if req.continue_final_message:
         ctk = {**ctk, "continue_final_message": True}
     return GenSpec(
@@ -254,7 +256,12 @@ async def handle_chat_completion(
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
         )
-        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            default_max_tokens=default_max_tokens,
+            thinking=_thinking_policy(state),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -805,6 +812,11 @@ def create_error_response(
             }
         },
     )
+
+
+def _thinking_policy(state: Any) -> str | None:
+    """The operator's --thinking policy ("auto" | "on" | "off")."""
+    return getattr(state.config, "thinking", None)
 
 
 def _resolve_sampling(
