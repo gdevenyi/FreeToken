@@ -356,17 +356,30 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
+    @staticmethod
+    async def _client_gone(request: Request) -> None:
+        """Return when the ASGI server reports the client gone. A blocking receive sees
+        uvicorn's ``http.disconnect`` the moment the socket closes; ``is_disconnected()``'s
+        zero-timeout poll can miss it, and under ASGI 2.4 a ``send()`` to a gone client
+        returns silently, so nothing else in the streaming path would ever notice."""
+        while True:
+            message = await request.receive()
+            if message.get("type") == "http.disconnect":
+                return
+
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         finished = False
+        gone = asyncio.create_task(self._client_gone(request))
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
-                if await request.is_disconnected():
+                if gone.done() or await request.is_disconnected():
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
                 yield chunk
             finished = True
         finally:
+            gone.cancel()
             # Two ways the client goes away: CancelledError while this generator awaits
             # the next chunk, or GeneratorExit when Starlette closes the response body
             # while the generator is suspended at the yield (the common case with a

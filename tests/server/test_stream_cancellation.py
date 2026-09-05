@@ -36,11 +36,19 @@ def _state(send_impl=None):
 
 
 class _Request:
-    def __init__(self, disconnected=False):
+    def __init__(self, disconnected=False, disconnect_after=None):
         self._disconnected = disconnected
+        self._disconnect_after = disconnect_after
 
     async def is_disconnected(self):
         return self._disconnected
+
+    async def receive(self):
+        # the ASGI receive channel: http.disconnect after a delay, else never
+        if self._disconnect_after is None:
+            await asyncio.sleep(3600)
+        await asyncio.sleep(self._disconnect_after)
+        return {"type": "http.disconnect"}
 
 
 async def _consume(state, request, uid=7):
@@ -71,6 +79,34 @@ def test_cancellation_sends_one_abort_and_cleans_maps_inline():
         assert state.ack_map == {}
         assert state.event_map == {}
         assert state.stats.aborts == [7]
+
+    asyncio.run(run())
+
+
+def test_http_disconnect_on_the_receive_channel_aborts_the_stream():
+    """uvicorn's send() returns silently once the client is gone and is_disconnected()'s
+    zero-timeout poll can miss the message, so the stream watches the receive channel:
+    an http.disconnect there must abort the request even while chunks keep flowing."""
+
+    async def run():
+        state = _state()
+        state.abort_user = lambda request_uid: FrontendManager.abort_user(state, request_uid)
+
+        async def chunks():
+            while True:
+                await asyncio.sleep(0.005)
+                yield b"tok"
+
+        seen = 0
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in FrontendManager.stream_with_cancellation(
+                state, chunks(), _Request(disconnect_after=0.03), 7
+            ):
+                seen += 1
+        assert seen >= 1
+        assert len(state.sent) == 1 and isinstance(state.sent[0], AbortMsg)
+        assert state.stats.aborts == [7]
+        assert asyncio.all_tasks() - {asyncio.current_task()} == set()  # the watcher is cancelled
 
     asyncio.run(run())
 
