@@ -24,12 +24,14 @@ def _grouped_gemma_rmsnorm_kernel(
     x_ptr,
     w_ptr,
     y_ptr,
+    amax_ptr,
     stride_x,
     stride_y,
     DIM: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     W_SHARED: tl.constexpr,
     EPS: tl.constexpr,
+    HAS_AMAX: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     GROUP_DIM: tl.constexpr = DIM // NUM_GROUPS
@@ -61,11 +63,22 @@ def _grouped_gemma_rmsnorm_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offsets, y, mask)
+    if HAS_AMAX:
+        # max|y| over this program's slice, taken on the values as STORED (rounded to the
+        # output dtype), so a per-tensor quantizer folding these partials gets exactly the
+        # amax it would have computed by re-reading y.
+        stored = y.to(y_ptr.dtype.element_ty).to(tl.float32)
+        tl.store(amax_ptr + pid, tl.max(tl.where(mask, tl.abs(stored), 0.0), axis=0))
 
 
 def grouped_gemma_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
+    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int,
+    amax_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Grouped (1+w) RMSNorm. ``amax_out`` is an optional ``[N * num_groups]`` fp32 buffer that
+    receives one max|y| per program -- the partial amaxes a per-tensor FP8 quantizer would
+    otherwise spend a whole extra pass over ``y`` computing. Free here: the values are already
+    in registers."""
     N, DIM = x.shape
     assert x.stride(1) == 1, "grouped Gemma RMSNorm requires unit inner stride"
     assert weight.is_contiguous(), "grouped Gemma RMSNorm weight must be contiguous"
@@ -73,17 +86,20 @@ def grouped_gemma_rmsnorm(
     group_dim = DIM // num_groups
     assert weight.numel() in (group_dim, DIM)
 
+    assert amax_out is None or amax_out.numel() == N * num_groups, amax_out.shape
     y = x.new_empty(x.shape)
     _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
         x,
         weight,
         y,
+        amax_out,
         x.stride(0),
         y.stride(0),
         DIM,
         num_groups,
         W_SHARED=weight.numel() == group_dim,
         EPS=eps,
+        HAS_AMAX=amax_out is not None,
         launch_pdl=_pdl_supported(),
     )
     return y

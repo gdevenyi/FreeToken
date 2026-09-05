@@ -228,6 +228,13 @@ _FP8_DENSE_SUFFIXES = (
     ".self_attn.qkv_proj.weight",
     ".self_attn.o_proj.weight",
     ".linear_attn.out_proj.weight",
+    # hyper-connection mixers (hc.py: GatedResidual); replicated, so every rank re-reads
+    # all of them each step. The merged down|inject tensor quantizes as one: the inject rows
+    # sit within ~100x of the global amax on this checkpoint, so per-tensor e4m3 leaves every
+    # row normal.
+    ".input_mix_weight_down_block_inject.weight",
+    ".input_mix_weight_down.weight",
+    ".input_mix_weight_up.weight",
 )
 # Behind its own flag: this one moves the logits (see models.config.fp8_lmhead_enabled).
 _FP8_LMHEAD_SUFFIX = "lm_head.weight"

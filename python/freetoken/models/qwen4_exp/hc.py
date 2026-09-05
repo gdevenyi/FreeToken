@@ -21,6 +21,7 @@ from freetoken.kernel.triton.hc import (
     hc_silu,
 )
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers.fp8_dynamic import Fp8DynamicLinear
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -86,6 +87,8 @@ class GatedResidual(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, use_combine: bool = True) -> None:
+        from .config import dense_quant_mode
+
         args = config.qwen4_args
         self.hc_count = args.hc_count
         self.hidden_size = args.hidden_size
@@ -93,16 +96,34 @@ class GatedResidual(BaseOP):
         self.use_combine = use_combine
         width = args.ple_state_width
         self.hc_norm = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
+        # The mixer weights are REPLICATED on every rank and re-read every step (1.3 GB per
+        # step per rank at the shipping geometry -- the largest bf16 block left on the decode
+        # path), so they follow the dense projections into per-tensor FP8 under
+        # FREETOKEN_FP8_DENSE=1. Both operands of both GEMMs are 16-aligned by construction.
+        def linear(isize: int, osize: int):
+            if dense_quant_mode(config) == "fp8_dynamic":
+                return Fp8DynamicLinear(isize, osize)
+            return LinearReplicated(isize, osize, has_bias=False)
+
+        self._fp8 = dense_quant_mode(config) == "fp8_dynamic"
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
+            self.input_mix_weight_down_block_inject = linear(
+                width, self.lowrank + self.hc_count + self.pad_size
             )
         else:
             self.pad_size = 0
-            self.input_mix_weight_down = LinearReplicated(width, self.lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(self.lowrank, width, has_bias=False)
+            self.input_mix_weight_down = linear(width, self.lowrank)
+        self.input_mix_weight_up = linear(self.lowrank, width)
+
+    @property
+    def _down_op(self):
+        return (
+            self.input_mix_weight_down_block_inject
+            if self.use_combine
+            else self.input_mix_weight_down
+        )
 
     def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""
@@ -113,8 +134,40 @@ class GatedResidual(BaseOP):
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        if self._fp8:
+            return self._mix_kernel_fp8(R)
         rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
         lora, s = self._down(rn)
+        gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
+        return hc_gate_mix(rn, gate, self.hc_count), s
+
+    def _mix_kernel_fp8(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Same chain with the two activation quants folded into the kernels that write their
+        inputs. Quantizing after the fact costs more than the FP8 GEMMs save at these shapes
+        (see the module docstring), so the fusion is what makes the FP8 mixers worth having.
+
+        ``rn`` is still needed in bf16 by ``hc_gate_mix``, so the norm keeps its bf16 store and
+        only hands over the per-program maxima; the silu output feeds nothing but the up-GEMM,
+        so it is never materialized in bf16 at all."""
+        from freetoken.layers.fp8_dynamic import quant_from_partials
+
+        parts = torch.empty(
+            R.shape[0] * self.hc_count, dtype=torch.float32, device=R.device
+        )
+        rn = grouped_gemma_rmsnorm(
+            R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count, amax_out=parts
+        )
+        rn8, rn_scale = quant_from_partials(rn, parts)
+        down = self._down_op.forward_quantized(rn8, rn_scale)
+        if self.use_combine:
+            lora = down[:, : self.lowrank]
+            s = down[:, self.lowrank : self.lowrank + self.hc_count]
+        else:
+            lora, s = down, None
+        # The up-GEMM input keeps the ordinary quantizer: hc_silu is one program per row, and
+        # a single-program silu+quant that could fold the two measured 3.08 us against their
+        # 2.52 us -- the per-tensor amax needs every row, and serializing 8 parallel programs
+        # to get it costs more than the launch it saves.
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
 
