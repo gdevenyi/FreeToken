@@ -66,6 +66,14 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
         raise
 
 
+def _configure_worker_tqdm_lock() -> None:
+    import threading
+
+    from tqdm import tqdm
+
+    tqdm.set_lock(threading.RLock())
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
@@ -76,6 +84,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
     targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
     set_assigned_gpu(targets[args.tp_info.rank])
+    _configure_worker_tqdm_lock()
 
     import torch
     from freetoken.scheduler import Scheduler
