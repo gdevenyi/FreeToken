@@ -23,6 +23,12 @@ from .api_models import (
 )
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
+from .logprobs import (
+    chat_content_entry,
+    chat_logprobs_error,
+    completion_logprobs_error,
+    completions_logprobs,
+)
 from .generation import (
     ContentDelta,
     GenDone,
@@ -70,17 +76,20 @@ def chat_request_to_genspec(
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
     images: list[bytes] = []
+    sampling_params = resolve_sampling(
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        ignore_eos=req.ignore_eos,
+        model_sampling=model_sampling,
+        stop=req.stop,
+    )
+    sampling_params.logprobs = req.logprobs
+    sampling_params.top_logprobs = req.top_logprobs or 0
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages], images),
-        sampling_params=resolve_sampling(
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens,
-            ignore_eos=req.ignore_eos,
-            model_sampling=model_sampling,
-            stop=req.stop,
-        ),
+        sampling_params=sampling_params,
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
@@ -237,6 +246,32 @@ def _client_disconnected_response() -> JSONResponse:
     )
 
 
+def _chat_logprobs_conflict(req: ChatCompletionRequest, state: Any) -> str | None:
+    """Fail-close chat logprobs when a semantic parsing layer can hide or reclassify
+    generated tokens. A reasoning parser routes tokens out of visible content (and its
+    stream buffering re-chunks text), and tool parsing consumes tokens into tool_calls,
+    so logprob entries could not be aligned 1:1 with visible content tokens — and hidden
+    reasoning-token strings must never surface through logprobs entries. The raw
+    /v1/completions path has no semantic layer and keeps full logprobs support."""
+    if not req.logprobs:
+        return None
+    if getattr(state.config, "reasoning_parser", None):
+        return (
+            "logprobs on /v1/chat/completions are not supported when the server runs a "
+            "reasoning parser: reasoning tokens are hidden from message content, so "
+            "logprob entries cannot be aligned with it. Use /v1/completions for raw "
+            "token logprobs."
+        )
+    if _should_parse_tools(req):
+        return (
+            "logprobs with tool parsing on /v1/chat/completions are not supported: "
+            "tool-call tokens are consumed into tool_calls, so logprob entries cannot "
+            "be aligned with message content. Send tool_choice='none' or use "
+            "/v1/completions for raw token logprobs."
+        )
+    return None
+
+
 async def handle_chat_completion(
     req: ChatCompletionRequest,
     request: Request | None,
@@ -247,6 +282,12 @@ async def handle_chat_completion(
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
+    logprobs_error = chat_logprobs_error(req)
+    if logprobs_error is not None:
+        return create_error_response(logprobs_error, param="top_logprobs")
+    logprobs_conflict = _chat_logprobs_conflict(req, state)
+    if logprobs_conflict is not None:
+        return create_error_response(logprobs_conflict, param="logprobs")
     if _response_format_unsupported(req.response_format):
         return create_error_response(
             "response_format json_object/json_schema is not supported (no constrained decoding)",
@@ -305,18 +346,20 @@ async def handle_chat_completion(
     if result.tool_calls:
         message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
 
+    choice: dict[str, Any] = {
+        "index": 0,
+        "message": message,
+        "finish_reason": result.finish_reason,
+    }
+    if req.logprobs:
+        choice["logprobs"] = {"content": [chat_content_entry(e) for e in result.logprobs]}
+
     return {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": result.finish_reason,
-            }
-        ],
+        "choices": [choice],
         "usage": _usage(
             result.prompt_tokens,
             result.completion_tokens,
@@ -369,13 +412,10 @@ async def stream_chat_completion_chunks(
                 )
             )
         elif isinstance(ev, ContentDelta):
-            yield _sse(
-                _chat_chunk(
-                    req,
-                    uid,
-                    [{"delta": {"content": ev.text}, "index": 0, "finish_reason": None}],
-                )
-            )
+            choice: dict[str, Any] = {"delta": {"content": ev.text}, "index": 0, "finish_reason": None}
+            if ev.logprobs:
+                choice["logprobs"] = {"content": [chat_content_entry(e) for e in ev.logprobs]}
+            yield _sse(_chat_chunk(req, uid, [choice]))
         elif isinstance(ev, ToolCallStart):
             open_tool = {
                 "index": tool_calls_sent,
@@ -512,6 +552,7 @@ async def handle_completion(
         async def _drain_one(uid: int = uid, index: int = index):
             nonlocal prompt_tokens, completion_tokens, cached_tokens
             text = ""
+            entries: list[dict] = []
             finish_reason = "stop"
             async for ack in state.wait_for_ack(uid):
                 if getattr(ack, "error", None):
@@ -520,10 +561,12 @@ async def handle_completion(
                 completion_tokens += ack.completion_tokens_delta
                 cached_tokens += ack.cached_tokens
                 text += ack.incremental_output
+                if req.logprobs is not None and ack.logprobs is not None:
+                    entries.append(ack.logprobs)
                 if ack.finished:
                     finish_reason = getattr(ack, "finish_reason", None) or "stop"
                     break
-            return {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None}
+            return {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": completions_logprobs(entries) if req.logprobs is not None else None}
 
         choice = await _await_watching_disconnect(_drain_one(), request, state, uid)
         if choice is None:
@@ -544,6 +587,7 @@ async def handle_completion(
 
 async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any) -> AsyncIterator[bytes]:
     prompt_tokens = 0
+    text_offset = 0
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
@@ -567,11 +611,16 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
                             "text": ack.incremental_output,
                             "index": 0,
                             "finish_reason": None,
-                            "logprobs": None,
+                            "logprobs": (
+                                completions_logprobs([ack.logprobs], text_offset)
+                                if req.logprobs is not None and ack.logprobs is not None
+                                else None
+                            ),
                         }
                     ],
                 }
             )
+            text_offset += len(ack.incremental_output)
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
@@ -625,7 +674,7 @@ def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
 ) -> SamplingParams:
-    return resolve_sampling(
+    sampling_params = resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
         top_p=req.top_p,
@@ -634,6 +683,10 @@ def _resolve_sampling(
         model_sampling=model_sampling,
         stop=req.stop,
     )
+    if isinstance(req, CompletionRequest) and req.logprobs is not None:
+        sampling_params.logprobs = True
+        sampling_params.top_logprobs = req.logprobs
+    return sampling_params
 
 
 def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:
@@ -734,8 +787,9 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if _is_token_prompt(req.prompt):
         return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
-    if req.logprobs is not None:
-        return "logprobs is not supported"
+    logprobs_error = completion_logprobs_error(req)
+    if logprobs_error is not None:
+        return logprobs_error
     if req.echo:
         return "echo is not supported"
     if req.suffix is not None:
