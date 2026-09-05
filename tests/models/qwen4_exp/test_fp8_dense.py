@@ -138,3 +138,39 @@ def test_split_quant_path_agrees_with_the_single_program_one(n: int):
     m._quant_fused_kernel[(1,)](x, ref8, ref_scale, n, BLOCK=m._BLOCK, num_warps=8)
     assert torch.equal(got_scale, ref_scale)
     assert torch.equal(got8.view(torch.uint8), ref8.view(torch.uint8))
+
+
+def test_hyper_connection_linears_go_fp8_under_the_dense_flag(monkeypatch):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers import LinearReplicated
+    from freetoken.layers.fp8_dynamic import Fp8DynamicLinear
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.hc import GatedResidual
+
+    from .common import toy_hf_config
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    assert isinstance(
+        GatedResidual(parse_config(toy_hf_config())).input_mix_weight_up, LinearReplicated
+    )
+    monkeypatch.setenv("FREETOKEN_FP8_DENSE", "1")
+    config = parse_config(toy_hf_config())
+    for hc in (GatedResidual(config), GatedResidual(config, use_combine=False)):
+        for op in vars(hc).values():
+            if isinstance(op, (LinearReplicated, Fp8DynamicLinear)):
+                assert isinstance(op, Fp8DynamicLinear)
+                assert set(op.state_dict()) == {"weight", "weight_scale"}
+
+
+def test_reader_quantizes_the_hc_mixers():
+    cfg = _cfg()
+    t = torch.randn(64, 32, dtype=torch.bfloat16)
+    for name in (
+        "x.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+        "x.mlp_hyper_connection.input_mix_weight_up.weight",
+        "model.hyper_connection_mixer.input_mix_weight_down.weight",
+    ):
+        out = dict(_fp8_dense(name, t, cfg, 1))
+        assert sorted(out) == [name, name[: -len("weight")] + "weight_scale"]
+        assert out[name].dtype == torch.float8_e4m3fn
