@@ -30,6 +30,24 @@ def thinking_toggle_kwargs(enabled: bool) -> dict:
     return dict(THINKING_ON_KWARGS if enabled else THINKING_OFF_KWARGS)
 
 
+def thinking_override_kwargs(policy: str | None, chat_template_kwargs: dict | None) -> dict:
+    """Apply the operator's ``--thinking`` policy over a request's template kwargs.
+
+    ``auto`` (or None) keeps whatever the request asked for. ``on``/``off`` strip EVERY client
+    spelling of the knob first, then overlay the operator's, so a client cannot escape server
+    policy by sending a dialect the request path did not normalize (Responses
+    ``reasoning.effort``, Anthropic ``thinking.type``, a raw ``chat_template_kwargs`` entry).
+    Unrelated kwargs ride along untouched. Apply this AFTER ``effort_toggle_kwargs``."""
+    ctk = dict(chat_template_kwargs or {})
+    if policy not in ("on", "off"):
+        return ctk
+    for key in (*_THINKING_KWARG_KEYS, *THINKING_ON_KWARGS, *THINKING_OFF_KWARGS,
+                *THINKING_ADAPTIVE_KWARGS):
+        ctk.pop(key, None)
+    ctk.update(thinking_toggle_kwargs(policy == "on"))
+    return ctk
+
+
 def derive_think_gears(
     profile: ThinkingProfile, parser_configured: bool
 ) -> Tuple[Tuple[str, ...], str | None, dict] | None:
