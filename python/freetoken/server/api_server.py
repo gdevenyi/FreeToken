@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json
 import os
 import signal
@@ -34,7 +33,7 @@ from freetoken.utils import (
     init_logger,
     load_generation_sampling,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
@@ -138,13 +137,6 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
-    # Abort claims live HERE, not in the maps above: a disconnect cancels the response
-    # task at its innermost await (inside wait_for_ack, whose finally empties both maps
-    # on the way out), so by the time any abort path runs, a map-based claim would no-op
-    # exactly when the AbortMsg matters most. Insertion-ordered, FIFO-bounded like the
-    # scheduler's abort tombstones; a duplicate AbortMsg for an evicted or finished uid
-    # is safe (the scheduler acks aborts for uids it no longer has).
-    aborted_uids: Dict[int, None] = field(default_factory=dict)
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -366,37 +358,28 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_with_cancellation(self, generator, request: Request, uid: int):
-        finished = False
+    async def stream_with_cancellation(self, generator, request: Request, uid):
+        """``uid`` is one request id or a sequence of them (an ``n > 1`` fan-out streams
+        several generations into one response): a disconnect aborts every one."""
+        uids = list(uid) if isinstance(uid, (list, tuple)) else [uid]
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
                 if await request.is_disconnected():
-                    logger.info("Client disconnected for user %s", uid)
+                    logger.info("Client disconnected for user %s", uids)
                     raise asyncio.CancelledError
                 yield chunk
-            finished = True
-        finally:
-            # finally, not `except CancelledError`: the abort must go out however the
-            # stream dies -- the server cancelling the response task (the CancelledError
-            # lands on wait_for_ack's await, never on the poll above), a late close
-            # delivering GeneratorExit, or an exception out of the generator. Only a
-            # stream that ran to completion leaves the engine with nothing to stop.
-            if not finished:
-                try:
-                    await asyncio.shield(self.abort_user(uid))
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed to deliver abort for user %s", uid)
+        except asyncio.CancelledError:
+            for one in uids:
+                asyncio.create_task(self.abort_user(one))
+            raise
 
     async def abort_user(self, uid: int):
-        if uid in self.aborted_uids:
-            return
-        self.aborted_uids[uid] = None
-        while len(self.aborted_uids) > 65_536:
-            self.aborted_uids.pop(next(iter(self.aborted_uids)))
-        self.event_map.pop(uid, None)
-        self.ack_map.pop(uid, None)
         await asyncio.sleep(0.1)
+        if uid in self.ack_map:
+            del self.ack_map[uid]
+        if uid in self.event_map:
+            del self.event_map[uid]
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
@@ -461,80 +444,44 @@ _TRACKED_REQUEST_PREFIXES = (
 _UNTRACKED_REQUEST_PREFIXES = ("/v1/messages/count_tokens",)
 
 
-# --api-key (ServerArgs.api_key), installed by run_api_server before serving. None means no
-# authentication -- every route answers as before. Module-level rather than closed over so the
-# middleware below can be registered at import time like the others and tests can set it.
-_API_KEY: str | None = None
-# Routes that stay open with a key set: liveness probes (load balancers, Docker healthchecks,
-# the desktop app's load-progress polling) cannot carry a header and reveal nothing but status.
-_API_KEY_OPEN_PATHS = ("/health",)
-
-
-def install_api_key(key: str | None) -> None:
-    """Arm the bearer check for every route but ``_API_KEY_OPEN_PATHS``; ``None``/"" disarms."""
-    global _API_KEY
-    _API_KEY = key or None
-    if _API_KEY is not None:
-        logger.info("API key required (Authorization: Bearer) on every route except /health")
-
-
 def _served_model_name() -> str | None:
     st = _GLOBAL_STATE
     cfg = getattr(st, "config", None) if st is not None else None
     return getattr(cfg, "served_model_name", None)
 
 
-class _RecordRequestMiddleware:
+@app.middleware("http")
+async def _record_request_middleware(request: Request, call_next):
     """Time every generation request into the ring for /v1/requests + /v1/stats p95. Single-
     model server, so model = served_model_name; stream is inferred from the response media
-    type. Token counts are P3 (SSE usage arrives after the handler returns) — kept as None.
+    type. Token counts are P3 (SSE usage arrives after the handler returns) — kept as None."""
+    path = request.url.path
+    if path.startswith(_UNTRACKED_REQUEST_PREFIXES) or not path.startswith(
+        _TRACKED_REQUEST_PREFIXES
+    ):
+        return await call_next(request)
+    import time as _time
 
-    Pure ASGI on purpose: Starlette's ``@app.middleware("http")`` (BaseHTTPMiddleware) hands the
-    handler a wrapped receive channel that never yields the client's ``http.disconnect`` while a
-    non-streaming request is still computing, so ``request.is_disconnected()`` stays False and an
-    abandoned request runs to max_tokens. The recorder is the only such middleware here."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        path = scope.get("path", "") if scope["type"] == "http" else ""
-        if not path.startswith(_TRACKED_REQUEST_PREFIXES) or path.startswith(_UNTRACKED_REQUEST_PREFIXES):
-            await self.app(scope, receive, send)
-            return
-        import time as _time
-
-        start = _time.monotonic()
-
-        async def send_recording(message):
-            # the base-class version recorded once the handler returned its response object,
-            # i.e. at response start, before a streaming body -- keep that timing
-            if message["type"] == "http.response.start":
-                ctype = ""
-                for name, value in message.get("headers", ()):
-                    if name.lower() == b"content-type":
-                        ctype = value.decode("latin-1")
-                request_ring.record_request(
-                    request_ring.RequestRecord(
-                        ts=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-                        method=scope["method"],
-                        path=path,
-                        status=message["status"],
-                        model=_served_model_name(),
-                        duration_ms=int((_time.monotonic() - start) * 1000),
-                        ttft_ms=None,
-                        prompt_tokens=None,
-                        completion_tokens=None,
-                        stream=ctype.startswith("text/event-stream"),
-                        error=None,
-                    )
-                )
-            await send(message)
-
-        await self.app(scope, receive, send_recording)
-
-
-app.add_middleware(_RecordRequestMiddleware)
+    start = _time.monotonic()
+    response = await call_next(request)
+    duration_ms = int((_time.monotonic() - start) * 1000)
+    ctype = response.headers.get("content-type", "")
+    request_ring.record_request(
+        request_ring.RequestRecord(
+            ts=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            method=request.method,
+            path=path,
+            status=response.status_code,
+            model=_served_model_name(),
+            duration_ms=duration_ms,
+            ttft_ms=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            stream=ctype.startswith("text/event-stream"),
+            error=None,
+        )
+    )
+    return response
 
 
 class CacheRebuildRequest(BaseModel):
@@ -554,7 +501,7 @@ class CacheRebuildRequest(BaseModel):
     # is deferred (needs the drain-gate machinery); constraining the Literal makes an
     # unsupported value fail fast with a 422 at the API layer instead of a generic 503.
     mode: Literal["if_idle"] = "if_idle"
-    timeout: float = Field(default=300.0, gt=0, le=3600)
+    timeout: float = 300.0
 
 
 async def dispatch_rebuild(
@@ -624,53 +571,6 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     swa_page_size = page_size if is_dsv4 else 1
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
-
-
-class _ApiKeyMiddleware:
-    """Reject any request without ``Authorization: Bearer <api_key>`` when a key is set.
-
-    Registered after ``_RecordRequestMiddleware`` so it runs *before* it (Starlette wraps the
-    last-added middleware outermost): a 401 never lands in the request ring or a handler. CORS
-    preflights (OPTIONS) carry no credentials by design and pass through; the CORS middleware
-    installed at startup is outer still, so it answers them. Constant-time compare, and the
-    same body shape the OpenAI-compatible routes use for errors. Pure ASGI for the same reason
-    as the recorder: a BaseHTTPMiddleware hides the client's disconnect from the handlers."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        key = _API_KEY
-        if (
-            key is None
-            or scope["type"] != "http"
-            or scope["method"] == "OPTIONS"
-            or scope.get("path", "") in _API_KEY_OPEN_PATHS
-        ):
-            await self.app(scope, receive, send)
-            return
-        authorization = Request(scope).headers.get("authorization", "")
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(
-            token.strip().encode("utf-8"), key.encode("utf-8")
-        ):
-            response = JSONResponse(
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-                content={
-                    "error": {
-                        "message": "Invalid or missing API key (Authorization: Bearer <key>).",
-                        "type": "authentication_error",
-                        "code": 401,
-                    }
-                },
-            )
-            await response(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
-
-
-app.add_middleware(_ApiKeyMiddleware)
 
 
 @app.post("/v1/cache/rebuild")
@@ -814,30 +714,6 @@ def _reasoning_geometry(state: Any) -> dict | None:
     return {"gears": list(gears), "default": default, "kwargs": kwargs}
 
 
-def kv_pool_geometry(state: Any) -> tuple[int, int]:
-    """The allocated KV pool as ``(num_pages, page_size)``, most-recent-truth first: the last
-    rebuild's result, else the running UserReply snapshot, else the load-time ("meta", …) ack.
-    ``num_pages`` is 0 until one of those lands (still loading / older engine build).
-
-    Split out of cache_geometry so /v1/models can clamp the advertised context to the pool
-    without recomputing the whole panel payload -- both callers must agree on the resolution
-    order or they would report different capacities for the same server.
-    """
-    stats = getattr(state, "stats", None)
-    last = getattr(state, "last_rebuild", None) or {}
-    pools = getattr(state, "cache_pools", None) or {}
-    num_pages = int(
-        last.get("num_pages")
-        or getattr(stats, "kv_total_pages", 0)
-        or pools.get("num_pages", 0)
-        or 0
-    )
-    page_size = int(
-        pools.get("page_size", 0) or getattr(getattr(state, "config", None), "page_size", 1) or 1
-    )
-    return num_pages, page_size
-
-
 def cache_geometry(state: Any) -> dict:
     """Current cache geometry for the desktop cache panel. Each pool size resolves
     most-recent-truth first: the last rebuild's result, else the running UserReply snapshot
@@ -853,10 +729,11 @@ def cache_geometry(state: Any) -> dict:
     config = state.config
     last = getattr(state, "last_rebuild", None) or {}
     pools = getattr(state, "cache_pools", None) or {}
-    num_pages, page_size = kv_pool_geometry(state)
+    num_pages = int(last.get("num_pages") or tr.kv_total_pages or pools.get("num_pages", 0) or 0)
     num_mamba_slots = int(
         last.get("mamba_slots") or tr.mamba_total_slots or pools.get("num_mamba_slots", 0) or 0
     )
+    page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
     moe_cache_size = last.get("moe_cache_size")
     if moe_cache_size is None:
         moe_cache_size = int(pools.get("moe_cache_size", 0) or 0) or configured_moe_cache_size(
@@ -1003,7 +880,7 @@ def _install_shell_stop_handlers() -> None:
         signal.signal(sig, _flag_shutdown)
 
 
-def _serve_and_run_shell(host: str, port: int, api_key: str | None = None) -> None:
+def _serve_and_run_shell(host: str, port: int) -> None:
     """Shell mode: serve the API here, and attach the terminal client to it over the loopback.
 
     The shell is an ordinary API client (see ``freetoken.shell``), so shell mode is just
@@ -1036,8 +913,7 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None = None) -> No
         # /health and echoes the same load progress the desktop app polls for. A ^C during that
         # wait is a stop, not a crash -- exit through the teardown below, not a traceback.
         with contextlib.suppress(KeyboardInterrupt):
-            # The attached shell is an ordinary client, so it carries the server's own key.
-            asyncio.run(run_shell(origin, connect_grace=30.0, api_key=api_key))
+            asyncio.run(run_shell(origin, connect_grace=30.0))
     finally:
         server.should_exit = True
         thread.join(timeout=15)
@@ -1082,7 +958,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
-    install_api_key(config.api_key)
     init_request_logging()
     # Hide the frequent health/stats/requests/cache-status polling of the desktop app (and of
     # the shell's status bar) from uvicorn's access log; non-polling access lines are
@@ -1166,7 +1041,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     ).start()
 
     if run_shell:
-        _serve_and_run_shell(host, port, config.api_key)
+        _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
     uvicorn.run(app, host=host, port=port)

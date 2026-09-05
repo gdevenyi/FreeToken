@@ -36,14 +36,8 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
     one implementation prevents the two sides from disagreeing. Thinking is on
     when tools are offered (dsv4 only emits well-formed tool calls in thinking
     mode) or when the caller requests it via ``chat_template_kwargs``.
-    An explicit ``enable_thinking=False`` (or ``thinking=False``) from the
-    caller always wins, even when tools are present — the caller knows their
-    intent better than the heuristic.
     """
     ctk = chat_template_kwargs or {}
-    # Explicit disable takes precedence over the tools-presumed-thinking heuristic.
-    if ctk.get("enable_thinking") is False or ctk.get("thinking") is False:
-        return "chat"
     mode = str(ctk.get("thinking_mode") or "chat")
     if tools or ctk.get("enable_thinking") or ctk.get("thinking"):
         mode = "thinking"
@@ -53,27 +47,6 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 
 
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
-
-
-def _map_developer_role(
-    messages: list[dict[str, Any]], chat_template: str | None
-) -> list[dict[str, Any]]:
-    """OpenAI's ``developer`` role is the current spelling of ``system`` (clients such as pi
-    send the system prompt that way by default). Most chat templates do not know it and raise
-    ("Unexpected message role"), so map it to ``system`` unless the template handles it."""
-    if "developer" in (chat_template or "") or not any(
-        m.get("role") == "developer" for m in messages
-    ):
-        return messages
-    mapped = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
-    # Templates such as Qwen's raise on a system message that is not first, so merge every
-    # system/developer message into one leading system message.
-    system = [m for m in mapped if m.get("role") == "system"]
-    if len(system) == 1 and mapped[0] is system[0]:
-        return mapped
-    rest = [m for m in mapped if m.get("role") != "system"]
-    content = "\n\n".join(str(m.get("content") or "") for m in system if m.get("content"))
-    return [{"role": "system", "content": content}] + rest
 
 
 class TokenizeManager:
@@ -157,11 +130,15 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
-        messages = _map_developer_role(messages, getattr(self.tokenizer, "chat_template", None))
+        # continue_final_message (an OpenAI-compatible extra, as in vLLM / SGLang): the last
+        # message is an assistant prefix the model must continue, so no generation prompt.
+        chat_template_kwargs = dict(chat_template_kwargs)
+        continue_final = bool(chat_template_kwargs.pop("continue_final_message", False))
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
+            add_generation_prompt=not continue_final,
+            continue_final_message=continue_final,
             **chat_template_kwargs,
         )
         assert isinstance(prompt, str)

@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
-    from freetoken.kvcache.kv_host_offload import KVHostOffloader
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -25,12 +24,43 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # ---- logits processors (engine/sample.py), all off by default ----
+    # min_p: drop tokens whose probability is below min_p x the top probability.
+    min_p: float = 0.0
+    # OpenAI presence/frequency penalties over the generated tokens; repetition_penalty is the
+    # HF/vLLM multiplicative penalty over prompt + generated tokens (1.0 = off).
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    # token id -> additive logit bias (OpenAI logit_bias, clamped to [-100, 100] by the API).
+    logit_bias: dict[int, float] | None = None
+    # No EOS / stop token before this many generated tokens (vLLM min_tokens, SGLang
+    # min_new_tokens). The scheduler fills min_tokens_stop_ids with the ids to mask.
+    min_tokens: int = 0
+    min_tokens_stop_ids: list[int] = field(default_factory=list)
+    # Extra token ids that end generation with finish_reason "stop" (vLLM stop_token_ids).
+    stop_token_ids: list[int] = field(default_factory=list)
+    # Keep the matched stop string in the output instead of trimming it (vLLM
+    # include_stop_str_in_output, SGLang no_stop_trim).
+    include_stop_str_in_output: bool = False
+    # Decode with skip_special_tokens. Off by default here: the reasoning and tool parsers
+    # consume the <think>/tool tags from the decoded text.
+    skip_special_tokens: bool = False
 
     @property
     def is_greedy(self) -> bool:
-        return self.temperature <= 0.0 or self.top_k == 1
+        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+
+    @property
+    def needs_logits_processing(self) -> bool:
+        return bool(
+            self.min_p > 0.0
+            or self.presence_penalty != 0.0
+            or self.frequency_penalty != 0.0
+            or self.repetition_penalty != 1.0
+            or self.logit_bias
+            or self.min_tokens > 0
+        )
 
 
 @dataclass(eq=False)
@@ -67,7 +97,6 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
-    output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -187,9 +216,6 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
-    # KV host offload (--kv-host-pages): the QSA backend's logical->physical page bridge.
-    # Set by the engine before create_attention_backend; None when disabled.
-    kv_offloader: KVHostOffloader | None = None
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
