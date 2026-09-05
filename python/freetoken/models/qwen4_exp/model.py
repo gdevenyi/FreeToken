@@ -24,6 +24,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
+from .config import dense_quant_mode
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
@@ -51,7 +52,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
         # Qwen3.8's block-fp8 checkpoint keeps the GDN projections bf16 (only the routed
         # experts are quantized), so do not let expert_quant flip them to Fp8Block.
         expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
-        attn_quant=config.attn_quant,
+        attn_quant=dense_quant_mode(config),
     )
 
 

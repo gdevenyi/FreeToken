@@ -168,3 +168,40 @@ def test_eos_token_id_list_uses_the_first_entry():
     hf = _hf_config()
     hf.text_config.eos_token_id = [base, base + 1]
     assert parse_config(hf).qwen4_args.ngram_boundary_token_id == base
+
+
+def _mixed_hf_config(dense_block=True):
+    """modelopt MIXED_PRECISION: NVFP4 routed experts, block-FP8 (FP8_PB_WO) dense projections."""
+    cfg = _hf_config()
+    layers = {"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}}
+    if dense_block:
+        layers["model.layers.3.self_attn.q_proj"] = {"quant_algo": "FP8_PB_WO"}
+    cfg.quantization_config = {
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+        "quantized_layers": layers,
+    }
+    return cfg
+
+
+def test_mixed_precision_block_fp8_dense(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_FP8_DENSE", raising=False)
+    cfg = parse_config(_mixed_hf_config())
+    assert (cfg.expert_quant, cfg.attn_quant) == ("nvfp4", "fp8_block")
+    assert parse_config(_mixed_hf_config(dense_block=False)).attn_quant == "none"
+    # the env flag wins: dequantize at load, serve per-tensor W8A8 (TP-capable)
+    monkeypatch.setenv("FREETOKEN_FP8_DENSE", "1")
+    assert parse_config(_mixed_hf_config()).attn_quant == "fp8_dynamic"
+
+
+def test_dense_quant_mode_dequantizes_block_fp8_under_tp(monkeypatch):
+    from freetoken.distributed import info
+    from freetoken.models.qwen4_exp.config import dense_quant_mode
+
+    monkeypatch.delenv("FREETOKEN_FP8_DENSE", raising=False)
+    cfg = parse_config(_mixed_hf_config())
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(0, 1))
+    assert dense_quant_mode(cfg) == "fp8_block"  # native Fp8Block linears at TP=1
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(0, 2))
+    assert dense_quant_mode(cfg) == "none"  # no TP block-fp8 linears: bf16 at load
+    assert dense_quant_mode(parse_config(_hf_config())) == "none"
