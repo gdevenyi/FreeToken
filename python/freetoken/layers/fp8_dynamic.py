@@ -116,6 +116,27 @@ def quant_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return out, scale
 
 
+def quant_from_partials(
+    x: torch.Tensor, partials: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``quant_per_tensor`` for a tensor whose per-block maxima the producing kernel already
+    wrote (see ``grouped_gemma_rmsnorm(..., amax_out=)``): only the reduce+cast pass remains.
+
+    ``partials`` must cover every element of ``x`` and hold max|x| as stored, which is what
+    makes the result identical to quantizing ``x`` from scratch. Falls back when there are
+    more partials than the fold is compiled for."""
+    n = x.numel()
+    if partials.numel() > _MAX_PARTS:
+        return quant_per_tensor(x)
+    out = torch.empty_like(x, dtype=FP8)
+    scale = torch.empty((), dtype=torch.float32, device=x.device)
+    _reduce_cast_kernel[(triton.cdiv(n, _BLOCK),)](
+        x, out, partials, scale, n, partials.numel(),
+        MAX_PARTS=_MAX_PARTS, BLOCK=_BLOCK, num_warps=8,
+    )
+    return out, scale
+
+
 def fp8_dynamic_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> torch.Tensor:
@@ -148,6 +169,16 @@ class Fp8DynamicLinear(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = fp8_dynamic_linear(x, self.weight, self.weight_scale)
+        if self._comm is not None:
+            y = self._comm.all_reduce(y)
+        return y
+
+    def forward_quantized(self, x8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """The GEMM alone, for a caller that already holds ``x`` in e4m3 with its scale."""
+        y = torch._scaled_mm(
+            x8, self.weight.t(), scale_a=scale, scale_b=self.weight_scale,
+            out_dtype=torch.bfloat16,
+        )
         if self._comm is not None:
             y = self._comm.all_reduce(y)
         return y
@@ -207,5 +238,6 @@ __all__ = [
     "Fp8DynamicLinear",
     "Fp8DynamicRowParallel",
     "fp8_dynamic_linear",
+    "quant_from_partials",
     "quant_per_tensor",
 ]
