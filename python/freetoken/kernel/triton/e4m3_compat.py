@@ -232,3 +232,33 @@ def kv_load_e4m3_tile_f32(ptrs, mask):
     QSA sparse one read the same pool, hence this helper lives here.
     """
     return e4m3_u8_to_f32(tl.load(ptrs, mask=mask, other=0))
+
+
+# What kv_load_e4m3_tile_scaled16 leaves on its tile for the caller to repay.
+# tl.constexpr, not a plain float: a @jit function that references a module-level
+# python float fails triton's cache-key AST walk with a CompilationError, the same
+# way this module's header describes for @constexpr_function and host functions.
+# Host-side callers (tests) want ``KV_TILE_SCALE.value``.
+KV_TILE_SCALE = tl.constexpr(256.0)
+
+
+@jit
+def kv_load_e4m3_tile_scaled16(ptrs, mask):
+    """Load a tile of KV e4m3 codes as fp16 holding the value times 1/KV_TILE_SCALE.
+
+    :func:`kv_load_e4m3_tile_f32` without its last two steps: the widen to fp32 and
+    the ``* 256.0`` that puts the tile back on the true e4m3 scale exist only so the
+    result is directly usable, and they are what force the tile to 32 bits. A caller
+    that must apply a per-(token, kv_head) dequant scale anyway can fold ``2**8`` into
+    that scale instead -- exactly, since it is a power of two -- and keep the tile
+    16-bit. Callers owe that fold; see :data:`KV_TILE_SCALE`.
+
+    Same straight-line load-with-int-fill as that function, for the same reason (see
+    its docstring), and the same bit placement, folded: for ``v = 128s + r`` it builds
+    ``32768s + 128r`` with two masks, two widens, two shifts and an or, while
+    ``(v + (v & 0x80)) << 7 = (256s + r) << 7`` is the same number in one widen, one
+    mask, one add and one shift. Verified identical on all 256 codes, NaN patterns
+    (0x7F/0xFF -> +-480 after the caller's fold) included.
+    """
+    w = tl.load(ptrs, mask=mask, other=0).to(tl.uint16)
+    return ((w + (w & 0x80)) << 7).to(tl.float16, bitcast=True)

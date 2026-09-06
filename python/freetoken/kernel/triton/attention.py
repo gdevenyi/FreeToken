@@ -6,7 +6,31 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.e4m3_compat import KV_TILE_SCALE
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32 as _kv_load_f32
+from freetoken.kernel.triton.e4m3_compat import (
+    kv_load_e4m3_tile_scaled16 as _kv_load_s16,
+)
+
+
+@triton.jit
+def _kv_dequant_scale(scale_ptr, slots, stride, kv_head, mask):
+    """Per-(token, kv_head) dequant scale for an fp8 KV tile, pre-multiplied by the
+    2**8 that :func:`kv_load_e4m3_tile_scaled16` leaves on the tile it returns.
+
+    Applied to a dot's OUTPUT rather than to K or V. The scale is constant down the
+    reduction dim, so ``scores[m,n] = (sum_d q[m,d]*k[d,n]) * s_k[n]`` and
+    ``p @ (diag(s_v) @ v) = (p * s_v[None,:]) @ v`` both hold: scaling the
+    ``BLOCK_M x BLOCK_N`` result costs less than scaling the ``BLOCK_D x BLOCK_N`` K
+    tile or the ``BLOCK_N x BLOCK_DV`` V tile, by a factor of head_dim / BLOCK_M.
+
+    It is also the more accurate order, which is why the 16-bit tile is safe: every
+    value the loader returns carries at most the code's own 3 mantissa bits and lies
+    in +-1.75, so narrowing it to the compute dtype is lossless, whereas multiplying
+    by a general scale first and narrowing after rounds the product.
+    """
+    s = tl.load(scale_ptr + slots * stride + kv_head, mask=mask, other=0.0)
+    return s * KV_TILE_SCALE
 
 
 _MAX_KV_SPLITS = 8
@@ -25,10 +49,11 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
 
     Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
     q/k/v tiles need about ``(BLOCK_M + 2 * BLOCK_N) * BLOCK_D * 2`` bytes of shared
-    memory, which overflows consumer GPUs (sm_89 ~99KB opt-in) once head_dim >= 256.
-    Keep the fast tiles where the device's opt-in shared memory fits them (datacenter
-    A100/H100); shrink only where it does not. ``smem_optin == 0`` (unknown) conservatively
-    selects the small tiles, i.e. the prior consumer-safe behavior.
+    memory, which overflows consumer GPUs (sm_89 ~99KB opt-in) once head_dim >= 256. Keep the fast tiles where the device's opt-in shared memory fits
+    them (datacenter A100/H100); shrink only where it does not. ``smem_optin == 0``
+    (unknown) conservatively selects the small tiles, i.e. the prior consumer-safe
+    behavior.
+
     """
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
@@ -38,7 +63,10 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     if head_dim <= 128:
         return 128, 64
     if head_dim <= 256:
-        return (128, 64) if fits(128, 64) else (64, 32)
+        if fits(128, 64):
+            return 128, 64
+        # Reachable by an fp8 cache where a 16-bit one falls through to 64x32.
+        return (64, 64) if fits(64, 64) else (64, 32)
     if head_dim <= 384:
         return (32, 64) if fits(32, 64) else (32, 32)
     return (32, 64) if fits(32, 64) else (16, 16)
@@ -278,14 +306,11 @@ def _decode_grouped_stage1_kernel(
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
 
             if HAS_KV_SCALE:
-                s_k = tl.load(
-                    k_scale_ptr + slots * stride_kss + kv_head, mask=mask_n, other=0.0
-                )
-                k = _kv_load_f32(
+                s_k = _kv_dequant_scale(k_scale_ptr, slots, stride_kss, kv_head, mask_n)
+                k = _kv_load_s16(
                     k_ptr + slots[None, :] * stride_ks + k_base_offsets,
                     mask_n[None, :] & mask_d[:, None],
-                )
-                k = (k * s_k[None, :]).to(q.dtype)
+                ).to(q.dtype)
             else:
                 k = tl.load(
                     k_ptr + slots[None, :] * stride_ks + k_base_offsets,
@@ -293,17 +318,16 @@ def _decode_grouped_stage1_kernel(
                     other=0.0,
                 )
             scores = tl.dot(q, k) * sm_scale
+            if HAS_KV_SCALE:
+                scores = scores * s_k[None, :]
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
             if HAS_KV_SCALE:
-                s_v = tl.load(
-                    v_scale_ptr + slots * stride_vss + kv_head, mask=mask_n, other=0.0
-                )
-                v = _kv_load_f32(
+                s_v = _kv_dequant_scale(v_scale_ptr, slots, stride_vss, kv_head, mask_n)
+                v = _kv_load_s16(
                     v_ptr + slots[:, None] * stride_vs + v_base_offsets,
                     mask_n[:, None] & mask_dv[None, :],
-                )
-                v = (v * s_v[:, None]).to(q.dtype)
+                ).to(q.dtype)
             else:
                 v = tl.load(
                     v_ptr + slots[:, None] * stride_vs + v_base_offsets,
@@ -314,7 +338,10 @@ def _decode_grouped_stage1_kernel(
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            # p itself stays unscaled: l_i is the softmax denominator and knows
+            # nothing about V's quantization.
+            pv = (p * s_v[None, :]) if HAS_KV_SCALE else p
+            acc = acc * alpha[:, None] + tl.dot(pv.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -638,17 +665,14 @@ def _extend_attention_kernel(
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
             if HAS_KV_SCALE:
-                s_k = tl.load(
-                    k_scale_ptr + slots * stride_kss + kv_head, mask=mask_n, other=0.0
-                )
-                k = _kv_load_f32(
+                s_k = _kv_dequant_scale(k_scale_ptr, slots, stride_kss, kv_head, mask_n)
+                k = _kv_load_s16(
                     k_ptr
                     + slots[None, :] * stride_ks
                     + kv_head * stride_kh
                     + offs_d[:, None],
                     mask_n[None, :] & mask_d[:, None],
-                )
-                k = (k * s_k[None, :]).to(q.dtype)
+                ).to(q.dtype)
             else:
                 k = tl.load(
                     k_ptr
@@ -659,6 +683,8 @@ def _extend_attention_kernel(
                     other=0.0,
                 )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
+            if HAS_KV_SCALE:
+                scores = scores * s_k[None, :]
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -668,17 +694,14 @@ def _extend_attention_kernel(
             p = tl.exp(scores - m_new[:, None])
 
             if HAS_KV_SCALE:
-                s_v = tl.load(
-                    v_scale_ptr + slots * stride_vss + kv_head, mask=mask_n, other=0.0
-                )
-                v = _kv_load_f32(
+                s_v = _kv_dequant_scale(v_scale_ptr, slots, stride_vss, kv_head, mask_n)
+                v = _kv_load_s16(
                     v_ptr
                     + slots[:, None] * stride_vs
                     + kv_head * stride_vh
                     + offs_dv[None, :],
                     mask_n[:, None] & mask_dv[None, :],
-                )
-                v = (v * s_v[:, None]).to(q.dtype)
+                ).to(q.dtype)
             else:
                 v = tl.load(
                     v_ptr
@@ -688,7 +711,9 @@ def _extend_attention_kernel(
                     mask=mask_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            # p stays unscaled for the l_i denominator below.
+            pv = (p * s_v[None, :]) if HAS_KV_SCALE else p
+            acc = acc * alpha[:, None] + tl.dot(pv.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -796,17 +821,14 @@ def _extend_attention_split_kernel(
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
             if HAS_KV_SCALE:
-                s_k = tl.load(
-                    k_scale_ptr + slots * stride_kss + kv_head, mask=mask_n, other=0.0
-                )
-                k = _kv_load_f32(
+                s_k = _kv_dequant_scale(k_scale_ptr, slots, stride_kss, kv_head, mask_n)
+                k = _kv_load_s16(
                     k_cache_ptr
                     + slots[None, :] * stride_kcs
                     + kv_head * stride_kch
                     + offs_d[:, None],
                     mask_n[None, :] & mask_d[:, None],
-                )
-                k = (k * s_k[None, :]).to(q.dtype)
+                ).to(q.dtype)
             else:
                 k = tl.load(
                     k_cache_ptr
@@ -817,6 +839,8 @@ def _extend_attention_split_kernel(
                     other=0.0,
                 )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
+            if HAS_KV_SCALE:
+                scores = scores * s_k[None, :]
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -826,17 +850,14 @@ def _extend_attention_split_kernel(
             p = tl.exp(scores - m_new[:, None])
 
             if HAS_KV_SCALE:
-                s_v = tl.load(
-                    v_scale_ptr + slots * stride_vss + kv_head, mask=mask_n, other=0.0
-                )
-                v = _kv_load_f32(
+                s_v = _kv_dequant_scale(v_scale_ptr, slots, stride_vss, kv_head, mask_n)
+                v = _kv_load_s16(
                     v_cache_ptr
                     + slots[:, None] * stride_vcs
                     + kv_head * stride_vch
                     + offs_dv[None, :],
                     mask_n[:, None] & mask_dv[None, :],
-                )
-                v = (v * s_v[:, None]).to(q.dtype)
+                ).to(q.dtype)
             else:
                 v = tl.load(
                     v_cache_ptr
@@ -846,7 +867,9 @@ def _extend_attention_split_kernel(
                     mask=mask_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            # p stays unscaled for the l_i denominator below.
+            pv = (p * s_v[None, :]) if HAS_KV_SCALE else p
+            acc = acc * alpha[:, None] + tl.dot(pv.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
