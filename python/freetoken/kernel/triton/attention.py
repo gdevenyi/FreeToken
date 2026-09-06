@@ -44,21 +44,26 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
-def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
+def _select_extend_tile(
+    head_dim: int, block_d: int, smem_optin: int, kv_bytes: int = 2
+) -> tuple[int, int]:
     """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
 
-    Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
-    q/k/v tiles need about ``(BLOCK_M + 2 * BLOCK_N) * BLOCK_D * 2`` bytes of shared
-    memory, which overflows consumer GPUs (sm_89 ~99KB opt-in) once head_dim >= 256. Keep the fast tiles where the device's opt-in shared memory fits
+    Larger tiles run materially faster (~2x for head_dim 512 on H100) but their q/k/v
+    tiles need shared memory, which overflows consumer GPUs (sm_89 ~99KB opt-in) once
+    head_dim >= 256. Keep the fast tiles where the device's opt-in shared memory fits
     them (datacenter A100/H100); shrink only where it does not. ``smem_optin == 0``
     (unknown) conservatively selects the small tiles, i.e. the prior consumer-safe
     behavior.
 
+    ``kv_bytes`` is the KV cache's element size: q is always 2 bytes/element but K and
+    V follow the cache, so a 1-byte fp8 cache fits a tile a 16-bit one cannot. Passing
+    2 reproduces the previous budget exactly, so the 16-bit ladder is unchanged.
     """
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
     def fits(block_m: int, block_n: int) -> bool:
-        return (block_m + 2 * block_n) * block_d * 2 <= budget
+        return (block_m * 2 + 2 * block_n * kv_bytes) * block_d <= budget
 
     if head_dim <= 128:
         return 128, 64
@@ -988,7 +993,7 @@ def extend_paged_attention(
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
     block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index)
+        head_dim, block_d, _optin_smem_bytes(q.device.index), k_cache.element_size()
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:
