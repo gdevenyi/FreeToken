@@ -614,6 +614,36 @@ def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expecte
     assert _select_extend_tile(head_dim, block_d, smem_optin) == expected
 
 
+@pytest.mark.parametrize(
+    ("head_dim", "smem_optin", "expected_16bit", "expected_fp8"),
+    [
+        # consumer opt-in smem (sm_86/sm_89 ~99KB): a 1-byte cache buys BLOCK_N 32 -> 64
+        (256, 101376, (64, 32), (64, 64)),
+        # where the fast tile already fits, the cache dtype changes nothing
+        (256, 232448, (128, 64), (128, 64)),
+        # unknown budget stays conservative for both
+        (256, 0, (64, 32), (64, 32)),
+    ],
+)
+def test_select_extend_tile_uses_kv_cache_element_size(
+    head_dim, smem_optin, expected_16bit, expected_fp8
+):
+    """The q tile is always 2 bytes/element but K and V follow the cache, so charging
+    K/V at 2 bytes regardless makes an fp8 cache run a smaller tile than it has shared
+    memory for. On an RTX 3070 (sm_86, 99KB opt-in, head_dim 256) that was BLOCK_N 32
+    where 64 fits, worth ~9% of prefill time at 99k context.
+
+    The 16-bit column is the no-regression half: ``kv_bytes=2`` reproduces the previous
+    budget identically, since (M + 2N) * D * 2 == (M*2 + 2N*2) * D."""
+    import triton
+
+    from freetoken.kernel.triton.attention import _select_extend_tile
+
+    block_d = triton.next_power_of_2(head_dim)
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 2) == expected_16bit
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 1) == expected_fp8
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
     from freetoken.attention import AttentionSpec
