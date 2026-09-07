@@ -88,9 +88,10 @@ def test_e2m1_grid_and_round_to_even_boundaries():
     torch.testing.assert_close(pool.k_scale(1)[loc], row)
 
 
-@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("mode", ["paged", "decode", "extend", "split"])
-def test_attention_reads_packed_cache(dim, mode):
+def test_attention_reads_packed_cache(dim, dtype, mode):
     from freetoken.kernel.triton.attention import (
         decode_paged_attention, extend_paged_attention, paged_attention,
     )
@@ -98,11 +99,16 @@ def test_attention_reads_packed_cache(dim, mode):
     torch.manual_seed(42)
     pool = _pool(dim)
     n, prefix = 67, 35
-    k, v = [torch.randn(n, 2 * dim, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    k, v = [torch.randn(n, 2 * dim, device="cuda", dtype=dtype) for _ in range(2)]
+    # Distinct token/head and block scales expose accidental FP8 rescaling of NVFP4.
+    row_gain = torch.linspace(0.25, 2.0, n * 2, device="cuda").view(n, 2, 1)
+    block_gain = torch.linspace(0.5, 1.5, dim // 16, device="cuda").repeat_interleave(16)
+    k.view(n, 2, dim).mul_(row_gain * block_gain)
+    v.view(n, 2, dim).mul_(row_gain.flip(0) * block_gain.flip(0))
     loc = torch.randperm(95, device="cuda")[:n] + 1
     pool.store_kv(k, v, loc, 1)
     tokens = 1 if mode in ("paged", "decode") else n - prefix
-    q = torch.randn(tokens, 6, dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(tokens, 6, dim, device="cuda", dtype=dtype)
     indptr = torch.tensor([0, n], device="cuda", dtype=torch.int32)
     pos = torch.arange(n - tokens, n, device="cuda")
     args = dict(q=q, k_cache=pool.k_cache(1).flatten(0, 1),
