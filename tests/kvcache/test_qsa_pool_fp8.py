@@ -115,7 +115,7 @@ def test_fp8_replaces_the_kv_slab_and_adds_scale_views():
     assert bf16.k_scale(3) is None and bf16.v_scale(3) is None
 
 
-@pytest.mark.parametrize("kv_quant", ["none", "fp8"])
+@pytest.mark.parametrize("kv_quant", ["none", "fp8", "nvfp4"])
 def test_index_tiers_stay_16_bit_whatever_the_kv_store_does(kv_quant):
     """Block selection is quantization-agnostic by construction: it reads the compressed
     index keys, not the KV rows, so fp8 must not touch these three buffers."""
@@ -134,6 +134,9 @@ def test_index_tiers_stay_16_bit_whatever_the_kv_store_does(kv_quant):
     assert plain == kv_16bit + index_term
     if kv_quant == "fp8":
         assert cost == kv_16bit // 2 + scale_term + index_term
+    elif kv_quant == "nvfp4":
+        block_term = 2 * kv_layers * HEADS * (DIM // 16)
+        assert cost == kv_16bit // 4 + scale_term + block_term + index_term
     else:
         assert cost == plain
 
@@ -206,4 +209,13 @@ def test_factory_threads_kv_quant_into_the_qsa_pool():
     )
     assert isinstance(pool, QSAKVCache) and pool.kv_quant == "fp8"
     assert pool.k_cache(1).element_size() == 1 and pool.k_scale(1) is not None
+
+
+def test_nvfp4_replaces_only_qsa_kv_tiers():
+    pool = _pool(kv_quant="nvfp4")
+    slots = 4 * PAGE_SIZE
+    assert pool.k_cache(3).shape == (4, PAGE_SIZE, HEADS, DIM // 2)
+    assert pool.k_block_scale(3).shape == (slots, HEADS, DIM // 16)
+    assert pool.v_block_scale(3).dtype is torch.uint8
+    assert pool.cmp_k_cache(0).dtype is torch.bfloat16
 

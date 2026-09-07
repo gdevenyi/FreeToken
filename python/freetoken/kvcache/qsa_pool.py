@@ -65,6 +65,8 @@ class QSAKVCache(MHAKVCache):
         layer_ids: Sequence[int] | None = None,
         kv_quant: str = "none",
     ) -> None:
+        if kv_quant not in ("none", "fp8", "nvfp4"):
+            raise ValueError(f"unsupported QSA kv_quant {kv_quant!r}")
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(
@@ -160,6 +162,7 @@ class QSAKVCache(MHAKVCache):
             # Same reason as above on an fp8 pool: a grown K/V slab whose scales are gone
             # would serve quantized rows at the wrong scale rather than fail.
             self._scale_buffer = None
+            self._block_scale_buffer = None
             raise
 
     @classmethod
