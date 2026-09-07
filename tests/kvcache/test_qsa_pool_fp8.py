@@ -168,8 +168,8 @@ def test_store_kv_writes_the_slot_the_attend_kernel_will_read():
     """out_loc numbering (page * page_size + offset) is the contract between the fused
     writer and the attend kernel's scale slot arithmetic -- this is that round trip."""
     torch.manual_seed(0)
-    pool = _pool(num_pages=4)
-    slots = 4 * PAGE_SIZE
+    pool = _pool(num_pages=5)
+    slots = 5 * PAGE_SIZE
     rows = (0, 1, 63, 64, 255, 256)  # page boundaries included: 63/64 and 255/256
     k = torch.randn(len(rows), HEADS * DIM, device=DEV, dtype=torch.bfloat16) * 3.0
     v = torch.randn(len(rows), HEADS * DIM, device=DEV, dtype=torch.bfloat16) * 0.25

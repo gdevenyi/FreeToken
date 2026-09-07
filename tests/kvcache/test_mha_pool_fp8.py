@@ -35,13 +35,13 @@ def _tp():
     _init_tp()
 
 
-def _pool(kv_quant="fp8", num_pages=PAGES, layer_ids=None):
+def _pool(kv_quant="fp8", num_pages=PAGES, layer_ids=None, num_layers=LAYERS):
     from freetoken.kvcache.mha_pool import MHAKVCache
 
     _init_tp()
     return MHAKVCache(
         num_kv_heads=HEADS,
-        num_layers=LAYERS,
+        num_layers=num_layers,
         head_dim=DIM,
         num_pages=num_pages,
         page_size=PAGE_SIZE,
@@ -84,8 +84,10 @@ def test_fp8_pool_keeps_geometry_and_adds_scale_views():
 def test_layer_ids_remap_applies_to_scales_too():
     # Hybrid GDN models back only their full-attention layers; a scale view that
     # forgot the remap would hand layer 7's rows to layer 2's attention.
+    # (1, 3) names a subset of a model, so layer id 3 has to be inside it: LAYERS is 3, which
+    # makes 3 one past the end, so this pool is told the depth the ids imply.
     layer_ids = (1, 3)
-    pool = _pool(layer_ids=layer_ids)
+    pool = _pool(layer_ids=layer_ids, num_layers=4)
     assert pool._kv_buffer.shape[1] == 2
     with pytest.raises(KeyError):
         pool.k_scale(0)
