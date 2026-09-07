@@ -182,10 +182,8 @@ def test_fp8_lands_just_above_half_the_bytes():
     assert quantized == plain // 2 + scales, (plain, quantized, scales)
 
 
-def test_latent_kv_pool_rejects_fp8():
-    """MLA/DSA (and by the same guard BSA/QSA/DSV4) have no scale-read path: asking
-    for fp8 must fail loudly, not quietly allocate a 16-bit cache the budget priced
-    as fp8."""
+def test_latent_kv_pool_accepts_fp8():
+    """MLA carries one latent row per token, so it uses one FP32 scale per row."""
     from freetoken.attention import AttnType
     from freetoken.kvcache import create_kvcache_pool
 
@@ -206,16 +204,15 @@ def test_latent_kv_pool_rejects_fp8():
         head_dim=DIM,
         kv_cache_group_specs=lambda: (spec,),
     )
-    with pytest.raises(ValueError, match="kv-cache-dtype"):
-        create_kvcache_pool(
-            model_config=mc,
-            num_pages=4,
-            page_size=1,
-            dtype=torch.bfloat16,
-            device=DEV,
-            kv_quant="fp8",
-        )
-    # The same request on the 16-bit path is fine (guards against an over-eager check).
+    fp8 = create_kvcache_pool(
+        model_config=mc,
+        num_pages=4,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=DEV,
+        kv_quant="fp8",
+    )
+    assert fp8.kv_quant == "fp8" and fp8.store_dtype is torch.uint8
     pool = create_kvcache_pool(
         model_config=mc,
         num_pages=4,
