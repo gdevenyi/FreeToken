@@ -976,22 +976,27 @@ def test_extend_paged_attention_decodes_fp8_scales(use_split_inputs: bool):
     seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
     total_q, total_kv = sum(extend_lens), sum(seq_lens)
     q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    k_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 6.0).to(
+    k_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 3.0).to(
         torch.bfloat16
     )
-    v_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 6.0).to(
+    v_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 3.0).to(
         torch.bfloat16
     )
     # Magnitudes far from 1: a dropped scale is then off by orders of magnitude.
     k_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.3).to(
         torch.bfloat16
     )
-    v_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 30.0).to(
+    v_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 3.0).to(
         torch.bfloat16
     )
     qo_indptr = torch.tensor([0] + extend_lens, dtype=torch.int32, device=device).cumsum_(0)
     kv_indptr = torch.tensor([0] + seq_lens, dtype=torch.int32, device=device).cumsum_(0)
-    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    # KV positions are logical, but FP8 codes and their scales are addressed by the
+    # physical slots from the page table. A contiguous table masks a regression that
+    # looks scales up with the logical position instead of the slot.
+    indices = torch.tensor(
+        [10, 3, 8, 1, 9, 0, 7, 2, 6, 4, 5], dtype=torch.int32, device=device
+    )
     prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
     q_to_req = torch.empty(total_q, dtype=torch.int32, device=device)
     q_positions = torch.empty(total_q, dtype=torch.int64, device=device)
@@ -1012,18 +1017,24 @@ def test_extend_paged_attention_decodes_fp8_scales(use_split_inputs: bool):
         kv_off += cached_len + extend_len
     sm_scale = head_dim**-0.5
 
-    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_cache, v_cache)
+    num_slots = total_kv + 1
+    k_slots = torch.zeros(
+        num_slots, num_kv_heads, head_dim, dtype=k_cache.dtype, device=device
+    )
+    v_slots = torch.zeros_like(k_slots)
+    k_slots[indices.to(torch.long)] = k_cache
+    v_slots[indices.to(torch.long)] = v_cache
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_slots, v_slots)
     k_ref = _dequantized(k_codes, k_scale).clone()
     v_ref = _dequantized(v_codes, v_scale).clone()
     if use_split_inputs:
         q_off = kv_off = 0
         for cached_len, extend_len in zip(cached_lens, extend_lens):
-            k_ref[kv_off + cached_len : kv_off + cached_len + extend_len] = k_extend[
-                q_off : q_off + extend_len
-            ]
-            v_ref[kv_off + cached_len : kv_off + cached_len + extend_len] = v_extend[
-                q_off : q_off + extend_len
-            ]
+            current_slots = indices[
+                kv_off + cached_len : kv_off + cached_len + extend_len
+            ].to(torch.long)
+            k_ref[current_slots] = k_extend[q_off : q_off + extend_len].float()
+            v_ref[current_slots] = v_extend[q_off : q_off + extend_len].float()
             q_off += extend_len
             kv_off += cached_len + extend_len
 
