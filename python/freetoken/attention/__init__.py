@@ -112,7 +112,10 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
-    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
+    BackendInfo(
+        supported_types=frozenset({AttnType.MLA, AttnType.DSA}),
+        supports_fp8_kv=True,
+    ),
 )
 def create_dsa_backend(config: ModelConfig):
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
