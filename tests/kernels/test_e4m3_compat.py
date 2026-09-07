@@ -142,6 +142,49 @@ class TestPrimitives:
         assert int(((y != ref) & ~(y.isnan() & ref.isnan())).sum()) == 0
 
 
+def test_kv_tile_scaled16_agrees_with_the_f32_loader():
+    """kv_load_e4m3_tile_scaled16 is kv_load_e4m3_tile_f32 with its last two steps --
+    the widen to fp32 and the ``* 256.0`` -- left for the caller to fold into the
+    per-(token, kv_head) dequant scale it has to apply anyway. That fold is only legal
+    if the two loaders agree on every code, so pin it: all 256, NaN patterns included.
+
+    Second assertion pins the property that lets the 16-bit tile be narrowed to a bf16
+    compute dtype for free: every value carries at most the code's own 3 mantissa bits
+    and lies in +-1.75, so bf16 holds it exactly. That is what makes scaling AFTER the
+    dot strictly more accurate than upstream's scale-then-narrow.
+
+    Third pins masked lanes at zero in both, so a masked tile contributes nothing once
+    the scale is applied to the dot output instead of to the tile."""
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.e4m3_compat import (
+        KV_TILE_SCALE,
+        kv_load_e4m3_tile_f32,
+        kv_load_e4m3_tile_scaled16,
+    )
+
+    @triton.jit
+    def k(v_ptr, wide_ptr, narrow_ptr, N, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        mask = offs < N
+        tl.store(wide_ptr + offs, kv_load_e4m3_tile_f32(v_ptr + offs, mask))
+        tl.store(narrow_ptr + offs, kv_load_e4m3_tile_scaled16(v_ptr + offs, mask))
+
+    n = 256
+    v = torch.zeros(2 * n, dtype=torch.uint8, device="cuda")
+    v[:n] = torch.arange(n, dtype=torch.uint8, device="cuda")
+    wide = torch.empty(2 * n, dtype=torch.float32, device="cuda")
+    narrow = torch.empty(2 * n, dtype=torch.float16, device="cuda")
+    k[(1,)](v, wide, narrow, n, BLOCK=2 * n)
+
+    assert torch.equal(narrow.to(torch.float32) * KV_TILE_SCALE.value, wide)
+    assert torch.equal(
+        narrow.to(torch.bfloat16).to(torch.float32), narrow.to(torch.float32)
+    )
+    assert not wide[n:].any() and not narrow[n:].any()
+
+
 # ======================================================================================
 # Shared emit path: every affected wrapper, deterministic inputs.
 # ======================================================================================
