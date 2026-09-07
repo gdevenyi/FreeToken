@@ -94,6 +94,7 @@ def test_kv_quant_spellings():
     assert _resolve_kv_quant("auto") == "none"
     assert _resolve_kv_quant("bf16") == "none"
     assert _resolve_kv_quant("FP8") == "fp8"
+    assert _resolve_kv_quant("NVFP4") == "nvfp4"
     assert _resolve_kv_quant(None) == "none"
     with pytest.raises(ValueError, match="kv-cache-dtype"):
         _resolve_kv_quant("q8")
@@ -113,6 +114,13 @@ def test_only_the_backends_that_read_scales_declare_fp8_support():
     # dsa/dsv4_sparse kernels) have no scale path and would attend over raw e4m3 codes,
     # producing plausible garbage instead of an error.
     assert fp8 == {"triton", "qsa_sparse"}
+
+    nvfp4 = {
+        name
+        for name in SUPPORTED_ATTENTION_BACKENDS.supported_names()
+        if attention_backend_info(name).supports_nvfp4_kv
+    }
+    assert nvfp4 == {"triton", "qsa_sparse"}
 
 
 def test_auto_avoids_the_fast_backends_for_fp8(monkeypatch):
@@ -150,6 +158,72 @@ def test_explicit_triton_is_accepted(monkeypatch):
     config = _config("full", attention_backend="triton", kv_quant="fp8")
     _adjust_config(config)
     assert config.kv_quant == "fp8"
+
+
+def test_nvfp4_auto_selects_triton(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_quant="nvfp4")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+
+
+@pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa"])
+def test_nvfp4_rejects_unsupported_pools_before_allocation(monkeypatch, kind):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.kvcache import create_kvcache_pool
+
+    _patch_fast_machine(monkeypatch)
+    config = _config(kind, attention_backend="auto", kv_quant="nvfp4")
+    with pytest.raises(ValueError, match="nvfp4"):
+        _adjust_config(config)
+    with pytest.raises(ValueError, match="nvfp4"):
+        create_kvcache_pool(config.model_config, num_pages=4, page_size=1,
+                            dtype=torch.bfloat16, device=torch.device("cpu"), kv_quant="nvfp4")
+
+
+@pytest.mark.parametrize("backend", ["fi", "fa", "trtllm", "fi,triton", "triton,fi"])
+def test_nvfp4_rejects_backends_without_its_layout(monkeypatch, backend):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    monkeypatch.setattr("freetoken.engine.engine.is_sm100_family", lambda: True)
+    config = _config("full", attention_backend=backend, kv_quant="nvfp4")
+    with pytest.raises(ValueError, match="nvfp4"):
+        _adjust_config(config)
+
+
+def test_nvfp4_rejects_partial_blocks(monkeypatch):
+    from dataclasses import replace
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_quant="nvfp4")
+    spec = replace(config.model_config.kv_cache_group_specs()[0], head_dim=72)
+    config.model_config.kv_cache_group_specs = lambda: (spec,)
+    with pytest.raises(ValueError, match="divisible by 16"):
+        _adjust_config(config)
+
+
+def test_nvfp4_accepts_hybrid_swa(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("swa", attention_backend="auto", kv_quant="nvfp4")
+    _adjust_config(config)
+    assert config.kv_quant == "nvfp4"
+    assert config.attention_backend == "triton"
+
+
+def test_nvfp4_accepts_qsa(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("qsa", attention_backend="auto", kv_quant="nvfp4")
+    _adjust_config(config)
+    assert config.kv_quant == "nvfp4"
+    assert config.attention_backend == "qsa_sparse"
 
 
 @pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa"])
