@@ -229,7 +229,6 @@ def create_kvcache_pool(
     if len(kv_specs) == 1 and kv_specs[0].mla:
         from .dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache
 
-        _reject_unsupported_quant("latent-KV (MLA/DSA)", kv_quant)
         spec = kv_specs[0]
         # With a layer remap the pool allocates len(layer_ids) slabs; without one
         # it backs every model layer (all-MLA models, GLM-5.2).
@@ -245,6 +244,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
+                kv_quant=kv_quant,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -264,6 +264,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_quant=kv_quant,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None

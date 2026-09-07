@@ -185,6 +185,57 @@ def quantize_kv_to_cache(
     )
 
 
+@triton.jit
+def _kv_quant_rows_scatter_kernel(
+    src, dst, scale_ptr, idx_ptr,
+    stride_src, stride_dst, stride_scale,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Quantize one whole latent row per program and scatter it by ``out_loc``."""
+    t = tl.program_id(0)
+    pos = tl.load(idx_ptr + t).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    mask = d < D
+    x = tl.load(src + t * stride_src + d, mask=mask, other=0.0).to(tl.float32)
+    s = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-10) / 448.0
+    q = tl.clamp(x / s, -448.0, 448.0)
+    tl.store(dst + pos * stride_dst + d, e4m3_f32_to_u8(round_e4m3(q)), mask=mask)
+    tl.store(scale_ptr + pos * stride_scale, s)
+
+
+def quantize_rows_to_cache(
+    rows: torch.Tensor,
+    out_loc: torch.Tensor,
+    cache: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    """Quantize and scatter one scale-bearing FP8 row per token.
+
+    MLA stores its absorbed K/V state as one latent row, rather than separate K and
+    V heads. Its scale granularity is therefore one FP32 value per ``(token,
+    layer)`` row, which is the single-head MLA case already priced by
+    ``kv_scale_bytes_per_token``.
+    """
+    tokens = rows.shape[0]
+    if tokens == 0:
+        return
+    assert rows.dim() == 2 and rows.stride(1) == 1, tuple(rows.shape)
+    assert cache.dim() == 2 and cache.shape[1] == rows.shape[1], (
+        tuple(cache.shape), tuple(rows.shape),
+    )
+    assert scales.shape == (cache.shape[0],), (tuple(scales.shape), tuple(cache.shape))
+    assert cache.dtype == kv_codes_dtype(), cache.dtype
+    assert scales.dtype == KV_SCALE_DTYPE, scales.dtype
+    dim = rows.shape[1]
+    _kv_quant_rows_scatter_kernel[(tokens,)](
+        rows, cache, scales, out_loc,
+        rows.stride(0), cache.stride(0), scales.stride(0),
+        D=dim, BLOCK_D=triton.next_power_of_2(dim),
+        num_warps=4 if dim > 256 else 1,
+    )
+
+
 __all__ = [
     "FP8",
     "KV_QUANT_FP8",
@@ -193,5 +244,6 @@ __all__ = [
     "codes_to_f32",
     "kv_codes_dtype",
     "quantize_kv_to_cache",
+    "quantize_rows_to_cache",
 ]
 

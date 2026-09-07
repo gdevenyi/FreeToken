@@ -107,12 +107,10 @@ def test_only_the_backends_that_read_scales_declare_fp8_support():
         for name in SUPPORTED_ATTENTION_BACKENDS.supported_names()
         if attention_backend_info(name).supports_fp8_kv
     }
-    # triton serves the plain paged / hybrid-SWA pools and applies the scales in
-    # kernel/triton/attention.py; qsa_sparse dequantizes the rows it selects in
-    # kernel/triton/qsa/attend.py. Nothing else may join this set: fi/fa/trtllm (and the
-    # dsa/dsv4_sparse kernels) have no scale path and would attend over raw e4m3 codes,
-    # producing plausible garbage instead of an error.
-    assert fp8 == {"triton", "qsa_sparse"}
+    # triton serves plain paged / hybrid-SWA pools, qsa_sparse dequantizes selected
+    # rows, and dsa dequantizes MLA latent rows. External backends and sparse
+    # families without a scale path must stay out of this set.
+    assert fp8 == {"triton", "qsa_sparse", "dsa"}
 
 
 def test_auto_avoids_the_fast_backends_for_fp8(monkeypatch):
@@ -152,7 +150,17 @@ def test_explicit_triton_is_accepted(monkeypatch):
     assert config.kv_quant == "fp8"
 
 
-@pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa"])
+@pytest.mark.parametrize("kind", ["mla", "dsa"])
+def test_mla_and_dsa_select_the_scale_reading_backend(monkeypatch, kind):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config(kind, attention_backend="auto", kv_quant="fp8")
+    _adjust_config(config)
+    assert config.attention_backend == "dsa"
+
+
+@pytest.mark.parametrize("kind", ["dsv4", "bsa"])
 def test_pool_families_without_a_scale_read_path_are_rejected(monkeypatch, kind):
     from freetoken.engine.engine import _adjust_config
 
