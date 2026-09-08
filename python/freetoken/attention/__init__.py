@@ -115,6 +115,7 @@ def create_dsv4_sparse_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.MLA, AttnType.DSA}),
         supports_fp8_kv=True,
+        supports_nvfp4_kv=True,
     ),
 )
 def create_dsa_backend(config: ModelConfig):

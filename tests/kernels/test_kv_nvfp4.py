@@ -47,6 +47,94 @@ def _decode(pool, which, layer=1):
     return grid[code] * block.repeat_interleave(16, -1) * row[..., None]
 
 
+def _decode_latent(pool, layer=0):
+    codes = pool.latent_rows(layer)
+    code = torch.stack((codes & 15, codes >> 4), -1).flatten(-2).long()
+    grid = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6,
+                         0, -.5, -1, -1.5, -2, -3, -4, -6], device=codes.device)
+    block = pool.latent_block_scale(layer).view(torch.float8_e4m3fn).float()
+    return grid[code] * block.repeat_interleave(16, -1) * pool.latent_scale(layer)[:, None]
+
+
+@pytest.mark.parametrize("rope", [0, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_latent_scatter_matches_reference_and_preserves_prefix(rope, dtype):
+    from freetoken.kvcache.dsa_pool import MLAKVCache
+
+    torch.manual_seed(73)
+    dim = 512 + rope
+    pool = MLAKVCache(dim, 4, 2, 64, dtype, torch.device("cuda"),
+                      layer_ids=(1, 3), kv_quant="nvfp4")
+    x = torch.randn(7, dim + 32, device="cuda", dtype=dtype)[:, :dim]
+    x[0].zero_()
+    x[1, :16] *= 100
+    x[2] *= 1e-5
+    loc = torch.tensor([64, 3, 127, 14, 6, 90, 31], device="cuda")
+    pool.store_kv(x[:4, :512], x[:4, 512:], loc[:4], 3)
+    before = [v.clone() for v in (pool.latent_rows(3), pool.latent_scale(3),
+                                  pool.latent_block_scale(3))]
+    pool.store_kv(x[4:, :512], x[4:, 512:], loc[4:], 3)
+    pool.store_kv(x[:0, :512], x[:0, 512:], loc[:0], 3)
+    for got, saved in zip((pool.latent_rows(3), pool.latent_scale(3),
+                           pool.latent_block_scale(3)), before):
+        torch.testing.assert_close(got[loc[:4]], saved[loc[:4]], rtol=0, atol=0)
+    packed, block, row = _reference(x)
+    torch.testing.assert_close(pool.latent_rows(3)[loc], packed)
+    torch.testing.assert_close(pool.latent_block_scale(3)[loc], block)
+    torch.testing.assert_close(pool.latent_scale(3)[loc], row)
+    assert torch.count_nonzero(pool.latent_rows(1)) == 0
+    assert torch.isfinite(_decode_latent(pool, 3)).all()
+    assert pool.k_cache(3).data_ptr() == pool.v_cache(3).data_ptr()
+    # Reused physical slots replace codes and both scales together.
+    x[4:].mul_(0.125)
+    pool.store_kv(x[4:, :512], x[4:, 512:], loc[4:], 3)
+    packed, block, row = _reference(x[4:])
+    torch.testing.assert_close(pool.latent_rows(3)[loc[4:]], packed)
+    torch.testing.assert_close(pool.latent_block_scale(3)[loc[4:]], block)
+    torch.testing.assert_close(pool.latent_scale(3)[loc[4:]], row)
+
+
+@pytest.mark.parametrize("rope", [0, 64])
+@pytest.mark.parametrize("splits", [0, 4])
+@pytest.mark.parametrize("queries,broadcast", [(1, False), (5, False), (5, True)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sparse_mla_nvfp4_matches_restored_reference(rope, splits, queries, broadcast, dtype):
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+    from freetoken.kvcache.dsa_pool import MLAKVCache
+
+    torch.manual_seed(74)
+    dim, n = 512 + rope, 67
+    pool = MLAKVCache(dim, 1, 2, 64, torch.bfloat16, torch.device("cuda"), kv_quant="nvfp4")
+    x = torch.randn(n, dim, device="cuda", dtype=torch.bfloat16)
+    x *= torch.linspace(.2, 2, n, device="cuda")[:, None]
+    if rope:
+        x[:, 512:] *= 3
+    loc = torch.randperm(128, device="cuda")[:n]
+    pool.store_kv(x[:, :512], x[:, 512:], loc, 0)
+    q = torch.randn(2, queries, 19, dim, device="cuda", dtype=dtype)
+    sel = loc.repeat(2, 1 if broadcast else queries, 1).to(torch.int32)
+    sel[1] = sel[1].flip(-1)
+    sel[..., 5] = -1
+    cnt = torch.full((2, queries), n, device="cuda", dtype=torch.int32)
+    cnt[0, 0] = 0
+    cnt[1, 0] = 13
+    out = glm_dsa_sparse_attn(
+        q, pool.latent_rows(0), sel, .04, counts=cnt, d_v=512,
+        pool_scale=pool.latent_scale(0), pool_block_scale=pool.latent_block_scale(0),
+        kv_quant="nvfp4", force_splits=splits,
+    )
+    decoded = _decode_latent(pool)
+    ref = torch.zeros_like(out, dtype=torch.float32)
+    for b in range(2):
+        for m in range(queries):
+            rows = sel[b, 0 if broadcast else m, :int(cnt[b, m])]
+            rows = rows[rows >= 0].long()
+            if rows.numel():
+                kv = decoded[rows]
+                ref[b, m] = (q[b, m].float() @ kv.T * .04).softmax(-1) @ kv[:, :512]
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("dim", [16, 48, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_scatter_matches_independent_reference(dim, dtype):
