@@ -35,13 +35,14 @@ def _decode_e2m1(code):
 
 @triton.jit
 def load_nvfp4(ptr, block_ptr, row_ptr, slots, head, dims, slot_mask,
-               stride_slot, stride_head, stride_row, D: tl.constexpr):
+               stride_slot, stride_head, stride_row, D: tl.constexpr,
+               DIM_OFFSET: tl.constexpr = 0):
     TRANSPOSE: tl.constexpr = dims.shape[0] != 1
     WIDTH: tl.constexpr = dims.shape[0] if TRANSPOSE else dims.shape[1]
     TOKENS: tl.constexpr = slots.shape[0] * slots.shape[1]
     slot = slots.reshape(TOKENS).to(tl.int64)
     valid = slot_mask.reshape(TOKENS)
-    dim = tl.arange(0, WIDTH)
+    dim = DIM_OFFSET + tl.arange(0, WIDTH)
     packed = tl.load(
         ptr + slot[:, None] * stride_slot + head * stride_head + (dim[None, :] // 2),
         valid[:, None] & (dim[None, :] < D), other=0,
@@ -80,6 +81,35 @@ def _quantize_row(src, dst, block_ptr, row_ptr, t, h, slot, stride_src,
     tl.store(block_ptr + (slot * HEADS + h) * (D // 16) + blocks,
              e4m3_f32_to_u8(block_scale), blocks < D // 16)
     tl.store(row_ptr + slot * HEADS + h, row_scale)
+
+
+@triton.jit
+def _scatter_rows(src, dst, block, row, indices, stride_src,
+                  D: tl.constexpr, BLOCKS: tl.constexpr):
+    t = tl.program_id(0)
+    slot = tl.load(indices + t).to(tl.int64)
+    _quantize_row(src, dst, block, row, t, 0, slot, stride_src, 1, D, BLOCKS)
+
+
+def quantize_nvfp4_rows_to_cache(rows, out_loc, cache, scales, block_scales) -> None:
+    """Quantize a single MLA latent slab, with one second-level scale per token."""
+    tokens, dim = rows.shape
+    slots = cache.shape[0]
+    assert dim % 16 == 0 and rows.stride(1) == 1
+    assert rows.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    assert cache.shape == (slots, dim // 2) and cache.dtype == torch.uint8
+    assert scales.shape == (slots,) and scales.dtype == torch.float32
+    assert block_scales.shape == (slots, dim // 16) and block_scales.dtype == torch.uint8
+    assert out_loc.shape == (tokens,) and out_loc.dtype in (torch.int32, torch.int64)
+    for tensor in (cache, scales, block_scales, out_loc):
+        assert tensor.is_contiguous() and tensor.device == rows.device
+    assert rows.is_cuda
+    if tokens:
+        _scatter_rows[(tokens,)](
+            rows, cache, block_scales, scales, out_loc, rows.stride(0),
+            D=dim, BLOCKS=triton.next_power_of_2(dim // 16),
+            num_warps=4, enable_fp_fusion=False,
+        )
 
 
 @triton.jit

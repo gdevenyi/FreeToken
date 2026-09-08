@@ -203,9 +203,13 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 `ft serve --model <checkpoint> --kv-cache-dtype nvfp4 --attention-backend triton`
 opts into packed E2M1 KV storage. The initial implementation supports plain paged
 FULL attention (MHA/GQA), hybrid-SWA, and the full-attention portion of hybrid-linear
-models, and QSA. Head dimensions must be divisible by 16. MLA/DSA, DSV4, and BSA
-pools are rejected at startup. `auto` selects Triton or QSA sparse attention for
-supported models.
+models, QSA, and MLA/DSA (including GLM-5.3-Flash). Head dimensions must be
+divisible by 16. DSV4 and BSA pools are rejected at startup. `auto` selects
+Triton, QSA sparse, or DSA attention for supported models. For MLA/DSA use
+`--attention-backend auto` or `--attention-backend dsa`. Only the latent slab is
+quantized; indexer keys, kpool tails/gates, and recurrent states retain their
+existing precision. A 512-element latent row occupies 292 bytes instead of 1024
+bytes in BF16, excluding those other tiers.
 
 Each K or V row stores `head_dim / 2` packed bytes, `head_dim / 16` E4M3 block-scale
 bytes, and one FP32 row scale. At head_dim 128 this is 76 bytes, versus 256 for
@@ -216,8 +220,9 @@ The second-level scale is dynamic per token/head, so appending a token never
 rescales an existing prefix. This is a FreeToken KV layout, not an external
 NVFP4 checkpoint or attention-library ABI. K/V are restored inside attention;
 Q and attention arithmetic retain their compute precision. The MoE weight option
-`--nvfp4-backend` is independent. Prefill uses fresh compute-dtype K/V while
-cached prefixes are restored, as in the FP8 path.
+`--nvfp4-backend` is independent. Paged MHA prefill uses fresh compute-dtype K/V
+while cached prefixes are restored, as in the FP8 path. MLA/DSA stores fresh
+latent rows first and reads the quantized cache in both prefill and decode.
 
 NVFP4 is opt-in: assess quality on your checkpoint and workload before using it
 for long-context inference. Capacity savings do not guarantee faster decode;

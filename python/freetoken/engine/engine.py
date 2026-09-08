@@ -1362,15 +1362,15 @@ def _adjust_config(config: EngineConfig):
     kv_quant = _resolve_kv_quant(getattr(config, "kv_quant", "none"))
     override("kv_quant", kv_quant)
     if kv_quant == "nvfp4":
-        if required_attn_types - {AttnType.FULL, AttnType.SWA, AttnType.QSA}:
+        if required_attn_types - {AttnType.FULL, AttnType.SWA, AttnType.QSA, AttnType.MLA, AttnType.DSA}:
             raise ValueError(
-                "--kv-cache-dtype nvfp4 requires a plain paged FULL, hybrid-SWA, or QSA KV pool"
+                "--kv-cache-dtype nvfp4 requires a paged FULL, hybrid-SWA, QSA, or MLA/DSA KV pool"
             )
         for spec in model_config.kv_cache_group_specs():
             if spec.head_dim % 16:
                 raise ValueError("--kv-cache-dtype nvfp4 requires head_dim divisible by 16")
     if kv_quant != "none":
-        # fp8 codes are wired through the pools that hand their rows to a Triton
+        # Quantized codes are wired through the pools that hand their rows to a Triton
         # kernel: plain paged and hybrid-SWA, QSA sparse, and DSA/MLA. QSA's index
         # tier and DSA's index-key/tail tiers stay bf16; the DSA kernel dequantizes
         # selected latent rows with their per-token scale. Other sparse families have

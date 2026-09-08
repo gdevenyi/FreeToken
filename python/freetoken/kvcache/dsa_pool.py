@@ -46,6 +46,9 @@ class MLAKVCache(BaseKVCachePool):
         kv_quant: str = "none",
     ) -> None:
         self._latent_dim = latent_dim
+        if kv_quant == "nvfp4" and latent_dim % 16:
+            raise ValueError("NVFP4 KV requires latent_dim divisible by 16")
+        self._stored_dim = latent_dim // 2 if kv_quant == "nvfp4" else latent_dim
         if layer_ids is None:
             self._num_layers = num_layers
             self._layer_index: dict[int, int] | None = None
@@ -63,16 +66,20 @@ class MLAKVCache(BaseKVCachePool):
 
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
-        shape = (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim)
-        if self.kv_quant == "fp8":
-            from freetoken.kernel.triton.kv_quant import alloc_codes
-
-            self._kv_buffer = alloc_codes(shape, self._device)
+        shape = (1, self._num_layers, num_pages, self._page_size, 1, self._stored_dim)
+        self._block_scale_buffer = None
+        if self.kv_quant in ("fp8", "nvfp4"):
+            self._kv_buffer = torch.zeros(shape, device=self._device, dtype=torch.uint8)
             self._scale_buffer = torch.zeros(
                 (self._num_layers, num_pages * self._page_size),
                 device=self._device,
                 dtype=torch.float32,
             )
+            if self.kv_quant == "nvfp4":
+                self._block_scale_buffer = torch.zeros(
+                    (self._num_layers, num_pages * self._page_size, self._latent_dim // 16),
+                    device=self._device, dtype=torch.uint8,
+                )
         elif self.kv_quant == "none":
             self._kv_buffer = torch.empty(shape, device=self._device, dtype=self._dtype)
             self._scale_buffer = None
@@ -81,7 +88,7 @@ class MLAKVCache(BaseKVCachePool):
 
     # -- views (addressed by GLOBAL layer id; remapped when layer_ids was given) --
     def k_cache(self, layer_id: int) -> torch.Tensor:
-        """Paged latent view ``[num_pages, page_size, latent_dim]``."""
+        """Paged latent view; NVFP4 stores ``latent_dim // 2`` bytes per row."""
         return self._kv_buffer[0, self._local_layer(layer_id)].view(
             self._num_pages, self._page_size, -1
         )
@@ -91,14 +98,20 @@ class MLAKVCache(BaseKVCachePool):
         return self.k_cache(layer_id)
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
-        """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, self._local_layer(layer_id)].view(-1, self._latent_dim)
+        """Row-flat latent view ``[num_pages * page_size, stored_dim]``."""
+        return self._kv_buffer[0, self._local_layer(layer_id)].view(-1, self._stored_dim)
 
     def latent_scale(self, layer_id: int) -> torch.Tensor | None:
         """One FP32 scale per latent row, or ``None`` for the compute-dtype pool."""
         if self._scale_buffer is None:
             return None
         return self._scale_buffer[self._local_layer(layer_id)]
+
+    def latent_block_scale(self, layer_id: int) -> torch.Tensor | None:
+        """E4M3 bytes per 16 latent elements, present only for NVFP4."""
+        if self._block_scale_buffer is None:
+            return None
+        return self._block_scale_buffer[self._local_layer(layer_id)]
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -115,7 +128,18 @@ class MLAKVCache(BaseKVCachePool):
         store.cu (two-width store).
         """
         rows = self.latent_rows(layer_id)
-        split = rows.shape[1] - k_rope.shape[-1]
+        split = self._latent_dim - k_rope.shape[-1]
+        assert c_kv.shape == (out_loc.numel(), split)
+        assert k_rope.shape[0] == c_kv.shape[0]
+        if self.kv_quant == "nvfp4":
+            from freetoken.kernel.triton.kv_nvfp4 import quantize_nvfp4_rows_to_cache
+
+            latent = torch.cat((c_kv, k_rope), dim=-1) if k_rope.shape[-1] else c_kv
+            quantize_nvfp4_rows_to_cache(
+                latent, out_loc, rows, self.latent_scale(layer_id),
+                self.latent_block_scale(layer_id),
+            )
+            return
         if self.kv_quant == "fp8":
             from freetoken.kernel.triton.kv_quant import quantize_rows_to_cache
 
@@ -130,6 +154,7 @@ class MLAKVCache(BaseKVCachePool):
         callers re-derive views per forward, same contract as MHAKVCache.rebuild)."""
         self._kv_buffer = None
         self._scale_buffer = None
+        self._block_scale_buffer = None
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
@@ -156,6 +181,8 @@ class MLAKVCache(BaseKVCachePool):
         kv = int(buf.numel() * buf.element_size()) // tokens
         if self._scale_buffer is not None:
             kv += int(self._scale_buffer.numel() * self._scale_buffer.element_size()) // tokens
+        if self._block_scale_buffer is not None:
+            kv += self._block_scale_buffer.numel() // tokens
         return kv, 0
 
     # -- pool properties ----------------------------------------------------------
@@ -264,6 +291,21 @@ class KpoolDSAKVCache(DSAKVCache):
     def _index_rows(self, num_pages: int) -> int:
         # 1/ratio shadow of every token slot + one scratch row per request slot.
         return num_pages * self._page_size // self._index_ratio + self._num_req_slots
+
+    @classmethod
+    def kv_cost(cls, config) -> tuple[int, int, int, int]:
+        per_page, fixed, page_size, reserve = super().kv_cost(config)
+        for spec in config.model_config.kv_cache_group_specs():
+            if spec.mla and spec.index_ratio > 1:
+                row_bytes = spec.index_head_dim * spec.num_index_layers * 2
+                fixed += (config.max_running_req + 1) * row_bytes * (2 * spec.index_ratio + 1)
+        return per_page, fixed, page_size, reserve
+
+    def unit_bytes(self) -> tuple[int, int]:
+        # Scratch rows and the two tail rings are fixed costs, not token capacity.
+        kv, swa = MLAKVCache.unit_bytes(self)
+        index_bytes = self._num_index_layers * self._index_head_dim * 2 // self._index_ratio
+        return kv + index_bytes, swa
 
     @property
     def cmp_scratch_base(self) -> int:

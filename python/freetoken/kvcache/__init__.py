@@ -148,13 +148,12 @@ def create_kvcache_pool(
         from freetoken.attention import AttnType
 
         if any(
-            spec.attn_type not in (AttnType.FULL, AttnType.SWA, AttnType.QSA)
-            or spec.mla
+            spec.attn_type not in (AttnType.FULL, AttnType.SWA, AttnType.QSA, AttnType.MLA, AttnType.DSA)
             or spec.head_dim % 16
             for spec in model_config.kv_cache_group_specs()
         ):
             raise ValueError(
-                "--kv-cache-dtype nvfp4 requires paged FULL, hybrid-SWA, or QSA groups "
+                "--kv-cache-dtype nvfp4 requires paged FULL, hybrid-SWA, QSA, or MLA/DSA groups "
                 "with head_dim divisible by 16"
             )
     if model_config.has_swa_attention:

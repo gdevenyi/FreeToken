@@ -49,6 +49,7 @@ def _model_config(kind):
         ),
         "mla": (_spec("full", AttnType.MLA, mla=True),),
         "dsa": (_spec("full", AttnType.DSA, mla=True, index_head_dim=128),),
+        "kpool": (_spec("full", AttnType.DSA, mla=True, index_head_dim=128, index_ratio=4),),
         "dsv4": (_spec("dsv4", AttnType.DSV4, sliding_window=128),),
         "bsa": (_spec("full", AttnType.BSA, index_head_dim=128),),
         "qsa": (_spec("full", AttnType.QSA, index_head_dim=128, index_ratio=4),),
@@ -57,7 +58,7 @@ def _model_config(kind):
         mc.has_swa_attention = True
     if kind == "dsv4":
         mc.dsv4_args = SimpleNamespace(window_size=128)
-    if kind == "qsa":
+    if kind in ("qsa", "kpool"):
         mc.has_linear_attention = True
     mc.kv_cache_group_specs = lambda: specs
     return mc
@@ -118,7 +119,7 @@ def test_only_the_backends_that_read_scales_declare_fp8_support():
         for name in SUPPORTED_ATTENTION_BACKENDS.supported_names()
         if attention_backend_info(name).supports_nvfp4_kv
     }
-    assert nvfp4 == {"triton", "qsa_sparse"}
+    assert nvfp4 == {"triton", "qsa_sparse", "dsa"}
 
 
 def test_auto_avoids_the_fast_backends_for_fp8(monkeypatch):
@@ -167,7 +168,7 @@ def test_nvfp4_auto_selects_triton(monkeypatch):
     assert config.attention_backend == "triton"
 
 
-@pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa"])
+@pytest.mark.parametrize("kind", ["dsv4", "bsa"])
 def test_nvfp4_rejects_unsupported_pools_before_allocation(monkeypatch, kind):
     from freetoken.engine.engine import _adjust_config
     from freetoken.kvcache import create_kvcache_pool
@@ -224,25 +225,17 @@ def test_nvfp4_accepts_qsa(monkeypatch):
     assert config.attention_backend == "qsa_sparse"
 
 
-@pytest.mark.parametrize("kind", ["mla", "dsa"])
+@pytest.mark.parametrize("kind", ["mla", "dsa", "kpool"])
 @pytest.mark.parametrize("backend", ["auto", "dsa"])
-def test_mla_and_dsa_select_the_scale_reading_backend(monkeypatch, kind, backend):
+@pytest.mark.parametrize("kv_quant", ["fp8", "nvfp4"])
+def test_mla_and_dsa_select_the_scale_reading_backend(monkeypatch, kind, backend, kv_quant):
     from freetoken.engine.engine import _adjust_config
 
     _patch_fast_machine(monkeypatch)
-    config = _config(kind, attention_backend=backend, kv_quant="fp8")
+    config = _config(kind, attention_backend=backend, kv_quant=kv_quant)
     _adjust_config(config)
     assert config.attention_backend == "dsa"
-
-
-@pytest.mark.parametrize("kind", ["mla", "dsa"])
-def test_explicit_dsa_backend_does_not_enable_nvfp4(monkeypatch, kind):
-    from freetoken.engine.engine import _adjust_config
-
-    _patch_fast_machine(monkeypatch)
-    config = _config(kind, attention_backend="dsa", kv_quant="nvfp4")
-    with pytest.raises(ValueError, match="kv-cache-dtype nvfp4"):
-        _adjust_config(config)
+    assert config.page_size == (64 if kind == "kpool" else 1)
 
 
 @pytest.mark.parametrize("kind", ["dsv4", "bsa"])

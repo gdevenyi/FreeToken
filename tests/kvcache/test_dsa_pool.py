@@ -174,3 +174,57 @@ def test_rebuild_shrink_and_engine_wiring():
     pool.rebuild_from_config(config=None, num_pages=63)
     assert pool.latent_rows(0).shape[0] == 64  # 63 + 1 dummy page
     assert pool.index_k_cache(0).shape[0] == 64
+
+
+@pytest.mark.parametrize("kv_quant", ["none", "fp8", "nvfp4"])
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_latent_budget_matches_allocations_and_rebuild(kv_quant, ratio):
+    from types import SimpleNamespace
+    from freetoken.attention import AttnType
+    from freetoken.kvcache.dsa_pool import DSAKVCache, KpoolDSAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    cls = KpoolDSAKVCache if ratio > 1 else DSAKVCache
+    spec = KVCacheGroupSpec(
+        name="full", layer_ids=(3, 7), num_kv_heads=1, head_dim=512, sliding_window=None,
+        mla=True, index_head_dim=128, num_index_layers=2, index_ratio=ratio,
+        attn_type=AttnType.DSA,
+    )
+    cfg = SimpleNamespace(
+        kv_quant=kv_quant, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        max_running_req=3, page_size=64,
+        model_config=SimpleNamespace(kv_cache_group_specs=lambda: (spec,)),
+    )
+    extra = dict(index_ratio=ratio, num_req_slots=4) if ratio > 1 else {}
+    pool = cls(512, 8, 2, 64, torch.bfloat16, torch.device("cuda"),
+               index_head_dim=128, num_index_layers=2, layer_ids=(3, 7),
+               kv_quant=kv_quant, **extra)
+    page_bytes, fixed, page_size, _ = cls.kv_cost(cfg)
+    for pages in (2, 5, 1):
+        pool.rebuild_from_config(cfg, pages)
+        allocated_pages = pages + 1
+        buffers = (pool._kv_buffer, pool._scale_buffer, pool._block_scale_buffer,
+                   pool._index_k_buffer)
+        if ratio > 1:
+            buffers += (pool._tail_k, pool._tail_gate)
+            assert pool.cmp_scratch_base == allocated_pages * 64 // ratio
+            assert pool.tail_k(0).dtype == torch.bfloat16
+        actual = sum(b.numel() * b.element_size() for b in buffers if b is not None)
+        assert actual == allocated_pages * page_bytes + fixed
+        assert pool.unit_bytes() == (page_bytes // page_size, 0)
+        assert pool.latent_rows(7).shape == (allocated_pages * 64, 256 if kv_quant == "nvfp4" else 512)
+        loc = torch.tensor([allocated_pages * 64 - 1], device="cuda")
+        x = torch.ones(1, 512, device="cuda", dtype=torch.bfloat16)
+        pool.store_kv(x, x[:, :0], loc, 7)
+        if kv_quant == "nvfp4":
+            from tests.kernels.test_kv_nvfp4 import _decode_latent
+
+            torch.testing.assert_close(_decode_latent(pool, 7)[loc], x.float())
+        assert pool.k_cache(7).data_ptr() == pool.v_cache(7).data_ptr()
+
+
+def test_nvfp4_latent_rejects_partial_blocks():
+    from freetoken.kvcache.dsa_pool import MLAKVCache
+
+    with pytest.raises(ValueError, match="divisible by 16"):
+        MLAKVCache(72, 1, 1, 1, torch.bfloat16, torch.device("cpu"), kv_quant="nvfp4")
