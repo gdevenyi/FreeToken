@@ -21,6 +21,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.config import fp8_lmhead_enabled
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -50,6 +51,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         output_gate=g.output_gate,
         quant_config=config.quant,
         prefix=prefix,
+        attn_quant=config.attn_quant,
     )
 
 
@@ -137,16 +139,23 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self._config = config
         self._inv_freq: torch.Tensor | None = None
         self.model = Qwen4ExpModel(config)
-        # lm_head quantization now comes from the checkpoint's QuantConfig scheme, so the
-        # old lm_head_quant == "nvfp4" special case is gone.
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
-        )
+        if fp8_lmhead_enabled() and not config.tie_word_embeddings and config.quant is None:
+            # Load-time per-tensor FP8 head, for a checkpoint that ships lm_head unquantized.
+            # A checkpoint that declares its own scheme goes through QuantConfig instead.
+            from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
+
+            self.lm_head = Fp8ParallelLMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        else:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
         if config.vision_config is not None:  # FREETOKEN_LOAD_VISION=1
             from .vision import Qwen4ExpVisionTower
 
