@@ -41,7 +41,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        # tp_ok: nvfp4_banks._tp_shard slices the pieces per rank, the banks use cfg.local_intermediate and the
+        # MoE layer reduces the partial sum; marlin and b12x repack the rows and have no check against a sharded bank
+        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
