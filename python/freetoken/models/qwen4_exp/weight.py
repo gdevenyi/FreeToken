@@ -1,10 +1,10 @@
-"""Qwen3.8-Flash-Next (RadixArk NVFP4) checkpoint reader.
+"""Qwen3.8-Flash-Next checkpoint reader (the NVFP4 and the official block-fp8 releases).
 
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
-* :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
+* :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is dropped unless vision is opted in (``FREETOKEN_LOAD_VISION=1``), then it loads as ``visual.*``.
 """
@@ -25,7 +25,6 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight, init_logger
@@ -49,8 +48,7 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-# ``.weight_scale_inv`` is the 128x128 block-FP8 reciprocal scale (see _load_maybe_block_fp8).
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
+_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -58,6 +56,7 @@ _PLE_SHARD_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
 )
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
+_PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
 
 # Zero-centered Qwen4ExpTextRMSNorm weights, loaded RAW: GroupedPlusOneRMSNorm / GemmaPlusOneRMSNorm
 # and the vendored grouped_gemma_rmsnorm all apply (1+w) at runtime in fp32, so folding the +1 into
@@ -102,11 +101,8 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
-def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip.
-
-    ``keep_scale_inv`` retains the block-FP8 ``weight_scale_inv`` tensors, which the
-    fp8 linears need alongside their weight; they are dropped otherwise."""
+def _rename(raw_name: str) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
         return None
     if raw_name.startswith(("model.visual.", "visual.")):
@@ -118,9 +114,7 @@ def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
-    if raw_name.endswith(_SCALE_SUFFIXES) and not (
-        keep_scale_inv and raw_name.endswith(".weight_scale_inv")
-    ):
+    if raw_name.endswith(_SCALE_SUFFIXES):
         return None
     if raw_name.startswith("model.language_model."):
         return "model." + raw_name[len("model.language_model.") :]
@@ -129,28 +123,11 @@ def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
     return raw_name
 
 
-def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
-    """Load ``raw_name``, dequantizing 128x128 block-FP8 to bf16 when a sibling
-    ``.weight_scale_inv`` sits in the same shard (community MIXED_PRECISION builds store the
-    dense attn/GDN projections that way); plain bf16 passes through unchanged."""
-    tensor = f.get_tensor(raw_name)
-    if raw_name.endswith(".weight"):
-        base = raw_name[: -len(".weight")]
-        if base + ".weight_scale_inv" in keyset:
-            from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
-
-            return dequant_block_fp8(tensor, f.get_tensor(base + ".weight_scale_inv")).to(
-                torch.bfloat16
-            )
-    return tensor
-
-
 def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]],
-    table: dict[str, tuple[tuple[str, ...], int]] | None = None,
+    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
     """Buffer a fusion part; return the merged ``(name, tensor)`` once all parts arrive, ``()`` while incomplete, ``None`` if ``name`` is not a fusion part."""
-    for fused_suffix, (parts, pad_to) in (table or _FUSIONS).items():
+    for fused_suffix, (parts, pad_to) in _FUSIONS.items():
         for idx, part in enumerate(parts):
             if not name.endswith(part):
                 continue
@@ -269,69 +246,6 @@ def _fp8_dense(
         yield name, t
 
 
-# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
-_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
-
-# Serving the dense side natively as block-FP8 changes which buffers the model expects:
-# the four-way in_proj fusion splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM
-# (see gdn.py), and each fp8 group fuses its ``weight_scale_inv`` on the same axis as its
-# ``weight``. Every fp8 part is a whole number of 128-row blocks, so the per-block scales
-# concatenate exactly alongside the rows they describe.
-_BLOCK_FP8_FUSE: dict[str, tuple[str, ...]] = {
-    ".self_attn.qkv_proj": (
-        ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj",
-    ),
-    ".linear_attn.in_proj_qkvz": (
-        ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
-    ),
-}
-_BLOCK_BF16_FUSE: dict[str, tuple[str, ...]] = {
-    ".linear_attn.in_proj_ba": (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
-}
-_BLOCK_FP8_KINDS = (".weight", ".weight_scale_inv")
-
-
-def _block_fp8_fusions() -> dict[str, tuple[tuple[str, ...], int]]:
-    """``_FUSIONS`` with the two attention groups replaced by their block-FP8 split."""
-    table = {
-        key: val
-        for key, val in _FUSIONS.items()
-        if key not in (".self_attn.qkv_proj.weight", ".linear_attn.in_proj.weight")
-    }
-    for fused, parts in _BLOCK_FP8_FUSE.items():
-        for kind in _BLOCK_FP8_KINDS:
-            table[fused + kind] = (tuple(part + kind for part in parts), 0)
-    for fused, parts in _BLOCK_BF16_FUSE.items():
-        table[fused + ".weight"] = (tuple(part + ".weight" for part in parts), 0)
-    return table
-
-
-_FUSIONS_BLOCK_FP8 = _block_fp8_fusions()
-
-
-def _dense_is_block_fp8(model_path: str) -> bool:
-    """True when the checkpoint DECLARES its dense (non-expert) modules per-block
-    weight-only FP8 -- exactly when config.py sets ``attn_quant="fp8_block"``.
-
-    Both sides read the same declaration, so the buffers emitted here always match the
-    modules the model built. A checkpoint carrying ``weight_scale_inv`` WITHOUT declaring
-    it falls through to ``_load_maybe_block_fp8`` and is dequantized to bf16 as before.
-    """
-    try:
-        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as fh:
-            quant = json.load(fh).get("quantization_config") or {}
-    except (OSError, ValueError):
-        return False
-    algo = str(quant.get("quant_algo") or quant.get("quant_method") or "").lower()
-    if algo != "mixed_precision":
-        return False
-    return any(
-        ".mlp.experts" not in str(module)
-        and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
-        for module, spec in (quant.get("quantized_layers") or {}).items()
-    )
-
-
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -342,22 +256,23 @@ def iter_weights(
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the
-    model's state dict minus the routed experts. Nothing here is quantized: the modelopt
-    ``ignore`` list covers everything except those experts, so attention, GDN, HC, PLE, the shared
-    expert and lm_head are all plain bf16 (the n-gram hash constants stay int64). Fusions:
+    model's state dict minus the routed experts. Nothing here is quantized: every release's skip
+    list (modelopt ``ignore``, fp8 ``modules_to_not_convert``) covers everything except those experts,
+    so attention, GDN, HC, PLE, the shared expert and lm_head are all plain bf16 (the n-gram hash
+    constants stay int64). Fusions:
     attention q|k|v -> ``qkv_proj``, GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, shared-expert
     gate|up -> ``gate_up_proj``, and each per-layer HC's ``input_mix_weight_down`` |
     ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
 
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
-    routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
+    routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
     if not include_non_moe:
         return
 
     from freetoken.models.config import fp8_dense_enabled, fp8_lmhead_enabled
 
-    from .config import dense_quant_mode, parse_config
+    from .config import parse_config
 
     tp = get_tp_info()
     # The sharding geometry (and the fp8 split) need the HF config; TP=1 bf16 never does, so
@@ -365,23 +280,15 @@ def iter_weights(
     lmhead = fp8_lmhead_enabled()
     config = (
         parse_config(cached_load_hf_config(model_path))
-        if tp.size > 1 or fp8_dense_enabled() or lmhead or _dense_is_block_fp8(model_path)
+        if tp.size > 1 or fp8_dense_enabled() or lmhead
         else None
     )
-    mode = "none" if config is None else dense_quant_mode(config)
-    fp8 = mode == "fp8_dynamic"
-    # Checkpoint-declared block-FP8 dense served natively (TP=1; upstream PR #392): keep the
-    # fp8 weights + weight_scale_inv and fuse on the split table. Anything else keeps the
-    # dequant path (and, under fp8_dynamic, re-quantizes per tensor after sharding).
-    block_fp8 = mode == "fp8_block"
-    fusions = _FUSIONS_BLOCK_FP8 if block_fp8 else _FUSIONS
+    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
     if fp8:
         logger.info(
             "qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), "
             "FREETOKEN_FP8_DENSE=1"
         )
-    elif block_fp8:
-        logger.info("qwen4_exp dense projections: checkpoint block-FP8 served natively")
     if lmhead:
         logger.info("qwen4_exp lm_head: load-time per-tensor FP8, FREETOKEN_FP8_LMHEAD=1")
 
@@ -399,17 +306,12 @@ def iter_weights(
         disable=not tp.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            keyset = set(f.keys())
             for raw_name in f.keys():
-                name = _rename(raw_name, keep_scale_inv=block_fp8)
+                name = _rename(raw_name)
                 if name is None:
                     continue
-                tensor = (
-                    f.get_tensor(raw_name)
-                    if block_fp8
-                    else _load_maybe_block_fp8(f, raw_name, keyset)
-                )
-                fused = _try_fuse(name, tensor, fuse_buf, fusions)
+                tensor = f.get_tensor(raw_name)
+                fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         name, tensor = fused
@@ -461,6 +363,39 @@ def _ple_table_files(folder: str) -> list[str]:
         weight_map = json.load(fh)["weight_map"]
     files = {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}
     return sorted(os.path.join(folder, shard) for shard in files)
+
+
+def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
+    """Write the PLE n-gram table tensors, and only those, into ``ple-table-*.safetensors`` next to an FTW checkpoint.
+
+    The table is served from safetensors files in the checkpoint dir (see load_ple_table), not from FTW entries."""
+    from safetensors.torch import save_file
+
+    folder = download_hf_weight(model_path)
+    written: list[str] = []
+    batch: dict[str, torch.Tensor] = {}
+    size = 0
+
+    def flush():
+        nonlocal batch, size
+        if batch:
+            name = f"ple-table-{len(written):05d}.safetensors"
+            save_file(batch, os.path.join(out_dir, name))
+            written.append(name)
+            batch, size = {}, 0
+
+    for path in _ple_table_files(folder):
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if _PLE_TABLE_INFIX not in key:
+                    continue
+                t = f.get_tensor(key)
+                batch[key] = t
+                size += t.numel() * t.element_size()
+                if size >= _PLE_FILE_BYTES:
+                    flush()
+    flush()
+    return written
 
 
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
@@ -530,40 +465,13 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 # ======================================================================================
 
 
-def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> dict:
-    """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-) -> dict:
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
 __all__ = [
+    "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
     "load_ple_table",
 ]

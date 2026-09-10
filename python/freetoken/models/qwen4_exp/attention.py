@@ -28,11 +28,8 @@ from freetoken.layers import (
     LinearReplicated,
 )
 from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
-from freetoken.models.quant_linear import make_col_merged_quant, make_replicated_quant
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import div_even, nvtx_annotate
-
-from .config import dense_quant_mode
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -87,7 +84,7 @@ class QSAAttentionBackend(Protocol):
 class Qwen4ExpIndexer(BaseOP):
     """QSA indexer weights (checkpoint prefix ``self_attn.indexer``); the scoring lives in the backend."""
 
-    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         args = config.qwen4_args
         self.layer_id = layer_id
         self.num_heads = args.index_n_heads
@@ -95,7 +92,10 @@ class Qwen4ExpIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
-        self.index_qk_proj = LinearReplicated(args.hidden_size, sum(self._split), has_bias=False)
+        self.index_qk_proj = LinearReplicated(
+            args.hidden_size, sum(self._split), has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
+        )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
@@ -124,7 +124,7 @@ class Qwen4ExpAttention(BaseOP):
     (both zero-centered, loaded RAW), ``indexer.*``.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self.layer_id = layer_id
         self.num_q = config.num_qo_heads
         self.num_kv = config.num_kv_heads
@@ -140,23 +140,29 @@ class Qwen4ExpAttention(BaseOP):
         self._local_kv_dim = self._local_num_kv * self.head_dim
         self._qkv_split = [self._local_qo_dim * 2, self._local_kv_dim, self._local_kv_dim]
         qkv_sizes = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        mode = dense_quant_mode(config)
-        if mode == "fp8_dynamic":  # load-time per-tensor FP8, W8A8 GEMMs
+        # Load-time per-tensor FP8 applies only where the checkpoint declares no scheme of
+        # its own; a quantized checkpoint always wins, and its modules go through QuantConfig.
+        fp8_dyn = config.attn_quant == "fp8_dynamic" and (
+            config.quant is None or config.quant.scheme_for(f"{prefix}.qkv_proj") is None
+        )
+        if fp8_dyn:  # W8A8 through _scaled_mm, weights quantized by the loader
             self.qkv_proj = Fp8DynamicColMerged(
                 config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split
             )
             self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size)
-        elif mode == "fp8_block":
-            # checkpoint-declared 128x128 block-FP8 dense (modelopt FP8_PB_WO, upstream PR
-            # #392): the Fp8Block linears consume the weight + weight_scale_inv directly.
-            # TP=1 only (dense_quant_mode dequantizes under TP>1).
-            self.qkv_proj = make_col_merged_quant("none", mode, config.hidden_size, qkv_sizes)
-            self.o_proj = make_replicated_quant("none", mode, self.qo_attn_dim, config.hidden_size)
         else:
             self.qkv_proj = LinearColParallelMerged(
-                config.hidden_size, qkv_sizes, has_bias=False, local_output_sizes=self._qkv_split
+                config.hidden_size, qkv_sizes, has_bias=False,
+                local_output_sizes=self._qkv_split,
+                quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
             )
-            self.o_proj = LinearOProj(self.qo_attn_dim, config.hidden_size, has_bias=False)
+            # row-parallel, NOT LinearReplicated: under TP>1 qkv_proj is column-parallel, so
+            # this rank's attention output is its own head slice and o_proj must consume the
+            # sharded input dim and all-reduce. At TP=1 the two are equivalent.
+            self.o_proj = LinearOProj(
+                self.qo_attn_dim, config.hidden_size, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config
@@ -167,7 +173,7 @@ class Qwen4ExpAttention(BaseOP):
             base=rotary.base,
             rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
         )
-        self.indexer = Qwen4ExpIndexer(config, layer_id)
+        self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:

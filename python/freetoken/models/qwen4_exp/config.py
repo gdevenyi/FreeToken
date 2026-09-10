@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
 
+from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
     fp8_dense_enabled,
     FullAttentionGroupConfig,
@@ -99,17 +99,6 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     )
 
 
-def _quant_get(hf_config: Any):
-    quant = getattr(hf_config, "quantization_config", None)
-    if quant is None:
-        return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
-
-
-def _ignored(patterns, module_name: str) -> bool:
-    return any(fnmatch(module_name, pat) for pat in patterns)
-
-
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
@@ -124,26 +113,6 @@ def _layer_types(text: Any) -> list[str]:
         "full_attention" if (i + 1) % interval == 0 else "linear_attention"
         for i in range(n)
     ]
-
-
-# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
-_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
-
-
-def dense_quant_mode(config: ModelConfig) -> str:
-    """``attn_quant`` as the model and the weight loader must build it on THIS rank.
-
-    A checkpoint-declared block-FP8 dense (``fp8_block``) has no tensor-parallel linears, so
-    under TP>1 it is dequantized to bf16 at load and built as the bf16 TP path (``none``).
-    Called after the TP info is set (model build, ``iter_weights``); ``parse_config`` itself
-    may run in the frontend before that."""
-    if config.attn_quant == "fp8_block":
-        from freetoken.distributed import try_get_tp_info
-
-        tp = try_get_tp_info()
-        if tp is not None and tp.size > 1:
-            return "none"
-    return config.attn_quant
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -175,69 +144,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    get = _quant_get(hf_config)
-    if get is None:
-        expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
-    else:
-        algo = str(get("quant_algo") or get("quant_method") or "").lower()
-        block = get("weight_block_size")
-        if algo == "fp8" and block:
-            # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
-            # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
-            # GDN, the shared expert, HC, PLE and lm_head stay bf16.
-            bs = tuple(int(x) for x in block)
-            assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
-            expert_quant = "fp8_block"
-            attn_quant = dense_quant = lm_head_quant = "none"
-        elif algo == "mixed_precision":
-            # modelopt MIXED_PRECISION (upstream PR #320 / #392): the quant algo is declared per
-            # module in ``quantized_layers``. The community NVFP4-FP8 build of
-            # Qwen3.8-Flash-Next quantizes the routed experts to NVFP4 (read natively by the
-            # offload cache) and the dense attn/GDN projections to 128x128 block-FP8, declared
-            # per module as ``FP8_PB_WO``.
-            quantized = get("quantized_layers") or {}
-            experts_nvfp4 = any(
-                ".mlp.experts" in str(module)
-                and str((spec or {}).get("quant_algo", "")).upper() == "NVFP4"
-                for module, spec in quantized.items()
-            )
-            # The same map declares the dense attn/GDN projections as FP8_PB_WO
-            # (per-block, weight-only FP8 with a ``weight_scale_inv`` sibling). Serve
-            # them natively instead of dequantizing at load: the four-way in_proj fusion
-            # splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM (see gdn.py), which
-            # halves the dense bytes read on every decode step.
-            dense_block_fp8 = any(
-                ".mlp.experts" not in str(module)
-                and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
-                for module, spec in quantized.items()
-            )
-            expert_quant = "nvfp4" if experts_nvfp4 else "none"
-            attn_quant = "fp8_block" if dense_block_fp8 else "none"
-            dense_quant = lm_head_quant = "none"
-        else:
-            is_fp4 = "fp4" in algo
-            ignore = list(get("ignore") or [])
-
-            # The RadixArk NVFP4 build quantizes only the routed experts; attention/GDN,
-            # the shared expert, HC, PLE and lm_head all sit in the modelopt ignore list
-            # and stay bf16. Derive every flag from that list instead of assuming the split.
-            def _quant(probe: str) -> str:
-                return "nvfp4" if is_fp4 and not _ignored(ignore, probe) else "none"
-
-            prefix = "model.language_model.layers.0"
-            expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
-            dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
-            attn_quant = _quant(f"{prefix}.self_attn.q_proj")
-            lm_head_quant = _quant("lm_head")
-
-    # FREETOKEN_FP8_DENSE=1 wins over a checkpoint-declared block-FP8 dense: the block-FP8
-    # weights are dequantized at load and re-quantized per tensor, so the W8A8 _scaled_mm
-    # path (faster than the Triton block kernels on sm_89, and TP-capable) serves them.
-    if attn_quant in ("none", "fp8_block") and fp8_dense_enabled():
-        attn_quant = "fp8_dynamic"
+    # FREETOKEN_FP8_DENSE=1: the bf16 attention / GDN projections are quantized at LOAD to
+    # per-tensor e4m3 and served W8A8 through cuBLASLt (layers/fp8_dynamic.py). This is a
+    # synthetic scheme for a checkpoint that ships those modules unquantized -- distinct from
+    # the QuantConfig path, which serves what the checkpoint declares. The module builders
+    # apply it only where the checkpoint has no scheme of its own, so the two never collide.
+    attn_quant = "fp8_dynamic" if fp8_dense_enabled() else "none"
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
+    # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
@@ -343,8 +262,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )

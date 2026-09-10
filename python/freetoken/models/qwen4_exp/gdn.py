@@ -5,17 +5,12 @@ import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, LinearColParallelMerged, LinearOProj
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
+from freetoken.layers.quantization import QuantConfig
 from freetoken.utils import div_even
-
-from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
-from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
-from freetoken.models.quant_linear import make_replicated_quant
-
-
-_GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -23,30 +18,6 @@ class _DepthwiseConv1d(BaseOP):
 
     def __init__(self, conv_dim: int, kernel: int):
         self.weight = torch.empty(conv_dim, 1, kernel)
-
-
-class _GatedRMSNorm(BaseOP):
-    """RMSNorm of x followed by an ``activation(z)`` gate (HF Qwen4ExpTextRMSNormGated).
-
-    Uses the fused fla ``rms_norm_gated`` triton kernel (norm(x) * act(z) in one
-    kernel) instead of the unfused pow/mean/rsqrt/mul/act chain, matching sglang's
-    ``RMSNormGated`` -- collapses ~8 elementwise kernels per GDN layer into one.
-    Qwen3.8-Flash-Next gates with sigmoid where Qwen3.5 gates with silu."""
-
-    def __init__(self, dim: int, eps: float, activation: str):
-        # rms_norm_gated drops the gate entirely (no error) for a name it does not know.
-        assert activation in _GATE_ACTIVATIONS, f"unsupported GDN output gate {activation!r}"
-        self.weight = torch.empty(dim)
-        self.eps = eps
-        self.activation = activation
-
-    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.fla import rms_norm_gated
-
-        return rms_norm_gated(
-            x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
-            is_rms_norm=True, norm_before_gate=True, activation=self.activation,
-        )
 
 
 class Qwen4ExpGatedDeltaNet(BaseOP):
@@ -65,7 +36,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "sigmoid",
-        expert_quant: str = "none", attn_quant: str = "none",
+        *, quant_config: QuantConfig | None = None, prefix: str = "",
+        attn_quant: str = "none",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -92,25 +64,23 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self._local_key_dim = self._local_num_k_heads * head_k_dim
         self._local_value_dim = self._local_num_v_heads * head_v_dim
         self._local_conv_dim = 2 * self._local_key_dim + self._local_value_dim
-        # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
-        # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
-        # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
-        # Block-fp8 dense can come from either a wholly block-fp8 checkpoint
-        # (expert_quant) or a modelopt MIXED_PRECISION one where only the dense
-        # attn/GDN projections are FP8_PB_WO while the experts are NVFP4 (attn_quant).
-        self._block_fp8 = "fp8_block" in (expert_quant, attn_quant)
-        self._pertensor_fp8 = attn_quant == "fp8_pertensor"
-        self._dynamic_fp8 = attn_quant == "fp8_dynamic"  # load-time per-tensor FP8, W8A8
-        self._fp8 = self._block_fp8 or self._pertensor_fp8 or self._dynamic_fp8
+        # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
+        self._split_in_proj = (
+            quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
+        )
+        # Load-time per-tensor FP8 splits the fusion the same way, but it is synthetic: it
+        # applies only where the checkpoint declares no scheme of its own.
+        self._dynamic_fp8 = attn_quant == "fp8_dynamic" and not self._split_in_proj
 
         self._in_proj_split = [
             self._local_conv_dim, self._local_value_dim,
             self._local_num_v_heads, self._local_num_v_heads,
         ]
-        if tp.size > 1:
-            assert self._dynamic_fp8 or (not self._fp8 and attn_quant == "none"), (
-                "qwen4_exp TP shards bf16 or load-time fp8 GDN projections only"
-            )
+        # A checkpoint-declared scheme has no TP-aware variant here: those two linears are
+        # built from the checkpoint's own scheme and are not sharded. Load-time fp8 is.
+        assert not (tp.size > 1 and self._split_in_proj), (
+            "qwen4_exp TP shards bf16 or load-time fp8 GDN projections only"
+        )
         if self._dynamic_fp8:
             self.in_proj_qkvz = Fp8DynamicColMerged(
                 hidden_size, [self.conv_dim, self.value_dim],
@@ -120,19 +90,21 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
                 local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
             )
-        elif self._fp8:
-            ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
-            self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+        elif self._split_in_proj:
+            self.in_proj_qkvz = LinearColParallelMerged(
+                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
-                hidden_size, [num_v_heads, num_v_heads], has_bias=False
+                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
                 hidden_size, [self.conv_dim, self.value_dim, num_v_heads, num_v_heads],
                 has_bias=False, local_output_sizes=self._in_proj_split,
+                quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self._local_conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
@@ -141,17 +113,17 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # *.A_log / *.dt_bias from the model-dtype downcast.
         self.dt_bias = torch.empty(self._local_num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(self._local_num_v_heads, dtype=torch.float32)
-        self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
-        # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
-        # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
+        self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
+        # Row-parallel over the local v heads, all-reduce inside. At TP=1 LinearOProj is
+        # exactly LinearReplicated (div_even(x, 1) == x and the reduction is skipped), so one
+        # class covers both -- and under TP>1 a replicated o_proj would silently take the
+        # wrong input width and skip the reduction.
         if self._dynamic_fp8:
             self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size)
-        elif tp.size > 1:  # row-parallel over the local v heads, all-reduce inside
-            self.out_proj = LinearOProj(self.value_dim, hidden_size, has_bias=False)
         else:
-            self.out_proj = make_replicated_quant(
-                expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            self.out_proj = LinearOProj(
+                self.value_dim, hidden_size, has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.out_proj",
             )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
@@ -210,8 +182,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        nk, nv = self._local_num_k_heads, self._local_num_v_heads
-        if self._fp8:
+        if self._split_in_proj or self._dynamic_fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, self._in_proj_split[:2], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
