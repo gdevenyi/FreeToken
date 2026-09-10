@@ -67,6 +67,15 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
         def v_cache(self, layer_id):
             return self.v
 
+        # A 16-bit pool has no per-(token, head) codes, so it reports no scales; the fp8
+        # pool (--kv-cache-dtype fp8) returns tensors here and the kernels take the scaled
+        # path. Part of the KV-cache interface the backend reads, so the stub must have it.
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
     kv_cache = FakeKVCache()
     monkeypatch.setattr(
         "freetoken.attention.triton.get_global_ctx",
