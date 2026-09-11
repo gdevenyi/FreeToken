@@ -296,8 +296,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
-        # Scale tensors only exist on an fp8 pool (k_scale returns None otherwise); the
-        # index tier stays bf16 either way, so _select above is quantization-agnostic.
+        # K/V scale tensors are independent of the BF16 index tier, so selection is
+        # quantization-agnostic; only sparse K/V attention reconstructs the codes.
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -308,6 +308,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             torch.empty_like(q),
             k_scale=self.kvcache.k_scale(layer_id),
             v_scale=self.kvcache.v_scale(layer_id),
+            kv_quant=self.kvcache.kv_quant,
+            k_block_scale=self.kvcache.k_block_scale(layer_id),
+            v_block_scale=self.kvcache.v_block_scale(layer_id),
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

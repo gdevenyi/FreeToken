@@ -124,7 +124,7 @@ def _backend_requirements_met(name: str) -> bool:
 
 
 # --kv-cache-dtype spellings -> the stored EngineConfig.kv_quant value.
-KV_QUANT_ALIASES = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8"}
+KV_QUANT_ALIASES = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8", "nvfp4": "nvfp4"}
 
 
 def _resolve_kv_quant(value: str | None) -> str:
@@ -143,8 +143,11 @@ def _backend_supports_kv_quant(name: str, kv_quant: str) -> bool:
     KV pool (an unquantized pool needs nothing from the backend)."""
     if kv_quant == "none":
         return True
+    if kv_quant not in ("fp8", "nvfp4"):
+        return False
     return all(
-        attention_backend_info(part.strip()).supports_fp8_kv for part in name.split(",")
+        getattr(attention_backend_info(part.strip()), f"supports_{kv_quant}_kv")
+        for part in name.split(",")
     )
 
 
@@ -246,7 +249,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             name
             for name in ("trtllm", "fi", "fa", "triton")
             if required <= attention_backend_info(name).supported_types
-            and attention_backend_info(name).supports_fp8_kv
+            and _backend_supports_kv_quant(name, kv_quant)
         ]
         raise ValueError(
             f"--kv-cache-dtype {kv_quant} needs an attention backend that decodes the KV "
@@ -1569,20 +1572,27 @@ def _adjust_config(config: EngineConfig):
     # which pool families are usable and which backend auto may pick.
     kv_quant = _resolve_kv_quant(getattr(config, "kv_quant", "none"))
     override("kv_quant", kv_quant)
+    if kv_quant == "nvfp4":
+        if required_attn_types - {AttnType.FULL, AttnType.SWA, AttnType.QSA, AttnType.MLA, AttnType.DSA}:
+            raise ValueError(
+                "--kv-cache-dtype nvfp4 requires a paged FULL, hybrid-SWA, QSA, or MLA/DSA KV pool"
+            )
+        for spec in model_config.kv_cache_group_specs():
+            if spec.head_dim % 16:
+                raise ValueError("--kv-cache-dtype nvfp4 requires head_dim divisible by 16")
     if kv_quant != "none":
-        # fp8 codes are wired through the pools that hand their rows to a Triton
-        # kernel: the plain paged and hybrid-SWA ones, plus the QSA sparse pool, whose
-        # index tier stays bf16 -- only the selected tokens come back as codes.
-        # Everything else (MLA's absorbed cache, DSA/DSV4/BSA sparse) has kernels that
-        # assert on 16-bit rows, and kvcache/__init__.py rejects fp8 for those families
-        # at pool creation.
+        # Quantized codes are wired through the pools that hand their rows to a Triton
+        # kernel: plain paged and hybrid-SWA, QSA sparse, and DSA/MLA. QSA's index
+        # tier and DSA's index-key/tail tiers stay bf16; the DSA kernel dequantizes
+        # selected latent rows with their per-token scale. Other sparse families have
+        # no scale-read path and remain rejected before weights load.
         quant_unsupported = required_attn_types - {
-            AttnType.FULL, AttnType.SWA, AttnType.QSA,
+            AttnType.FULL, AttnType.SWA, AttnType.QSA, AttnType.MLA, AttnType.DSA,
         }
         if quant_unsupported:
             raise ValueError(
                 f"--kv-cache-dtype {kv_quant} is implemented for the plain paged, "
-                "hybrid-SWA and QSA sparse KV pools; this model also needs "
+                "hybrid-SWA, QSA sparse and DSA/MLA KV pools; this model also needs "
                 f"{', '.join(sorted(t.value for t in quant_unsupported))} attention "
                 "(use --kv-cache-dtype bf16)."
             )

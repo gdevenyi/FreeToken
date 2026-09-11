@@ -72,7 +72,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--kv-cache-dtype` | bf16 | `bf16` or `fp8`: store the KV cache as e4m3 codes plus one fp32 scale per (token, kv head), roughly doubling the tokens that fit in the same VRAM; see [FP8 KV cache](#fp8-kv-cache) |
+| `--kv-cache-dtype` | bf16 | `bf16`, `fp8`, or `nvfp4` (see [NVFP4 KV cache](#nvfp4-kv-cache)): FP8 stores the KV cache as e4m3 codes plus one fp32 scale per (token, kv head), roughly doubling the tokens that fit in the same VRAM; see [FP8 KV cache](#fp8-kv-cache) |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 
 ### FP8 KV cache
@@ -201,3 +201,33 @@ profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
 
+
+### NVFP4 KV cache
+
+`ft serve --model <checkpoint> --kv-cache-dtype nvfp4 --attention-backend triton`
+opts into packed E2M1 KV storage. The initial implementation supports plain paged
+FULL attention (MHA/GQA), hybrid-SWA, and the full-attention portion of hybrid-linear
+models, QSA, and MLA/DSA (including GLM-5.3-Flash). Head dimensions must be
+divisible by 16. DSV4 and BSA pools are rejected at startup. `auto` selects
+Triton, QSA sparse, or DSA attention for supported models. For MLA/DSA use
+`--attention-backend auto` or `--attention-backend dsa`. Only the latent slab is
+quantized; indexer keys, kpool tails/gates, and recurrent states retain their
+existing precision. A 512-element latent row occupies 292 bytes instead of 1024
+bytes in BF16, excluding those other tiers.
+
+Each K or V row stores `head_dim / 2` packed bytes, `head_dim / 16` E4M3 block-scale
+bytes, and one FP32 row scale. At head_dim 128 this is 76 bytes, versus 256 for
+BF16 and 132 for the existing FP8 format. Pool management, recurrent states,
+attention workspace and model weights consume additional memory.
+
+The second-level scale is dynamic per token/head, so appending a token never
+rescales an existing prefix. This is a FreeToken KV layout, not an external
+NVFP4 checkpoint or attention-library ABI. K/V are restored inside attention;
+Q and attention arithmetic retain their compute precision. The MoE weight option
+`--nvfp4-backend` is independent. Paged MHA prefill uses fresh compute-dtype K/V
+while cached prefixes are restored, as in the FP8 path. MLA/DSA stores fresh
+latent rows first and reads the quantized cache in both prefill and decode.
+
+NVFP4 is opt-in: assess quality on your checkpoint and workload before using it
+for long-context inference. Capacity savings do not guarantee faster decode;
+packing, reconstruction, and the selected attention backend affect throughput.

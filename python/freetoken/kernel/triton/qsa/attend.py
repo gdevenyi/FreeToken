@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32
+from freetoken.kernel.triton.kv_nvfp4 import load_nvfp4
 
 
 @triton.jit
@@ -19,6 +20,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     v_cache_ptr,
     k_scale_ptr,
     v_scale_ptr,
+    k_block_scale_ptr,
+    v_block_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -56,6 +59,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # 16-bit values. The bf16 branch below stays exactly as it was, instruction for
     # instruction, for the unquantized default.
     HAS_KV_SCALE: tl.constexpr,
+    KV_NVFP4: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -111,7 +115,35 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        if HAS_KV_SCALE:
+        if KV_NVFP4:
+            scale_slot = safe_page * PAGE_SIZE + page_offset
+            keys = load_nvfp4(
+                k_cache_ptr,
+                k_block_scale_ptr,
+                k_scale_ptr,
+                scale_slot[None, :],
+                kv_head,
+                dim_offsets[:, None],
+                valid[None, :],
+                stride_k_token,
+                stride_k_head,
+                stride_kss,
+                HEAD_DIM,
+            ).to(query.dtype)
+            values = load_nvfp4(
+                v_cache_ptr,
+                v_block_scale_ptr,
+                v_scale_ptr,
+                scale_slot[:, None],
+                kv_head,
+                dim_offsets[None, :],
+                valid[:, None],
+                stride_v_token,
+                stride_v_head,
+                stride_vss,
+                HEAD_DIM,
+            ).to(query.dtype)
+        elif HAS_KV_SCALE:
             # The scale row is the slot the code lives in: QSA pins page_size to this
             # kernel's PAGE_SIZE (attention/__init__.py registers page_sizes=(64,)), so
             # slot = page * PAGE_SIZE + offset addresses k_scale/v_scale exactly.
@@ -286,8 +318,11 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    kv_quant: str | None = None,
+    k_block_scale: torch.Tensor | None = None,
+    v_block_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged K/V caches (bf16, or e4m3 + row scales)."""
+    """Run sparse GQA over bf16, FP8, or packed NVFP4 K/V caches."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -297,12 +332,25 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention metadata has invalid shapes")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    kv_quant = kv_quant if kv_quant is not None else ("fp8" if k_scale is not None else "none")
+    if kv_quant not in ("none", "fp8", "nvfp4"):
+        raise ValueError(f"unknown QSA kv_quant {kv_quant!r}")
+    stored_dim = q.shape[2] // 2 if kv_quant == "nvfp4" else q.shape[2]
+    if (
+        (kv_quant == "nvfp4" and q.shape[2] % 16)
+        or k_cache.shape[3] != stored_dim
+        or q.shape[1] % k_cache.shape[2]
+    ):
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    if (k_scale is None) != (v_scale is None):
+    if (k_scale is None) != (v_scale is None) or (k_block_scale is None) != (v_block_scale is None):
         raise ValueError("QSA sparse attention requires both KV scale tensors")
+    nvfp4 = kv_quant == "nvfp4"
+    if nvfp4 and (k_scale is None or k_block_scale is None):
+        raise ValueError("QSA NVFP4 requires row and block scale tensors")
+    if not nvfp4 and (k_block_scale is not None or v_block_scale is not None):
+        raise ValueError("QSA block scales require kv_quant='nvfp4'")
     if k_scale is not None:
         # The pool hands out 1-byte e4m3 codes plus one fp32 row scale per
         # (slot, kv_head); the kernel rebuilds that slot as
@@ -316,6 +364,18 @@ def qsa_sparse_paged_attention(
         if k_scale.shape != want or v_scale.shape != want:
             raise ValueError(f"QSA KV scale tensors must have shape {want}")
         assert k_scale.stride(1) == v_scale.stride(1) == 1
+        if nvfp4:
+            block_want = (*want, head_dim // 16)
+            if (
+                k_cache.dtype is not torch.uint8
+                or v_cache.dtype is not torch.uint8
+                or k_block_scale.dtype is not torch.uint8
+                or v_block_scale.dtype is not torch.uint8
+                or k_block_scale.shape != block_want
+                or v_block_scale.shape != block_want
+            ):
+                raise ValueError(f"QSA NVFP4 block scales must have shape {block_want}")
+            assert k_block_scale.stride(2) == v_block_scale.stride(2) == 1
     else:
         assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
@@ -377,6 +437,8 @@ def qsa_sparse_paged_attention(
         # launch stays type-valid without a second None-handling path.
         k_cache if k_scale is None else k_scale,
         v_cache if v_scale is None else v_scale,
+        k_cache if k_block_scale is None else k_block_scale,
+        v_cache if v_block_scale is None else v_block_scale,
         logical_indices,
         block_table,
         token_to_req,
@@ -411,6 +473,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HAS_KV_SCALE=k_scale is not None,
+        KV_NVFP4=nvfp4,
         num_warps=partial_warps,
         num_stages=2,
     )

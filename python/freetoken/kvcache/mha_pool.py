@@ -13,6 +13,8 @@ def _kv_store_dtype(dtype: torch.dtype, kv_quant: str) -> torch.dtype:
     """Storage dtype of the KV buffer for a quantization mode."""
     if kv_quant == "none":
         return dtype
+    if kv_quant == "nvfp4":
+        return torch.uint8
     if kv_quant == "fp8":
         from freetoken.kernel.triton.kv_quant import kv_codes_dtype
 
@@ -37,6 +39,10 @@ class MHAKVCache(BaseKVCachePool):
     :mod:`freetoken.kernel.triton.kv_quant`). The codes buffer keeps the exact same
     shape as the 16-bit one, so ``k_cache``/``v_cache`` and every index into them are
     unchanged -- only the element type, and ``store_kv``'s write path, differ.
+
+    ``kv_quant="nvfp4"`` packs two E2M1 values per byte and adds one E4M3 scale
+    per 16 values, alongside the FP32 row scale. Logical head_dim is retained
+    separately so rebuild never mistakes the packed width for the model width.
     """
 
     def __init__(
@@ -53,6 +59,10 @@ class MHAKVCache(BaseKVCachePool):
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        _kv_store_dtype(dtype, kv_quant)
+        if kv_quant == "nvfp4" and head_dim % 16:
+            raise ValueError("NVFP4 KV requires head_dim divisible by 16")
+        self._head_dim = head_dim
         self._num_layers = num_layers
         self.kv_quant = kv_quant
         self._compute_dtype = dtype
@@ -85,8 +95,10 @@ class MHAKVCache(BaseKVCachePool):
         one. The 16-bit buffer keeps ``torch.empty``: it is bytes-sized, never
         interpreted, and the memset would cost real startup time on a large cache.
         """
-        shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
-        if self.kv_quant == "fp8":
+        stored_dim = head_dim // 2 if self.kv_quant == "nvfp4" else head_dim
+        shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, stored_dim)
+        self._block_scale_buffer = None
+        if self.kv_quant in ("fp8", "nvfp4"):
             from freetoken.kernel.triton.kv_quant import alloc_codes
 
             self._kv_buffer = alloc_codes(shape, self._device)
@@ -100,9 +112,14 @@ class MHAKVCache(BaseKVCachePool):
                 shape, device=self._device, dtype=self._compute_dtype
             )
             self._scale_buffer = None
+        if self.kv_quant == "nvfp4":
+            self._block_scale_buffer = torch.zeros(
+                (2, num_storage_layers, num_pages * page_size, local_kv_heads, head_dim // 16),
+                device=self._device, dtype=torch.uint8,
+            )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, local_kv_heads, stored_dim)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -111,8 +128,10 @@ class MHAKVCache(BaseKVCachePool):
         existing buffer; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
+        _, num_storage_layers, _old_pages, page_size, local_kv_heads, _stored_dim = self._kv_buffer.shape
+        head_dim = self._head_dim
         device = self._device
+        self._block_scale_buffer = None
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
@@ -145,6 +164,8 @@ class MHAKVCache(BaseKVCachePool):
         if self._scale_buffer is not None:
             sc = self._scale_buffer
             kv += int(sc.numel() * sc.element_size()) // tokens
+        if self._block_scale_buffer is not None:
+            kv += self._block_scale_buffer.numel() // tokens
         return kv, 0
 
     def _dense(self, layer_id: int) -> int:
@@ -171,6 +192,16 @@ class MHAKVCache(BaseKVCachePool):
             return None
         return self._scale_buffer[1][self._dense(index)]
 
+    def k_block_scale(self, index: int) -> torch.Tensor | None:
+        if self._block_scale_buffer is None:
+            return None
+        return self._block_scale_buffer[0][self._dense(index)]
+
+    def v_block_scale(self, index: int) -> torch.Tensor | None:
+        if self._block_scale_buffer is None:
+            return None
+        return self._block_scale_buffer[1][self._dense(index)]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -179,6 +210,17 @@ class MHAKVCache(BaseKVCachePool):
         layer_id: int,
     ) -> None:
         dense = self._dense(layer_id)
+        if self.kv_quant == "nvfp4":
+            from freetoken.kernel.triton.kv_nvfp4 import quantize_nvfp4_to_cache
+
+            quantize_nvfp4_to_cache(
+                k, v, out_loc,
+                self._k_buffer[dense].view(self._storage_shape),
+                self._v_buffer[dense].view(self._storage_shape),
+                self.k_scale(layer_id), self.v_scale(layer_id),
+                self.k_block_scale(layer_id), self.v_block_scale(layer_id),
+            )
+            return
         if self.kv_quant == "fp8":
             from freetoken.kernel.triton.kv_quant import quantize_kv_to_cache
 

@@ -35,15 +35,18 @@ def kv_storage_bytes_per_elem(config) -> int:
 
 
 def kv_scale_bytes_per_token(spec, config) -> int:
-    """Sidecar scale bytes per token of one group: the fp8 cache keeps one fp32 scale
-    per (token, slab, layer, kv head). 0 for the unquantized pool.
+    """Sidecar bytes per token: FP32 row scales plus NVFP4 E4M3 block scales.
+    The unquantized pool has no scales.
 
     Priced here rather than inside the pool so ``kv_cost`` and the pool's own
     allocation can never disagree -- the same rule the 16-bit path follows."""
-    if getattr(config, "kv_quant", "none") != "fp8":
+    if getattr(config, "kv_quant", "none") not in ("fp8", "nvfp4"):
         return 0
     heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-    return (1 if spec.mla else 2) * spec.num_layers * heads * FP8_KV_SCALE_BYTES
+    scale_bytes = FP8_KV_SCALE_BYTES
+    if getattr(config, "kv_quant", "none") == "nvfp4":
+        scale_bytes += spec.head_dim // 16
+    return (1 if spec.mla else 2) * spec.num_layers * heads * scale_bytes
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
@@ -56,11 +59,16 @@ def spec_kv_bytes_per_token(spec, config) -> int:
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    if getattr(config, "kv_quant", "none") == "nvfp4":
+        if spec.head_dim % 16:
+            raise ValueError("NVFP4 KV requires head_dim divisible by 16")
+        row_bytes = spec.head_dim // 2
+    else:
+        row_bytes = spec.head_dim * kv_storage_bytes_per_elem(config)
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
+        * row_bytes
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * kv_storage_bytes_per_elem(config)
         * spec.num_layers
     )
     return (
@@ -202,6 +210,14 @@ class BaseKVCachePool(ABC):
 
     def v_scale(self, index: int) -> torch.Tensor | None:
         """fp32 ``[num_slots, local_kv_heads]`` scale of ``v_cache(index)``; see k_scale."""
+        return None
+
+    def k_block_scale(self, index: int) -> torch.Tensor | None:
+        """NVFP4 E4M3 scales for ``k_cache(index)``, or ``None`` for other layouts."""
+        return None
+
+    def v_block_scale(self, index: int) -> torch.Tensor | None:
+        """NVFP4 E4M3 scales for ``v_cache(index)``, or ``None`` for other layouts."""
         return None
 
     @property

@@ -179,7 +179,8 @@ def test_encoder_inverts_the_grid_through_the_scale_one_path():
             expected[t, j + 1] = code
 
     k_cache, _, k_scale, _ = _store(
-        rows.to(DEV, dtype=torch.bfloat16), torch.zeros(tokens, 1, dim, dtype=torch.bfloat16)
+        rows.to(DEV, dtype=torch.bfloat16),
+        torch.zeros(tokens, 1, dim, dtype=torch.bfloat16, device=DEV),
     )
     assert torch.equal(k_scale[:, 0], torch.ones_like(k_scale[:, 0]))
     got = _canonical_zero(_as_bytes(k_cache)[:, 0, :])

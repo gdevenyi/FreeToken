@@ -623,6 +623,36 @@ def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expecte
     assert _select_extend_tile(head_dim, block_d, smem_optin) == expected
 
 
+@pytest.mark.parametrize(
+    ("head_dim", "smem_optin", "expected_16bit", "expected_fp8"),
+    [
+        # consumer opt-in smem (sm_86/sm_89 ~99KB): a 1-byte cache buys BLOCK_N 32 -> 64
+        (256, 101376, (64, 32), (64, 64)),
+        # where the fast tile already fits, the cache dtype changes nothing
+        (256, 232448, (128, 64), (128, 64)),
+        # unknown budget stays conservative for both
+        (256, 0, (64, 32), (64, 32)),
+    ],
+)
+def test_select_extend_tile_uses_kv_cache_element_size(
+    head_dim, smem_optin, expected_16bit, expected_fp8
+):
+    """The q tile is always 2 bytes/element but K and V follow the cache, so charging
+    K/V at 2 bytes regardless makes an fp8 cache run a smaller tile than it has shared
+    memory for. On an RTX 3070 (sm_86, 99KB opt-in, head_dim 256) that was BLOCK_N 32
+    where 64 fits, worth ~9% of prefill time at 99k context.
+
+    The 16-bit column is the no-regression half: ``kv_bytes=2`` reproduces the previous
+    budget identically, since (M + 2N) * D * 2 == (M*2 + 2N*2) * D."""
+    import triton
+
+    from freetoken.kernel.triton.attention import _select_extend_tile
+
+    block_d = triton.next_power_of_2(head_dim)
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 2) == expected_16bit
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 1) == expected_fp8
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
     from freetoken.attention import AttentionSpec
@@ -644,6 +674,14 @@ def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
 
         def v_cache(self, layer_id):
             return self.v
+
+        # A 16-bit pool answers None here. The backend reads it on every path since the
+        # fp8 store landed, so the double answers it too.
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
 
     device = torch.device("cuda")
     head_dim = 256
@@ -969,22 +1007,27 @@ def test_extend_paged_attention_decodes_fp8_scales(use_split_inputs: bool):
     seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
     total_q, total_kv = sum(extend_lens), sum(seq_lens)
     q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    k_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 6.0).to(
+    k_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 3.0).to(
         torch.bfloat16
     )
-    v_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 6.0).to(
+    v_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 3.0).to(
         torch.bfloat16
     )
     # Magnitudes far from 1: a dropped scale is then off by orders of magnitude.
     k_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.3).to(
         torch.bfloat16
     )
-    v_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 30.0).to(
+    v_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 3.0).to(
         torch.bfloat16
     )
     qo_indptr = torch.tensor([0] + extend_lens, dtype=torch.int32, device=device).cumsum_(0)
     kv_indptr = torch.tensor([0] + seq_lens, dtype=torch.int32, device=device).cumsum_(0)
-    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    # KV positions are logical, but FP8 codes and their scales are addressed by the
+    # physical slots from the page table. A contiguous table masks a regression that
+    # looks scales up with the logical position instead of the slot.
+    indices = torch.tensor(
+        [10, 3, 8, 1, 9, 0, 7, 2, 6, 4, 5], dtype=torch.int32, device=device
+    )
     prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
     q_to_req = torch.empty(total_q, dtype=torch.int32, device=device)
     q_positions = torch.empty(total_q, dtype=torch.int64, device=device)
@@ -1005,18 +1048,24 @@ def test_extend_paged_attention_decodes_fp8_scales(use_split_inputs: bool):
         kv_off += cached_len + extend_len
     sm_scale = head_dim**-0.5
 
-    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_cache, v_cache)
+    num_slots = total_kv + 1
+    k_slots = torch.zeros(
+        num_slots, num_kv_heads, head_dim, dtype=k_cache.dtype, device=device
+    )
+    v_slots = torch.zeros_like(k_slots)
+    k_slots[indices.to(torch.long)] = k_cache
+    v_slots[indices.to(torch.long)] = v_cache
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_slots, v_slots)
     k_ref = _dequantized(k_codes, k_scale).clone()
     v_ref = _dequantized(v_codes, v_scale).clone()
     if use_split_inputs:
         q_off = kv_off = 0
         for cached_len, extend_len in zip(cached_lens, extend_lens):
-            k_ref[kv_off + cached_len : kv_off + cached_len + extend_len] = k_extend[
-                q_off : q_off + extend_len
-            ]
-            v_ref[kv_off + cached_len : kv_off + cached_len + extend_len] = v_extend[
-                q_off : q_off + extend_len
-            ]
+            current_slots = indices[
+                kv_off + cached_len : kv_off + cached_len + extend_len
+            ].to(torch.long)
+            k_ref[current_slots] = k_extend[q_off : q_off + extend_len].float()
+            v_ref[current_slots] = v_extend[q_off : q_off + extend_len].float()
             q_off += extend_len
             kv_off += cached_len + extend_len
 

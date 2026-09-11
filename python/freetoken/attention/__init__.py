@@ -38,6 +38,7 @@ class BackendInfo:
     # kernel is proven to apply our scale layout; the engine then refuses (or auto-
     # avoids) them for --kv-cache-dtype fp8.
     supports_fp8_kv: bool = False
+    supports_nvfp4_kv: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -90,6 +91,7 @@ def create_fa_backend(config: ModelConfig):
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         consumes_attn_spec=True,
         supports_fp8_kv=True,
+        supports_nvfp4_kv=True,
     ),
 )
 def create_triton_backend(config: ModelConfig):
@@ -110,7 +112,11 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
-    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
+    BackendInfo(
+        supported_types=frozenset({AttnType.MLA, AttnType.DSA}),
+        supports_fp8_kv=True,
+        supports_nvfp4_kv=True,
+    ),
 )
 def create_dsa_backend(config: ModelConfig):
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
@@ -146,6 +152,7 @@ def create_m3_sparse_backend(config: ModelConfig):
         # The attend kernel dequantizes on load (kernel/triton/qsa/attend.py); the
         # compressed index keys it scores against are a separate, always-16-bit tier.
         supports_fp8_kv=True,
+        supports_nvfp4_kv=True,
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),

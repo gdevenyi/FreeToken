@@ -23,8 +23,11 @@ class _KVGroupStorage:
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
     storage_shape: tuple[int, int, int]
+    logical_head_dim: int
     # (2, num_layers, num_slots, local_kv_heads) fp32, or None for an unquantized group.
     scale_buffer: torch.Tensor | None = None
+    # (2, num_layers, num_slots, local_kv_heads, head_dim // 16) uint8, or None.
+    block_scale_buffer: torch.Tensor | None = None
 
 
 def _alloc_group_storage(
@@ -36,7 +39,7 @@ def _alloc_group_storage(
     store_dtype: torch.dtype,
     outer_size: int,
     inner_size: int,
-    quantized: bool,
+    kv_quant: str,
 ) -> _KVGroupStorage:
     """One group's code buffer (+ fp8 scale buffer), shared by the initial allocation
     and the in-place rebuild so the two can never drift.
@@ -46,8 +49,9 @@ def _alloc_group_storage(
     while code 0x00 is exactly 0.0. One memset per allocation, same as
     kvcache/bsa_pool.py. The 16-bit buffer keeps torch.empty.
     """
-    shape = (2, num_layers, outer_size, inner_size, local_kv_heads, head_dim)
-    if quantized:
+    stored_dim = head_dim // 2 if kv_quant == "nvfp4" else head_dim
+    shape = (2, num_layers, outer_size, inner_size, local_kv_heads, stored_dim)
+    if kv_quant != "none":
         from freetoken.kernel.triton.kv_quant import alloc_codes
 
         buffer = alloc_codes(shape, device)
@@ -59,12 +63,21 @@ def _alloc_group_storage(
     else:
         buffer = torch.empty(shape, device=device, dtype=store_dtype)
         scale = None
+    block_scale = None
+    if kv_quant == "nvfp4":
+        block_scale = torch.zeros(
+            (2, num_layers, outer_size * inner_size, local_kv_heads, head_dim // 16),
+            device=device,
+            dtype=torch.uint8,
+        )
     return _KVGroupStorage(
         buffer=buffer,
         k_buffer=buffer[0],
         v_buffer=buffer[1],
-        storage_shape=(outer_size * inner_size, local_kv_heads, head_dim),
+        storage_shape=(outer_size * inner_size, local_kv_heads, stored_dim),
+        logical_head_dim=head_dim,
         scale_buffer=scale,
+        block_scale_buffer=block_scale,
     )
 
 
@@ -82,9 +95,13 @@ class HybridSWAKVCache(BaseKVCachePool):
         num_swa_tokens: int | None = None,
         kv_quant: str = "none",
     ) -> None:
+        if kv_quant not in ("none", "fp8", "nvfp4"):
+            raise ValueError(f"unsupported hybrid-SWA kv_quant {kv_quant!r}")
         specs = {group.name: group for group in groups if group.num_layers > 0}
         if set(specs) != {"full", "swa"}:
             raise ValueError(f"HybridSWAKVCache requires full and swa groups, got {sorted(specs)}")
+        if kv_quant == "nvfp4" and any(spec.head_dim % 16 for spec in specs.values()):
+            raise ValueError("NVFP4 KV requires head_dim divisible by 16")
 
         from .mha_pool import _kv_store_dtype
 
@@ -154,7 +171,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             store_dtype=_kv_store_dtype(dtype, kv_quant),
             outer_size=outer_size,
             inner_size=inner_size,
-            quantized=kv_quant != "none",
+            kv_quant=kv_quant,
         )
 
     @staticmethod
@@ -265,6 +282,16 @@ class HybridSWAKVCache(BaseKVCachePool):
         scale = self._storages[ref.group].scale_buffer
         return None if scale is None else scale[1][ref.index]
 
+    def k_block_scale(self, index: int) -> torch.Tensor | None:
+        ref = self.layers_mapping[index]
+        scale = self._storages[ref.group].block_scale_buffer
+        return None if scale is None else scale[0][ref.index]
+
+    def v_block_scale(self, index: int) -> torch.Tensor | None:
+        ref = self.layers_mapping[index]
+        scale = self._storages[ref.group].block_scale_buffer
+        return None if scale is None else scale[1][ref.index]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -277,6 +304,21 @@ class HybridSWAKVCache(BaseKVCachePool):
         indices = out_loc
         if ref.group == "swa":
             indices = self.translate_loc_from_full_to_swa(out_loc)
+        if self.kv_quant == "nvfp4":
+            from freetoken.kernel.triton.kv_nvfp4 import quantize_nvfp4_to_cache
+
+            quantize_nvfp4_to_cache(
+                k=k,
+                v=v,
+                out_loc=indices,
+                k_cache=storage.k_buffer[ref.index].view(storage.storage_shape),
+                v_cache=storage.v_buffer[ref.index].view(storage.storage_shape),
+                k_scale=storage.scale_buffer[0][ref.index],
+                v_scale=storage.scale_buffer[1][ref.index],
+                k_block_scale=storage.block_scale_buffer[0][ref.index],
+                v_block_scale=storage.block_scale_buffer[1][ref.index],
+            )
+            return
         if self.kv_quant == "fp8":
             from freetoken.kernel.triton.kv_quant import quantize_kv_to_cache
 
@@ -328,22 +370,22 @@ class HybridSWAKVCache(BaseKVCachePool):
     @staticmethod
     def _group_geometry(group: _KVGroupStorage) -> tuple:
         # Everything the realloc needs that does NOT pin the old buffer alive: layer count,
-        # kv heads, head_dim, device, storage dtype, and whether codes are fp8.
+        # kv heads, logical head_dim, device, storage dtype, and quantized sidecars.
         # (Plain ints + device/dtype handles, no tensor.)
-        _, num_layers, _old_outer, _old_inner, local_kv_heads, head_dim = group.buffer.shape
+        _, num_layers, _old_outer, _old_inner, local_kv_heads, _stored_dim = group.buffer.shape
         return (
             num_layers,
             local_kv_heads,
-            head_dim,
+            group.logical_head_dim,
             group.buffer.device,
             group.buffer.dtype,
-            group.scale_buffer is not None,
+            "nvfp4" if group.block_scale_buffer is not None else ("fp8" if group.scale_buffer is not None else "none"),
         )
 
     @staticmethod
     def _alloc_group(geom: tuple, outer_size: int, inner_size: int) -> _KVGroupStorage:
         # Only the outer (page/token) dimension changes; the rest comes from ``geom``.
-        num_layers, local_kv_heads, head_dim, device, store_dtype, quantized = geom
+        num_layers, local_kv_heads, head_dim, device, store_dtype, kv_quant = geom
         return _alloc_group_storage(
             num_layers=num_layers,
             local_kv_heads=local_kv_heads,
@@ -352,7 +394,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             store_dtype=store_dtype,
             outer_size=outer_size,
             inner_size=inner_size,
-            quantized=quantized,
+            kv_quant=kv_quant,
         )
 
     def rebuild(self, num_full_pages: int, num_swa_tokens: int | None = None) -> None:
@@ -444,6 +486,12 @@ class HybridSWAKVCache(BaseKVCachePool):
             kv += int(fs.numel() * fs.element_size()) // full_tokens
         if self.swa_kv_pool.scale_buffer is not None:
             ss = self.swa_kv_pool.scale_buffer
+            swa_b += int(ss.numel() * ss.element_size()) // self._swa_num_tokens
+        if self.full_kv_pool.block_scale_buffer is not None:
+            fs = self.full_kv_pool.block_scale_buffer
+            kv += int(fs.numel() * fs.element_size()) // full_tokens
+        if self.swa_kv_pool.block_scale_buffer is not None:
+            ss = self.swa_kv_pool.block_scale_buffer
             swa_b += int(ss.numel() * ss.element_size()) // self._swa_num_tokens
         return kv, swa_b
 
