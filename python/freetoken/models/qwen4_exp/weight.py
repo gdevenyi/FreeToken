@@ -448,17 +448,24 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     bar = byte_bar(expected * shard_bytes, "Loading PLE table")
     try:
         buf = bank.memoryview()
+        # Coalesce the shards into maximal runs that are contiguous in BOTH the file and the
+        # bank, then issue one read per run. read_range_into is O_DIRECT (the page cache is
+        # fadvised away), so its throughput is queue depth x chunk -- and a 382 MiB shard is
+        # only ~24 chunks, too few to fill the queue, with 128 pool setups on top. On the
+        # Qwen3.8-Flash-Next table the 128 shards form 4 runs, which reads at device speed.
+        runs: list[list] = []
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
             assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            # workers is NVMe queue depth: read_range_into is O_DIRECT and fadvises the
-            # range away, so the page cache cannot help and throughput is depth x chunk.
-            # Measured on 2 x Xeon 6526Y + NVMe, 4 GiB slices of this very table:
-            #   8 x 8MB -> 0.72 GB/s   16 x 8MB -> 3.36   32 x 16MB -> 3.77   128 x 32MB -> 3.27
-            # A queue of 8 leaves the device starved; 32 saturates it. For the 47.7 GiB
-            # Qwen3.8-Flash-Next table that is 71 s -> 14 s of a 145 s cold start.
+            dest = shard * shard_bytes
+            if runs and runs[-1][0] == path and runs[-1][1] + runs[-1][2] == offset \
+                    and runs[-1][3] + runs[-1][2] == dest:
+                runs[-1][2] += nbytes           # extend the run
+            else:
+                runs.append([path, offset, nbytes, dest])
+        for path, offset, nbytes, dest in runs:
             read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
+                            dest_offset=dest, workers=workers, chunk=chunk)
             bar.update(nbytes)
     finally:
         bar.close()
