@@ -400,7 +400,7 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
 
 
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
-                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
+                   workers: int = 32, chunk: int = 16 << 20) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
 
     The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
@@ -451,6 +451,12 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
             assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
+            # workers is NVMe queue depth: read_range_into is O_DIRECT and fadvises the
+            # range away, so the page cache cannot help and throughput is depth x chunk.
+            # Measured on 2 x Xeon 6526Y + NVMe, 4 GiB slices of this very table:
+            #   8 x 8MB -> 0.72 GB/s   16 x 8MB -> 3.36   32 x 16MB -> 3.77   128 x 32MB -> 3.27
+            # A queue of 8 leaves the device starved; 32 saturates it. For the 47.7 GiB
+            # Qwen3.8-Flash-Next table that is 71 s -> 14 s of a 145 s cold start.
             read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
                             dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
             bar.update(nbytes)
