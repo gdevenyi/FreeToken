@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import copy
-import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -9,8 +7,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
-from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
-from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
+from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -33,12 +30,6 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
-    # --dense-quant / --lm-head-quant: "mxfp8" requantizes the family's bf16 projections (the
-    # lm_head) at load, "none" serves them as the checkpoint stores them.
-    dense_quant: str = "none"
-    lm_head_quant: str = "none"
-    # --embed-weights: "host" keeps the token embedding in pinned host RAM, gathered over PCIe.
-    embed_weights: str = "gpu"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -73,17 +64,11 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
-    # KV-cache storage quantization: "none" stores the compute dtype, "fp8" stores e4m3
-    # codes plus one fp32 scale per (token, slab, layer, kv head) -- about 2x the tokens
-    # per GiB, at a small accuracy cost. --kv-cache-dtype; resolved from "auto" by
-    # _adjust_config, which also refuses it on a pool family or attention backend that
-    # cannot read the scales.
-    kv_quant: str = "none"
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
-    linear_state_cache_ratio: float = float(os.environ.get("FT_LINEAR_STATE_CACHE_RATIO", "2.0"))
+    linear_state_cache_ratio: float = 2.0
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
@@ -94,7 +79,8 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 1800.0  # ranks reach the first collective minutes apart on a 100+ GiB offload load
+    distributed_timeout: float = 60.0
+    distributed_port: int = 2333
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
@@ -102,13 +88,6 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
-    # Extra KV pages mirrored to pinned host RAM (QSA paged pools, e.g. Qwen3.8-Flash-Next):
-    # the GPU pool becomes an LRU cache over the logical page space (scheduler, page table and
-    # radix tree all see num_pages + kv_host_pages pages), extending context past VRAM
-    # capacity. 0 (default) = off.
-    kv_host_pages: int = 0
-    # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
-    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
         if self.moe_backend is None:
@@ -124,55 +103,12 @@ class EngineConfig:
         return cached_load_hf_config(self.model_path)
 
     @cached_property
-    def model_spec(self) -> ModelSpec:
-        return get_model_spec(self.hf_config.architectures[0])
-
-    @cached_property
-    def active_encoders(self) -> tuple[EncoderSpec, ...]:
-        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
-        return tuple(
-            e
-            for e in self.model_spec.encoders
-            if getattr(self.hf_config, e.config_key, None) is not None
-            and e.kind not in self.mm.disabled_encoders
-        )
-
-    @cached_property
-    def served_modalities(self) -> frozenset[str]:
-        """Modalities this process accepts."""
-        return frozenset(m for e in self.active_encoders for m in e.modalities)
-
-    @cached_property
     def model_config(self) -> ModelConfig:
-        # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
-        hf_config = copy.copy(self.hf_config)
-        built = {e.config_key for e in self.active_encoders}
-        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
-            if key not in built:
-                setattr(hf_config, key, None)
-        spec = self.model_spec
-        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
-        quant = self._load_time_quant(quant, spec, hf_config)
+        spec = get_model_spec(self.hf_config.architectures[0])
+        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
         set_quant_config(quant)
-        model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
-
-    def _load_time_quant(self, quant, spec: ModelSpec, hf_config):
-        targets: tuple[str, ...] = ()
-        if self.dense_quant == "mxfp8":
-            if not spec.load_quant_targets:
-                raise ValueError(f"--dense-quant is not supported for {self.hf_config.architectures[0]}")
-            targets += spec.load_quant_targets
-        if self.lm_head_quant == "mxfp8":
-            text = getattr(hf_config, "text_config", hf_config)
-            if getattr(text, "tie_word_embeddings", False) or getattr(hf_config, "tie_word_embeddings", False):
-                raise ValueError("--lm-head-quant needs an untied lm_head (a tied head shares the embedding table)")
-            targets += (r"^lm_head$",)
-        if not targets:
-            return quant
-        from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig
-
-        return LoadTimeQuantConfig(quant, targets)
+        parse_config = _load_attr(spec.module, spec.parse_config)
+        return replace(parse_config(self.hf_config), quant=quant)
 
     @property
     def max_seq_len(self) -> int:
@@ -186,4 +122,4 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        return f"tcp://127.0.0.1:{self.distributed_port}"

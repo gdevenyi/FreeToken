@@ -40,7 +40,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
-| `--api-key` | disabled | Require `Authorization: Bearer <key>` on every route except `/health` (401 otherwise); `FREETOKEN_API_KEY` is read when the flag is absent |
+| `--dist-port` | `--port` + 1 | Internal TP rendezvous port (loopback-only regardless of `--host`) |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
@@ -72,31 +72,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--kv-cache-dtype` | bf16 | `bf16`, `fp8`, or `nvfp4` (see [NVFP4 KV cache](#nvfp4-kv-cache)): FP8 stores the KV cache as e4m3 codes plus one fp32 scale per (token, kv head), roughly doubling the tokens that fit in the same VRAM; see [FP8 KV cache](#fp8-kv-cache) |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
-
-### FP8 KV cache
-
-`ft serve --kv-cache-dtype fp8` halves the bytes per cached token (8-bit codes instead
-of 16), so a card that held N tokens holds close to 2N. Each `(token, kv head)` row
-keeps its own fp32 scale, which costs ~3% back at `head_dim=128`. Requirements and
-trade-offs:
-
-- Needs the **triton** attention backend; `--attn auto` selects it (and refuses an
-  explicit `fi`/`fa`/`trtllm`, which cannot be shown to apply these scales).
-- Works on the plain paged, hybrid-SWA and QSA sparse (Qwen3.8-Flash-Next) KV pools.
-  On QSA the block-selection index keys stay 16-bit; only the selected K/V rows are
-  read back as codes. MLA/DSA latent KV, DeepSeek-V4's tiered pool and the block-sparse
-  MiniMax-M3 pool stay 16-bit; asking for fp8 there fails at startup rather than
-  silently ignoring the flag.
-- The same bytes on every GPU FreeToken targets: the codes sit in a plain byte buffer
-  and are decoded in software, so the cache holds identical data and produces identical
-  numbers on any card (the fp8 type is deliberately kept out of the kernels, which is
-  also what makes the feature work on the RTX 30 series).
-- Accuracy is checkpoint-dependent. Expect it to matter most on long contexts and on
-  models with outlier key channels; keep `bf16` when a run must be bit-reproducible.
-- `ft ctl stats` / `/v1/cache/status` report the smaller `kv_bytes_per_token`, and
-  `ft ctl cache --kv N` moves the same (now cheaper) pool.
 
 ### MoE offload
 
@@ -123,84 +99,6 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
-| `--enable-metrics-report` | off | Serve a per-request `metrics` object next to usage ([below](#per-request-performance-metrics)) |
-
-### Per-request performance metrics
-
-`--enable-metrics-report` adds a `metrics` object to each response on `/v1/chat/completions`,
-`/v1/messages` and `/v1/responses`. It is not part of any of those protocols, which is why it is
-off by default; clients that do not read it are unaffected.
-
-```json
-{
-  "usage": { "prompt_tokens": 8192, "completion_tokens": 256, "total_tokens": 8448 },
-  "metrics": {
-    "ttft_ms": 320.5,
-    "prefill_tokens": 2048,
-    "cached_prompt_tokens": 6144,
-    "prefill_time_ms": 410.0,
-    "prefill_tokens_per_second": 4995.12,
-    "decode_tokens": 256,
-    "decode_time_ms": 5120.8,
-    "decode_tokens_per_second": 49.8,
-    "total_time_ms": 5480.2
-  }
-}
-```
-
-| Field | Meaning |
-| --- | --- |
-| `ttft_ms` | Time to the first generated token, from the point the request entered the generation path |
-| `prefill_tokens` | Prompt tokens actually forwarded: `prompt_tokens - cached_prompt_tokens` |
-| `cached_prompt_tokens` | Prompt tokens served from the prefix cache instead of recomputed |
-| `prefill_time_ms` | The scheduler's own prefill span: admission to the token sampled off the last prefill chunk |
-| `prefill_tokens_per_second` | `prefill_tokens / prefill_time_ms` |
-| `decode_tokens` | Generated tokens (same as `usage.completion_tokens`) |
-| `decode_time_ms` | First generated token to the last |
-| `decode_tokens_per_second` | `(decode_tokens - 1) / decode_time_ms`; the first token comes out of prefill, so it spans no decode interval |
-| `total_time_ms` | Request latency up to the terminal engine reply, excluding HTTP framing |
-
-Reading the numbers:
-
-- `prefill_time_ms` is measured inside the scheduler, which is the point of the flag: a client
-  timing SSE frames cannot see when prefill starts or ends. The others are measured at the API
-  layer and carry the same IPC hops a client's own timestamps would.
-- `ttft_ms` is larger than `prefill_time_ms` by the time the request spent queued before
-  admission. Under load that gap is the queue, not the model.
-- Every span is **this request's share of shared work**. Its prefill chunk is co-scheduled with
-  other prompts and its decode steps are batched with other requests, so the throughputs
-  describe this request under that load, not isolated engine benchmarks. For those,
-  send one request at a time.
-- `cached_prompt_tokens` here always reports the real prefix-cache hit, whether or not
-  `--enable-cache-report` is set; that flag governs the billing fields in `usage`. Without it
-  `prefill_tokens_per_second` would be computed over tokens that were never forwarded.
-
-Streaming responses carry `metrics` on the same final message as usage, so the request has to ask
-for usage too: `stream_options: {"include_usage": true}` on `/v1/chat/completions`. On
-`/v1/messages` it rides `message_delta`; on `/v1/responses`, `response.completed`.
-`/v1/completions` does not serve `metrics`: it does not go through the shared generation core.
-
-### Image input
-
-Experimental. Needs a checkpoint whose family registers a vision encoder ([models.md](models.md#image-input) lists them and how each one
-maps the flags below); a request carrying images is rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
-Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside a tool
-result (an Anthropic `tool_result` block from Claude Code's Read, a Responses `function_call_output`
-from Codex's view_image) are moved to the user turn that follows the tool message, as vLLM does,
-because chat templates render tool messages as plain text.
-`GET /v1/stats` reports what the server accepts as `model.input_modalities` (`["text"]` or `["text", "image"]`),
-so a client can gate its attachment controls without reading the checkpoint config.
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
-| `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
-| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute, so the GPU holds two blocks instead of the whole tower; small images pay the copy time, large ones hide it behind the compute. `gpu` keeps them resident. An encoder without a block stack stays resident either way |
-| `--image-min-tokens`, `--image-max-tokens` | processor defaults | Per-image token budget: the image processor resizes every image to take between these many tokens, converted to the family's own units by its processor. A family with fixed budgets honors the maximum only and refuses one below its smallest budget at start-up |
-| `--mm-processor-kwargs` | none | JSON object of extra keyword arguments for the checkpoint's image processor call, for knobs the token budget does not cover; applied after the budget, so an explicit key wins |
-| `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
-| `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
-| `--allowed-local-media-path` | off | Directory `file://` image refs may be read from; unset rejects local files |
 
 ## ft shell
 
@@ -221,7 +119,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
 | `health` | `GET /health` | Server status, model, load progress |
-| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, accepted input modalities |
+| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
@@ -237,10 +135,6 @@ Discovers the served model via `/v1/models`, writes the agent's provider
 config, installs the agent CLI if missing, then launches it. Cloud API keys
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
 environment so the agent cannot silently fall back to a paid endpoint.
-When `/v1/stats` reports `image` among `model.input_modalities`, the written
-config declares the model image-capable, which Codex, OpenCode, OpenClaw and
-dsh require before their image tools and attachments send anything; Claude
-Code and Hermes need no declaration.
 
 | Flag | Meaning |
 |---|---|
@@ -283,33 +177,3 @@ profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
 
-
-### NVFP4 KV cache
-
-`ft serve --model <checkpoint> --kv-cache-dtype nvfp4 --attention-backend triton`
-opts into packed E2M1 KV storage. The initial implementation supports plain paged
-FULL attention (MHA/GQA), hybrid-SWA, and the full-attention portion of hybrid-linear
-models, QSA, and MLA/DSA (including GLM-5.3-Flash). Head dimensions must be
-divisible by 16. DSV4 and BSA pools are rejected at startup. `auto` selects
-Triton, QSA sparse, or DSA attention for supported models. For MLA/DSA use
-`--attention-backend auto` or `--attention-backend dsa`. Only the latent slab is
-quantized; indexer keys, kpool tails/gates, and recurrent states retain their
-existing precision. A 512-element latent row occupies 292 bytes instead of 1024
-bytes in BF16, excluding those other tiers.
-
-Each K or V row stores `head_dim / 2` packed bytes, `head_dim / 16` E4M3 block-scale
-bytes, and one FP32 row scale. At head_dim 128 this is 76 bytes, versus 256 for
-BF16 and 132 for the existing FP8 format. Pool management, recurrent states,
-attention workspace and model weights consume additional memory.
-
-The second-level scale is dynamic per token/head, so appending a token never
-rescales an existing prefix. This is a FreeToken KV layout, not an external
-NVFP4 checkpoint or attention-library ABI. K/V are restored inside attention;
-Q and attention arithmetic retain their compute precision. The MoE weight option
-`--nvfp4-backend` is independent. Paged MHA prefill uses fresh compute-dtype K/V
-while cached prefixes are restored, as in the FP8 path. MLA/DSA stores fresh
-latent rows first and reads the quantized cache in both prefill and decode.
-
-NVFP4 is opt-in: assess quality on your checkpoint and workload before using it
-for long-context inference. Capacity savings do not guarantee faster decode;
-packing, reconstruction, and the selected attention backend affect throughput.
