@@ -74,7 +74,7 @@ def _spec():
 
 
 def _config(kv_quant, *, page_size=PAGE_SIZE, max_running_req=3):
-    mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True)
+    mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False)
     mc.kv_cache_group_specs = lambda: (_spec(),)
     return SimpleNamespace(
         model_config=mc,
@@ -200,7 +200,7 @@ def test_factory_threads_kv_quant_into_the_qsa_pool():
 
     mc = SimpleNamespace(
         num_layers=8, has_swa_attention=False, has_linear_attention=True,
-        num_kv_heads=HEADS, head_dim=DIM, dsv4_args=None,
+        num_kv_heads=HEADS, head_dim=DIM, dsv4_args=None, model_is_mrope=False,
     )
     mc.kv_cache_group_specs = lambda: (_spec(),)
     pool = create_kvcache_pool(
