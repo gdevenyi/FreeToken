@@ -706,6 +706,11 @@ class Engine:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
+            if config.moe_prefill_overlap and not overlap:
+                logger.info_rank0(
+                    f"--moe-cache-auto: prefill overlap disabled, its {2 * config.model_config.num_experts} "
+                    "slot floor does not fit beside the KV reserve"
+                )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
