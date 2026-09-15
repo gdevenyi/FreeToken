@@ -840,6 +840,12 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
         def v_cache(self, layer_id):
             return self.v
 
+        def k_scale(self, layer_id):  # 16-bit pool: no fp8 scales
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
     device = torch.device("cuda")
     head_dim = 256
     kv_cache = FakeKVCache(device, head_dim)
