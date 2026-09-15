@@ -218,10 +218,18 @@ def load_weight(
     # decided at conversion (offload -> experts live in banks, not here); a backend mismatch
     # fails loudly in load_state_dict (strict missing/unexpected expert keys), so the reader
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
+    from freetoken.checkpoint.ftw import FTWReader, is_ftw_checkpoint, iter_ftw_weights
     from freetoken.models.config import VISION_KEY_PREFIXES
 
     if is_ftw_checkpoint(model_path):
+        spec = get_model_spec(cached_load_hf_config(model_path).architectures[0])
+        # a family whose stored tensors depend on load-time settings checks them against the index before the read
+        check = _model_override(spec, "check_ftw_weights")
+        if check is not None:
+            reader = FTWReader(model_path)
+            names = {e["name"] for e in reader.entries("weight")}
+            reader.close()
+            check(_spec_for_model_path(model_path)[0], model_path, names)
         weights = iter_ftw_weights(model_path)
     else:
         _config, spec = _spec_for_model_path(model_path)
