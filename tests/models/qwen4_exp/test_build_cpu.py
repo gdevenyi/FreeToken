@@ -10,7 +10,7 @@ Building on the meta device costs no memory and no GPU, so there is no reason no
 
 import torch
 from freetoken.distributed import set_tp_info, try_get_tp_info
-from freetoken.layers import set_rope_device
+from freetoken.layers import rotary, set_rope_device
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
 
@@ -20,9 +20,15 @@ from .common import toy_hf_config
 def _build():
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
+    previous = rotary._ROPE_DEVICE
     set_rope_device(torch.device("cpu"))
-    with torch.device("meta"):
-        return Qwen4ExpForCausalLM(parse_config(toy_hf_config()))
+    try:
+        with torch.device("meta"):
+            return Qwen4ExpForCausalLM(parse_config(toy_hf_config()))
+    finally:
+        # get_rope is cached per geometry: a CPU cos/sin table left behind feeds later CUDA tests
+        rotary.get_rope.cache_clear()
+        set_rope_device(previous)
 
 
 def test_model_constructs_on_meta_without_cuda():
