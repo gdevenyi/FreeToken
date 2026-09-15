@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
@@ -6,6 +7,22 @@ from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
 VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
+_ENV_TRUE = {"1", "true", "yes", "on"}
+
+
+def fp8_dense_enabled() -> bool:
+    """Load-time FP8 for a model's bf16 attention / GDN projections (opt-in, default OFF):
+    per-tensor e4m3 weights, per-tensor dynamic activation scale, cuBLASLt W8A8 GEMMs
+    (``torch._scaled_mm``, sm_89+). ``FREETOKEN_FP8_DENSE=1``."""
+    return os.getenv("FREETOKEN_FP8_DENSE", "0").strip().lower() in _ENV_TRUE
+
+
+def fp8_lmhead_enabled() -> bool:
+    """Load-time FP8 for the lm_head as well (opt-in, default OFF, needs FREETOKEN_FP8_DENSE=1
+    for the rest). Separate from :func:`fp8_dense_enabled` because this one moves the logits:
+    a per-tensor e4m3 vocab matrix changes every sampled token's score, so it carries its own
+    quality gate. ``FREETOKEN_FP8_LMHEAD=1``."""
+    return os.getenv("FREETOKEN_FP8_LMHEAD", "0").strip().lower() in _ENV_TRUE
 
 
 def detect_expert_quant(hf_config: Any) -> str:
