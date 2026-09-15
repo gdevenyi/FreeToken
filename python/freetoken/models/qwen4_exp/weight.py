@@ -31,9 +31,11 @@ from freetoken.models.nvfp4_banks import (
 from freetoken.layers.quantization import get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight, init_logger
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+logger = init_logger(__name__)
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -240,6 +242,55 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     return shard_tensor(name, t, rank=rank, world_size=world, num_kv_heads=None)
 
 
+# Load-time per-tensor FP8 (attn_quant == "fp8_dynamic", layers/fp8_dynamic.py): these keep
+# their name and gain a sibling ``weight_scale``; GDN ``in_proj`` splits into the fp8
+# ``in_proj_qkvz`` and the bf16 ``in_proj_ba`` (the gate projections stay bf16, as in the
+# block-fp8 checkpoints and in sglang / vLLM).
+_FP8_DENSE_SUFFIXES = (
+    ".self_attn.qkv_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".linear_attn.out_proj.weight",
+)
+# Behind its own flag: this one moves the logits (see models.config.fp8_lmhead_enabled).
+_FP8_LMHEAD_SUFFIX = "lm_head.weight"
+_E4M3_MAX = 448.0
+
+
+def _quantize_per_tensor(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(e4m3 weight, fp32 scale ())`` with ``w ~= weight * scale``."""
+    w = w.float()
+    scale = (w.abs().amax() / _E4M3_MAX).clamp_min(1e-12)
+    return (w / scale).clamp_(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), scale.reshape(())
+
+
+def _fp8_dense(
+    name: str, t: torch.Tensor, config, world: int, *,
+    dense: bool = True, lm_head: bool = False,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """The (already sharded) dense tensor as the fp8_dynamic model expects it."""
+    if dense and name.endswith(".linear_attn.in_proj.weight"):
+        g = config.linear_attention_group()
+        nk = div_even(g.num_key_heads, world, allow_replicate=True)
+        nv = div_even(g.num_value_heads, world, allow_replicate=True)
+        qkvz = 2 * nk * g.key_head_dim + 2 * nv * g.value_head_dim  # [q | k | v | z] local rows
+        assert t.shape[0] == qkvz + 2 * nv, (name, t.shape, qkvz, nv)
+        base = name[: -len("in_proj.weight")]
+        w8, scale = _quantize_per_tensor(t[:qkvz])
+        yield base + "in_proj_qkvz.weight", w8
+        yield base + "in_proj_qkvz.weight_scale", scale
+        # clone, not contiguous(): a contiguous row slice IS contiguous, so .contiguous() would
+        # hand back a view that keeps the whole bf16 in_proj (36 x 42 MB per rank) resident
+        yield base + "in_proj_ba.weight", t[qkvz:].clone()
+    elif (dense and name.endswith(_FP8_DENSE_SUFFIXES)) or (
+        lm_head and name.endswith(_FP8_LMHEAD_SUFFIX)
+    ):
+        w8, scale = _quantize_per_tensor(t)
+        yield name, w8
+        yield name[: -len("weight")] + "weight_scale", scale
+    else:
+        yield name, t
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -258,15 +309,39 @@ def iter_weights(
     if not include_non_moe:
         return
 
-    from .config import parse_config
+    from freetoken.models.config import fp8_dense_enabled, fp8_lmhead_enabled
+
+    from .config import parse_config, use_fp8_lmhead
 
     tp = get_tp_info()
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
-    # The sharding geometry needs the parsed config; TP=1 never shards, so keep the plain path free
-    # of a parse (synthetic test checkpoints carry no model_type).
-    config = parse_config(hf_config) if tp.size > 1 else None
+    # The sharding geometry (and the fp8 split) need the parsed config; TP=1 bf16 never does, so
+    # keep that path free of a parse (synthetic test checkpoints carry no model_type).
+    config = (
+        parse_config(hf_config)
+        if tp.size > 1 or fp8_dense_enabled() or fp8_lmhead_enabled()
+        else None
+    )
+    # the SAME predicate the model builder uses, so the emitted keys always match its slots
+    lmhead = config is not None and use_fp8_lmhead(config)
+    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+    if fp8:
+        logger.info(
+            "qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), "
+            "FREETOKEN_FP8_DENSE=1"
+        )
+    if lmhead:
+        logger.info("qwen4_exp lm_head: load-time per-tensor FP8, FREETOKEN_FP8_LMHEAD=1")
+
+    def emit(name: str, tensor: torch.Tensor):
+        tensor = _shard(name, tensor, config, tp.rank, tp.size)
+        if fp8 or lmhead:
+            yield from _fp8_dense(name, tensor, config, tp.size, dense=fp8, lm_head=lmhead)
+        else:
+            yield name, tensor
+
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -283,12 +358,17 @@ def iter_weights(
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, _shard(name, tensor, config, tp.rank, tp.size)
+                    yield from emit(name, tensor)
                 else:
                     for fused_name, fused_tensor in fused:
-                        yield fused_name, _shard(fused_name, fused_tensor, config, tp.rank, tp.size)
+                        yield from emit(fused_name, fused_tensor)
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    if (fp8 or lmhead) and device.type == "cuda":
+        # The bf16 originals and fp32 temporaries of the quantization sit in the caching
+        # allocator; hand them back so the expert-cache planner (free VRAM after load) sees
+        # the halved dense footprint instead of the slack.
+        torch.cuda.empty_cache()
 
 
 # ======================================================================================
