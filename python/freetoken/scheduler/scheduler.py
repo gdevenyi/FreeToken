@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -30,6 +33,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -88,8 +92,13 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            encoder_cache=self.engine.encoder_cache,
+            keep_images_whole=self._bidirectional_mm,
         )
 
         # some alias for easy access
@@ -103,6 +112,11 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
+        # uid -> monotonic clock at admission, for the per-request prefill span shipped on the
+        # first sampled token. An entry existing IS the "this is the first token" test, so it is
+        # popped there; _free_req_resources pops too, so a request aborted mid-prefill (which
+        # never samples) cannot leave one behind.
+        self._prefill_start: dict[int, float] = {}
         self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
@@ -133,6 +147,8 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._model_is_mrope = config.model_config.model_is_mrope
+        self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -303,9 +319,8 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, outputs = last_data[0].batch, last_data[1]
-        next_tokens_cpu = outputs.next_tokens_cpu
-        outputs.copy_done_event.synchronize()
+        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -338,19 +353,6 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-
-                row_chosen_logprob: float | None = None
-                row_top_ids: list[int] | None = None
-                row_top_logprobs: list[float] | None = None
-                if req.sampling_params.logprobs and outputs.chosen_logprobs_cpu is not None:
-                    row_chosen_logprob = float(outputs.chosen_logprobs_cpu[i].item())
-                    requested_top = req.sampling_params.top_logprobs
-                    if requested_top > 0 and outputs.top_ids_cpu is not None:
-                        row_top_ids = [int(t) for t in outputs.top_ids_cpu[i, :requested_top].tolist()]
-                        row_top_logprobs = outputs.top_logprobs_cpu[i, :requested_top].tolist()
-                    else:
-                        row_top_ids = []
-                        row_top_logprobs = []
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
@@ -374,6 +376,10 @@ class Scheduler(SchedulerIOMixin):
                     and not finished
                 ):
                     req.toolcall_anchor_len = req.input_ids.numel()
+                # Present only until this request's first token is sampled, i.e. off its last
+                # prefill chunk -- so popping it both ends the prefill span and marks this as
+                # the one reply that carries it.
+                started_at = self._prefill_start.pop(req.uid, None)
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
@@ -382,9 +388,10 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
-                        chosen_logprob=row_chosen_logprob,
-                        top_ids=row_top_ids,
-                        top_logprobs=row_top_logprobs,
+                        prefill_ms=(
+                            0.0 if started_at is None
+                            else (time.monotonic() - started_at) * 1000.0
+                        ),
                     )
                 )
 
@@ -506,6 +513,17 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if msg.mm_items and self.engine.encoder_cache is None:
+                # no encoder runtime: fail loudly instead of decoding unexpanded placeholders
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error="image input is not supported by this server",
+                        )
+                    ]
+                )
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -551,6 +569,15 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if (
+                req_to_free is not None
+                and req_to_free.mm_items
+                and self.engine.encoder_cache is not None
+            ):
+                # drop the aborted request's claims; entries it held alone die here
+                self.engine.encoder_cache.release(
+                    msg.uid, [item.hash for item in req_to_free.mm_items]
+                )
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -618,6 +645,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # A request freed without ever sampling (aborted mid-prefill) would otherwise keep its
+        # admission timestamp forever; a normally-finished one popped it at its first token.
+        self._prefill_start.pop(req.uid, None)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -798,6 +828,8 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        if self._model_is_mrope:
+            batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -836,14 +868,20 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+        if plan:
+            batch.mm_encoder_jobs = jobs
+            batch.mm_gather_plan = plan
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
+            # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
+            lo, hi = cut[0]
+            self._warned_cut_image = True
+            logger.warning_rank0(
+                f"an image of {hi - lo} tokens does not fit one prefill chunk (--max-extend-tokens {self.prefill_budget}, or the sliding-window pool's share of it): its earlier rows attend within the first part only"
+            )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -865,6 +903,11 @@ class Scheduler(SchedulerIOMixin):
         """
         if not batch.is_prefill or not batch.prompt_admissions:
             return
+        # Before the forward, which is what makes this the prefill START: _schedule_next_batch
+        # has prepared the batch but not run it.
+        now = time.monotonic()
+        for uid, _, _ in batch.prompt_admissions:
+            self._prefill_start[uid] = now
         self.send_result(
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
@@ -889,6 +932,28 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
+    needed = sum(r.extend_len for r in batch.padded_reqs)
+    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        out = host[:, offset : offset + length]
+        full = req.mrope_positions_full
+        if full is not None and req.device_len <= full.shape[1]:
+            out.copy_(full[:, req.cached_len : req.device_len])
+        else:
+            row = torch.arange(
+                req.cached_len + req.mrope_delta,
+                req.device_len + req.mrope_delta,
+                dtype=torch.int32,
+            )
+            out.copy_(row.unsqueeze(0).expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
