@@ -765,9 +765,8 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         # The routing histogram rides the same switch: on its own the miss rate says how
         # often we fetch, but not whether a smarter policy could have avoided the fetch.
-        # decode_routing_stats turns it into an oracle hit rate -- the ceiling any policy
-        # holding this many slots could reach on the observed routing -- which is the number
-        # worth having before anyone rewrites eviction.
+        # decode_routing_stats turns it into routing-skew numbers, including the hit rate of
+        # the best fixed expert set per layer (not a ceiling: LRU's temporal locality can beat it).
         cache.collect_decode_freq = config.moe_collect_stats
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
@@ -1122,8 +1121,8 @@ class Engine:
         Accumulation is device-side and captured into the decode graph, so it is free to
         leave running; reading it is not (the counters have to come back to the host), which
         is why this only fires every MOE_STATS_INTERVAL decode steps. The routing histogram
-        is deliberately *not* reset -- the oracle bound wants the whole run's distribution,
-        not one window's.
+        is deliberately *not* reset -- it describes the whole run's distribution, not one
+        window's, so the static top-k figure flattens as a session covers more topics.
         """
         cache = self.moe_offload_cache
         agg = cache.decode_miss_stats()
@@ -1149,14 +1148,12 @@ class Engine:
             )
         routing = cache.decode_routing_stats()
         if routing:
-            # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
-            # many slots per layer. If it sits near the realized hit rate, the cache is
-            # already doing as well as the routing allows and the win has to come from
-            # somewhere else (more slots, more bandwidth); if it sits far above, eviction
-            # policy is leaving something on the table.
+            # static_topk_hit is what pinning each layer's most frequent experts would score over
+            # the whole run. A realized hit rate above it means the cache is winning on temporal
+            # locality; it says nothing about how close to optimal eviction is.
             logger.info_rank0(
                 "MoE routing: "
-                f"oracle_hit={routing['oracle_hit_at_slots']:.3f} "
+                f"static_topk_hit={routing['static_topk_hit_at_slots']:.3f} "
                 f"(realized {1.0 - agg['miss_rate']:.3f}), "
                 f"slots/layer={routing['slots_per_layer']:.1f}, "
                 f"working_set={routing['working_set_mean']:.1f}"
