@@ -224,9 +224,13 @@ def load_weight(
     # a text-only engine never built the tower, so its tensors are not even read
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
-        spec = get_model_spec(cached_load_hf_config(model_path).architectures[0])
-        # a family whose stored tensors depend on load-time settings checks them against the index before the read
-        check = _model_override(spec, "check_ftw_weights")
+        # a family whose stored tensors depend on load-time settings checks them against the index before the
+        # read; a bare FTW without a readable HF config (synthetic test checkpoints) has no family to ask
+        try:
+            spec = get_model_spec(cached_load_hf_config(model_path).architectures[0])
+        except (OSError, ValueError):
+            spec = None
+        check = _model_override(spec, "check_ftw_weights") if spec is not None else None
         if check is not None:
             reader = FTWReader(model_path)
             names = {e["name"] for e in reader.entries("weight")}
