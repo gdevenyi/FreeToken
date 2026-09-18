@@ -294,3 +294,25 @@ def test_non_stream_connected_client_gets_result_without_abort(monkeypatch):
 
     assert result["choices"][0]["message"]["content"] == "Hi"
     assert state.aborted == []
+
+
+def test_chat_non_stream_disconnect_aborts_every_sample(monkeypatch):
+    # n > 1 fans out into one engine request per sample; a disconnect must stop all of them
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+
+    class _State(_ApiState):
+        def __init__(self):
+            super().__init__(acks=None)
+            self._next = 7
+
+        def new_user(self):
+            self._next += 1
+            return self._next
+
+    state = _State()
+    resp = asyncio.run(
+        openai_api.handle_chat_completion(_chat_req(n=2), _Request(disconnected=True), state, {})
+    )
+
+    assert resp.status_code == 499
+    assert sorted(state.aborted) == [8, 9]
