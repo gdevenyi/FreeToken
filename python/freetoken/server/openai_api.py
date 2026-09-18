@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -42,6 +43,8 @@ from .generation import (
     resolve_sampling,
     submit_generation,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -182,6 +185,68 @@ def register_openai_routes(
         )])
 
 
+# How often a non-streaming handler looks at the transport while the engine
+# generates. The streaming path checks per chunk; one second bounds an abandoned
+# request's extra decode work without measurable polling overhead.
+_DISCONNECT_POLL_SECONDS = 1.0
+
+
+async def _await_watching_disconnect(
+    awaitable, request: Request | None, state: Any, uids: Sequence[int]
+):
+    """Run an in-flight generation awaitable while watching the transport — the
+    non-streaming twin of stream_with_cancellation. Returns the awaitable's result,
+    or None when the client disconnected first: the same shielded abort_user is
+    delivered for every uid (an ``n > 1`` fan-out) so an abandoned request stops
+    burning decode slots instead of running to max_tokens (with
+    --max-running-requests 1 that is a full outage for its remaining budget)."""
+    gen = asyncio.ensure_future(awaitable)
+    if request is None:
+        return await gen
+
+    async def abort_all():
+        for uid in uids:
+            try:
+                await asyncio.shield(state.abort_user(uid))
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to deliver abort for user %s", uid)
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
+            if done:
+                return gen.result()
+            if await request.is_disconnected():
+                break
+    except asyncio.CancelledError:
+        # The handler itself was cancelled (server shutdown): deliver the abort,
+        # then let the cancellation propagate — mirrors stream_with_cancellation.
+        await abort_all()
+        gen.cancel()
+        raise
+    # Client gone. Deliver the AbortMsg first (the decode stops sooner), then
+    # wind down the drain task; its result is undeliverable either way.
+    await abort_all()
+    gen.cancel()
+    try:
+        await gen
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — the response is undeliverable, only cleanup matters
+        pass
+    return None
+
+
+def _client_disconnected_response() -> JSONResponse:
+    # 499 — nginx's "client closed request". The client is gone; this status is
+    # for the access log, not the wire.
+    return create_error_response(
+        "client disconnected before the response was ready",
+        status_code=499,
+        err_type="client_disconnected",
+    )
+
+
 async def handle_chat_completion(
     req: ChatCompletionRequest,
     request: Request | None,
@@ -264,13 +329,18 @@ async def handle_chat_completion(
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        results = await asyncio.gather(
-            *(generate_full(u, spec, state, source="/v1/chat/completions") for u in uids)
+        results = await _await_watching_disconnect(
+            asyncio.gather(*(generate_full(u, spec, state, source="/v1/chat/completions") for u in uids)),
+            request,
+            state,
+            uids,
         )
     except GenerationError as exc:
         for u in uids:
             await state.abort_user(u)
         return create_error_response(str(exc), code=exc.code)
+    if results is None:
+        return _client_disconnected_response()
     choices: list[dict[str, Any]] = []
     for index, result in enumerate(results):
         message: dict[str, Any] = {"role": "assistant", "content": result.content}
@@ -537,7 +607,11 @@ async def handle_completion(
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
 
-    drained = await asyncio.gather(*(_drain_one(u, i) for i, u in enumerate(uids)))
+    drained = await _await_watching_disconnect(
+        asyncio.gather(*(_drain_one(u, i) for i, u in enumerate(uids))), request, state, uids
+    )
+    if drained is None:
+        return _client_disconnected_response()
     choices: list[dict[str, Any]] = []
     prompt_tokens = completion_tokens = cached_tokens = 0
     for choice in drained:
