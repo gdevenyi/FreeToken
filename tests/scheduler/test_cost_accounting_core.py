@@ -132,7 +132,8 @@ def test_prepare_failure_emits_no_prompt_admission():
 
 def test_scheduler_rejection_emits_error_but_no_admission():
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.engine = SimpleNamespace(max_seq_len=4)
+    scheduler.engine = SimpleNamespace(max_seq_len=4, num_pages=4)
+    scheduler.config = SimpleNamespace(page_size=1)
     added = []
     scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
     sent = []
