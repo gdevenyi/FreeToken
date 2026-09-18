@@ -484,38 +484,57 @@ def _served_model_name() -> str | None:
     return getattr(cfg, "served_model_name", None)
 
 
-@app.middleware("http")
-async def _record_request_middleware(request: Request, call_next):
+class _RecordRequestMiddleware:
     """Time every generation request into the ring for /v1/requests + /v1/stats p95. Single-
     model server, so model = served_model_name; stream is inferred from the response media
-    type. Token counts are P3 (SSE usage arrives after the handler returns) — kept as None."""
-    path = request.url.path
-    if path.startswith(_UNTRACKED_REQUEST_PREFIXES) or not path.startswith(
-        _TRACKED_REQUEST_PREFIXES
-    ):
-        return await call_next(request)
-    import time as _time
+    type. Token counts are P3 (SSE usage arrives after the handler returns) — kept as None.
 
-    start = _time.monotonic()
-    response = await call_next(request)
-    duration_ms = int((_time.monotonic() - start) * 1000)
-    ctype = response.headers.get("content-type", "")
-    request_ring.record_request(
-        request_ring.RequestRecord(
-            ts=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-            method=request.method,
-            path=path,
-            status=response.status_code,
-            model=_served_model_name(),
-            duration_ms=duration_ms,
-            ttft_ms=None,
-            prompt_tokens=None,
-            completion_tokens=None,
-            stream=ctype.startswith("text/event-stream"),
-            error=None,
-        )
-    )
-    return response
+    Pure ASGI on purpose: Starlette's ``@app.middleware("http")`` (BaseHTTPMiddleware) hands the
+    handler a wrapped receive channel that never yields the client's ``http.disconnect`` while a
+    non-streaming request is still computing, so ``request.is_disconnected()`` stays False and an
+    abandoned request runs to max_tokens. The recorder is the only such middleware here."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "") if scope["type"] == "http" else ""
+        if not path.startswith(_TRACKED_REQUEST_PREFIXES) or path.startswith(_UNTRACKED_REQUEST_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        import time as _time
+
+        start = _time.monotonic()
+
+        async def send_recording(message):
+            # the base-class version recorded once the handler returned its response object,
+            # i.e. at response start, before a streaming body -- keep that timing
+            if message["type"] == "http.response.start":
+                ctype = ""
+                for name, value in message.get("headers", ()):
+                    if name.lower() == b"content-type":
+                        ctype = value.decode("latin-1")
+                request_ring.record_request(
+                    request_ring.RequestRecord(
+                        ts=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                        method=scope["method"],
+                        path=path,
+                        status=message["status"],
+                        model=_served_model_name(),
+                        duration_ms=int((_time.monotonic() - start) * 1000),
+                        ttft_ms=None,
+                        prompt_tokens=None,
+                        completion_tokens=None,
+                        stream=ctype.startswith("text/event-stream"),
+                        error=None,
+                    )
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_recording)
+
+
+app.add_middleware(_RecordRequestMiddleware)
 
 
 class CacheRebuildRequest(BaseModel):
