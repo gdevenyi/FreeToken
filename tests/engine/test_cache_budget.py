@@ -80,6 +80,43 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
+def test_overlap_floor_that_does_not_fit_falls_back_to_num_experts():
+    # #4: 2*num_experts slots (800 B) + the KV reserve (100 B) exceed the 700 B budget, but
+    # num_experts slots do fit. Plan without overlap instead of refusing to start.
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=700, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert overlap is False
+    assert size == 6  # (700 - 100) // 100, above the num_experts floor
+    assert pages == 10
+    assert size * 100 + pages * 10 <= 700
+
+
+def test_overlap_kept_when_its_floor_fits_the_budget():
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=900, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert (size, pages, overlap) == (8, 10, True)
+
+
+def test_budget_too_small_message_names_what_fits_and_the_flags():
+    # num_experts slots (400 B) + 10 reserved pages (100 B) > 450 B: 5 pages fit beside them.
+    with pytest.raises(AssertionError) as err:
+        plan_cache_budget(
+            budget_bytes=450, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=50, prefill_overlap=True,
+            kv_reserve_pages=10, max_slots=50, page_size=64,
+        )
+    msg = str(err.value)
+    assert "beside 4 slots at most 5 KV pages (320 tokens) fit" in msg
+    for flag in ("--kv-reserve-tokens", "--kv-cache-dtype", "--memory-ratio", "--moe-cache-size"):
+        assert flag in msg
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
@@ -110,6 +147,25 @@ def test_resolve_auto_applies_ratio_once():
     )
     # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
     assert size == 8 and pages == 40 and overlap is True
+
+
+def test_resolve_auto_reserves_usable_tokens_beyond_the_dummy_page():
+    size, pages, overlap = resolve_moe_cache_auto(
+        baseline_free=940,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=2,
+        total_experts=50,
+        prefill_overlap=False,
+        kv_reserve_tokens=256,
+        page_size=64,
+    )
+    assert overlap is False
+    assert (pages - 1) * 64 >= 256
+    assert size == 8 and pages == 14
 
 
 def test_resolve_auto_caps_slots_at_the_kernel_limit():
@@ -266,7 +322,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -293,6 +349,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        num_page_override = 64
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -314,28 +371,31 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     engine._weights_bytes = 1_000_000
     engine._pool_cls = MHAKVCache  # __init__ skipped -> install the generic pool family
 
-    size, pages, overlap = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+    captured = {}
 
-    # cross-check against the same pure functions, proving the kwarg mapping is faithful
-    from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
-    from freetoken.kvcache.mha_pool import MHAKVCache
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 8, 64, True
 
-    cache_per_page, fixed, _, _ = MHAKVCache.kv_cost(StubConfig())
-    expected = resolve_moe_cache_auto(
-        baseline_free=10_000_000, weights_bytes=1_000_000, memory_ratio=0.9,
-        cache_per_page=cache_per_page, fixed_cache_size=fixed,
-        per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=16,
+    monkeypatch.setattr(
+        "freetoken.engine.cache_budget.resolve_moe_cache_auto", fake_resolve
     )
-    assert (size, pages, overlap) == expected
+    got = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+
+    assert got == (8, 64, True)
+    assert captured["kv_reserve_tokens"] == 64 * 16
+    assert captured["page_size"] == 16
+    assert captured["num_experts"] == 4
+    assert captured["total_experts"] == 8
+    assert captured["per_expert_bytes"] == 512 + 256
 
     class StubMethod:
         def slot_limit(self):
             return 5
 
-    size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
-    assert size == 5
+    # the kernel's slot limit rides the same mapping (fork #20)
+    engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
+    assert captured["max_slots"] == 5
 
 
 # ---------------------------------------------------------------------------

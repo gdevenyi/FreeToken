@@ -49,6 +49,12 @@ class ServerArgs(SchedulerConfig):
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
+    # Server-wide default thinking mode for reasoning-capable models: "auto" keeps the
+    # current per-request behavior; "chat" forces enable_thinking=False for every request
+    # that does not explicitly set it in chat_template_kwargs (for OpenAI-compatible
+    # clients that never send template kwargs, like Vercel AI SDK or llama-swap);
+    # "thinking" forces thinking on the same way.
+    default_thinking_mode: str = "auto"
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
@@ -601,6 +607,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--default-thinking-mode",
+        type=str,
+        default=ServerArgs.default_thinking_mode,
+        choices=["auto", "chat", "thinking"],
+        help=(
+            "Server-wide default thinking mode for reasoning-capable models. 'auto' keeps "
+            "the current per-request behavior; 'chat' forces enable_thinking=False for "
+            "every request that does not explicitly set it in chat_template_kwargs (for "
+            "OpenAI-compatible clients that never send template kwargs, like Vercel AI SDK "
+            "or llama-swap); 'thinking' forces thinking on the same way."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-strategy",
         default=ServerArgs.moe_strategy,
         choices=["auto", *MOE_STRATEGIES],
@@ -691,7 +711,10 @@ def parse_args(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
-        help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+        help=(
+            "Usable KV-cache token floor reserved before --moe-cache-auto fills experts "
+            "(the internal dummy page is additional)."
+        ),
     )
 
     parser.add_argument(
@@ -886,16 +909,26 @@ def parse_args(
     if is_offload_moe_strategy(kwargs["moe_strategy"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
 
-    if kwargs["model_source"] == "modelscope":
-        model_path = kwargs["model_path"]
-        if not os.path.isdir(model_path):
+    # Resolve a hub repo id ("org/model") to a local checkpoint directory. This has to
+    # happen here, after served_model_name and the parser cascade have read the repo id
+    # (they want "DeepSeek-V4-Flash-0731", not a snapshot hash) and before anything opens
+    # the checkpoint: config parsing reads model-specific files straight off disk, so a
+    # bare repo id reaches `open()` as a relative path and dies with a FileNotFoundError.
+    model_path = kwargs["model_path"]
+    if not os.path.isdir(model_path):
+        if kwargs["model_source"] == "modelscope":
             from modelscope import snapshot_download
 
             ignore_patterns = []
             if kwargs["use_dummy_weight"]:
                 ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
-            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
-            kwargs["model_path"] = model_path
+            kwargs["model_path"] = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+        else:
+            from freetoken.utils import download_hf_checkpoint
+
+            kwargs["model_path"] = download_hf_checkpoint(
+                model_path, dummy_weight=kwargs["use_dummy_weight"]
+            )
     del kwargs["model_source"]
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /

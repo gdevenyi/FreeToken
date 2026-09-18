@@ -639,7 +639,11 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=max(
+                config.kv_reserve_tokens,
+                min_reserve,
+                (config.num_page_override or 0) * page_tokens,
+            ),
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
@@ -713,6 +717,11 @@ class Engine:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
+            if config.moe_prefill_overlap and not overlap:
+                logger.info_rank0(
+                    f"--moe-cache-auto: prefill overlap disabled, its {2 * config.model_config.num_experts} "
+                    "slot floor does not fit beside the KV reserve"
+                )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -765,9 +774,8 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         # The routing histogram rides the same switch: on its own the miss rate says how
         # often we fetch, but not whether a smarter policy could have avoided the fetch.
-        # decode_routing_stats turns it into an oracle hit rate -- the ceiling any policy
-        # holding this many slots could reach on the observed routing -- which is the number
-        # worth having before anyone rewrites eviction.
+        # decode_routing_stats turns it into routing-skew numbers, including the hit rate of
+        # the best fixed expert set per layer (not a ceiling: LRU's temporal locality can beat it).
         cache.collect_decode_freq = config.moe_collect_stats
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
@@ -908,6 +916,40 @@ class Engine:
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
         self.kv_cache.attach_page_table(self.page_table)
 
+    def _resize_pools(
+        self, config, moe_cache_size: int | None, num_pages: int | None,
+        num_mamba_slots: int | None, num_swa_pages: int | None,
+    ) -> None:
+        """Resize the requested pools, shrinking ones first.
+
+        Each pool frees its own tensors before allocating, but a pool that grows ahead of one
+        that shrinks needs both geometries resident at once: on a nearly full card that OOMs
+        a resize whose final total fits (MoE 512 -> 1024 slots with KV 262K -> 64K tokens)."""
+        steps = []  # (shrinks, resize)
+        if moe_cache_size is not None:
+            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            steps.append((
+                moe_cache_size < self.moe_offload_cache.cache_size,
+                lambda: self.moe_offload_cache.rebuild(moe_cache_size),
+            ))
+        if num_pages is not None or num_swa_pages is not None:
+            # A window-only change (num_pages None) re-derives the window pool at the new pin
+            # against the CURRENT page count; _resize_kv_pool sets self.num_pages either way.
+            pages = num_pages if num_pages is not None else self.num_pages
+            steps.append((
+                pages < self.num_pages,
+                lambda: self._resize_kv_pool(config, pages, num_swa_pages),
+            ))
+        if num_mamba_slots is not None:
+            # Must sit between graph teardown and re-capture so the recaptured graphs bind the new
+            # state tensors. +1 for the reserved padding sink: num_mamba_slots is the usable count.
+            steps.append((
+                num_mamba_slots + 1 < self.linear_state_pool.num_slots,
+                lambda: self.linear_state_pool.rebuild(num_mamba_slots + 1),
+            ))
+        for _, resize in sorted(steps, key=lambda step: not step[0]):
+            resize()
+
     @torch.inference_mode()
     def rebuild_runtime_cache(
         self,
@@ -1017,22 +1059,7 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
-        if moe_cache_size is not None:
-            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            self.moe_offload_cache.rebuild(moe_cache_size)
-        if num_pages is not None:
-            # sets self.num_pages (rebuilds KV + window)
-            self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
-            # Window-only change: no page-count change, but re-derive the window pool at the new
-            # pin against the CURRENT page count. This re-allocs the same-size full pool and
-            # the resized window, both inside the pool's own rebuild_from_config.
-            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
-        if num_mamba_slots is not None:
-            # Reallocate the GDN state pool (frees old tensors first). Must sit between graph
-            # teardown and re-capture so the recaptured graphs bind the new state tensors.
-            # +1 for the reserved padding sink: num_mamba_slots is the usable count.
-            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+        self._resize_pools(config, moe_cache_size, num_pages, num_mamba_slots, num_swa_pages)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
@@ -1122,8 +1149,8 @@ class Engine:
         Accumulation is device-side and captured into the decode graph, so it is free to
         leave running; reading it is not (the counters have to come back to the host), which
         is why this only fires every MOE_STATS_INTERVAL decode steps. The routing histogram
-        is deliberately *not* reset -- the oracle bound wants the whole run's distribution,
-        not one window's.
+        is deliberately *not* reset -- it describes the whole run's distribution, not one
+        window's, so the static top-k figure flattens as a session covers more topics.
         """
         cache = self.moe_offload_cache
         agg = cache.decode_miss_stats()
@@ -1149,14 +1176,12 @@ class Engine:
             )
         routing = cache.decode_routing_stats()
         if routing:
-            # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
-            # many slots per layer. If it sits near the realized hit rate, the cache is
-            # already doing as well as the routing allows and the win has to come from
-            # somewhere else (more slots, more bandwidth); if it sits far above, eviction
-            # policy is leaving something on the table.
+            # static_topk_hit is what pinning each layer's most frequent experts would score over
+            # the whole run. A realized hit rate above it means the cache is winning on temporal
+            # locality; it says nothing about how close to optimal eviction is.
             logger.info_rank0(
                 "MoE routing: "
-                f"oracle_hit={routing['oracle_hit_at_slots']:.3f} "
+                f"static_topk_hit={routing['static_topk_hit_at_slots']:.3f} "
                 f"(realized {1.0 - agg['miss_rate']:.3f}), "
                 f"slots/layer={routing['slots_per_layer']:.1f}, "
                 f"working_set={routing['working_set_mean']:.1f}"

@@ -352,7 +352,7 @@ class Scheduler(SchedulerIOMixin):
                 hit_length = not req.can_decode
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
+                ) or next_token in req.sampling_params.stop_token_ids
                 matched_stop = (
                     self._match_stop_str(req)
                     if not hit_eos and req.sampling_params.stop_strs
@@ -378,6 +378,8 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        keep_stop_str=req.sampling_params.include_stop_str_in_output,
+                        skip_special_tokens=req.sampling_params.skip_special_tokens,
                     )
                 )
 
@@ -511,10 +513,17 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
+            # max_seq_len is the model's advertised context, which can far exceed the
+            # KV pool actually allocated (see issue #111): a prompt that passes this
+            # check but can never be granted enough pages is queued forever with no
+            # error and no log line. Clamp admission to the real pool so oversized
+            # prompts fail loudly with the same error clients already understand.
+            pool_tokens = self.engine.num_pages * self.config.page_size
+            effective_max = min(max_seq_len, pool_tokens)
+            max_output_len = effective_max - input_len
             if max_output_len <= 0:
                 logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                    f"Input sequence length {input_len} exceeds {effective_max}, "
                     f"request {msg.uid} is dropped."
                 )
                 # Tell the client instead of dropping silently — otherwise its wait_for_ack
@@ -526,7 +535,7 @@ class Scheduler(SchedulerIOMixin):
                             # "prompt is too long: N tokens > M" is the phrasing Claude Code and
                             # OpenClaw match on; the Anthropic wire has no error code to read.
                             error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
+                                f"prompt is too long: {input_len} tokens > {effective_max} maximum "
                                 f"(prompt + generation); shorten the prompt or increase the KV "
                                 f"cache budget"
                             ),
@@ -541,6 +550,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            sp = msg.sampling_params
+            if sp.min_tokens > 0:
+                # min_tokens: the sampler masks these ids while the output is shorter.
+                sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
+                sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
