@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -78,7 +79,7 @@ class EngineConfig:
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
-    linear_state_cache_ratio: float = 2.0
+    linear_state_cache_ratio: float = float(os.environ.get("FT_LINEAR_STATE_CACHE_RATIO", "2.0"))
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
