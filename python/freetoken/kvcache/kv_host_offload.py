@@ -33,10 +33,24 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 
+def _reject_block_scaled_pool(pool, knob: str) -> None:
+    """The host mirrors carry codes plus the fp8 pool's per-token scales; an nvfp4 pool
+    (--kv-cache-dtype nvfp4) keeps per-block scales in _block_scale_buffer, which no mirror
+    copies, so a rehydrated page would be codes without scales. Refuse instead of decoding
+    garbage."""
+    if getattr(pool, "_block_scale_buffer", None) is not None:
+        raise ValueError(
+            f"{knob} needs a KV pool with per-token scales (bf16 or fp8); the nvfp4 pool keeps "
+            "block scales the host mirror does not carry -- leave the tier off or serve with "
+            "--kv-cache-dtype fp8"
+        )
+
+
 class KVHostOffloader:
     """GPU-slot LRU cache over the pinned host mirror of the logical KV page space."""
 
     def __init__(self, pool, num_logical_pages: int, device: torch.device) -> None:
+        _reject_block_scaled_pool(pool, "--kv-host-pages")
         buf = pool._kv_buffer  # [2, L, P_gpu + 1, page_size, kv_heads, head_dim]
         assert buf.shape[0] == 2 and buf.is_contiguous()
         _, num_layers, num_slots, page_size, kv_heads, head_dim = buf.shape
