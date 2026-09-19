@@ -79,6 +79,9 @@ class HostPrefixTier:
         self._kv_scales: HostBank | None = None
         self._kv_free: list[int] = []
         if kv_pool is not None and kv_budget_bytes > 0:
+            from freetoken.kvcache.kv_host_offload import _reject_block_scaled_pool
+
+            _reject_block_scaled_pool(kv_pool, "FT_PREFIX_HOST")
             codes = kv_pool._kv_buffer            # [2, L, P, page, H, D]
             scales = kv_pool._scale_buffer        # [2, L, P*page, H] | None (fp8)
             _, layers, _, page_size, heads, dim = codes.shape
