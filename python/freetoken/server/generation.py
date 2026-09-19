@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -24,6 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -43,256 +43,14 @@ from .reasoning_parser import (
 )
 
 
-# Qwen's decoder intentionally keeps protocol markers visible so reasoning and
-# tool-call parsers can consume their (non-special-token) tags.  At the semantic
-# API waist, after those parsers, only transport/internal multimodal markers are
-# suppressed.  Grounding markers (object_ref/box/quad), think tags, tool tags,
-# and FIM/repository markers are deliberately absent from this list.
-_QWEN_SEMANTIC_HIDDEN_TOKENS = (
-    "<|endoftext|>",
-    "<|im_start|>",
-    "<|im_end|>",
-    "<|vision_start|>",
-    "<|vision_end|>",
-    "<|vision_pad|>",
-    "<|image_pad|>",
-    "<|video_pad|>",
-    "<|audio_start|>",
-    "<|audio_end|>",
-    "<|audio_pad|>",
-    "<tts_pad>",
-    "<tts_text_bos>",
-    "<tts_text_eod>",
-    "<tts_text_bos_single>",
-)
-
-
-def _uses_qwen_semantic_protocol(state: Any) -> bool:
-    """Whether this server is configured for a Qwen semantic output dialect.
-
-    Parser selection is the stable frontend-visible family signal available in
-    ``ServerArgs``.  Either half is enough because users may explicitly disable
-    reasoning or omit tools for an individual request.
-    """
-    config = state.config
-    return (
-        getattr(config, "reasoning_parser", None) == "qwen3"
-        or getattr(config, "tool_call_parser", None) in {"qwen", "qwen25", "qwen3_coder"}
-    )
-
-
-class _SemanticSpecialTokenFilter:
-    """Request-local, chunk-safe suppression of semantic protocol markers.
-
-    A proper marker prefix is retained until the next detokenizer delta, so a
-    marker split at any byte boundary cannot leak. A marker inside a quoted/code
-    literal is retained only once the matching closer arrives; an unclosed quote
-    is sanitized at end-of-stream. Structured events can be held inside either
-    ambiguity so their ordering relative to surrounding content stays exact.
-    """
-
-    def __init__(self, tokens: tuple[str, ...]) -> None:
-        self._tokens = tokens
-        self._quote: str | None = None
-        self._escaped = False
-        self._last_char = ""
-        self._candidate_text = ""
-        self._candidate_items: list[Any] = []
-        self._candidate_quoted = False
-        self._literal_items: list[Any] | None = None
-
-    @staticmethod
-    def _append_item(items: list[Any], item: Any) -> None:
-        if item == "":
-            return
-        if isinstance(item, str) and items and isinstance(items[-1], str):
-            items[-1] += item
-        else:
-            items.append(item)
-
-    @classmethod
-    def _strip_items(cls, items: list[Any], tokens: tuple[str, ...]) -> list[Any]:
-        """Strip markers across text segments while preserving event positions."""
-        out: list[Any] = []
-        candidate_text = ""
-        candidate_items: list[Any] = []
-
-        def flush(*, keep_text: bool) -> None:
-            nonlocal candidate_text, candidate_items
-            for pending in candidate_items:
-                if keep_text or not isinstance(pending, str):
-                    cls._append_item(out, pending)
-            candidate_text = ""
-            candidate_items = []
-
-        for item in items:
-            if not isinstance(item, str):
-                if candidate_text:
-                    cls._append_item(candidate_items, item)
-                else:
-                    cls._append_item(out, item)
-                continue
-            index = 0
-            while index < len(item):
-                ch = item[index]
-                if not candidate_text:
-                    if any(token.startswith(ch) for token in tokens):
-                        candidate_text = ch
-                        cls._append_item(candidate_items, ch)
-                    else:
-                        cls._append_item(out, ch)
-                    index += 1
-                    continue
-                extended = candidate_text + ch
-                if extended in tokens:
-                    candidate_text = extended
-                    cls._append_item(candidate_items, ch)
-                    flush(keep_text=False)
-                    index += 1
-                elif any(token.startswith(extended) for token in tokens):
-                    candidate_text = extended
-                    cls._append_item(candidate_items, ch)
-                    index += 1
-                else:
-                    flush(keep_text=True)
-        flush(keep_text=True)
-        return out
-
-    def _start_candidate(self, ch: str, *, quoted: bool) -> None:
-        self._candidate_text = ch
-        self._candidate_items = [ch]
-        self._candidate_quoted = quoted
-
-    def _extend_candidate(self, ch: str) -> tuple[list[Any], bool]:
-        extended = self._candidate_text + ch
-        if extended in self._tokens:
-            self._candidate_text = extended
-            self._append_item(self._candidate_items, ch)
-            if self._candidate_quoted:
-                self._literal_items = self._candidate_items
-                out: list[Any] = []
-            else:
-                out = [item for item in self._candidate_items if not isinstance(item, str)]
-            self._candidate_text = ""
-            self._candidate_items = []
-            self._candidate_quoted = False
-            return out, True
-        if any(token.startswith(extended) for token in self._tokens):
-            self._candidate_text = extended
-            self._append_item(self._candidate_items, ch)
-            return [], True
-        out = self._candidate_items
-        self._last_char = self._candidate_text[-1]
-        self._candidate_text = ""
-        self._candidate_items = []
-        self._candidate_quoted = False
-        return out, False
-
-    def feed_items(self, text: str, *, final: bool = False) -> list[Any]:
-        if not self._tokens:
-            return [text] if text else []
-        out: list[Any] = []
-        index = 0
-        while index < len(text):
-            ch = text[index]
-            if self._literal_items is not None:
-                self._append_item(self._literal_items, ch)
-                if self._escaped:
-                    self._escaped = False
-                elif ch == "\\":
-                    self._escaped = True
-                elif ch == self._quote:
-                    out.extend(self._literal_items)
-                    self._literal_items = None
-                    self._quote = None
-                self._last_char = ch
-                index += 1
-                continue
-
-            if self._candidate_text:
-                emitted, consumed = self._extend_candidate(ch)
-                out.extend(emitted)
-                if consumed:
-                    index += 1
-                continue
-
-            if self._quote is not None:
-                if any(token.startswith(ch) for token in self._tokens):
-                    self._escaped = False
-                    self._start_candidate(ch, quoted=True)
-                    index += 1
-                    continue
-                if self._escaped:
-                    self._escaped = False
-                elif ch == "\\":
-                    self._escaped = True
-                elif ch == self._quote:
-                    self._quote = None
-                self._append_item(out, ch)
-                self._last_char = ch
-                index += 1
-                continue
-
-            opens_quote = ch in {'"', "`", "“", "‘"} or (
-                ch == "'" and not self._last_char.isalnum()
-            )
-            if opens_quote:
-                self._quote = {"“": "”", "‘": "’"}.get(ch, ch)
-                self._append_item(out, ch)
-            elif any(token.startswith(ch) for token in self._tokens):
-                self._start_candidate(ch, quoted=False)
-                index += 1
-                continue
-            else:
-                self._append_item(out, ch)
-            self._last_char = ch
-            index += 1
-
-        if final:
-            if self._literal_items is not None:
-                out.extend(self._strip_items(self._literal_items, self._tokens))
-                self._literal_items = None
-            elif self._candidate_text:
-                out.extend(self._candidate_items)
-            self._candidate_text = ""
-            self._candidate_items = []
-            self._candidate_quoted = False
-            self._quote = None
-            self._escaped = False
-        return out
-
-    def feed(self, text: str, *, final: bool = False) -> str:
-        items = self.feed_items(text, final=final)
-        assert all(isinstance(item, str) for item in items)
-        return "".join(items)
-
-    def boundary(self, item: Any) -> list[Any]:
-        if self._literal_items is not None:
-            self._append_item(self._literal_items, item)
-            return []
-        if self._candidate_text:
-            self._append_item(self._candidate_items, item)
-            return []
-        return [item]
-
-    def finish(self) -> str:
-        return self.feed("", final=True)
-
-    def finish_items(self) -> list[Any]:
-        return self.feed_items("", final=True)
-
-
-def _make_semantic_special_token_filter(state: Any) -> _SemanticSpecialTokenFilter:
-    tokens = _QWEN_SEMANTIC_HIDDEN_TOKENS if _uses_qwen_semantic_protocol(state) else ()
-    return _SemanticSpecialTokenFilter(tokens)
-
-
-class GenerationError(Exception):
+class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
     adapter turns this into its own wire-level error instead of hanging on a reply that never
     arrives. ``code`` carries the stable class (``UserReply.error_code``) when the failure has
-    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose."""
+    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose.
+
+    Subclasses ValueError so every adapter's invalid-request handler maps it to a 400."""
 
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
@@ -408,6 +166,9 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -422,22 +183,15 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
-    resolved_temperature = pick(temperature, "temperature", 0.0)
-    if not math.isfinite(resolved_temperature) or resolved_temperature < 0:
-        raise ValueError(f"temperature must be a finite number >= 0, got {resolved_temperature}")
-    resolved_top_p = pick(top_p, "top_p", 1.0)
-    if not math.isfinite(resolved_top_p) or not 0 < resolved_top_p <= 1:
-        raise ValueError(f"top_p must be in (0, 1], got {resolved_top_p}")
-    resolved_top_k = pick(top_k, "top_k", -1)
-    if resolved_top_k != -1 and resolved_top_k < 1:
-        raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {resolved_top_k}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
-        temperature=resolved_temperature,
-        top_k=resolved_top_k,
-        top_p=resolved_top_p,
+        max_tokens=default_max_tokens if max_tokens is None else max_tokens,
+        temperature=pick(temperature, "temperature", 0.0),
+        top_k=pick(top_k, "top_k", -1),
+        top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
     )
 
 
@@ -484,15 +238,41 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
-    texts: list[str] = []
+def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    """Plain string for text-only parts; a template-ready part list with {"type": "image"} entries (source kept under freetoken_ref) when images are present."""
+    out: list[dict[str, Any]] = []
+    has_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
-            texts.append((part.get("text") if isinstance(part, dict) else None) or "")
+            out.append({"type": "text", "text": part.get("text") or ""})
+        elif ptype in ("image_url", "input_image"):
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            url = url or part.get("url")
+            if not url:
+                raise ValueError("image content part carries no url")
+            out.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+        elif ptype == "image" and isinstance(part.get("freetoken_ref"), dict):
+            out.append(part)
+            has_image = True
         else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
-    return "".join(texts)
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    if not has_image:
+        return "".join(p["text"] for p in out)
+    return out
+
+
+async def _resolve_images(refs: list[dict[str, Any]], state: Any) -> list[bytes]:
+    """Gate and fetch a request's images; every failure is a GenerationError."""
+    if reason := image_reject_reason(state.config):
+        raise GenerationError(reason)
+    try:
+        return await fetch_image_bytes(refs, state.config)
+    except ValueError as exc:
+        raise GenerationError(str(exc)) from exc
 
 
 def split_tool_lists(
@@ -515,6 +295,8 @@ def split_tool_lists(
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    refs = collect_image_refs(spec.messages)
+    images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -523,6 +305,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=images,
         )
     )
     return uid
@@ -546,19 +329,22 @@ async def count_prompt_tokens(
     class the generation path maps to a 400. A tokenizer *initialization* failure (missing
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
+    refs = collect_image_refs(messages)
+    images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
         text=messages,
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        images=images,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
-        input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
+        (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
-    return int(input_ids.numel())
+    return int(user_msg.input_ids.numel())
 
 
 async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
@@ -816,14 +602,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
     specials = _leaked_special_tokens(state)
-    reasoning_special_filter = _make_semantic_special_token_filter(state)
-    content_special_filter = _make_semantic_special_token_filter(state)
-
-    def _filter_reasoning(piece: str) -> str:
-        return reasoning_special_filter.feed(strip_special_tokens(piece, specials))
-
-    def _filter_content(piece: str) -> str:
-        return content_special_filter.feed(strip_special_tokens(piece, specials))
 
     tool_parser: FunctionCallParser | None = None
     if parse_tools:
@@ -845,28 +623,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     # chunk is a legitimate word gap.
     suppress_ws = False
 
-    def _semantic_content_events(items: list[Any]) -> list[GenEvent]:
-        nonlocal suppress_ws
-        out: list[GenEvent] = []
-        for item in items:
-            if isinstance(item, str):
-                if item and not (item.strip() == "" and suppress_ws):
-                    out.append(ContentDelta(item))
-                    if item.strip():
-                        suppress_ws = False
-            else:
-                out.append(item)
-                if isinstance(item, ToolCallsDelta):
-                    suppress_ws = True
-        return out
-
-    def _filter_tool_text(piece: str) -> list[GenEvent]:
-        text = strip_special_tokens(piece, specials)
-        return _semantic_content_events(content_special_filter.feed_items(text))
-
-    def _filter_tool_boundary(event: GenEvent) -> list[GenEvent]:
-        return _semantic_content_events(content_special_filter.boundary(event))
-
     def _close_open_call() -> ToolCallsDelta | None:
         nonlocal open_call, calls_emitted
         if open_call is None:
@@ -882,6 +638,8 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         )
         open_call = None
         calls_emitted += 1
+        nonlocal suppress_ws
+        suppress_ws = True
         return ToolCallsDelta([call])
 
     def _route_tool_text(piece: str) -> list[GenEvent]:
@@ -895,8 +653,12 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                 # close it first so wire order matches generation order.
                 done = _close_open_call()
                 if done is not None:
-                    out.extend(_filter_tool_boundary(done))
-                out.extend(_filter_tool_text(payload))
+                    out.append(done)
+                stripped = strip_special_tokens(payload, specials)
+                if stripped and not (stripped.strip() == "" and suppress_ws):
+                    out.append(ContentDelta(stripped))
+                    if stripped.strip():
+                        suppress_ws = False
                 continue
             for frag in payload:
                 starts_new = frag.name is not None and (
@@ -905,7 +667,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                 if starts_new:
                     done = _close_open_call()
                     if done is not None:
-                        out.extend(_filter_tool_boundary(done))
+                        out.append(done)
                 if open_call is None or starts_new:
                     open_call = {
                         "detector_index": frag.tool_index,
@@ -913,16 +675,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                         "params": "",
                         "ordinal": calls_emitted,
                     }
-                    out.extend(_filter_tool_boundary(ToolCallStart(
-                        tool_index=calls_emitted,
-                        name=frag.name,
-                        args_prefix_stable=frag_stable,
-                    )))
+                    out.append(ToolCallStart(
+                        tool_index=calls_emitted, name=frag.name, args_prefix_stable=frag_stable,
+                    ))
                 if frag.parameters:
                     open_call["params"] += frag.parameters
-                    out.extend(_filter_tool_boundary(
+                    out.append(
                         ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
-                    ))
+                    )
         return out
 
     engine_finish_reason: str | None = None
@@ -937,7 +697,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
             if reasoning_delta:
-                stripped_reasoning = _filter_reasoning(reasoning_delta)
+                stripped_reasoning = strip_special_tokens(reasoning_delta, specials)
                 if stripped_reasoning:  # a bare special token must not open a thinking block
                     yield ReasoningDelta(stripped_reasoning)
         if content_delta:
@@ -947,9 +707,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += content_delta
             else:
-                stripped_content = _filter_content(content_delta)
-                if stripped_content:
-                    yield ContentDelta(stripped_content)
+                yield ContentDelta(strip_special_tokens(content_delta, specials))
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -960,7 +718,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     if reasoning_parser is not None:
         flush_reasoning, flush_content = reasoning_parser.flush()
         if flush_reasoning:
-            stripped_reasoning = _filter_reasoning(flush_reasoning)
+            stripped_reasoning = strip_special_tokens(flush_reasoning, specials)
             if stripped_reasoning:
                 yield ReasoningDelta(stripped_reasoning)
         if flush_content:
@@ -970,9 +728,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += flush_content
             else:
-                stripped_content = _filter_content(flush_content)
-                if stripped_content:
-                    yield ContentDelta(stripped_content)
+                yield ContentDelta(strip_special_tokens(flush_content, specials))
 
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -986,60 +742,35 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         for frag in tool_parser.finalize_stream():
             if open_call is not None and frag.parameters:
                 open_call["params"] += frag.parameters
-                for ev in _filter_tool_boundary(
-                    ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
-                ):
-                    yield ev
+                yield ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
         done = _close_open_call()
         if done is not None:
-            for ev in _filter_tool_boundary(done):
-                yield ev
+            yield done
         for item in tool_parser.recover_truncated_call():
-            recovered = [
-                ToolCallStart(tool_index=calls_emitted, name=item.name),
-                ToolCallsDelta([
-                    ToolCallItem(
-                        tool_index=calls_emitted,
-                        name=item.name,
-                        parameters=item.parameters,
-                    )
-                ]),
-            ]
-            for event in recovered:
-                for ev in _filter_tool_boundary(event):
-                    yield ev
+            yield ToolCallStart(tool_index=calls_emitted, name=item.name)
+            yield ToolCallsDelta(
+                [ToolCallItem(tool_index=calls_emitted, name=item.name, parameters=item.parameters)]
+            )
             calls_emitted += 1
         residual = tool_parser.finish_stream()
         if residual:
-            for ev in _filter_tool_text(residual):
-                yield ev
+            stripped = strip_special_tokens(residual, specials)
+            if stripped and not (stripped.strip() == "" and suppress_ws):
+                yield ContentDelta(stripped)
         if calls_emitted and finish_reason != "length":
             finish_reason = "tool_calls"
     else:
         parsed = _parse_tool_response(pending, spec, state) if parse_tools else None
         if parsed is not None:
             normal_text, tool_calls = parsed
-            normal_text = _filter_content(normal_text)
+            normal_text = strip_special_tokens(normal_text, specials)
             if normal_text:
                 yield ContentDelta(normal_text)
             yield ToolCallsDelta(tool_calls)
             if finish_reason != "length":
                 finish_reason = "tool_calls"
         elif parse_tools and pending:
-            stripped_pending = _filter_content(pending)
-            if stripped_pending:
-                yield ContentDelta(stripped_pending)
-
-    trailing_reasoning = reasoning_special_filter.finish()
-    if trailing_reasoning:
-        yield ReasoningDelta(trailing_reasoning)
-    if tool_parser is not None:
-        for ev in _semantic_content_events(content_special_filter.finish_items()):
-            yield ev
-    else:
-        trailing_content = content_special_filter.finish()
-        if trailing_content:
-            yield ContentDelta(trailing_content)
+            yield ContentDelta(strip_special_tokens(pending, specials))
 
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
@@ -1079,15 +810,9 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
-    reasoning_special_filter = _make_semantic_special_token_filter(state)
-    content_special_filter = _make_semantic_special_token_filter(state)
     return GenResult(
-        reasoning=reasoning_special_filter.feed(
-            strip_special_tokens(reasoning_text, specials), final=True
-        ).strip(),
-        content=content_special_filter.feed(
-            strip_special_tokens(content_text, specials), final=True
-        ),
+        reasoning=strip_special_tokens(reasoning_text, specials).strip(),
+        content=strip_special_tokens(content_text, specials),
         tool_calls=tool_calls,
         finish_reason=finish_reason,
         prompt_tokens=prompt_tokens,
