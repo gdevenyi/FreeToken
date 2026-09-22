@@ -29,7 +29,7 @@ from enum import Enum
 
 import torch
 
-from freetoken.utils import init_logger
+from freetoken.utils import init_logger, numa
 
 logger = init_logger(__name__)
 
@@ -101,7 +101,9 @@ class HostBank:
 
             # direct-IO readers need page alignment, but cudaHostAlloc only guarantees ~512 in practice
             # over-allocate one block and carve the aligned window; the numpy slice keeps the pinned storage alive via .base
-            raw = alloc_pinned_tensor(asize + _BLK, dtype=torch.uint8)  # cudaMallocHost
+            # cudaHostAlloc faults + pins here, so the thread policy is the only placement lever
+            with numa.allocating_on_node(numa.moe_pool_numa_node()):
+                raw = alloc_pinned_tensor(asize + _BLK, dtype=torch.uint8)  # cudaMallocHost
             raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
             off = (-raw.data_ptr()) % _BLK
             self._buf = raw.numpy()[off:off + asize]
@@ -112,6 +114,12 @@ class HostBank:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            # Ask for the CPU MoE pool's node *before* the fill faults these pages in --
+            # pin-after-fill means nothing is resident yet, which is the only moment
+            # placement is free. Without it the pages land wherever the loader threads
+            # happen to run and the confined worker pool reads half its bytes remote.
+            # A preference, not a reservation: a full node spills instead of OOM-ing.
+            numa.prefer_node(self.addr, len(self._buf), numa.moe_pool_numa_node())
             self._pinned = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
