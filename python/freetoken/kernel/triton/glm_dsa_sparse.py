@@ -498,9 +498,9 @@ def glm_dsa_sparse_attn(
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=block_t,
             HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, HAS_FP8=has_fp8, HAS_NVFP4=has_nvfp4, NUM_SPLITS=n_splits,
-            # The 512-wide latent accumulator exceeds the 99 KiB shared-memory
-            # limit of consumer Blackwell GPUs with a two-stage pipeline.
-            num_warps=4, num_stages=1,
+            # Consumer Blackwell caps kernel shared memory at 99 KiB. Single-stage, the float path
+            # needs 100 KiB; two stages (its setting before quantized KV) fit.
+            num_warps=4, num_stages=1 if has_fp8 or has_nvfp4 else 2,
         )
         grid2 = (m, b, h)
         _glm_dsa_merge_kernel[grid2](
@@ -527,7 +527,8 @@ def glm_dsa_sparse_attn(
         D_V=d_v, D_R=d_r,
         BLOCK_H=BLOCK_H, BLOCK_T=block_t,
         HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, HAS_FP8=has_fp8, HAS_NVFP4=has_nvfp4,
-        num_warps=4, num_stages=1,
+        # same shared-memory split as the split-k launch above
+        num_warps=4, num_stages=1 if has_fp8 or has_nvfp4 else 2,
     )
     return o
 
