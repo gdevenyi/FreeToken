@@ -979,10 +979,10 @@ class OffloadMoeCache:
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
-        Uses the histogram from ``collect_decode_freq``. The ``oracle_hit`` is the best a
-        per-layer LRU holding ``cache_size/num_layers`` slots could achieve on the observed
-        (stationary) routing distribution -- i.e. an upper bound on hit rate that depends
-        purely on how skewed routing is, independent of any LRU/LFU dynamics.
+        Uses the histogram from ``collect_decode_freq``. ``static_topk_hit_at_slots`` is the
+        hit rate of the best *fixed* expert set: each layer's ``cache_size/num_layers`` (rounded)
+        most frequent experts over the whole histogram. It measures routing skew only. It is
+        not an upper bound on a dynamic cache: LRU exploits temporal locality and can beat it.
         """
         freq = self.decode_freq.float()
         total = freq.sum(dim=1)
@@ -992,7 +992,7 @@ class OffloadMoeCache:
         slots_per_layer = self.cache_size / self.num_layers
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
-        oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
+        static_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
         ws = (freq > 0).sum(dim=1).float()
         cdf = torch.cumsum(sorted_f, dim=1) / total.clamp(min=1).unsqueeze(1)
         cover90 = ((cdf < 0.9).sum(dim=1).float() + 1)[valid]
@@ -1004,7 +1004,7 @@ class OffloadMoeCache:
             "working_set_mean": ws[valid].mean().item(),
             "working_set_max": int(ws[valid].max().item()),
             "experts_for_90pct": cover90.mean().item(),
-            "oracle_hit_at_slots": oracle_hit,
+            "static_topk_hit_at_slots": static_hit,
             "norm_entropy": norm_ent,
         }
 
