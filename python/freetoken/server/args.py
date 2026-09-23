@@ -810,6 +810,16 @@ def parse_args(
             "decode batch to its slots / top_k."
         ),
     )
+    parser.add_argument(
+        "--kv-host-pages",
+        type=int,
+        default=ServerArgs.kv_host_pages,
+        help=(
+            "Extra KV pages mirrored to pinned host RAM (QSA models): the GPU pool becomes "
+            "an LRU cache over the logical page space, extending context past VRAM capacity. "
+            "0 = off."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-policy",
