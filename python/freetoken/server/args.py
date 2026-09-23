@@ -66,6 +66,10 @@ class ServerArgs(SchedulerConfig):
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
     anthropic_inline_system: str = "auto"
+    # Serve a per-request `metrics` object (TTFT, prefill/decode times and throughputs,
+    # prefix-cache hit) alongside usage. Off by default: it is a non-standard field on
+    # every protocol we speak.
+    enable_metrics_report: bool = False
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
     # Directory file:// image refs may be read from; empty rejects local files.
@@ -567,6 +571,22 @@ def parse_args(
         default=ServerArgs.anthropic_inline_system,
         help="Preserve inline system instructions when supported by the renderer, "
         "or fold them into nearby user/tool content without hoisting the prompt prefix.",
+    )
+
+    parser.add_argument(
+        "--enable-metrics-report",
+        action="store_true",
+        default=ServerArgs.enable_metrics_report,
+        help=(
+            "Serve a per-request `metrics` object next to usage on /v1/chat/completions, "
+            "/v1/completions, /v1/messages and /v1/responses: ttft_ms, prefill_time_ms and "
+            "prefill_tokens_per_second (the prefill span measured by the scheduler itself), "
+            "decode_time_ms and decode_tokens_per_second, cached_prompt_tokens and "
+            "total_time_ms. Streaming responses carry it on the same final chunk as usage, so "
+            "the request must also ask for usage (OpenAI stream_options.include_usage). "
+            "Non-standard on every protocol, hence opt-in. Under concurrency the spans are "
+            "this request's share of shared batches, not isolated engine throughput."
+        ),
     )
 
     parser.add_argument(
