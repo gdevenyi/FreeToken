@@ -32,12 +32,15 @@ from .generation import (
     GenDone,
     GenerationError,
     GenSpec,
+    GenTimings,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    build_metrics,
     generate_events,
     generate_full,
+    metrics_enabled,
     prerender_error,
     render_messages,
     resolve_sampling,
@@ -380,7 +383,7 @@ async def handle_chat_completion(
         choices.append({"index": index, "message": message, "finish_reason": result.finish_reason})
 
     first = results[0]
-    return {
+    response: dict[str, Any] = {
         "id": _response_id("chatcmpl", req, uid),
         "object": "chat.completion",
         "created": int(time.time()),
@@ -394,6 +397,14 @@ async def handle_chat_completion(
             reasoning_tokens=sum(r.reasoning_tokens for r in results),
         ),
     }
+    if metrics_enabled(state):
+        response["metrics"] = build_metrics(
+            prompt_tokens=first.prompt_tokens,
+            completion_tokens=first.completion_tokens,
+            cached_tokens=first.cached_tokens,
+            timings=first.timings,
+        )
+    return response
 
 
 async def stream_chat_completion_chunks(
@@ -427,6 +438,7 @@ async def stream_chat_completion_chunks(
     completion_tokens = 0
     cached_tokens = 0
     reasoning_tokens = 0
+    timings = GenTimings()
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
@@ -538,6 +550,7 @@ async def stream_chat_completion_chunks(
             cached_tokens = ev.cached_tokens
             reasoning_tokens = ev.reasoning_tokens
             yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": index, "finish_reason": ev.finish_reason}]))
+            timings = ev.timings
 
     usage = _usage(
         prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens),
@@ -547,7 +560,15 @@ async def stream_chat_completion_chunks(
         yield _StreamUsage(usage)
         return
     if req.stream_options and req.stream_options.include_usage:
-        yield _sse({**_chat_chunk(req, uid, []), "usage": usage})
+        final: dict[str, Any] = {**_chat_chunk(req, uid, []), "usage": usage}
+        if metrics_enabled(state):
+            final["metrics"] = build_metrics(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                timings=timings,
+            )
+        yield _sse(final)
 
     yield b"data: [DONE]\n\n"
 
