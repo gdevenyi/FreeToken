@@ -10,7 +10,10 @@ import contextlib
 import io
 from types import SimpleNamespace
 
+import torch
+
 from freetoken.engine.engine import MOE_STATS_INTERVAL, Engine
+from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.server.args import ServerArgs, parse_args
 
 
@@ -63,7 +66,7 @@ class _StubCache:
             "working_set_mean": 173.1,
             "working_set_max": 243,
             "experts_for_90pct": 92.3,
-            "oracle_hit_at_slots": 0.764,
+            "static_topk_hit_at_slots": 0.764,
             "norm_entropy": 0.813,
         }
 
@@ -82,9 +85,9 @@ def test_emit_reports_and_resets_the_window(caplog):
     cache = _StubCache()
     out = _emit(cache, caplog)
     assert "miss_rate=0.250" in out
-    # The oracle bound is the whole point of the report: it says how much room a different
-    # eviction policy could possibly have.
-    assert "oracle_hit=0.764" in out
+    # Labelled as the fixed-set figure it is; "oracle" implied an upper bound it is not.
+    assert "static_topk_hit=0.764" in out
+    assert "oracle" not in out
     assert "(realized 0.750)" in out
     # Ranked worst-first, and the layer that never ran is left out entirely.
     assert "L0=0.500, L1=0.100" in out
@@ -107,3 +110,22 @@ def test_idle_window_emits_nothing_and_keeps_counters(caplog):
 
 def test_interval_is_a_sane_window():
     assert MOE_STATS_INTERVAL >= 1
+
+
+def test_static_topk_hit_is_not_an_upper_bound_on_lru():
+    """One slot, four experts each routed in a run of four tokens: A A A A B B B B ...
+
+    The best fixed expert catches 4 of 16 tokens; an LRU holding one slot misses only on
+    each run's first token. The figure is routing skew, not a ceiling on a dynamic cache.
+    """
+    trace = [e for e in range(4) for _ in range(4)]
+    cached, lru_hits = None, 0
+    for e in trace:
+        lru_hits += e == cached
+        cached = e
+    freq = torch.bincount(torch.tensor(trace), minlength=4).unsqueeze(0)
+    cache = SimpleNamespace(decode_freq=freq, cache_size=1, num_layers=1, num_experts=4)
+    stats = OffloadMoeCache.decode_routing_stats(cache)
+    assert stats["static_topk_hit_at_slots"] == 0.25
+    assert "oracle_hit_at_slots" not in stats
+    assert lru_hits / len(trace) == 0.75
