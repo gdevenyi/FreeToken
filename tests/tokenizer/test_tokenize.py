@@ -816,3 +816,14 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     )
     assert manager.render_prompt(msg) == f"Reasoning Effort: {budget}"
     assert msg.chat_template_kwargs["reasoning_effort"] == budget
+
+
+def test_developer_role_maps_to_system_unless_the_template_knows_it():
+    from freetoken.tokenizer.tokenize import _map_developer_role
+
+    msgs = [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    mapped = _map_developer_role(msgs, "{% if message.role == 'system' %}")
+    assert [m["role"] for m in mapped] == ["system", "user"]
+    assert mapped[0]["content"] == "be brief" and msgs[0]["role"] == "developer"  # input untouched
+    assert _map_developer_role(msgs, "{% if message.role == 'developer' %}") is msgs
+    assert _map_developer_role(msgs[1:], None) == msgs[1:]  # nothing to map
