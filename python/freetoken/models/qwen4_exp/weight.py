@@ -417,6 +417,32 @@ def _ple_table_files(folder: str) -> list[str]:
     return sorted(os.path.join(folder, shard) for shard in files)
 
 
+def check_ftw_weights(config, model_path: str, names: set[str]) -> None:
+    """Refuse an FTW checkpoint whose stored FP8 split disagrees with this process's FP8 flags.
+
+    The FTW holds the tensors ``iter_weights`` emitted at conversion, so a mismatch otherwise
+    surfaces only after the dense read, as a KeyError on the first fused GDN projection."""
+    from .config import use_fp8_lmhead
+
+    stored = {
+        "FREETOKEN_FP8_DENSE": any(n.endswith(".in_proj_qkvz.weight_scale") for n in names),
+        "FREETOKEN_FP8_LMHEAD": "lm_head.weight_scale" in names,
+    }
+    wanted = {
+        "FREETOKEN_FP8_DENSE": config.attn_quant == "fp8_dynamic",
+        "FREETOKEN_FP8_LMHEAD": use_fp8_lmhead(config),
+    }
+    wrong = [var for var in stored if stored[var] != wanted[var]]
+    if wrong:
+        was = ", ".join(f"{var}={int(stored[var])}" for var in wrong)
+        now = ", ".join(f"{var}={int(wanted[var])}" for var in wrong)
+        raise ValueError(
+            f"FTW checkpoint {model_path} stores its dense weights as converted with {was}, "
+            f"but this process has {now}; serve it with the conversion-time setting, or "
+            "reconvert with ft checkpoint under the setting you want"
+        )
+
+
 def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     """Write the PLE n-gram table tensors, and only those, into ``ple-table-*.safetensors`` next to an FTW checkpoint.
 

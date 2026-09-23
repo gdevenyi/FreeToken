@@ -151,3 +151,72 @@ def test_reader_gates_lm_head_behind_its_own_flag():
     passthrough = dict(_fp8_dense("x.self_attn.qkv_proj.weight", t, cfg, 1,
                                   dense=False, lm_head=True))
     assert list(passthrough) == ["x.self_attn.qkv_proj.weight"]
+
+
+def _ftw_with(tmp_path, names):
+    from freetoken.checkpoint.ftw import FTWWriter
+
+    writer = FTWWriter(str(tmp_path))
+    for name in names:
+        writer.add_tensor(name, torch.zeros(4, dtype=torch.bfloat16))
+    writer.finalize({})
+    return str(tmp_path)
+
+
+_BF16_NAMES = ["model.layers.0.linear_attn.in_proj.weight", "lm_head.weight"]
+_FP8_NAMES = [
+    "model.layers.0.linear_attn.in_proj_qkvz.weight",
+    "model.layers.0.linear_attn.in_proj_qkvz.weight_scale",
+    "model.layers.0.linear_attn.in_proj_ba.weight",
+    "lm_head.weight",
+    "lm_head.weight_scale",
+]
+
+
+@pytest.mark.parametrize(
+    "names, env, bad",
+    [
+        (_BF16_NAMES, {"FREETOKEN_FP8_DENSE": "1", "FREETOKEN_FP8_LMHEAD": "1"},
+         "FREETOKEN_FP8_DENSE=0, FREETOKEN_FP8_LMHEAD=0"),
+        (_FP8_NAMES, {}, "FREETOKEN_FP8_DENSE=1, FREETOKEN_FP8_LMHEAD=1"),
+        (_FP8_NAMES, {"FREETOKEN_FP8_DENSE": "1"}, "converted with FREETOKEN_FP8_LMHEAD=1, but"),
+    ],
+)
+def test_ftw_load_refuses_fp8_flags_that_differ_from_conversion(tmp_path, monkeypatch, names, env, bad):
+    """#8: the FTW replays conversion-time tensors, so the FP8 flags must match before any byte is read."""
+    from freetoken.models import weight as model_weight
+
+    for var in ("FREETOKEN_FP8_DENSE", "FREETOKEN_FP8_LMHEAD"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    path = _ftw_with(tmp_path, names)
+    spec = SimpleNamespace(module="freetoken.models.qwen4_exp")
+    config = SimpleNamespace(
+        attn_quant="fp8_dynamic" if env.get("FREETOKEN_FP8_DENSE") else "none",
+        tie_word_embeddings=False,
+        quant=None,
+    )
+    monkeypatch.setattr(model_weight, "cached_load_hf_config", lambda _: SimpleNamespace(architectures=["x"]))
+    monkeypatch.setattr(model_weight, "get_model_spec", lambda _: spec)
+    monkeypatch.setattr(model_weight, "_spec_for_model_path", lambda _: (config, spec))
+    with pytest.raises(ValueError, match=bad):
+        next(model_weight.load_weight(path, torch.device("cpu")))
+
+
+@pytest.mark.parametrize("names, fp8", [(_BF16_NAMES, False), (_FP8_NAMES, True)])
+def test_ftw_load_accepts_matching_fp8_flags(tmp_path, monkeypatch, names, fp8):
+    from freetoken.models import weight as model_weight
+
+    for var in ("FREETOKEN_FP8_DENSE", "FREETOKEN_FP8_LMHEAD"):
+        if fp8:
+            monkeypatch.setenv(var, "1")
+        else:
+            monkeypatch.delenv(var, raising=False)
+    path = _ftw_with(tmp_path, names)
+    spec = SimpleNamespace(module="freetoken.models.qwen4_exp")
+    config = SimpleNamespace(attn_quant="fp8_dynamic" if fp8 else "none", tie_word_embeddings=False, quant=None)
+    monkeypatch.setattr(model_weight, "cached_load_hf_config", lambda _: SimpleNamespace(architectures=["x"]))
+    monkeypatch.setattr(model_weight, "get_model_spec", lambda _: spec)
+    monkeypatch.setattr(model_weight, "_spec_for_model_path", lambda _: (config, spec))
+    assert [name for name, _ in model_weight.load_weight(path, torch.device("cpu"))] == names
