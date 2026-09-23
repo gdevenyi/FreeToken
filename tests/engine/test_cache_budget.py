@@ -80,6 +80,43 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
+def test_overlap_floor_that_does_not_fit_falls_back_to_num_experts():
+    # #4: 2*num_experts slots (800 B) + the KV reserve (100 B) exceed the 700 B budget, but
+    # num_experts slots do fit. Plan without overlap instead of refusing to start.
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=700, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert overlap is False
+    assert size == 6  # (700 - 100) // 100, above the num_experts floor
+    assert pages == 10
+    assert size * 100 + pages * 10 <= 700
+
+
+def test_overlap_kept_when_its_floor_fits_the_budget():
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=900, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert (size, pages, overlap) == (8, 10, True)
+
+
+def test_budget_too_small_message_names_what_fits_and_the_flags():
+    # num_experts slots (400 B) + 10 reserved pages (100 B) > 450 B: 5 pages fit beside them.
+    with pytest.raises(AssertionError) as err:
+        plan_cache_budget(
+            budget_bytes=450, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=50, prefill_overlap=True,
+            kv_reserve_pages=10, max_slots=50, page_size=64,
+        )
+    msg = str(err.value)
+    assert "beside 4 slots at most 5 KV pages (320 tokens) fit" in msg
+    for flag in ("--kv-reserve-tokens", "--kv-cache-dtype", "--memory-ratio", "--moe-cache-size"):
+        assert flag in msg
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
