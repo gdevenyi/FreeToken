@@ -63,6 +63,7 @@ def _setup():
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         send_result=sent.extend,
+        _prefill_start={},
         _kv_usage_pages=cm.page_usage,
         _mamba_slot_usage=lambda: None,
         _swa_token_usage=lambda: None,
