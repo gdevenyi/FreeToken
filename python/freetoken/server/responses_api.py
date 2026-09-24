@@ -79,6 +79,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .openai_api import _await_watching_disconnect
 from .request_logger import log_request
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
@@ -177,9 +178,14 @@ async def handle_responses(
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/responses")
+        # an abandoned request must not keep decoding to max_tokens (#222's watcher)
+        result = await _await_watching_disconnect(
+            generate_full(uid, spec, state, source="/v1/responses"), request, state, [uid]
+        )
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
+    if result is None:
+        return _error_response(499, "client disconnected before the response was ready")
     response = build_responses_response(
         result, req, response_id, created, cache_report=cache_report, metrics=metrics
     )
