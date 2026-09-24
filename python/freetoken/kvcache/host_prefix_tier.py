@@ -59,13 +59,15 @@ class HostPrefixTier:
         tensors = {"conv": state_pool.conv_states, "rec": state_pool.recurrent_states}
         tensors.update(state_pool.slot_states)
         self._order = list(tensors)
-        self._banks: dict[str, tuple[torch.Tensor, HostBank]] = {}
+        # banks only: the pool tensors are re-read on every copy, since
+        # LinearStatePool.rebuild replaces them (a runtime cache rebuild)
+        self._banks: dict[str, HostBank] = {}
         for name, t in tensors.items():
             # pool: [layers, slots, *rest] -> bank: [host_slots, layers, *rest]
             bank = HostBank((gdn_slots_host, t.shape[0], *t.shape[2:]), t.dtype)
             if self.device.type == "cuda" and torch.cuda.is_available():
                 bank.pin()
-            self._banks[name] = (t, bank)
+            self._banks[name] = bank
         self.num_slots = gdn_slots_host
         self._free = list(range(gdn_slots_host))
         self._in_use: set[int] = set()
@@ -99,40 +101,40 @@ class HostPrefixTier:
             torch.cuda.Stream(self.device) if self.device.type == "cuda" else None)
 
     # ---------------- GDN snapshot storage ----------------
+    def _pairs(self):
+        """(live pool tensor [layers, slots, ...], host bank) per state tensor."""
+        pool = self.pool
+        live = {"conv": pool.conv_states, "rec": pool.recurrent_states, **pool.slot_states}
+        return [(live[name], self._banks[name]) for name in self._order]
+
+    def _copy(self, copies) -> None:
+        if self.copy_stream is None:
+            for dst, src in copies:
+                dst.copy_(src)
+            return
+        # The engine stream may still have work queued on these slots (overlap launches the
+        # next batch before the previous one is drained): order the copies after it.
+        self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self.copy_stream):
+            for dst, src in copies:
+                dst.copy_(src, non_blocking=True)
+        self.copy_stream.synchronize()
+
     def write_gdn(self, gpu_slot: int) -> int:
         """D2H do snapshot do gpu_slot pra um slot host livre. Retorna o host_slot.
-        Deve ser enfileirado ANTES de state_pool.free(gpu_slot): a ordem de stream do
-        engine garante leitura antes de qualquer reescrita do slot (ver spec)."""
+        Deve ser enfileirado ANTES de state_pool.free(gpu_slot)."""
         if not self._free:
             raise RuntimeError("HostPrefixTier: sem slots host GDN livres (chame evict_host)")
         hs = self._free.pop()
         self._in_use.add(hs)
-        if self.copy_stream is not None:
-            with torch.cuda.stream(self.copy_stream):
-                for name in self._order:
-                    t, bank = self._banks[name]
-                    bank.tensor[hs].copy_(t[:, gpu_slot], non_blocking=True)
-            self.copy_stream.synchronize()
-        else:
-            for name in self._order:
-                t, bank = self._banks[name]
-                bank.tensor[hs].copy_(t[:, gpu_slot])
+        self._copy([(bank.tensor[hs], t[:, gpu_slot]) for t, bank in self._pairs()])
         return hs
 
     def read_gdn(self, host_slot: int, dst_gpu_slot: int) -> None:
         """H2D host_slot -> dst_gpu_slot do pool (já alocado pelo caller)."""
         if host_slot not in self._in_use:
             raise KeyError(f"HostPrefixTier: slot host {host_slot} não está em uso")
-        if self.copy_stream is not None:
-            with torch.cuda.stream(self.copy_stream):
-                for name in self._order:
-                    t, bank = self._banks[name]
-                    t[:, dst_gpu_slot].copy_(bank.tensor[host_slot], non_blocking=True)
-            self.copy_stream.synchronize()
-        else:
-            for name in self._order:
-                t, bank = self._banks[name]
-                t[:, dst_gpu_slot].copy_(bank.tensor[host_slot])
+        self._copy([(t[:, dst_gpu_slot], bank.tensor[host_slot]) for t, bank in self._pairs()])
 
     def free_gdn(self, host_slot: int) -> None:
         self._in_use.discard(host_slot)
