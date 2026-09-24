@@ -65,7 +65,15 @@ def _map_developer_role(
         m.get("role") == "developer" for m in messages
     ):
         return messages
-    return [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    mapped = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    # The frontend hoisted and merged system messages before this mapping ran (templates such
+    # as Qwen's raise on a system message that is not first), so do it again for the new ones.
+    system = [m for m in mapped if m.get("role") == "system"]
+    if len(system) == 1 and mapped[0] is system[0]:
+        return mapped
+    rest = [m for m in mapped if m.get("role") != "system"]
+    content = "\n\n".join(str(m.get("content") or "") for m in system if m.get("content"))
+    return [{"role": "system", "content": content}] + rest
 
 
 class TokenizeManager:
