@@ -22,7 +22,9 @@ class _CoalescedUnpacker:
     """
 
     def __init__(self) -> None:
-        self._unpacker = msgpack.Unpacker(raw=False)
+        # 0 = no size cap (2**32-1), as unpackb had; the Unpacker default of 100 MiB would
+        # kill the worker on a large message (e.g. an image's pixel values)
+        self._unpacker = msgpack.Unpacker(raw=False, max_buffer_size=0)
         self._pending: list[Any] = []
 
     def feed(self, frame: bytes) -> None:
