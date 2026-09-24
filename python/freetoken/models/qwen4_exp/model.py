@@ -152,6 +152,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        if not _internal:
+            from .fp8_post_load import quantize_after_load
+
+            quantize_after_load(self)
+
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
         ple_layers = self.model.ple_layers
