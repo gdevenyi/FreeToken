@@ -14,6 +14,7 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 import time
 from collections.abc import AsyncIterator
@@ -229,8 +230,9 @@ def resolve_sampling(
     for name, value in (("presence_penalty", presence_penalty), ("frequency_penalty", frequency_penalty)):
         if not -2.0 <= float(value) <= 2.0:
             raise ValueError(f"{name} must be in [-2, 2], got {value}")
-    if resolved_rep <= 0.0:
-        raise ValueError(f"repetition_penalty must be positive, got {resolved_rep}")
+    # not `<= 0`: NaN compares False and would poison every seen token's logit
+    if not (math.isfinite(resolved_rep) and resolved_rep > 0.0):
+        raise ValueError(f"repetition_penalty must be a positive finite number, got {resolved_rep}")
     if min_tokens < 0:
         raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
     bias: list[list[float]] | None = None
@@ -478,7 +480,12 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # The qwen3 chat template opens an implicit <think> (thinking on) unless
         # enable_thinking is explicitly false, so the model emits only the closing
         # </think>. Mirror that default here, else the chain-of-thought leaks into content.
-        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+        # continue_final_message is the exception: the template renders the final assistant
+        # turn as <think>...</think> + content, so the continuation starts in content.
+        ctk = spec.chat_template_kwargs or {}
+        force_reasoning = ctk.get("enable_thinking") is not False and not ctk.get(
+            "continue_final_message"
+        )
     elif parser_name == "glm":
         # GLM's template honors enable_thinking (default on) even with tools; the
         # generic fallback would force thinking and mislabel disabled output as reasoning.

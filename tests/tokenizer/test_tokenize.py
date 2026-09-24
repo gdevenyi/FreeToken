@@ -296,3 +296,21 @@ def test_developer_role_maps_to_system_unless_the_template_knows_it():
     assert mapped[0]["content"] == "be brief" and msgs[0]["role"] == "developer"  # input untouched
     assert _map_developer_role(msgs, "{% if message.role == 'developer' %}") is msgs
     assert _map_developer_role(msgs[1:], None) == msgs[1:]  # nothing to map
+
+
+def test_mapped_developer_messages_are_merged_into_one_leading_system_message():
+    """The frontend hoists system messages before the tokenizer maps developer -> system; a
+    template that rejects a non-first system message must still get exactly one, first."""
+    from freetoken.tokenizer.tokenize import _map_developer_role
+
+    template = "{% if message.role == 'system' %}"
+    msgs = [
+        {"role": "system", "content": "be brief"},
+        {"role": "developer", "content": "answer in German"},
+        {"role": "user", "content": "hi"},
+    ]
+    mapped = _map_developer_role(msgs, template)
+    assert [m["role"] for m in mapped] == ["system", "user"]
+    assert mapped[0]["content"] == "be brief\n\nanswer in German"
+    late = [{"role": "user", "content": "hi"}, {"role": "developer", "content": "be brief"}]
+    assert [m["role"] for m in _map_developer_role(late, template)] == ["system", "user"]

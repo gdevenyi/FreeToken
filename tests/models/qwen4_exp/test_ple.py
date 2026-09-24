@@ -201,6 +201,19 @@ def test_token_index_cache_is_keyed_by_shape():
     assert embedding._token_index(other)[0] is not first[0]
 
 
+def test_token_index_capture_never_reuses_an_evictable_cache_entry(monkeypatch):
+    """The eager warmup forward caches the decode pair right before capture; a capture that
+    reused it would bake an address the FIFO later evicts while the graph still reads it."""
+    embedding = _make_layer(_config()).ple_embedding
+    decode = _meta([[5]], [[EOS, EOS]], decode=True)
+    eager = embedding._token_index(decode)  # the warmup forward
+    monkeypatch.setattr(ple_module, "_capturing", lambda device: True)
+    captured = embedding._token_index(decode)
+    assert captured[0] is not eager[0] and captured[1] is not eager[1]
+    assert all(v[0] is not captured[0] for v in embedding._token_index_cache.values())
+    assert captured[0].tolist() == [0] and captured[1].tolist() == [0]
+
+
 def test_token_index_does_not_confuse_a_decode_with_a_one_request_prefill():
     """Same [T], opposite meaning: B decode rows at offset 0 vs B offsets in one request."""
     layer = _make_layer(_config())
