@@ -27,6 +27,11 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 # Prefills of at most this many tokens load only their routed experts (the decode path's
 # on-demand LRU) instead of streaming every expert of every layer; 0 = off.
 _SMALL_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_SMALL_PREFILL_TOKENS", "0"))
+_TRITON_MAX_NUMEL = 1 << 20  # Triton's per-tensor element limit (the LRU kernel's block)
+
+
+def triton_next_power_of_2(n: int) -> int:
+    return 1 << max(0, int(n) - 1).bit_length()
 
 
 class MoELayer(BaseOP):
@@ -363,18 +368,18 @@ class OffloadMoELayer(MoELayer):
             # A short extension (an agent turn over a cached prefix) touches a fraction of each
             # layer's experts; fetching those beats streaming all of them (~68 GB here). The same
             # token count holds in every layer, so the overlap double buffer is never begun.
-            cache.ensure_experts(self.layer_id, topk_ids)
-            cache.copy_missing()
-            return self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                views=cache.bank_views(),
-                n=None,
-                alphas=cache.alphas_for_slots(self.layer_id),
-                is_prefill=False,
-            )
+            slots = self._ensure_unique(cache, topk_ids)
+            if slots is not None:
+                return self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    slots,
+                    views=cache.bank_views(),
+                    n=None,
+                    alphas=cache.alphas_for_slots(self.layer_id),
+                    is_prefill=False,
+                )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -401,6 +406,26 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _ensure_unique(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> torch.Tensor | None:
+        """Make this layer's routed experts resident and return ``topk_ids`` mapped to slots, or
+        None (take the whole-layer path) when they cannot all be resident at once.
+
+        The LRU kernel is sized for decode: its block is next_pow2(ids) x next_pow2(slots), so a
+        prefill's tokens x top_k ids overflow Triton's element limit. It gets the unique ids
+        instead (at most num_experts), chunked under that limit; each chunk's misses are copied
+        before the next ensure reuses the copy plan."""
+        uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
+        n = uniq.numel()
+        if n > cache.cache_size // 2:  # leave room so a chunk never evicts the one before it
+            return None
+        uniq = uniq.to(torch.int32)
+        per_call = max(1, _TRITON_MAX_NUMEL // triton_next_power_of_2(cache.cache_size))
+        for start in range(0, n, per_call):
+            part = uniq[start : start + per_call]  # a contiguous view: ensure rewrites it in place
+            cache.ensure_experts(self.layer_id, part)
+            cache.copy_missing()
+        return uniq[inverse].view_as(topk_ids)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
