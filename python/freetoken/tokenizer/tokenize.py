@@ -65,7 +65,15 @@ def _map_developer_role(
         m.get("role") == "developer" for m in messages
     ):
         return messages
-    return [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    mapped = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    # The frontend hoisted and merged system messages before this mapping ran (templates such
+    # as Qwen's raise on a system message that is not first), so do it again for the new ones.
+    system = [m for m in mapped if m.get("role") == "system"]
+    if len(system) == 1 and mapped[0] is system[0]:
+        return mapped
+    rest = [m for m in mapped if m.get("role") != "system"]
+    content = "\n\n".join(str(m.get("content") or "") for m in system if m.get("content"))
+    return [{"role": "system", "content": content}] + rest
 
 
 class TokenizeManager:
@@ -150,10 +158,16 @@ class TokenizeManager:
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
         messages = _map_developer_role(messages, getattr(self.tokenizer, "chat_template", None))
+        # continue_final_message (an OpenAI-compatible extra, as in vLLM / SGLang): the last
+        # message is an assistant prefix the model must continue, so no generation prompt.
+        chat_template_kwargs = dict(chat_template_kwargs)
+        continue_final = bool(chat_template_kwargs.pop("continue_final_message", False))
+        if continue_final:
+            chat_template_kwargs["continue_final_message"] = True
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
+            add_generation_prompt=not continue_final,
             **chat_template_kwargs,
         )
         assert isinstance(prompt, str)

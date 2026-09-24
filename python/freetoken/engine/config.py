@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -78,7 +79,7 @@ class EngineConfig:
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
-    linear_state_cache_ratio: float = 2.0
+    linear_state_cache_ratio: float = float(os.environ.get("FT_LINEAR_STATE_CACHE_RATIO", "2.0"))
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
@@ -89,7 +90,7 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 60.0
+    distributed_timeout: float = 1800.0  # ranks reach the first collective minutes apart on a 100+ GiB offload load
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
@@ -97,6 +98,11 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Extra KV pages mirrored to pinned host RAM (QSA paged pools, e.g. Qwen3.8-Flash-Next):
+    # the GPU pool becomes an LRU cache over the logical page space (scheduler, page table and
+    # radix tree all see num_pages + kv_host_pages pages), extending context past VRAM
+    # capacity. 0 (default) = off.
+    kv_host_pages: int = 0
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 

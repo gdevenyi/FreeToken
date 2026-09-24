@@ -14,6 +14,7 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 import time
 from collections.abc import AsyncIterator
@@ -73,6 +74,10 @@ class ReasoningDelta:
 @dataclass
 class ContentDelta:
     text: str
+    # Neutral sampled-token logprob entries riding this delta (see UserReply.logprobs);
+    # None when the request did not ask. Parser buffering can attach several entries
+    # to one delta.
+    logprobs: list[dict] | None = None
 
 
 @dataclass
@@ -108,12 +113,34 @@ class ToolCallsDelta:
 
 
 @dataclass
+class GenTimings:
+    """Per-request inference timings, in milliseconds.
+
+    ``prefill_ms`` is the scheduler's own span (admission to the token sampled off the
+    request's last prefill chunk), shipped over the wire because it is the one boundary a
+    client cannot see; the rest are measured here, around the engine ack loop, so they carry
+    the same IPC hops the client's own HTTP timestamps would.
+
+    Under concurrency every span is this request's SHARE of shared work -- its prefill chunk
+    is co-scheduled with other prompts, its decode steps batched with other requests -- so
+    the derived rates describe this request under that load, not isolated engine throughput.
+    """
+
+    ttft_ms: float = 0.0
+    prefill_ms: float = 0.0
+    decode_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+@dataclass
 class GenDone:
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    timings: GenTimings = field(default_factory=GenTimings)
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -129,6 +156,11 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    timings: GenTimings = field(default_factory=GenTimings)
+    # Neutral sampled-token logprob entries, one per sampled token (empty when the
+    # request did not ask).
+    logprobs: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -167,9 +199,19 @@ def resolve_sampling(
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    min_p: float | None = None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    repetition_penalty: float | None = None,
+    logit_bias: dict[str, float] | dict[int, float] | None = None,
+    min_tokens: int = 0,
+    stop_token_ids: list[int] | None = None,
+    include_stop_str_in_output: bool = False,
+    skip_special_tokens: bool | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
-    filling unspecified fields from the checkpoint's recommended defaults."""
+    filling unspecified fields from the checkpoint's recommended defaults. Range errors
+    raise ValueError (the adapters answer 400)."""
 
     def pick(value, key, framework):
         return value if value is not None else model_sampling.get(key, framework)
@@ -181,21 +223,77 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
-    return SamplingParams(
+    resolved_min_p = float(pick(min_p, "min_p", 0.0))
+    resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
+    if not 0.0 <= resolved_min_p <= 1.0:
+        raise ValueError(f"min_p must be in [0, 1], got {resolved_min_p}")
+    for name, value in (("presence_penalty", presence_penalty), ("frequency_penalty", frequency_penalty)):
+        if not -2.0 <= float(value) <= 2.0:
+            raise ValueError(f"{name} must be in [-2, 2], got {value}")
+    # not `<= 0`: NaN compares False and would poison every seen token's logit
+    if not (math.isfinite(resolved_rep) and resolved_rep > 0.0):
+        raise ValueError(f"repetition_penalty must be a positive finite number, got {resolved_rep}")
+    if min_tokens < 0:
+        raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
+    bias: list[list[float]] | None = None
+    if logit_bias:
+        bias = []
+        for key, value in logit_bias.items():
+            try:
+                tid = int(key)
+            except (TypeError, ValueError):
+                raise ValueError(f"logit_bias keys must be token ids, got {key!r}") from None
+            if tid < 0:
+                raise ValueError(f"logit_bias token id must be >= 0, got {tid}")
+            bias.append([tid, max(-100.0, min(100.0, float(value)))])  # the OpenAI range
+    ids = [int(t) for t in (stop_token_ids or [])]
+    if any(t < 0 for t in ids):
+        raise ValueError("stop_token_ids must be non-negative token ids")
+    params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        min_p=resolved_min_p,
+        presence_penalty=float(presence_penalty),
+        frequency_penalty=float(frequency_penalty),
+        repetition_penalty=resolved_rep,
+        logit_bias=bias,
+        min_tokens=int(min_tokens),
+        stop_token_ids=ids,
+        include_stop_str_in_output=bool(include_stop_str_in_output),
     )
+    if skip_special_tokens is not None:
+        params.skip_special_tokens = bool(skip_special_tokens)
+    return params
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
-    return [_render_message(m) for m in messages]
+    ValueError on a non-text content part (text-only server). Shared by all adapters.
+
+    Some chat templates (e.g. Qwen3.6) require the system message at index 0;
+    hoist system messages to the front and merge multiples into one to satisfy
+    that constraint."""
+    rendered = [_render_message(m) for m in messages]
+    system_msgs = [m for m in rendered if m.get("role") == "system"]
+    if system_msgs and rendered[0].get("role") != "system":
+        non_system = [m for m in rendered if m.get("role") != "system"]
+        rendered = system_msgs + non_system
+    # Merge multiple system messages into one (Qwen3.6 template rejects
+    # system messages that are not at loop.first, i.e. after the first).
+    system_msgs = [m for m in rendered if m.get("role") == "system"]
+    if len(system_msgs) > 1:
+        sep = chr(10) + chr(10)
+        merged_content = sep.join(
+            str(m.get("content") or "") for m in system_msgs if m.get("content")
+        )
+        non_system = [m for m in rendered if m.get("role") != "system"]
+        rendered = [{"role": "system", "content": merged_content}] + non_system
+    return rendered
 
 
 def _render_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -382,7 +480,12 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # The qwen3 chat template opens an implicit <think> (thinking on) unless
         # enable_thinking is explicitly false, so the model emits only the closing
         # </think>. Mirror that default here, else the chain-of-thought leaks into content.
-        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+        # continue_final_message is the exception: the template renders the final assistant
+        # turn as <think>...</think> + content, so the continuation starts in content.
+        ctk = spec.chat_template_kwargs or {}
+        force_reasoning = ctk.get("enable_thinking") is not False and not ctk.get(
+            "continue_final_message"
+        )
     elif parser_name == "glm":
         # GLM's template honors enable_thinking (default on) even with tools; the
         # generic fallback would force thinking and mislabel disabled output as reasoning.
@@ -491,6 +594,85 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
             task.cancel()
 
 
+class _Timer:
+    """Times one generation off the raw ack stream.
+
+    Deliberately fed from acks rather than from emitted GenEvents: a reasoning or tool-call
+    parser holds text back, sometimes to the end of the stream, so the first EVENT can lag the
+    first generated token by a lot. Acks are also the one path both the streaming and the
+    buffered generator share, so TTFT means the same thing on either.
+    """
+
+    def __init__(self) -> None:
+        self.start = time.monotonic()
+        self.first_token_at: float | None = None
+        self.end: float | None = None
+        self.prefill_ms = 0.0
+
+    def observe(self, ack: Any) -> None:
+        # an older peer (or a reply built before #504) carries no prefill span
+        prefill_ms = getattr(ack, "prefill_ms", 0.0)
+        if prefill_ms:
+            self.prefill_ms = prefill_ms
+        # completion_tokens_delta, not incremental_output: the detokenizer holds back a
+        # trailing partial-stop prefix, so a real generated token can arrive with empty text.
+        if self.first_token_at is None and ack.completion_tokens_delta:
+            self.first_token_at = time.monotonic()
+        if ack.finished:
+            # Stamped here, not in finish(): the callers run the reasoning split and the
+            # tool-call drain between the terminal ack and building their result, and that
+            # post-processing is not inference time.
+            self.end = time.monotonic()
+
+    def finish(self) -> GenTimings:
+        # A stream cut short (client disconnect) never saw a terminal ack; time it to here.
+        end = self.end if self.end is not None else time.monotonic()
+        first = self.first_token_at
+        return GenTimings(
+            ttft_ms=0.0 if first is None else (first - self.start) * 1000.0,
+            prefill_ms=self.prefill_ms,
+            decode_ms=0.0 if first is None else (end - first) * 1000.0,
+            total_ms=(end - self.start) * 1000.0,
+        )
+
+
+def build_metrics(
+    *, prompt_tokens: int, completion_tokens: int, cached_tokens: int, timings: GenTimings
+) -> dict[str, Any]:
+    """The `metrics` object served under --enable-metrics-report, identical on every protocol.
+
+    ``cached_prompt_tokens`` is the real prefix-cache hit whatever --enable-cache-report says:
+    that flag governs BILLING fields in `usage`, and gating the hit here instead would leave
+    prefill_tokens_per_second silently computed over tokens that were never forwarded.
+
+    Decode throughput divides by completion_tokens - 1, not completion_tokens: the first token
+    falls out of prefill, so decode_time_ms spans only the intervals after it (the convention
+    vLLM's and sglang's serving benchmarks use).
+    """
+    prefill_tokens = max(prompt_tokens - cached_tokens, 0)
+    prefill_s = timings.prefill_ms / 1000.0
+    decode_s = timings.decode_ms / 1000.0
+    return {
+        "ttft_ms": round(timings.ttft_ms, 3),
+        "prefill_tokens": prefill_tokens,
+        "cached_prompt_tokens": cached_tokens,
+        "prefill_time_ms": round(timings.prefill_ms, 3),
+        "prefill_tokens_per_second": round(prefill_tokens / prefill_s, 2) if prefill_s > 0 else 0.0,
+        "decode_tokens": completion_tokens,
+        "decode_time_ms": round(timings.decode_ms, 3),
+        "decode_tokens_per_second": (
+            round((completion_tokens - 1) / decode_s, 2)
+            if decode_s > 0 and completion_tokens > 1
+            else 0.0
+        ),
+        "total_time_ms": round(timings.total_ms, 3),
+    }
+
+
+def metrics_enabled(state: Any) -> bool:
+    return bool(getattr(state.config, "enable_metrics_report", False))
+
+
 def _record_generation(
     *,
     source: str | None,
@@ -532,27 +714,24 @@ async def generate_events(
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
     if the drop lands before `GenDone`, the only event carrying the totals."""
-    start = time.monotonic()
+    timer = _Timer()
     prompt_tokens = 0
     completion_tokens = 0
-    first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(uid, spec, state, timer):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
-            elif first_token_at is None:
-                first_token_at = time.monotonic()
             yield ev
     except GenerationError as exc:
         error = str(exc)
         raise
     finally:
         _record_generation(
-            source=source, stream=True, start=start,
+            source=source, stream=True, start=timer.start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
-            first_token_at=first_token_at,
+            first_token_at=timer.first_token_at,
         )
 
 
@@ -561,25 +740,29 @@ async def generate_full(
 ) -> GenResult:
     """Wraps `_generate_full_impl` to log the request with its totals; the `finally` also records
     a `GenerationError` as a failed row."""
-    start = time.monotonic()
+    timer = _Timer()
     result: GenResult | None = None
     error: str | None = None
     try:
-        result = await _generate_full_impl(uid, spec, state)
+        result = await _generate_full_impl(uid, spec, state, timer)
         return result
     except GenerationError as exc:
         error = str(exc)
         raise
     finally:
         _record_generation(
-            source=source, stream=False, start=start,
+            source=source, stream=False, start=timer.start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
+            # No first_token_at: non-streaming rows deliberately carry no TTFT, because
+            # requests_ttft_mean_ms averages only the rows that have one. `metrics` still does.
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, timer: _Timer
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -594,10 +777,18 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    reasoning_tokens = 0
     pending = ""
+    pending_logprobs: list[dict] = []
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
     specials = _leaked_special_tokens(state)
+
+    def _content_delta(text: str) -> ContentDelta:
+        nonlocal pending_logprobs
+        logprobs = pending_logprobs or None
+        pending_logprobs = []
+        return ContentDelta(text, logprobs=logprobs)
 
     tool_parser: FunctionCallParser | None = None
     if parse_tools:
@@ -608,6 +799,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         if candidate is not None and candidate.supports_streaming():
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
+
+    # Logprob entries are collected only on the passthrough path: with a reasoning
+    # parser or tool parsing active, text can be hidden, held back, or reclassified,
+    # so an entry could come to describe a token that never reaches visible content.
+    # The API layer fail-closes those request combinations; this guard is the
+    # structural half of the contract — a hidden-token entry must never ride a
+    # later visible delta, whatever the caller.
+    collect_logprobs = reasoning_parser is None and tool_parser is None and not parse_tools
 
     # Streaming tool-call assembly: detectors emit fragments (name first, then
     # argument diffs); they accumulate here and the call is emitted complete when
@@ -652,7 +851,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                     out.append(done)
                 stripped = strip_special_tokens(payload, specials)
                 if stripped and not (stripped.strip() == "" and suppress_ws):
-                    out.append(ContentDelta(stripped))
+                    out.append(_content_delta(stripped))
                     if stripped.strip():
                         suppress_ws = False
                 continue
@@ -686,9 +885,13 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
+        timer.observe(ack)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
+        if collect_logprobs and getattr(ack, "logprobs", None) is not None:
+            pending_logprobs.append(ack.logprobs)
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -703,7 +906,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += content_delta
             else:
-                yield ContentDelta(strip_special_tokens(content_delta, specials))
+                yield _content_delta(strip_special_tokens(content_delta, specials))
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -724,7 +927,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += flush_content
             else:
-                yield ContentDelta(strip_special_tokens(flush_content, specials))
+                yield _content_delta(strip_special_tokens(flush_content, specials))
 
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -752,7 +955,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         if residual:
             stripped = strip_special_tokens(residual, specials)
             if stripped and not (stripped.strip() == "" and suppress_ws):
-                yield ContentDelta(stripped)
+                yield _content_delta(stripped)
         if calls_emitted and finish_reason != "length":
             finish_reason = "tool_calls"
     else:
@@ -761,35 +964,44 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             normal_text, tool_calls = parsed
             normal_text = strip_special_tokens(normal_text, specials)
             if normal_text:
-                yield ContentDelta(normal_text)
+                yield _content_delta(normal_text)
             yield ToolCallsDelta(tool_calls)
             if finish_reason != "length":
                 finish_reason = "tool_calls"
         elif parse_tools and pending:
-            yield ContentDelta(strip_special_tokens(pending, specials))
+            yield _content_delta(strip_special_tokens(pending, specials))
 
+    # Entries without a content delta are intentionally dropped in streaming mode.
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
+        timings=timer.finish(),
     )
 
 
-async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
+async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer) -> GenResult:
     """Protocol-neutral non-streaming generation: accumulate, split reasoning, parse
     tool calls, strip special tokens. The adapters format the GenResult into their wire."""
     full_content = ""
+    logprob_entries: list[dict] = []
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    reasoning_tokens = 0
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
+        timer.observe(ack)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         full_content += ack.incremental_output
+        if getattr(ack, "logprobs", None) is not None:
+            logprob_entries.append(ack.logprobs)
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -815,4 +1027,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
+        timings=timer.finish(),
+        logprobs=logprob_entries,
     )

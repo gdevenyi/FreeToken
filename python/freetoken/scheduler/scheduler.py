@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -111,6 +112,11 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
+        # uid -> monotonic clock at admission, for the per-request prefill span shipped on the
+        # first sampled token. An entry existing IS the "this is the first token" test, so it is
+        # popped there; _free_req_resources pops too, so a request aborted mid-prefill (which
+        # never samples) cannot leave one behind.
+        self._prefill_start: dict[int, float] = {}
         self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
@@ -313,8 +319,9 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        batch, outputs = last_data[0].batch, last_data[1]
+        next_tokens_cpu = outputs.next_tokens_cpu
+        outputs.copy_done_event.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -347,12 +354,25 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+
+                row_chosen_logprob: float | None = None
+                row_top_ids: list[int] | None = None
+                row_top_logprobs: list[float] | None = None
+                if req.sampling_params.logprobs and outputs.chosen_logprobs_cpu is not None:
+                    row_chosen_logprob = float(outputs.chosen_logprobs_cpu[i].item())
+                    requested_top = req.sampling_params.top_logprobs
+                    if requested_top > 0 and outputs.top_ids_cpu is not None:
+                        row_top_ids = [int(t) for t in outputs.top_ids_cpu[i, :requested_top].tolist()]
+                        row_top_logprobs = outputs.top_logprobs_cpu[i, :requested_top].tolist()
+                    else:
+                        row_top_ids = []
+                        row_top_logprobs = []
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
+                ) or next_token in req.sampling_params.stop_token_ids
                 matched_stop = (
                     self._match_stop_str(req)
                     if not hit_eos and req.sampling_params.stop_strs
@@ -370,6 +390,10 @@ class Scheduler(SchedulerIOMixin):
                     and not finished
                 ):
                     req.toolcall_anchor_len = req.input_ids.numel()
+                # Present only until this request's first token is sampled, i.e. off its last
+                # prefill chunk -- so popping it both ends the prefill span and marks this as
+                # the one reply that carries it.
+                started_at = self._prefill_start.pop(req.uid, None)
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
@@ -378,6 +402,15 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        keep_stop_str=req.sampling_params.include_stop_str_in_output,
+                        skip_special_tokens=req.sampling_params.skip_special_tokens,
+                        prefill_ms=(
+                            0.0 if started_at is None
+                            else (time.monotonic() - started_at) * 1000.0
+                        ),
+                        chosen_logprob=row_chosen_logprob,
+                        top_ids=row_top_ids,
+                        top_logprobs=row_top_logprobs,
                     )
                 )
 
@@ -511,10 +544,17 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
+            # max_seq_len is the model's advertised context, which can far exceed the
+            # KV pool actually allocated (see issue #111): a prompt that passes this
+            # check but can never be granted enough pages is queued forever with no
+            # error and no log line. Clamp admission to the real pool so oversized
+            # prompts fail loudly with the same error clients already understand.
+            pool_tokens = self.engine.num_pages * self.config.page_size
+            effective_max = min(max_seq_len, pool_tokens)
+            max_output_len = effective_max - input_len
             if max_output_len <= 0:
                 logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                    f"Input sequence length {input_len} exceeds {effective_max}, "
                     f"request {msg.uid} is dropped."
                 )
                 # Tell the client instead of dropping silently — otherwise its wait_for_ack
@@ -526,7 +566,7 @@ class Scheduler(SchedulerIOMixin):
                             # "prompt is too long: N tokens > M" is the phrasing Claude Code and
                             # OpenClaw match on; the Anthropic wire has no error code to read.
                             error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
+                                f"prompt is too long: {input_len} tokens > {effective_max} maximum "
                                 f"(prompt + generation); shorten the prompt or increase the KV "
                                 f"cache budget"
                             ),
@@ -541,6 +581,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            sp = msg.sampling_params
+            if sp.min_tokens > 0:
+                # min_tokens: the sampler masks these ids while the output is shorter.
+                sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
+                sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -631,6 +676,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # A request freed without ever sampling (aborted mid-prefill) would otherwise keep its
+        # admission timestamp forever; a normally-finished one popped it at its first token.
+        self._prefill_start.pop(req.uid, None)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -886,6 +934,11 @@ class Scheduler(SchedulerIOMixin):
         """
         if not batch.is_prefill or not batch.prompt_admissions:
             return
+        # Before the forward, which is what makes this the prefill START: _schedule_next_batch
+        # has prepared the batch but not run it.
+        now = time.monotonic()
+        for uid, _, _ in batch.prompt_admissions:
+            self._prefill_start[uid] = now
         self.send_result(
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)

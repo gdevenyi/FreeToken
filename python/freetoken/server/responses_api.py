@@ -69,14 +69,17 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    build_metrics,
     generate_events,
     generate_full,
+    metrics_enabled,
     render_messages,
     resolve_sampling,
     split_tool_lists,
     submit_generation,
     with_keepalive,
 )
+from .openai_api import _await_watching_disconnect
 from .request_logger import log_request
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
@@ -155,6 +158,7 @@ async def handle_responses(
         spec = convert_responses_to_genspec(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
         )
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
@@ -163,20 +167,28 @@ async def handle_responses(
         return _error_response(400, str(exc))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
+    metrics = metrics_enabled(state)
     if req.stream:
         events = responses_stream_generator(
             generate_events(uid, spec, state, source="/v1/responses"), req, response_id, created,
-            cache_report=cache_report,
+            cache_report=cache_report, metrics=metrics,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/responses")
+        # an abandoned request must not keep decoding to max_tokens (#222's watcher)
+        result = await _await_watching_disconnect(
+            generate_full(uid, spec, state, source="/v1/responses"), request, state, [uid]
+        )
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
-    response = build_responses_response(result, req, response_id, created, cache_report=cache_report)
+    if result is None:
+        return _error_response(499, "client disconnected before the response was ready")
+    response = build_responses_response(
+        result, req, response_id, created, cache_report=cache_report, metrics=metrics
+    )
     return JSONResponse(content=response.model_dump(mode="json"))
 
 
@@ -190,6 +202,7 @@ def convert_responses_to_genspec(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
+    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -234,7 +247,11 @@ def convert_responses_to_genspec(
 
     from .model_meta import effort_toggle_kwargs
 
-    ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
+    from .openai_api import apply_default_thinking_mode
+
+    ctk = apply_default_thinking_mode(
+        dict(getattr(req, "chat_template_kwargs", None) or {}), default_thinking_mode
+    )
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
 
@@ -410,6 +427,7 @@ def build_responses_response(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    metrics: bool = False,
 ) -> Response:
     truncated = result.finish_reason == "length"
     item_status = "incomplete" if truncated else "completed"
@@ -454,15 +472,21 @@ def build_responses_response(
             result.cached_tokens if cache_report else 0,
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
+        metrics=build_metrics(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            cached_tokens=result.cached_tokens,
+            timings=result.timings,
+        ) if metrics else None,
     )
 
 
 def _response_obj(
     response_id: str, created: int, model: str, output: list[Any],
     *, status: str, usage: ResponseUsage | None, error: ResponseError | None = None,
-    incomplete_reason: str | None = None,
+    incomplete_reason: str | None = None, metrics: dict[str, Any] | None = None,
 ) -> Response:
-    return Response(
+    response = Response(
         id=response_id,
         created_at=created,
         model=model,
@@ -476,6 +500,11 @@ def _response_obj(
         tool_choice="auto",
         tools=[],
     )
+    if metrics is not None:
+        # The SDK model allows extras, so the FreeToken-only `metrics` object rides the real
+        # Response type rather than forcing a parallel dict-shaped response path.
+        response.metrics = metrics
+    return response
 
 
 def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> ResponseUsage:
@@ -499,13 +528,15 @@ async def responses_stream_generator(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    metrics: bool = False,
 ) -> AsyncIterator[str]:
     seq = _Seq()
 
-    def snapshot(status, output, usage=None, incomplete_reason=None):
+    def snapshot(status, output, usage=None, incomplete_reason=None, request_metrics=None):
         return _response_obj(
             response_id, created, req.model, output,
             status=status, usage=usage, incomplete_reason=incomplete_reason,
+            metrics=request_metrics,
         )
 
     yield _sse(ResponseCreatedEvent(
@@ -707,6 +738,12 @@ async def responses_stream_generator(
                 finish_reason = ev.finish_reason
                 usage_pt, usage_ct = ev.prompt_tokens, ev.completion_tokens
                 usage_cached = ev.cached_tokens if cache_report else 0
+                request_metrics = build_metrics(
+                    prompt_tokens=ev.prompt_tokens,
+                    completion_tokens=ev.completion_tokens,
+                    cached_tokens=ev.cached_tokens,
+                    timings=ev.timings,
+                ) if metrics else None
                 for f in close_current():
                     yield f
                 if finish_reason == "length":
@@ -716,6 +753,7 @@ async def responses_stream_generator(
                             "incomplete", output_items,
                             usage=_usage(usage_pt, usage_ct, usage_cached),
                             incomplete_reason="max_output_tokens",
+                            request_metrics=request_metrics,
                         ),
                     ))
                 else:
@@ -724,6 +762,7 @@ async def responses_stream_generator(
                         response=snapshot(
                             "completed", output_items,
                             usage=_usage(usage_pt, usage_ct, usage_cached),
+                            request_metrics=request_metrics,
                         ),
                     ))
     except GenerationError as exc:

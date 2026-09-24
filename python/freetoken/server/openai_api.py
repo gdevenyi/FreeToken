@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -14,6 +15,9 @@ from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 
 from .api_models import (
+    MAX_N,
+    DetokenizeRequest,
+    TokenizeRequest,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
@@ -22,23 +26,34 @@ from .api_models import (
 )
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
+from .logprobs import (
+    chat_content_entry,
+    chat_logprobs_error,
+    completion_logprobs_error,
+    completions_logprobs,
+)
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     ContentDelta,
     GenDone,
     GenerationError,
     GenSpec,
+    GenTimings,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    build_metrics,
     generate_events,
     generate_full,
+    metrics_enabled,
     prerender_error,
     render_messages,
     resolve_sampling,
     submit_generation,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -56,30 +71,55 @@ def _thinking_type(req: Any) -> str | None:
 
 
 
+def apply_default_thinking_mode(
+    ctk: dict[str, Any] | None,
+    default_mode: str | None,
+) -> dict[str, Any] | None:
+    """Merge the server's --default-thinking-mode into a request's template kwargs.
+
+    An explicit per-request value always wins; the server default only fills
+    in what the request left unset. "auto" (the default) is a no-op.
+    """
+    if not default_mode or default_mode == "auto":
+        return ctk
+    if ctk is None:
+        ctk = {}
+    else:
+        ctk = dict(ctk)
+    has_explicit = (
+        "enable_thinking" in ctk
+        or "thinking" in ctk
+        or "thinking_mode" in ctk
+    )
+    if not has_explicit:
+        if default_mode == "chat":
+            ctk["enable_thinking"] = False
+        elif default_mode == "thinking":
+            ctk["enable_thinking"] = True
+    return ctk
+
+
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
 
-    ctk = req.chat_template_kwargs
+    ctk = apply_default_thinking_mode(req.chat_template_kwargs, default_thinking_mode)
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    if req.continue_final_message:
+        ctk = {**ctk, "continue_final_message": True}
+    sampling_params = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
+    sampling_params.logprobs = bool(req.logprobs)
+    sampling_params.top_logprobs = req.top_logprobs or 0
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
-        sampling_params=resolve_sampling(
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens,
-            ignore_eos=req.ignore_eos,
-            model_sampling=model_sampling,
-            stop=req.stop,
-            default_max_tokens=default_max_tokens,
-        ),
+        sampling_params=sampling_params,
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
@@ -131,6 +171,16 @@ def register_openai_routes(
             return gate
         return await handle_completion(req, request, state, get_model_sampling())
 
+    @app.post("/tokenize")
+    @app.post("/v1/tokenize")
+    async def tokenize(req: TokenizeRequest):
+        return await handle_tokenize(req, get_state())
+
+    @app.post("/detokenize")
+    @app.post("/v1/detokenize")
+    async def detokenize(req: DetokenizeRequest):
+        return await handle_detokenize(req, get_state())
+
     @app.get("/v1/models")
     async def v1_models():
         state = get_state()
@@ -146,6 +196,123 @@ def register_openai_routes(
             default_reasoning_effort=default_effort,
         )])
 
+    @app.get("/v1/models/{model_id:path}")
+    async def v1_model(model_id: str):
+        """Retrieve metadata for the currently served model.
+
+        OpenAI-compatible clients may use this endpoint to validate a model
+        name before sending completion requests.
+        """
+        state = get_state()
+        served_model_id = _served_model_name(state)
+
+        if model_id != served_model_id:
+            return create_error_response(
+                f"The model '{model_id}' does not exist",
+                status_code=404,
+                err_type="invalid_request_error",
+                param="model",
+                code="model_not_found",
+            )
+
+        ctx = _model_context_length(state)
+        efforts, default_effort = await _effort_fields(state)
+        return ModelCard(
+            id=served_model_id,
+            root=state.config.model_path,
+            max_model_len=ctx,
+            context_length=ctx,
+            supported_reasoning_efforts=efforts,
+            default_reasoning_effort=default_effort,
+        )
+
+# How often a non-streaming handler looks at the transport while the engine
+# generates. The streaming path checks per chunk; one second bounds an abandoned
+# request's extra decode work without measurable polling overhead.
+_DISCONNECT_POLL_SECONDS = 1.0
+
+
+async def _await_watching_disconnect(
+    awaitable, request: Request | None, state: Any, uids: Sequence[int]
+):
+    """Run an in-flight generation awaitable while watching the transport — the
+    non-streaming twin of stream_with_cancellation. Returns the awaitable's result,
+    or None when the client disconnected first: the same shielded abort_user is
+    delivered for every uid (an ``n > 1`` fan-out) so an abandoned request stops
+    burning decode slots instead of running to max_tokens (with
+    --max-running-requests 1 that is a full outage for its remaining budget)."""
+    gen = asyncio.ensure_future(awaitable)
+    if request is None:
+        return await gen
+
+    async def abort_all():
+        for uid in uids:
+            try:
+                await asyncio.shield(state.abort_user(uid))
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to deliver abort for user %s", uid)
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
+            if done:
+                return gen.result()
+            if await request.is_disconnected():
+                break
+    except asyncio.CancelledError:
+        # The handler itself was cancelled (server shutdown): deliver the abort,
+        # then let the cancellation propagate — mirrors stream_with_cancellation.
+        await abort_all()
+        gen.cancel()
+        raise
+    # Client gone. Deliver the AbortMsg first (the decode stops sooner), then
+    # wind down the drain task; its result is undeliverable either way.
+    await abort_all()
+    gen.cancel()
+    try:
+        await gen
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — the response is undeliverable, only cleanup matters
+        pass
+    return None
+
+
+def _client_disconnected_response() -> JSONResponse:
+    # 499 — nginx's "client closed request". The client is gone; this status is
+    # for the access log, not the wire.
+    return create_error_response(
+        "client disconnected before the response was ready",
+        status_code=499,
+        err_type="client_disconnected",
+    )
+
+
+def _chat_logprobs_conflict(req: ChatCompletionRequest, state: Any) -> str | None:
+    """Fail-close chat logprobs when a semantic parsing layer can hide or reclassify
+    generated tokens. A reasoning parser routes tokens out of visible content (and its
+    stream buffering re-chunks text), and tool parsing consumes tokens into tool_calls,
+    so logprob entries could not be aligned 1:1 with visible content tokens — and hidden
+    reasoning-token strings must never surface through logprobs entries. The raw
+    /v1/completions path has no semantic layer and keeps full logprobs support."""
+    if not req.logprobs:
+        return None
+    if getattr(state.config, "reasoning_parser", None):
+        return (
+            "logprobs on /v1/chat/completions are not supported when the server runs a "
+            "reasoning parser: reasoning tokens are hidden from message content, so "
+            "logprob entries cannot be aligned with it. Use /v1/completions for raw "
+            "token logprobs."
+        )
+    if _should_parse_tools(req):
+        return (
+            "logprobs with tool parsing on /v1/chat/completions are not supported: "
+            "tool-call tokens are consumed into tool_calls, so logprob entries cannot "
+            "be aligned with message content. Send tool_choice='none' or use "
+            "/v1/completions for raw token logprobs."
+        )
+    return None
+
 
 async def handle_chat_completion(
     req: ChatCompletionRequest,
@@ -155,15 +322,19 @@ async def handle_chat_completion(
 ):
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
-    if req.logit_bias is not None:
-        return create_error_response("logit_bias is not supported")
+    logprobs_error = chat_logprobs_error(req)
+    if logprobs_error is not None:
+        return create_error_response(logprobs_error, param="top_logprobs")
+    logprobs_conflict = _chat_logprobs_conflict(req, state)
+    if logprobs_conflict is not None:
+        return create_error_response(logprobs_conflict, param="logprobs")
     if _response_format_unsupported(req.response_format):
         return create_error_response(
             "response_format json_object/json_schema is not supported (no constrained decoding)",
             param="response_format",
         )
-    if req.n != 1:
-        return create_error_response("Only n=1 is supported", param="n")
+    if not 1 <= req.n <= MAX_N:
+        return create_error_response(f"n must be between 1 and {MAX_N}", param="n")
     # Case/whitespace and the "off" disable synonym stay accepted here because
     # effort_toggle_kwargs normalizes and honors them downstream.
     effort = req.reasoning_effort.strip().lower() if isinstance(req.reasoning_effort, str) else None
@@ -185,7 +356,12 @@ async def handle_chat_completion(
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
         )
-        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            default_max_tokens=default_max_tokens,
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -196,45 +372,86 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
+    # n > 1: one generation per choice, submitted together (the prefix cache serves the
+    # shared prompt after the first prefill).
+    uids: list[int] = []
     try:
-        uid = await submit_generation(spec, state)
+        for _ in range(req.n):
+            uids.append(await submit_generation(spec, state))
     except GenerationError as exc:
+        for u in uids:  # choices already queued before a later one failed
+            await state.abort_user(u)
         return create_error_response(str(exc), code=exc.code)
+    uid = uids[0]
 
     if req.stream:
-        chunks = stream_chat_completion_chunks(uid, req, state, spec)
+        if req.n == 1:
+            chunks = stream_chat_completion_chunks(uid, req, state, spec)
+        else:
+            chunks = _merge_streams(
+                [
+                    stream_chat_completion_chunks(u, req, state, spec, index=i, terminal=False)
+                    for i, u in enumerate(uids)
+                ],
+                lambda: _chat_chunk(req, uid, []),
+                include_usage=bool(req.stream_options and req.stream_options.include_usage),
+                state=state,
+            )
         if request is not None:
-            chunks = state.stream_with_cancellation(chunks, request, uid)
+            chunks = state.stream_with_cancellation(chunks, request, uids)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
+    tasks = [
+        asyncio.ensure_future(generate_full(u, spec, state, source="/v1/chat/completions"))
+        for u in uids
+    ]
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        results = await _await_watching_disconnect(asyncio.gather(*tasks), request, state, uids)
     except GenerationError as exc:
+        # gather does not cancel the other choices; the aborts below drop the events they
+        # wait on, so without the cancel they would stay pending forever
+        for task in tasks:
+            task.cancel()
+        for u in uids:
+            await state.abort_user(u)
         return create_error_response(str(exc), code=exc.code)
-    message: dict[str, Any] = {"role": "assistant", "content": result.content}
-    if result.reasoning:
-        message["reasoning_content"] = result.reasoning
-    if result.tool_calls:
-        message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
+    if results is None:
+        return _client_disconnected_response()
+    choices: list[dict[str, Any]] = []
+    for index, result in enumerate(results):
+        message: dict[str, Any] = {"role": "assistant", "content": result.content}
+        if result.reasoning:
+            message["reasoning_content"] = result.reasoning
+        if result.tool_calls:
+            message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
+        choice: dict[str, Any] = {"index": index, "message": message, "finish_reason": result.finish_reason}
+        if req.logprobs:
+            choice["logprobs"] = {"content": [chat_content_entry(e) for e in result.logprobs]}
+        choices.append(choice)
 
-    return {
-        "id": f"chatcmpl-{uid}",
+    first = results[0]
+    response: dict[str, Any] = {
+        "id": _response_id("chatcmpl", req, uid),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": result.finish_reason,
-            }
-        ],
+        "system_fingerprint": None,
+        "choices": choices,
         "usage": _usage(
-            result.prompt_tokens,
-            result.completion_tokens,
-            _reported_cached(state, result.cached_tokens),
+            first.prompt_tokens,
+            sum(r.completion_tokens for r in results),
+            _reported_cached(state, max(r.cached_tokens for r in results)),
+            reasoning_tokens=sum(r.reasoning_tokens for r in results),
         ),
     }
+    if metrics_enabled(state):
+        response["metrics"] = build_metrics(
+            prompt_tokens=first.prompt_tokens,
+            completion_tokens=first.completion_tokens,
+            cached_tokens=first.cached_tokens,
+            timings=first.timings,
+        )
+    return response
 
 
 async def stream_chat_completion_chunks(
@@ -242,21 +459,33 @@ async def stream_chat_completion_chunks(
     req: ChatCompletionRequest,
     state: Any,
     spec: GenSpec | None = None,
+    index: int = 0,
+    terminal: bool = True,
 ) -> AsyncIterator[bytes]:
-    """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
+    """Format generate_events() into the OpenAI chat.completion.chunk SSE stream.
+
+    ``index`` is the choice index (``n > 1`` runs one of these per choice); with
+    ``terminal=False`` the usage chunk and ``[DONE]`` are left to the merger, which reads
+    this stream's usage from the ``_StreamUsage`` yielded last."""
     if spec is None:
-        spec = chat_request_to_genspec(req, {})
+        spec = chat_request_to_genspec(
+            req,
+            {},
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+        )
     yield _sse(
         _chat_chunk(
             req,
             uid,
-            [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
+            [{"delta": {"role": "assistant", "content": ""}, "index": index, "finish_reason": None}],
         )
     )
 
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    reasoning_tokens = 0
+    timings = GenTimings()
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
@@ -277,17 +506,14 @@ async def stream_chat_completion_chunks(
                 _chat_chunk(
                     req,
                     uid,
-                    [{"delta": {"reasoning_content": ev.text}, "index": 0, "finish_reason": None}],
+                    [{"delta": {"reasoning_content": ev.text}, "index": index, "finish_reason": None}],
                 )
             )
         elif isinstance(ev, ContentDelta):
-            yield _sse(
-                _chat_chunk(
-                    req,
-                    uid,
-                    [{"delta": {"content": ev.text}, "index": 0, "finish_reason": None}],
-                )
-            )
+            choice: dict[str, Any] = {"delta": {"content": ev.text}, "index": index, "finish_reason": None}
+            if ev.logprobs:
+                choice["logprobs"] = {"content": [chat_content_entry(e) for e in ev.logprobs]}
+            yield _sse(_chat_chunk(req, uid, [choice]))
         elif isinstance(ev, ToolCallStart):
             open_tool = {
                 "index": tool_calls_sent,
@@ -305,7 +531,7 @@ async def stream_chat_completion_chunks(
                             "type": "function",
                             "function": {"name": ev.name, "arguments": ""},
                         }]},
-                        "index": 0, "finish_reason": None,
+                        "index": index, "finish_reason": None,
                     }],
                 )
             )
@@ -322,7 +548,7 @@ async def stream_chat_completion_chunks(
                                 "index": open_tool["index"],
                                 "function": {"arguments": ev.fragment},
                             }]},
-                            "index": 0, "finish_reason": None,
+                            "index": index, "finish_reason": None,
                         }],
                     )
                 )
@@ -346,7 +572,7 @@ async def stream_chat_completion_chunks(
                                         "index": open_tool["index"],
                                         "function": {"arguments": remainder},
                                     }]},
-                                    "index": 0, "finish_reason": None,
+                                    "index": index, "finish_reason": None,
                                 }],
                             )
                         )
@@ -358,7 +584,7 @@ async def stream_chat_completion_chunks(
                     yield _sse(
                         _chat_chunk(
                             req, uid,
-                            [{"delta": {"tool_calls": [delta]}, "index": 0, "finish_reason": None}],
+                            [{"delta": {"tool_calls": [delta]}, "index": index, "finish_reason": None}],
                         )
                     )
                 tool_calls_sent += 1
@@ -366,21 +592,27 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
-            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
+            reasoning_tokens = ev.reasoning_tokens
+            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": index, "finish_reason": ev.finish_reason}]))
+            timings = ev.timings
 
+    usage = _usage(
+        prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens),
+        reasoning_tokens=reasoning_tokens,
+    )
+    if not terminal:
+        yield _StreamUsage(usage)
+        return
     if req.stream_options and req.stream_options.include_usage:
-        yield _sse(
-            {
-                "id": f"chatcmpl-{uid}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
-                "choices": [],
-                "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
-                ),
-            }
-        )
+        final: dict[str, Any] = {**_chat_chunk(req, uid, []), "usage": usage}
+        if metrics_enabled(state):
+            final["metrics"] = build_metrics(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                timings=timings,
+            )
+        yield _sse(final)
 
     yield b"data: [DONE]\n\n"
 
@@ -394,47 +626,64 @@ async def handle_completion(
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
-    try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
+    if not 1 <= req.n <= MAX_N:
+        return create_error_response(f"n must be between 1 and {MAX_N}", param="n")
+    try:  # surfaces an out-of-range value as a 400 rather than a 500 from the worker
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
         )
-        _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
+        sampling = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
-        return create_error_response(str(exc), param="max_tokens")
+        return create_error_response(str(exc))
 
     prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
     assert isinstance(prompts, list)
+    if req.suffix is not None:
+        markers = await _fim_markers(state)
+        if markers is None:
+            return create_error_response(
+                "suffix needs a model with fill-in-the-middle tokens "
+                "(<|fim_prefix|> / <|fim_suffix|> / <|fim_middle|>)",
+                param="suffix",
+            )
+        prompts = [_fim_prompt(p, req.suffix, markers) for p in prompts]
+    echo_texts = list(prompts) if req.echo else [""] * len(prompts)
+    if req.suffix is not None and req.echo:
+        # echo returns what the client sent, not the FIM-wrapped prompt
+        echo_texts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
+
+    # choices are ordered prompt-major: prompt i, sample k -> index i * n + k (OpenAI)
+    uids: list[int] = []
+    for prompt in prompts:
+        for _ in range(req.n):
+            uid = state.new_user()
+            await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling))
+            uids.append(uid)
+
     if req.stream:
-        if len(prompts) != 1:
-            return create_error_response("Streaming completions only support a single text prompt")
-        uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                req, model_sampling, default_max_tokens=default_max_tokens
-            ))
-        )
-        chunks = stream_completion_chunks(uid, req, state)
+        if len(uids) == 1:
+            chunks = stream_completion_chunks(uids[0], req, state, echo_text=echo_texts[0])
+        else:
+            chunks = _merge_streams(
+                [
+                    stream_completion_chunks(
+                        u, req, state, index=i, terminal=False, echo_text=echo_texts[i // req.n]
+                    )
+                    for i, u in enumerate(uids)
+                ],
+                lambda: _completion_chunk(req, uids[0], []),
+                include_usage=bool(req.stream_options and req.stream_options.include_usage),
+                state=state,
+            )
         if request is not None:
-            chunks = state.stream_with_cancellation(chunks, request, uid)
+            chunks = state.stream_with_cancellation(chunks, request, uids)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
-    choices: list[dict[str, Any]] = []
-    prompt_tokens = 0
-    completion_tokens = 0
-    cached_tokens = 0
-    for index, prompt in enumerate(prompts):
-        uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(
-                uid=uid,
-                text=prompt,
-                sampling_params=_resolve_sampling(
-                    req, model_sampling, default_max_tokens=default_max_tokens
-                ),
-            )
-        )
+    async def _drain_one(uid: int, index: int) -> dict[str, Any] | JSONResponse:
         text = ""
+        entries: list[dict] = []
         finish_reason = "stop"
+        prompt_tokens = completion_tokens = cached_tokens = 0
         async for ack in state.wait_for_ack(uid):
             if getattr(ack, "error", None):
                 return create_error_response(ack.error)
@@ -442,78 +691,243 @@ async def handle_completion(
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
             text += ack.incremental_output
+            if req.logprobs is not None and ack.logprobs is not None:
+                entries.append(ack.logprobs)
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
-        choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
+        return {
+            "index": index,
+            "text": echo_texts[index // req.n] + text,
+            "finish_reason": finish_reason,
+            "logprobs": completions_logprobs(entries) if req.logprobs is not None else None,
+            "_usage": (prompt_tokens, completion_tokens, cached_tokens),
+        }
+
+    drained = await _await_watching_disconnect(
+        asyncio.gather(*(_drain_one(u, i) for i, u in enumerate(uids))), request, state, uids
+    )
+    if drained is None:
+        return _client_disconnected_response()
+    choices: list[dict[str, Any]] = []
+    prompt_tokens = completion_tokens = cached_tokens = 0
+    for choice in drained:
+        if isinstance(choice, JSONResponse):
+            return choice
+        p, c, cached = choice.pop("_usage")
+        # the prompt is counted once per prompt, not once per sample of it
+        if choice["index"] % req.n == 0:
+            prompt_tokens += p
+        completion_tokens += c
+        cached_tokens = max(cached_tokens, cached)
+        choices.append(choice)
 
     return {
-        "id": f"cmpl-{uuid.uuid4().hex}",
+        "id": _response_id("cmpl", req, uuid.uuid4().hex),
         "object": "text_completion",
         "created": int(time.time()),
         "model": req.model,
+        "system_fingerprint": None,
         "choices": choices,
         "usage": _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)),
     }
 
 
-async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any) -> AsyncIterator[bytes]:
+def _completion_chunk(req: CompletionRequest, uid: Any, choices: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "id": _response_id("cmpl", req, uid),
+        "object": "text_completion.chunk",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": choices,
+    }
+
+
+async def stream_completion_chunks(
+    uid: int,
+    req: CompletionRequest,
+    state: Any,
+    index: int = 0,
+    terminal: bool = True,
+    echo_text: str = "",
+) -> AsyncIterator[bytes]:
     prompt_tokens = 0
+    text_offset = 0
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
+    if echo_text:
+        # echo: the prompt leads the stream (vLLM sends it in the first chunk)
+        yield _sse(_completion_chunk(req, uid, [{"text": echo_text, "index": index, "finish_reason": None, "logprobs": None}]))
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
-            yield b"data: [DONE]\n\n"
+            if terminal:
+                yield b"data: [DONE]\n\n"
             return
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         if ack.incremental_output:
             yield _sse(
-                {
-                    "id": f"cmpl-{uid}",
-                    "object": "text_completion.chunk",
-                    "created": int(time.time()),
-                    "model": req.model,
-                    "choices": [
-                        {
-                            "text": ack.incremental_output,
-                            "index": 0,
-                            "finish_reason": None,
-                            "logprobs": None,
-                        }
-                    ],
-                }
+                _completion_chunk(
+                    req, uid,
+                    [{
+                        "text": ack.incremental_output,
+                        "index": index,
+                        "finish_reason": None,
+                        "logprobs": (
+                            completions_logprobs([ack.logprobs], text_offset)
+                            if req.logprobs is not None and ack.logprobs is not None
+                            else None
+                        ),
+                    }],
+                )
             )
+            text_offset += len(ack.incremental_output)
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
 
-    yield _sse(
-        {
-            "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
-            "created": int(time.time()),
-            "model": req.model,
-            "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
-        }
-    )
+    yield _sse(_completion_chunk(req, uid, [{"text": "", "index": index, "finish_reason": finish_reason, "logprobs": None}]))
+    usage = _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens))
+    if not terminal:
+        yield _StreamUsage(usage)
+        return
     if req.stream_options and req.stream_options.include_usage:
-        yield _sse(
-            {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
-                "choices": [],
-                "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
-                ),
-            }
-        )
+        yield _sse({**_completion_chunk(req, uid, []), "usage": usage})
     yield b"data: [DONE]\n\n"
+
+
+class _StreamUsage:
+    """Yielded last by a non-terminal sub-stream: its usage dict for the merger."""
+
+    __slots__ = ("usage",)
+
+    def __init__(self, usage: dict[str, Any]) -> None:
+        self.usage = usage
+
+
+async def _merge_streams(
+    streams: list[AsyncIterator[Any]],
+    envelope: Callable[[], dict[str, Any]],
+    *,
+    include_usage: bool,
+    state: Any,
+) -> AsyncIterator[bytes]:
+    """Interleave the SSE chunks of several choice streams into one response (``n > 1``),
+    then one usage chunk (prompt counted once, completions summed) and one ``[DONE]``."""
+    queue: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+    usages: dict[int, dict[str, Any]] = {}
+
+    async def pump(slot: int, stream: AsyncIterator[Any]) -> None:
+        try:
+            async for item in stream:
+                if isinstance(item, _StreamUsage):
+                    usages[slot] = item.usage
+                else:
+                    await queue.put((slot, item))
+        finally:
+            await queue.put((slot, None))
+
+    tasks = [asyncio.create_task(pump(i, st)) for i, st in enumerate(streams)]
+    try:
+        open_slots = len(streams)
+        while open_slots:
+            slot, item = await queue.get()
+            if item is None:
+                open_slots -= 1
+                continue
+            yield item
+    finally:
+        for task in tasks:
+            task.cancel()
+    if include_usage and usages:
+        first = usages[min(usages)]
+        merged = _usage(
+            first["prompt_tokens"],
+            sum(u["completion_tokens"] for u in usages.values()),
+            max(u.get("prompt_tokens_details", {}).get("cached_tokens", 0) for u in usages.values()),
+            reasoning_tokens=sum(
+                u.get("completion_tokens_details", {}).get("reasoning_tokens", 0) for u in usages.values()
+            ),
+        )
+        yield _sse({**envelope(), "usage": merged})
+    yield b"data: [DONE]\n\n"
+
+
+_FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
+
+
+async def _fim_markers(state: Any) -> tuple[str, str, str] | None:
+    """The model's fill-in-the-middle marker strings when its vocabulary has them
+    (Qwen / DeepSeek-Coder style), else None."""
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None
+    try:
+        manager = await asyncio.to_thread(build)
+        tok = manager.tokenizer
+        unk = getattr(tok, "unk_token_id", None)
+        for name in _FIM_TOKENS:
+            tid = tok.convert_tokens_to_ids(name)
+            if not isinstance(tid, int) or tid < 0 or tid == unk:
+                return None
+    except Exception:  # noqa: BLE001 -- no tokenizer here means no FIM
+        return None
+    return _FIM_TOKENS
+
+
+def _fim_prompt(prompt: str, suffix: str, markers: tuple[str, str, str]) -> str:
+    """The prefix-suffix-middle prompt of OpenAI's ``suffix`` (llama.cpp's /infill)."""
+    prefix_tok, suffix_tok, middle_tok = markers
+    return f"{prefix_tok}{prompt}{suffix_tok}{suffix}{middle_tok}"
+
+
+async def handle_tokenize(req: TokenizeRequest, state: Any):
+    """``POST /tokenize``: the vLLM / SGLang shape. A raw ``prompt`` is encoded as is; chat
+    ``messages`` are rendered through the model's chat template first (the exact prompt a
+    generation would tokenize)."""
+    if (req.prompt is None) == (req.messages is None):
+        return create_error_response("pass exactly one of prompt or messages")
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return create_error_response("no tokenizer on this server", status_code=503, err_type="api_error")
+    try:
+        manager = await asyncio.to_thread(build)
+        if req.prompt is not None:
+            ids = await asyncio.to_thread(
+                manager.tokenizer.encode, req.prompt, add_special_tokens=req.add_special_tokens
+            )
+        else:
+            messages = render_messages([m.model_dump(exclude_none=True) for m in req.messages])
+            ctk = dict(req.chat_template_kwargs)
+            if not req.add_generation_prompt:
+                ctk["continue_final_message"] = True
+            msg = TokenizeMsg(uid=-1, text=messages, sampling_params=SamplingParams(), chat_template_kwargs=ctk)
+            text = await asyncio.to_thread(manager.render_prompt, msg)
+            ids = await asyncio.to_thread(manager.tokenizer.encode, text, add_special_tokens=False)
+    except ValueError as exc:
+        return create_error_response(str(exc))
+    body: dict[str, Any] = {
+        "count": len(ids),
+        "max_model_len": _model_context_length(state),
+        "tokens": [int(t) for t in ids],
+    }
+    if req.return_token_strs:
+        body["token_strs"] = manager.tokenizer.convert_ids_to_tokens(ids)
+    return body
+
+
+async def handle_detokenize(req: DetokenizeRequest, state: Any):
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return create_error_response("no tokenizer on this server", status_code=503, err_type="api_error")
+    manager = await asyncio.to_thread(build)
+    text = await asyncio.to_thread(
+        manager.tokenizer.decode, req.tokens, skip_special_tokens=req.skip_special_tokens
+    )
+    return {"prompt": text}
 
 
 def create_error_response(
@@ -541,7 +955,7 @@ def _resolve_sampling(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> SamplingParams:
-    return resolve_sampling(
+    sampling_params = resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
         top_p=req.top_p,
@@ -550,7 +964,27 @@ def _resolve_sampling(
         model_sampling=model_sampling,
         stop=req.stop,
         default_max_tokens=default_max_tokens,
+        min_p=req.min_p,
+        presence_penalty=req.presence_penalty,
+        frequency_penalty=req.frequency_penalty,
+        repetition_penalty=req.repetition_penalty,
+        logit_bias=req.logit_bias,
+        min_tokens=req.min_tokens,
+        stop_token_ids=req.stop_token_ids,
+        include_stop_str_in_output=req.include_stop_str_in_output,
+        skip_special_tokens=req.skip_special_tokens,
     )
+    if isinstance(req, CompletionRequest) and req.logprobs is not None:
+        sampling_params.logprobs = True
+        sampling_params.top_logprobs = req.logprobs
+    return sampling_params
+
+
+def _response_id(prefix: str, req: Any, fallback: Any) -> str:
+    """``request_id`` from the client when given (vLLM request_id / SGLang rid), else the
+    server's own id."""
+    rid = getattr(req, "request_id", None)
+    return f"{prefix}-{rid}" if rid else f"{prefix}-{fallback}"
 
 
 def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:
@@ -613,10 +1047,11 @@ def _tool_call_id(name: str | None, index: int) -> str:
 
 def _chat_chunk(req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "id": f"chatcmpl-{uid}",
+        "id": _response_id("chatcmpl", req, uid),
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": req.model,
+        "system_fingerprint": None,
         "choices": choices,
     }
 
@@ -630,7 +1065,9 @@ def _reported_cached(state: Any, cached_tokens: int) -> int:
     return cached_tokens if getattr(state.config, "enable_cache_report", False) else 0
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> dict[str, Any]:
+def _usage(
+    prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0, reasoning_tokens: int = 0
+) -> dict[str, Any]:
     usage: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -640,6 +1077,10 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
     # disabled report and a 0-token hit serialize identically.
     if cached_tokens > 0:
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    # OpenAI's completion_tokens_details.reasoning_tokens: tokens up to and including the
+    # reasoning end tag, only when the model emitted one.
+    if reasoning_tokens > 0:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
     return usage
 
 
@@ -651,14 +1092,9 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if _is_token_prompt(req.prompt):
         return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
-    if req.logprobs is not None:
-        return "logprobs is not supported"
-    if req.echo:
-        return "echo is not supported"
-    if req.suffix is not None:
-        return "suffix is not supported"
-    if req.logit_bias is not None:
-        return "logit_bias is not supported"
+    logprobs_error = completion_logprobs_error(req)
+    if logprobs_error is not None:
+        return logprobs_error
     if _response_format_unsupported(req.response_format):
         return "response_format json_object/json_schema is not supported (no constrained decoding)"
     return None
