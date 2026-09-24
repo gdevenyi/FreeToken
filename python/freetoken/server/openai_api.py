@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -43,6 +44,8 @@ from .generation import (
     submit_generation,
 )
 
+logger = logging.getLogger(__name__)
+
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
 _ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
@@ -63,14 +66,16 @@ def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import effort_toggle_kwargs
+    from .model_meta import apply_default_thinking_mode, effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    ctk = apply_default_thinking_mode(ctk, default_thinking_mode)
     if req.continue_final_message:
         ctk = {**ctk, "continue_final_message": True}
     return GenSpec(
@@ -152,6 +157,101 @@ def register_openai_routes(
             default_reasoning_effort=default_effort,
         )])
 
+    @app.get("/v1/models/{model_id:path}")
+    async def v1_model(model_id: str):
+        """Retrieve metadata for the currently served model.
+
+        OpenAI-compatible clients may use this endpoint to validate a model
+        name before sending completion requests.
+        """
+        if not model_id:
+            # The :path converter also matches "/v1/models/", which used to redirect to the list.
+            return await v1_models()
+        state = get_state()
+        served_model_id = _served_model_name(state)
+
+        if model_id != served_model_id:
+            return create_error_response(
+                f"The model '{model_id}' does not exist",
+                status_code=404,
+                err_type="invalid_request_error",
+                param="model",
+                code="model_not_found",
+            )
+
+        ctx = _model_context_length(state)
+        efforts, default_effort = await _effort_fields(state)
+        return ModelCard(
+            id=served_model_id,
+            root=state.config.model_path,
+            max_model_len=ctx,
+            context_length=ctx,
+            supported_reasoning_efforts=efforts,
+            default_reasoning_effort=default_effort,
+        )
+
+
+# How often a non-streaming handler looks at the transport while the engine
+# generates. The streaming path checks per chunk; one second bounds an abandoned
+# request's extra decode work without measurable polling overhead.
+_DISCONNECT_POLL_SECONDS = 1.0
+
+
+async def _await_watching_disconnect(
+    awaitable, request: Request | None, state: Any, uids: Sequence[int]
+):
+    """Run an in-flight generation awaitable while watching the transport — the
+    non-streaming twin of stream_with_cancellation. Returns the awaitable's result,
+    or None when the client disconnected first: the same shielded abort_user is
+    delivered for every uid (an ``n > 1`` fan-out) so an abandoned request stops
+    burning decode slots instead of running to max_tokens (with
+    --max-running-requests 1 that is a full outage for its remaining budget)."""
+    gen = asyncio.ensure_future(awaitable)
+    if request is None:
+        return await gen
+
+    async def abort_all():
+        for uid in uids:
+            try:
+                await asyncio.shield(state.abort_user(uid))
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to deliver abort for user %s", uid)
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
+            if done:
+                return gen.result()
+            if await request.is_disconnected():
+                break
+    except asyncio.CancelledError:
+        # The handler itself was cancelled (server shutdown): deliver the abort,
+        # then let the cancellation propagate — mirrors stream_with_cancellation.
+        await abort_all()
+        gen.cancel()
+        raise
+    # Client gone. Deliver the AbortMsg first (the decode stops sooner), then
+    # wind down the drain task; its result is undeliverable either way.
+    await abort_all()
+    gen.cancel()
+    try:
+        await gen
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — the response is undeliverable, only cleanup matters
+        pass
+    return None
+
+
+def _client_disconnected_response() -> JSONResponse:
+    # 499 — nginx's "client closed request". The client is gone; this status is
+    # for the access log, not the wire.
+    return create_error_response(
+        "client disconnected before the response was ready",
+        status_code=499,
+        err_type="client_disconnected",
+    )
+
 
 async def handle_chat_completion(
     req: ChatCompletionRequest,
@@ -189,7 +289,12 @@ async def handle_chat_completion(
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
         )
-        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            default_max_tokens=default_max_tokens,
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -229,14 +334,22 @@ async def handle_chat_completion(
             chunks = state.stream_with_cancellation(chunks, request, uids)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
+    tasks = [
+        asyncio.ensure_future(generate_full(u, spec, state, source="/v1/chat/completions"))
+        for u in uids
+    ]
     try:
-        results = await asyncio.gather(
-            *(generate_full(u, spec, state, source="/v1/chat/completions") for u in uids)
-        )
+        results = await _await_watching_disconnect(asyncio.gather(*tasks), request, state, uids)
     except GenerationError as exc:
+        # gather does not cancel the other choices; the aborts below drop the events they
+        # wait on, so without the cancel they would stay pending forever
+        for task in tasks:
+            task.cancel()
         for u in uids:
             await state.abort_user(u)
         return create_error_response(str(exc), code=exc.code)
+    if results is None:
+        return _client_disconnected_response()
     choices: list[dict[str, Any]] = []
     for index, result in enumerate(results):
         message: dict[str, Any] = {"role": "assistant", "content": result.content}
@@ -277,7 +390,11 @@ async def stream_chat_completion_chunks(
     ``terminal=False`` the usage chunk and ``[DONE]`` are left to the merger, which reads
     this stream's usage from the ``_StreamUsage`` yielded last."""
     if spec is None:
-        spec = chat_request_to_genspec(req, {})
+        spec = chat_request_to_genspec(
+            req,
+            {},
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+        )
     yield _sse(
         _chat_chunk(
             req,
@@ -499,7 +616,11 @@ async def handle_completion(
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
 
-    drained = await asyncio.gather(*(_drain_one(u, i) for i, u in enumerate(uids)))
+    drained = await _await_watching_disconnect(
+        asyncio.gather(*(_drain_one(u, i) for i, u in enumerate(uids))), request, state, uids
+    )
+    if drained is None:
+        return _client_disconnected_response()
     choices: list[dict[str, Any]] = []
     prompt_tokens = completion_tokens = cached_tokens = 0
     for choice in drained:
@@ -912,10 +1033,31 @@ def _served_model_name(state: Any) -> str:
 
 
 def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
+    """The usable context: ``min(model ceiling, allocated KV tokens)``.
+
+    This is the clamp the engine already applies to its own ``max_seq_len`` (Engine.__init__,
+    and again in _refresh_seq_state after a rebuild), and therefore the limit the scheduler
+    admits against. The frontend process holds an unclamped ServerArgs copy, so publishing
+    ``config.max_seq_len`` here advertised the model's positional ceiling instead -- e.g. 262144
+    against a 178176-token pool, so the engine and this route disagreed about one quantity.
+
+    `ft launch` reads this to size each agent's context window (opencode's ``limit.context``,
+    codex's ``context_window``, ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``), so overstating it stops
+    those agents compacting before the KV pool runs out.
+    """
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None
-    return value if value > 0 else None
+    if value <= 0:
+        return None
+    try:
+        # Local import: api_server imports this module, so a module-level one would cycle.
+        from .api_server import kv_pool_geometry
+
+        num_pages, page_size = kv_pool_geometry(state)
+        kv_tokens = num_pages * page_size
+    except Exception:  # noqa: BLE001
+        kv_tokens = 0
+    # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.
+    return min(value, kv_tokens) if kv_tokens > 0 else value
