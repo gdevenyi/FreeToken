@@ -27,11 +27,9 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 # Prefills of at most this many tokens load only their routed experts (the decode path's
 # on-demand LRU) instead of streaming every expert of every layer; 0 = off.
 _SMALL_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_SMALL_PREFILL_TOKENS", "0"))
-_TRITON_MAX_NUMEL = 1 << 20  # Triton's per-tensor element limit (the LRU kernel's block)
-
-
-def triton_next_power_of_2(n: int) -> int:
-    return 1 << max(0, int(n) - 1).bit_length()
+# ids per LRU ensure in that path: the kernel's block is next_pow2(ids) x next_pow2(slots), and a
+# block much wider than decode's spills to local memory whose launch reservation can OOM
+_ENSURE_CHUNK_IDS = 32
 
 
 class MoELayer(BaseOP):
@@ -412,17 +410,16 @@ class OffloadMoELayer(MoELayer):
         None (take the whole-layer path) when they cannot all be resident at once.
 
         The LRU kernel is sized for decode: its block is next_pow2(ids) x next_pow2(slots), so a
-        prefill's tokens x top_k ids overflow Triton's element limit. It gets the unique ids
-        instead (at most num_experts), chunked under that limit; each chunk's misses are copied
-        before the next ensure reuses the copy plan."""
+        prefill's tokens x top_k ids overflow Triton's element limit, and even a block under it
+        can fail to launch on a full GPU. It gets the unique ids (at most num_experts) in
+        decode-width chunks; each chunk's misses are copied before the next ensure reuses the plan."""
         uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
         n = uniq.numel()
         if n > cache.cache_size // 2:  # leave room so a chunk never evicts the one before it
             return None
         uniq = uniq.to(torch.int32)
-        per_call = max(1, _TRITON_MAX_NUMEL // triton_next_power_of_2(cache.cache_size))
-        for start in range(0, n, per_call):
-            part = uniq[start : start + per_call]  # a contiguous view: ensure rewrites it in place
+        for start in range(0, n, _ENSURE_CHUNK_IDS):
+            part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
             cache.ensure_experts(self.layer_id, part)
             cache.copy_missing()
         return uniq[inverse].view_as(topk_ids)
