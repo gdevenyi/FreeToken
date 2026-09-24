@@ -316,3 +316,61 @@ def test_chat_non_stream_disconnect_aborts_every_sample(monkeypatch):
 
     assert resp.status_code == 499
     assert sorted(state.aborted) == [8, 9]
+
+
+def test_a_failed_choice_cancels_the_other_choices(monkeypatch):
+    # n > 1: one choice errors while another is still generating. gather passes the error up
+    # without cancelling the sibling, and the aborts drop the event it waits on.
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+
+    class _State(_ApiState):
+        def __init__(self):
+            super().__init__(acks=None)
+            self._next = 7
+
+        def new_user(self):
+            self._next += 1
+            return self._next
+
+        async def wait_for_ack(self, uid):
+            if uid == 8:
+                yield SimpleNamespace(**{**vars(_ack("")), "error": "boom"})
+                return
+            await asyncio.sleep(3600)
+            yield _ack("never")
+
+    async def scenario():
+        state = _State()
+        resp = await openai_api.handle_chat_completion(
+            _chat_req(n=2), _Request(disconnected=False), state, {}
+        )
+        await asyncio.sleep(0)
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        return resp, state, pending
+
+    resp, state, pending = asyncio.run(scenario())
+    assert resp.status_code == 400
+    assert sorted(state.aborted) == [8, 9]
+    assert pending == []
+
+
+def test_messages_and_responses_non_stream_disconnect_delivers_abort(monkeypatch):
+    # #222 only wrapped the OpenAI handlers; the Anthropic and Responses endpoints kept
+    # decoding an abandoned non-streaming request to max_tokens.
+    from freetoken.server import anthropic_api, responses_api
+    from freetoken.server.anthropic_models import AnthropicMessagesRequest
+    from freetoken.server.responses_api import ResponsesRequest
+
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+
+    state = _ApiState(acks=None)
+    req = AnthropicMessagesRequest(model="m", max_tokens=8, messages=[{"role": "user", "content": "hi"}])
+    handler = anthropic_api.handle_anthropic_messages(req, _Request(disconnected=True), state, {})
+    resp = asyncio.run(asyncio.wait_for(handler, timeout=5))  # unwatched: hangs, then times out
+    assert resp.status_code == 499 and state.aborted == [7]
+
+    state = _ApiState(acks=None)
+    req = ResponsesRequest(model="m", input="hi", max_output_tokens=8)
+    handler = responses_api.handle_responses(req, _Request(disconnected=True), state, {})
+    resp = asyncio.run(asyncio.wait_for(handler, timeout=5))
+    assert resp.status_code == 499 and state.aborted == [7]
