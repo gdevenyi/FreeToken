@@ -83,7 +83,8 @@ def _run_and_check_path(layer, hs, w, ids, *, on_demand):
 def test_a_real_sized_small_prefill_fits_the_lru_kernel(monkeypatch):
     # 200 tokens x top-10 = 2000 routed ids against a cache that rounds up to 2048 slots: the
     # LRU kernel's block is next_pow2(ids) x next_pow2(slots), so the raw ids overflow Triton's
-    # 1M-element limit; the path must hand it the (at most num_experts) unique ids instead.
+    # 1M-element limit, and a 512-id block failed to launch on a full GPU (CUDA OOM). The path
+    # must hand it the unique ids in decode-width chunks.
     dev = torch.device("cuda")
     tokens, experts, top_k = 200, 512, 10
     g = torch.Generator(device=dev).manual_seed(1)
@@ -94,5 +95,8 @@ def test_a_real_sized_small_prefill_fits_the_lru_kernel(monkeypatch):
     for threshold in (0, 1024):
         monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", threshold)
         layer, cache = _layer_and_cache(dev, num_experts=experts, top_k=top_k, cache_size=1100)
+        widths, ensure = [], cache.ensure_experts
+        monkeypatch.setattr(cache, "ensure_experts", lambda lid, q: (widths.append(q.numel()), ensure(lid, q))[1])
         outs[threshold] = _run_and_check_path(layer, hs, w, ids, on_demand=threshold > 0)
+    assert widths and max(widths) <= 32, f"LRU ensure widths {sorted(set(widths))}: wider than decode's"
     torch.testing.assert_close(outs[1024], outs[0], rtol=2e-2, atol=2e-2)
