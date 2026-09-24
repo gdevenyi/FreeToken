@@ -178,35 +178,24 @@ class Sampler:
         )
         pad = self.vocab_size
 
-        want_hist = any(
-            p.presence_penalty != 0.0 or p.frequency_penalty != 0.0 or p.repetition_penalty != 1.0
-            for _, p in picked
-        )
-        if want_hist:
+        # presence/frequency are not plan work: they ride the device counts (Sampler.prepare's penalties)
+        if any(p.repetition_penalty != 1.0 for _, p in picked):
             hist: list[list[int]] = []
             prompts: list[list[int]] = []
-            want_prompt = False
             for req, p in picked:
                 prompt_len = req.max_device_len - req.output_len
                 ids = req.input_ids
-                penalized = p.presence_penalty != 0.0 or p.frequency_penalty != 0.0 or p.repetition_penalty != 1.0
-                hist.append(ids[prompt_len:].tolist() if penalized else [])
                 if p.repetition_penalty != 1.0:
-                    want_prompt = True
+                    hist.append(ids[prompt_len:].tolist())
                     # multimodal placeholders are pseudo-ids >= vocab_size (MM_PAD_SHIFT_VALUE);
                     # send them to the scratch column, not past the scatter target
                     prompts.append(ids[:prompt_len].clamp(max=pad).tolist())
                 else:
+                    hist.append([])
                     prompts.append([])
             plan.hist_ids = _padded_rows(hist, pad, self.device)
-            if want_prompt:
-                plan.prompt_ids = _padded_rows(prompts, pad, self.device)
-            if any(p.presence_penalty != 0.0 for _, p in picked):
-                plan.presence = make_device_tensor([[p.presence_penalty] for _, p in picked], torch.float32, self.device)
-            if any(p.frequency_penalty != 0.0 for _, p in picked):
-                plan.frequency = make_device_tensor([[p.frequency_penalty] for _, p in picked], torch.float32, self.device)
-            if any(p.repetition_penalty != 1.0 for _, p in picked):
-                plan.repetition = make_device_tensor([[p.repetition_penalty] for _, p in picked], torch.float32, self.device)
+            plan.prompt_ids = _padded_rows(prompts, pad, self.device)
+            plan.repetition = make_device_tensor([[p.repetition_penalty] for _, p in picked], torch.float32, self.device)
 
         bias_rows: list[int] = []
         bias_ids: list[int] = []
