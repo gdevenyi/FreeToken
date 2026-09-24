@@ -153,3 +153,13 @@ def test_prepare_builds_no_plan_without_processors_and_a_plan_with_them():
     assert torch.isfinite(out[3]).all()
     # greedy path: argmax over the processed logits
     assert sampler.sample(logits, args)[1].item() == 5
+
+
+def test_repetition_penalty_ignores_multimodal_placeholder_ids_in_the_prompt():
+    # image tokens carry pseudo-ids >= MM_PAD_SHIFT_VALUE; scattering them into the
+    # [rows, V+1] prompt mask indexed out of bounds (a device-side assert on CUDA)
+    sampler = Sampler(CPU, V)
+    batch = SimpleNamespace(reqs=[_req([1, 1_000_000, 2], [3], 4, repetition_penalty=2.0)])
+    args = sampler.prepare(batch)
+    out = apply_logits_processors(torch.ones(1, V), args.plan, V)
+    assert out[0, 1] == 0.5 and out[0, 2] == 0.5 and out[0, 4] == 1.0
