@@ -478,7 +478,12 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # The qwen3 chat template opens an implicit <think> (thinking on) unless
         # enable_thinking is explicitly false, so the model emits only the closing
         # </think>. Mirror that default here, else the chain-of-thought leaks into content.
-        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+        # continue_final_message is the exception: the template renders the final assistant
+        # turn as <think>...</think> + content, so the continuation starts in content.
+        ctk = spec.chat_template_kwargs or {}
+        force_reasoning = ctk.get("enable_thinking") is not False and not ctk.get(
+            "continue_final_message"
+        )
     elif parser_name == "glm":
         # GLM's template honors enable_thinking (default on) even with tools; the
         # generic fallback would force thinking and mislabel disabled output as reasoning.
