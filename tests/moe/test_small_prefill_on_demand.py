@@ -8,7 +8,7 @@ import freetoken.layers.moe as moe_mod
 from freetoken.distributed import set_tp_info, try_get_tp_info
 
 
-def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32):
+def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32, cache_size=None):
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.layers.quantization import NoQuantConfig
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -17,7 +17,7 @@ def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32):
         set_tp_info(rank=0, size=1)
     layer = OffloadMoELayer(0, num_experts, top_k, hidden, inter, quant_config=NoQuantConfig(),
                             prefix="model.layers.0.mlp.experts")
-    cache = OffloadMoeCache(num_layers=1, num_experts=num_experts, cache_size=num_experts, device=device)
+    cache = OffloadMoeCache(num_layers=1, num_experts=num_experts, cache_size=cache_size or num_experts, device=device)
     g = torch.Generator().manual_seed(0)
     cache.set_bank_sources({
         "gate_up": [torch.randn(num_experts, 2 * inter, hidden, generator=g, dtype=torch.bfloat16) * 0.1],
@@ -64,6 +64,35 @@ def test_small_prefill_matches_the_whole_layer_path(monkeypatch):
     outs = {}
     for threshold in (0, 8):
         monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", threshold)
-        layer, cache = _layer_and_cache(dev)
-        outs[threshold] = layer._prefill_routed(hs.clone(), w.clone(), ids.clone()).float()
+        layer, cache = _layer_and_cache(dev, cache_size=32)
+        outs[threshold] = _run_and_check_path(layer, hs, w, ids, on_demand=threshold > 0)
     torch.testing.assert_close(outs[8], outs[0], rtol=2e-2, atol=2e-2)
+
+
+def _run_and_check_path(layer, hs, w, ids, *, on_demand):
+    taken = []
+    real = getattr(layer, "_ensure_unique", None)
+    if real is not None:
+        layer._ensure_unique = lambda cache, t: taken.append(r := real(cache, t)) or r
+    out = layer._prefill_routed(hs.clone(), w.clone(), ids.clone()).float()
+    assert (bool(taken) and taken[0] is not None) == on_demand
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_real_sized_small_prefill_fits_the_lru_kernel(monkeypatch):
+    # 200 tokens x top-10 = 2000 routed ids against a cache that rounds up to 2048 slots: the
+    # LRU kernel's block is next_pow2(ids) x next_pow2(slots), so the raw ids overflow Triton's
+    # 1M-element limit; the path must hand it the (at most num_experts) unique ids instead.
+    dev = torch.device("cuda")
+    tokens, experts, top_k = 200, 512, 10
+    g = torch.Generator(device=dev).manual_seed(1)
+    hs = torch.randn(tokens, 16, dtype=torch.bfloat16, device=dev, generator=g) * 0.5
+    ids = torch.randint(0, experts, (tokens, top_k), dtype=torch.int32, device=dev, generator=g)
+    w = torch.softmax(torch.randn(tokens, top_k, device=dev, generator=g), dim=-1)
+    outs = {}
+    for threshold in (0, 1024):
+        monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", threshold)
+        layer, cache = _layer_and_cache(dev, num_experts=experts, top_k=top_k, cache_size=1100)
+        outs[threshold] = _run_and_check_path(layer, hs, w, ids, on_demand=threshold > 0)
+    torch.testing.assert_close(outs[1024], outs[0], rtol=2e-2, atol=2e-2)
