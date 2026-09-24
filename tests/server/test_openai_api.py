@@ -223,6 +223,26 @@ def test_glm_reasoning_parser_honors_disabled_thinking_with_tools():
     assert parser is not None and parser.detector.force_reasoning is True
 
 
+def test_qwen3_continuation_of_a_final_assistant_message_is_content_not_reasoning():
+    # The Qwen template closes the think block before the assistant's content, so a
+    # continue_final_message continuation never emits </think>; starting the parser inside
+    # reasoning filed the whole continuation under reasoning_content.
+    from freetoken.server.generation import _make_reasoning_parser
+
+    state = FakeState([], reasoning_parser="qwen3")
+    req = chat_request(
+        messages=[
+            {"role": "user", "content": "Count to five."},
+            {"role": "assistant", "content": "One, two,"},
+        ],
+        continue_final_message=True,
+    )
+    parser = _make_reasoning_parser(chat_request_to_genspec(req, {}), state)
+    assert parser is not None and parser.detector.force_reasoning is False
+    plain = _make_reasoning_parser(chat_request_to_genspec(chat_request(), {}), state)
+    assert plain.detector.force_reasoning is True
+
+
 def test_non_stream_chat_completion_returns_openai_tool_calls_and_sends_tools():
     output = '[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Paris"}}]'
     state = FakeState(
