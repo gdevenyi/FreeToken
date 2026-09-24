@@ -14,6 +14,7 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 import time
 from collections.abc import AsyncIterator
@@ -229,8 +230,9 @@ def resolve_sampling(
     for name, value in (("presence_penalty", presence_penalty), ("frequency_penalty", frequency_penalty)):
         if not -2.0 <= float(value) <= 2.0:
             raise ValueError(f"{name} must be in [-2, 2], got {value}")
-    if resolved_rep <= 0.0:
-        raise ValueError(f"repetition_penalty must be positive, got {resolved_rep}")
+    # not `<= 0`: NaN compares False and would poison every seen token's logit
+    if not (math.isfinite(resolved_rep) and resolved_rep > 0.0):
+        raise ValueError(f"repetition_penalty must be a positive finite number, got {resolved_rep}")
     if min_tokens < 0:
         raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
     bias: list[list[float]] | None = None
