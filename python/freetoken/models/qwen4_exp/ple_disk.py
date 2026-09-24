@@ -6,6 +6,9 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+import queue
+import threading
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -100,6 +103,52 @@ def resolve_row_source(folder: str) -> PleRowSource:
     return source_from_safetensors(folder)
 
 
+class _Filler:
+    """The one thread that drives the PleStore (engine-thread-only C++, no locks), FIFO.
+
+    Graph fills run here, submitted before the launch: the fill releases the captured decode's
+    WAIT, and cuGraphLaunch may block until the GPU drains, so it must not wait for the launch
+    to return (a large graph deadlocked that way; fork issue #65)."""
+
+    def __init__(self) -> None:
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name="ple-filler", daemon=True)
+        self._thread.start()
+
+    def submit(self, fn) -> Future:
+        fut: Future = Future()
+        self._jobs.put((fn, fut))
+        return fut
+
+    def _run(self) -> None:
+        while (item := self._jobs.get()) is not None:
+            fn, fut = item
+            try:
+                fut.set_result(fn())
+            except BaseException as exc:  # noqa: BLE001 -- surfaced to the engine thread
+                fut.set_exception(exc)
+
+    def close(self) -> None:
+        self._jobs.put(None)
+        self._thread.join(timeout=5)
+
+
+class _PendingFill:
+    """A graph fill submitted before its launch; ``cancel`` after a failed launch."""
+
+    def __init__(self, table: "DiskRowTable", future: Future, cancelled: threading.Event) -> None:
+        self._table, self._future, self._cancelled = table, future, cancelled
+
+    def cancel(self) -> None:
+        # no WAIT consumed the signal: clear it, or the next step's WAIT passes on stale rows
+        self._cancelled.set()
+        try:
+            self._future.result()
+        except BaseException:  # noqa: BLE001 -- the launch error is the one to surface
+            pass
+        self._table._flag.zero_()
+
+
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
 
@@ -168,6 +217,31 @@ class DiskRowTable:
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
+    def _filler(self) -> _Filler:
+        filler = self.__dict__.get("_filler_thread")
+        if filler is None:
+            filler = self._filler_thread = _Filler()
+        return filler
+
+    def close(self) -> None:
+        filler = self.__dict__.pop("_filler_thread", None)
+        if filler is not None:
+            filler.close()
+
+    def _current_stream(self):
+        return torch.cuda.current_stream(self._device)
+
+    def _raise_failed_fill(self) -> None:
+        pending = self.__dict__.pop("_pending_fill", None)
+        if pending is not None and pending.done() and pending.exception() is not None:
+            raise pending.exception()
+        if pending is not None and not pending.done():
+            self._pending_fill = pending
+
+    def _fill_now(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
+        """A fill that completes before its launch, on the store's thread (after any queued graph fill)."""
+        self._filler().submit(lambda: self.fill(runs, graph=graph)).result()
+
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
         pinned = self._graph_pinned if graph else self._eager_pinned
@@ -187,22 +261,27 @@ class DiskRowTable:
             return _context(ids, position, self.eos_token_id)
         return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
 
-    def host_fill_batch(self, batch: Batch, use_graph: bool):
-        """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
-        eos = self.eos_token_id
+    def host_fill_batch(self, batch: Batch, use_graph: bool) -> _PendingFill | None:
+        """Stage this batch's rows before the dispatch. Under flag-sync a graph fill is only submitted:
+        it completes on the filler thread, independently of the launch; returns its handle, else None."""
+        self._raise_failed_fill()
         if batch.is_decode:
             reqs = list(batch.reqs)
+            # the context comes from the request as it is NOW: the engine mutates it once the launch returns
+            contexts = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
-                self._readback_event.record(torch.cuda.current_stream(self._device))
+                self._readback_event.record(self._current_stream())
+                cancelled = threading.Event()
 
-                def _complete() -> None:
+                def _job() -> None:
                     try:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        if cancelled.is_set():
+                            return
+                        runs = [torch.tensor([*ctx, t], dtype=torch.int64) for ctx, t in zip(contexts, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
                         from freetoken.kernel.row_store import signal
@@ -211,12 +290,12 @@ class DiskRowTable:
                         signal(self._flag)
                         raise
 
-                return _complete
+                self._pending_fill = self._filler().submit(_job)
+                return _PendingFill(self, self._pending_fill, cancelled)
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
-            self.fill(runs, graph=use_graph)
+            runs = [torch.tensor([*ctx, t], dtype=torch.int64) for ctx, t in zip(contexts, tokens)]
+            self._fill_now(runs, graph=use_graph)
             return None
         runs = [
             torch.cat((
@@ -225,17 +304,19 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        self._fill_now(runs, graph=False)
         return None
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
-        """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
-        deferred = self.host_fill_batch(batch, use_graph)
-        yield
-        # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
-        if deferred is not None:
-            deferred()
+        """Around one dispatch: stage (or submit the graph fill) on enter; cancel a submitted fill if the launch fails."""
+        pending = self.host_fill_batch(batch, use_graph)
+        try:
+            yield
+        except BaseException:
+            if pending is not None:
+                pending.cancel()
+            raise
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 
