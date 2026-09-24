@@ -294,14 +294,17 @@ async def handle_chat_completion(
             chunks = state.stream_with_cancellation(chunks, request, uids)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
+    tasks = [
+        asyncio.ensure_future(generate_full(u, spec, state, source="/v1/chat/completions"))
+        for u in uids
+    ]
     try:
-        results = await _await_watching_disconnect(
-            asyncio.gather(*(generate_full(u, spec, state, source="/v1/chat/completions") for u in uids)),
-            request,
-            state,
-            uids,
-        )
+        results = await _await_watching_disconnect(asyncio.gather(*tasks), request, state, uids)
     except GenerationError as exc:
+        # gather does not cancel the other choices; the aborts below drop the events they
+        # wait on, so without the cancel they would stay pending forever
+        for task in tasks:
+            task.cancel()
         for u in uids:
             await state.abort_user(u)
         return create_error_response(str(exc), code=exc.code)
