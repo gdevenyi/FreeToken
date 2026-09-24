@@ -159,7 +159,7 @@ def tokenize_worker(
 
     from freetoken.mm.processor import get_mm_processor
 
-    from .detokenize import DetokenizeManager
+    from .detokenize import DetokenizeManager, build_logprobs_entry
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
@@ -242,6 +242,19 @@ def tokenize_worker(
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                         prefill_ms=msg.prefill_ms,
+                        # Stop-string trimming can hide final visible text; keep one logprob
+                        # entry per sampled token.
+                        logprobs=(
+                            build_logprobs_entry(
+                                detokenize_manager.tokenizer,
+                                msg.next_token,
+                                msg.chosen_logprob,
+                                msg.top_ids,
+                                msg.top_logprobs,
+                            )
+                            if msg.chosen_logprob is not None
+                            else None
+                        ),
                     )
                     for msg, reply, reasoning_tokens in zip(
                         detokenize_msg, replies, reasoning_counts, strict=True
