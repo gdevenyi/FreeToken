@@ -156,3 +156,13 @@ def test_presence_and_frequency_ride_the_device_counts_not_the_plan():
     # once: 3 -> 0.5 beats 5 -> 0.25; twice would drop 3 to -0.5 and pick 5
     assert sampler.sample(logits, args).item() == 3
     assert req.output_token_counts[3].item() == 2
+
+
+def test_repetition_penalty_ignores_multimodal_placeholder_ids_in_the_prompt():
+    # image tokens carry pseudo-ids >= MM_PAD_SHIFT_VALUE; scattering them into the
+    # [rows, V+1] prompt mask indexed out of bounds (a device-side assert on CUDA)
+    sampler = Sampler(CPU, V)
+    batch = SimpleNamespace(reqs=[_req([1, 1_000_000, 2], [3], 4, repetition_penalty=2.0)])
+    args = sampler.prepare(batch)
+    out = apply_logits_processors(torch.ones(1, V), args.plan, V)
+    assert out[0, 1] == 0.5 and out[0, 2] == 0.5 and out[0, 4] == 1.0
