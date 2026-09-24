@@ -24,6 +24,9 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# Prefills of at most this many tokens load only their routed experts (the decode path's
+# on-demand LRU) instead of streaming every expert of every layer; 0 = off.
+_SMALL_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_SMALL_PREFILL_TOKENS", "0"))
 
 
 class MoELayer(BaseOP):
@@ -356,6 +359,22 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if 0 < hidden_states.shape[0] <= _SMALL_PREFILL_TOKENS and cache.decode_target in ("gpu", "hybrid"):
+            # A short extension (an agent turn over a cached prefix) touches a fraction of each
+            # layer's experts; fetching those beats streaming all of them (~68 GB here). The same
+            # token count holds in every layer, so the overlap double buffer is never begun.
+            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
