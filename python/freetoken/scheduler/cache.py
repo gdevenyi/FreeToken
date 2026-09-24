@@ -619,8 +619,11 @@ class CacheManager:
         prefix, copy the snapshot back into a fresh pool slot and return the slot; None =
         keep walking (the match truncates as before)."""
         tier = self.host_tier
-        hit = tier.lookup(self.prefix_cache._collect_key(node), self.page_size)
-        if hit is None or hit.gdn_slot is None:
+        key = self.prefix_cache._collect_key(node)
+        hit = tier.lookup(key, self.page_size)
+        # lookup is longest-prefix; a shorter entry's state would resume this node's full
+        # depth with the tokens in between missing from the recurrence
+        if hit is None or hit.gdn_slot is None or hit.host_len != len(key):
             return None
         pool = self.linear_state_pool
         if pool.num_free_slots < 1:
