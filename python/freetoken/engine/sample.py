@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -13,7 +13,8 @@ if TYPE_CHECKING:
 @dataclass
 class LogitsPlan:
     """Inputs of the logits processors for the rows of one batch that asked for any
-    (presence / frequency / repetition penalties, logit_bias, min_tokens, min_p).
+    (repetition penalty, logit_bias, min_tokens, min_p). Presence and frequency
+    penalties are not here: the sampler applies them from per-request device counts.
 
     Built on the host in ``Sampler.prepare`` from the requests' SamplingParams and
     token histories, applied on the device by ``apply_logits_processors`` before the
@@ -24,11 +25,9 @@ class LogitsPlan:
 
     rows: torch.Tensor  # [r] int64 batch rows
     temps: torch.Tensor  # [r, 1] float32 temperatures (min_p works on probabilities)
-    presence: torch.Tensor | None = None  # [r, 1] float32
-    frequency: torch.Tensor | None = None  # [r, 1] float32
     repetition: torch.Tensor | None = None  # [r, 1] float32 (1.0 = off)
     # Generated ids per row, right-padded with vocab_size (a scratch column that is
-    # dropped), for the presence / frequency counts and the repetition mask.
+    # dropped), for the repetition mask.
     hist_ids: torch.Tensor | None = None  # [r, L] int64
     # Prompt ids per row, same padding: repetition_penalty also covers the prompt.
     prompt_ids: torch.Tensor | None = None  # [r, P] int64
@@ -47,6 +46,8 @@ class BatchSamplingArgs:
     temperatures: torch.Tensor | None
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
+    greedy_mask: torch.Tensor | None = None
+    penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
     plan: LogitsPlan | None = None
 
 
@@ -72,31 +73,22 @@ def apply_logits_processors(
     logits: torch.Tensor, plan: LogitsPlan, vocab_size: int
 ) -> torch.Tensor:
     """A float32 copy of ``logits`` with the plan applied to its rows, in vLLM's order:
-    repetition -> presence -> frequency penalties, logit_bias, the min_tokens mask, then
-    min_p. Rows outside the plan are copied unchanged."""
+    repetition penalty, logit_bias, the min_tokens mask, then min_p. Rows outside the
+    plan are copied unchanged."""
     out = logits.to(torch.float32, copy=True)
     sub = out[plan.rows]  # [r, V] (advanced indexing copies)
     r = sub.shape[0]
     device = sub.device
     neg_inf = float("-inf")
 
-    if plan.hist_ids is not None:
-        counts = torch.zeros((r, vocab_size + 1), dtype=torch.float32, device=device)
-        counts.scatter_add_(1, plan.hist_ids, torch.ones_like(plan.hist_ids, dtype=torch.float32))
-        counts = counts[:, :vocab_size]
-        if plan.repetition is not None:
-            seen = counts > 0
-            if plan.prompt_ids is not None:
-                in_prompt = torch.zeros((r, vocab_size + 1), dtype=torch.bool, device=device)
-                in_prompt.scatter_(1, plan.prompt_ids, torch.ones_like(plan.prompt_ids, dtype=torch.bool))
-                seen = seen | in_prompt[:, :vocab_size]
-            # HF / vLLM semantics: divide positive logits, multiply negative ones.
-            penalized = torch.where(sub > 0, sub / plan.repetition, sub * plan.repetition)
-            sub = torch.where(seen, penalized, sub)
-        if plan.presence is not None:
-            sub = sub - plan.presence * (counts > 0).to(sub.dtype)
-        if plan.frequency is not None:
-            sub = sub - plan.frequency * counts
+    if plan.repetition is not None and plan.hist_ids is not None:
+        seen = torch.zeros((r, vocab_size + 1), dtype=torch.bool, device=device)
+        seen.scatter_(1, plan.hist_ids, torch.ones_like(plan.hist_ids, dtype=torch.bool))
+        if plan.prompt_ids is not None:
+            seen.scatter_(1, plan.prompt_ids, torch.ones_like(plan.prompt_ids, dtype=torch.bool))
+        # HF / vLLM semantics: divide positive logits, multiply negative ones.
+        penalized = torch.where(sub > 0, sub / plan.repetition, sub * plan.repetition)
+        sub = torch.where(seen[:, :vocab_size], penalized, sub)
 
     if plan.bias_ids is not None:
         sub.index_put_((plan.bias_rows, plan.bias_ids), plan.bias_vals, accumulate=True)
@@ -124,9 +116,14 @@ def sample_impl(
     top_p: torch.Tensor | float | None,
 ) -> torch.Tensor:
     from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.utils.arch import is_sm70_supported
 
     if is_flashinfer_installed():
         import flashinfer.sampling as sampling
+    elif not is_sm70_supported():
+        # The triton top-p/top-k threshold search accumulates through tl.atomic_*, which
+        # triton can only lower to sm_70+ encodings. Sort with torch instead.
+        import freetoken.kernel.torch_sampling as sampling
     else:
         import freetoken.kernel.triton.sampling as sampling
 
@@ -154,9 +151,8 @@ class Sampler:
     def _plan(self, batch: Batch, params) -> LogitsPlan | None:
         """The LogitsPlan for this batch, or None when no request asks for a processor.
         Token histories come from the host-side ``req.input_ids``; under overlap
-        scheduling the previous step's token may not be appended yet, so a penalty sees
-        the history one token late. That is the accepted cost of keeping the counts off
-        the device."""
+        scheduling the previous step's token may not be appended yet, so the repetition
+        penalty sees the history one token late."""
         MIN_T = 1e-6
         rows = [i for i, p in enumerate(params) if p.needs_logits_processing]
         if not rows:
@@ -169,33 +165,23 @@ class Sampler:
         )
         pad = self.vocab_size
 
-        want_hist = any(
-            p.presence_penalty != 0.0 or p.frequency_penalty != 0.0 or p.repetition_penalty != 1.0
-            for _, p in picked
-        )
-        if want_hist:
+        if any(p.repetition_penalty != 1.0 for _, p in picked):
             hist: list[list[int]] = []
             prompts: list[list[int]] = []
-            want_prompt = False
             for req, p in picked:
                 prompt_len = req.max_device_len - req.output_len
                 ids = req.input_ids
-                penalized = p.presence_penalty != 0.0 or p.frequency_penalty != 0.0 or p.repetition_penalty != 1.0
-                hist.append(ids[prompt_len:].tolist() if penalized else [])
                 if p.repetition_penalty != 1.0:
-                    want_prompt = True
-                    prompts.append(ids[:prompt_len].tolist())
+                    hist.append(ids[prompt_len:].tolist())
+                    # multimodal placeholders are pseudo-ids >= vocab_size (MM_PAD_SHIFT_VALUE);
+                    # send them to the scratch column, not past the scatter target
+                    prompts.append(ids[:prompt_len].clamp(max=pad).tolist())
                 else:
+                    hist.append([])
                     prompts.append([])
             plan.hist_ids = _padded_rows(hist, pad, self.device)
-            if want_prompt:
-                plan.prompt_ids = _padded_rows(prompts, pad, self.device)
-            if any(p.presence_penalty != 0.0 for _, p in picked):
-                plan.presence = make_device_tensor([[p.presence_penalty] for _, p in picked], torch.float32, self.device)
-            if any(p.frequency_penalty != 0.0 for _, p in picked):
-                plan.frequency = make_device_tensor([[p.frequency_penalty] for _, p in picked], torch.float32, self.device)
-            if any(p.repetition_penalty != 1.0 for _, p in picked):
-                plan.repetition = make_device_tensor([[p.repetition_penalty] for _, p in picked], torch.float32, self.device)
+            plan.prompt_ids = _padded_rows(prompts, pad, self.device)
+            plan.repetition = make_device_tensor([[p.repetition_penalty] for _, p in picked], torch.float32, self.device)
 
         bias_rows: list[int] = []
         bias_ids: list[int] = []
@@ -229,27 +215,76 @@ class Sampler:
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
+        is_greedy = [p.is_greedy for p in params]
+        penalties = []
+        for row, req in enumerate(batch.reqs):
+            p = req.sampling_params
+            if not (p.presence_penalty or p.frequency_penalty) or not req.can_decode:
+                continue
+            if req.output_token_counts is None:
+                req.output_token_counts = torch.zeros(
+                    self.vocab_size, dtype=torch.int32, device=self.device
+                )
+            penalties.append(
+                (row, req.output_token_counts, p.presence_penalty, p.frequency_penalty)
+            )
         plan = self._plan(batch, params)
-        if all(p.is_greedy for p in params):
-            return BatchSamplingArgs(temperatures=None, plan=plan)
+        if all(is_greedy):
+            return BatchSamplingArgs(temperatures=None, penalties=penalties, plan=plan)
 
         MIN_P = MIN_T = 1e-6
-        ts = [max(0.0 if p.is_greedy else p.temperature, MIN_T) for p in params]
-        top_ks = [p.top_k if p.top_k >= 1 else self.vocab_size for p in params]
-        top_ps = [min(max(p.top_p, MIN_P), 1.0) for p in params]
+        # Greedy outputs are selected explicitly in sample(); use neutral sampling
+        # parameters for those rows instead of approximating argmax at low temperature.
+        ts = [1.0 if g else max(p.temperature, MIN_T) for p, g in zip(params, is_greedy)]
+        top_ks = [
+            p.top_k if not g and p.top_k >= 1 else self.vocab_size
+            for p, g in zip(params, is_greedy)
+        ]
+        top_ps = [
+            1.0 if g else min(max(p.top_p, MIN_P), 1.0)
+            for p, g in zip(params, is_greedy)
+        ]
         temperatures = make_device_tensor(ts, torch.float32, self.device)
         top_k, top_p = None, None
         if any(k != self.vocab_size for k in top_ks):
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p, plan=plan)
+        greedy_mask = (
+            make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
+        )
+        return BatchSamplingArgs(
+            temperatures,
+            top_k=top_k,
+            top_p=top_p,
+            greedy_mask=greedy_mask,
+            penalties=penalties,
+            plan=plan,
+        )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.penalties:
+                logits = logits.float().clone()
+                for row, counts, presence, frequency in args.penalties:
+                    logits[row] -= frequency * counts + presence * (counts > 0)
+            # after the penalties: min_p must see the final distribution
             if args.plan is not None:
                 logits = apply_logits_processors(logits, args.plan, self.vocab_size)
             if args.temperatures is None:  # greedy sampling
-                return torch.argmax(logits, dim=-1)
-            return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                tokens = torch.argmax(logits, dim=-1)
+            else:
+                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                if args.greedy_mask is not None:
+                    # Mixed batches still run probability sampling for all rows, but
+                    # greedy rows must follow argmax's deterministic tie-breaking.
+                    greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
+                    tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+            # Update on the sampling stream: overlapped scheduling can prepare the next
+            # batch before the previous token reaches Req.input_ids on the CPU.
+            for row, counts, _, _ in args.penalties:
+                counts.scatter_add_(
+                    0, tokens[row : row + 1].long(), counts.new_ones(1)
+                )
+            return tokens

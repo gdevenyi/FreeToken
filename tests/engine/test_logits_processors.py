@@ -31,21 +31,6 @@ def _ids(rows: list[list[int]]) -> torch.Tensor:
     return out
 
 
-def test_presence_and_frequency_penalties_count_generated_tokens():
-    logits = torch.zeros((2, V))
-    plan = _plan(
-        [1],
-        hist_ids=_ids([[3, 3, 5]]),
-        presence=torch.tensor([[0.5]]),
-        frequency=torch.tensor([[0.25]]),
-    )
-    out = apply_logits_processors(logits, plan, V)
-    assert torch.equal(out[0], logits[0])  # row outside the plan untouched
-    assert out[1, 3].item() == -(0.5 + 2 * 0.25)
-    assert out[1, 5].item() == -(0.5 + 0.25)
-    assert out[1, 0].item() == 0.0
-
-
 def test_repetition_penalty_covers_prompt_and_output_with_hf_semantics():
     logits = torch.tensor([[2.0, -2.0, 2.0, -2.0, 1.0, 1.0, 1.0, 1.0]])
     plan = _plan(
@@ -107,6 +92,8 @@ def _req(
         output_len=max_tokens,
         max_device_len=len(prompt) + max_tokens,
         sampling_params=SamplingParams(**sp),
+        can_decode=True,
+        output_token_counts=None,
     )
 
 
@@ -145,11 +132,37 @@ def test_prepare_builds_no_plan_without_processors_and_a_plan_with_them():
 
     logits = torch.zeros((4, V))
     out = apply_logits_processors(logits, plan, V)
-    assert (
-        out[1, 3].item() == -1.0
-    )  # presence on the repeated 3 (repetition on 0 is a no-op)
+    assert out[1, 3].item() == 0.0  # repetition on 0 is a no-op; presence is not plan work
     assert out[1, 5].item() == 2.0
     assert out[2, 0].item() == float("-inf") and out[2, 7].item() == float("-inf")
     assert torch.isfinite(out[3]).all()
     # greedy path: argmax over the processed logits
     assert sampler.sample(logits, args)[1].item() == 5
+
+
+def test_presence_and_frequency_ride_the_device_counts_not_the_plan():
+    # the plan must not apply them a second time on top of the sampler's own counts
+    sampler = Sampler(CPU, V)
+    only = SimpleNamespace(reqs=[_req([1], [], 4, presence_penalty=1.0, frequency_penalty=0.5)])
+    args = sampler.prepare(only)
+    assert args.plan is None and [row for row, *_ in args.penalties] == [0]
+
+    req = _req([1], [], 4, presence_penalty=1.0, logit_bias=[[5, 0.25]])
+    args = sampler.prepare(SimpleNamespace(reqs=[req]))
+    assert args.plan is not None and [row for row, *_ in args.penalties] == [0]
+    req.output_token_counts[3] = 1
+    logits = torch.zeros((1, V))
+    logits[0, 3] = 1.5
+    # once: 3 -> 0.5 beats 5 -> 0.25; twice would drop 3 to -0.5 and pick 5
+    assert sampler.sample(logits, args).item() == 3
+    assert req.output_token_counts[3].item() == 2
+
+
+def test_repetition_penalty_ignores_multimodal_placeholder_ids_in_the_prompt():
+    # image tokens carry pseudo-ids >= MM_PAD_SHIFT_VALUE; scattering them into the
+    # [rows, V+1] prompt mask indexed out of bounds (a device-side assert on CUDA)
+    sampler = Sampler(CPU, V)
+    batch = SimpleNamespace(reqs=[_req([1, 1_000_000, 2], [3], 4, repetition_penalty=2.0)])
+    args = sampler.prepare(batch)
+    out = apply_logits_processors(torch.ones(1, V), args.plan, V)
+    assert out[0, 1] == 0.5 and out[0, 2] == 0.5 and out[0, 4] == 1.0
