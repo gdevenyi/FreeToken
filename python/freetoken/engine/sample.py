@@ -187,7 +187,9 @@ class Sampler:
                 hist.append(ids[prompt_len:].tolist() if penalized else [])
                 if p.repetition_penalty != 1.0:
                     want_prompt = True
-                    prompts.append(ids[:prompt_len].tolist())
+                    # multimodal placeholders are pseudo-ids >= vocab_size (MM_PAD_SHIFT_VALUE);
+                    # send them to the scratch column, not past the scatter target
+                    prompts.append(ids[:prompt_len].clamp(max=pad).tolist())
                 else:
                     prompts.append([])
             plan.hist_ids = _padded_rows(hist, pad, self.device)
