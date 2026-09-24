@@ -115,8 +115,9 @@ class HostPrefixTier:
             for dst, src in copies:
                 dst.copy_(src)
             return
-        # The engine stream may still have work queued on these slots (overlap launches the
-        # next batch before the previous one is drained): order the copies after it.
+        # Order the copies after the caller's stream: the scheduler stream (itself made to wait
+        # on the engine stream) or the engine stream. Overlap launches the next batch before
+        # the previous one is drained, so a just-freed slot may still be written by it.
         self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(self.copy_stream):
             for dst, src in copies:
@@ -200,6 +201,7 @@ class HostPrefixTier:
                     del staged_s
 
         if self.copy_stream is not None:
+            self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self.copy_stream):
                 _go()
             self.copy_stream.synchronize()
@@ -237,6 +239,7 @@ class HostPrefixTier:
                     del staged_s
 
         if self.copy_stream is not None:
+            self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self.copy_stream):
                 _go()
             self.copy_stream.synchronize()
