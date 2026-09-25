@@ -41,9 +41,12 @@ class VocabParallelEmbedding(BaseOP):
     def place_on_host(self) -> None:
         """Move the table into pinned host RAM; lookups then read their rows over PCIe (UVA)."""
         from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+        from freetoken.kernel.triton.ple import _TL_TABLE_DTYPES
 
         if self.tp_size > 1:
             raise ValueError("a host-resident embedding serves a single GPU only")
+        if self.weight.dtype not in _TL_TABLE_DTYPES:
+            raise ValueError(f"a host-resident embedding cannot gather a {self.weight.dtype} table")
         host = alloc_pinned_tensor(*self.weight.shape, dtype=self.weight.dtype)
         host.copy_(self.weight)
         self.weight = host
