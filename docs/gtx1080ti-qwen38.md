@@ -51,8 +51,8 @@ Decode, steady state, 1K context, temperature 0 (in-process A/B with the product
 | Before the CPU MoE and memops work (fetch 3) | 9.0 (older timing that also counted a ~6 s re-prefill, so not directly comparable) |
 | AVX2 int8 NVFP4 kernel, NUMA placement, worker hot-spin, fetch 1 | 18.15 (host-func handshake) |
 | + 32-bit stream-memops flag handshake | 19.08 |
-| Server, with the 262K host KV tier, before the selection-compaction fix | 14.0 |
-| Server, with the host KV tier, after it | 17.2 (in-process) |
+| With the 262K host KV tier, before the selection-compaction fix (server) | 14.0 |
+| With the host KV tier, after it (in-process; 17.4 streamed through the server, table below) | 17.2 |
 
 Short agent turns over a cached 4K prefix (time to the first token): 40 new tokens 1.9 s, 128 about 3.2 s
 (5.9 s each when every prefill streams all experts).
@@ -69,8 +69,8 @@ Long context through the server (recall = three codes planted at 5%, 50% and 95%
 | 84,232 | 18.2 min | 77 | 11.0 | 3/3 |
 | 247,231 | 2 h 20 min | 29 | 6.8 | 3/3 |
 
-Prefill and decode slow down with depth: the QSA indexer scores every earlier token, and past 32K tokens
-the selected KV pages come from the host mirror. At ~250K a few selections span more pages than the GPU
+Prefill and decode slow down with depth, probably because the QSA indexer scores every earlier token and,
+past 32K tokens, the selected KV pages come from the host mirror (not profiled at this depth). At ~250K a few selections span more pages than the GPU
 pool can hold for one row (the server logs "selected pages dropped"); recall stayed 3/3.
 A cold 262K prompt is therefore a multi-hour job; agent sessions grow their context incrementally through
 the prefix cache, so each turn only prefills its new tokens.
@@ -100,7 +100,8 @@ EXTRA_ARGS="--enable-metrics-report" scripts/freetoken-qwen38-1080.sh start
 ```
 
 As a systemd user service: `cp scripts/freetoken-qwen38-1080.service ~/.config/systemd/user/ && systemctl --user
-enable --now freetoken-qwen38-1080`; run `sudo loginctl enable-linger $USER` so it survives logout.
+enable --now freetoken-qwen38-1080`; run `sudo loginctl enable-linger $USER` so it survives logout (linger is off on this box, so the
+running instance is started with the script instead, which detaches it from the login session).
 
 After changing the C++ sources or pulling: `CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 .venv/bin/python setup.py
 build_ext --inplace` (the CPU MoE executor degrades to the host-func handshake on a stale build).
@@ -112,4 +113,4 @@ so the prefix cache keeps hitting.
 Known test failures on this card (other models' kernels that need more than 48 KB of shared memory or sm_70+):
 MiniMax-M3 sparse attention, GLM DSA, FP8 block-scale MoE, NVFP4 sparse-MLA KV; plus
 `test_scheme_for_agrees_with_the_stored_tensors[sentence-transformers/all-MiniLM-L6-v2]`, which scans a local HF cache.
-Full suite: 2771 passed, 50 failed (all in that list), 234 skipped.
+Full suite at this commit: 2773 passed, 50 failed (all in that list), 234 skipped.
