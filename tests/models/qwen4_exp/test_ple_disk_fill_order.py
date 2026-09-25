@@ -8,6 +8,7 @@ These tests stand in for the GPU with host fakes: the "launch" blocks until the 
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from types import SimpleNamespace
@@ -55,13 +56,13 @@ class _Event:
 def _table(monkeypatch) -> DiskRowTable:
     # host-only: no CUDA stream behind the (faked) readback event
     monkeypatch.setattr(ple_disk.torch.cuda, "current_stream", lambda *a, **k: None)
+    monkeypatch.setattr(ple_disk.torch.cuda, "Event", _Event)
     t = DiskRowTable.__new__(DiskRowTable)
     t._device = None
     t._wait_sync = True
     t._flag = torch.zeros(1, dtype=torch.int64)
     t._store = _Store(t._flag)
     t._token_readback = torch.zeros(8, dtype=torch.int32)
-    t._readback_event = _Event()
     t._graph_pinned = torch.zeros(64, dtype=torch.uint8)
     t._eager_pinned = torch.zeros(64, dtype=torch.uint8)
     t._token_bytes = 1
@@ -131,4 +132,96 @@ def test_a_failed_launch_leaves_no_stale_signal(monkeypatch):
             raise RuntimeError("launch failed")
     # no WAIT consumed it, so a leftover 1 would let the next step read stale rows
     assert int(t._flag[0]) == 0
+    _close(t)
+
+
+class _Gpu:
+    """One in-order stream: each launched graph parks on WAIT(flag), then RESETs it."""
+
+    def __init__(self, flag: torch.Tensor):
+        self.flag = flag
+        self.enqueued = self.completed = 0
+        self.stalled = False
+        self.cv = threading.Condition()
+        self._launches: queue.SimpleQueue = queue.SimpleQueue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def launch(self) -> None:
+        self.enqueued += 1
+        self._launches.put(True)
+
+    def close(self) -> None:
+        self._launches.put(False)
+
+    def _run(self) -> None:
+        while self._launches.get():
+            self.stalled |= not _blocking_launch(self.flag)
+            with self.cv:
+                self.completed += 1
+                self.cv.notify_all()
+
+    def wait_completed(self, n: int, timeout: float = 5.0) -> bool:
+        with self.cv:
+            return self.cv.wait_for(lambda: self.completed >= n, timeout)
+
+
+class _StreamEvent:
+    """cudaEvent semantics: synchronize() waits for the work enqueued before the LAST record."""
+
+    def __init__(self, gpu: _Gpu):
+        self.gpu, self.target = gpu, 0
+
+    def record(self, stream=None):
+        self.target = self.gpu.enqueued
+
+    def synchronize(self):
+        if not self.gpu.wait_completed(self.target, timeout=1.0):
+            raise TimeoutError("the readback waits on a graph parked on this fill's own WAIT")
+
+
+def _two_steps_behind_a_slow_filler(t: DiskRowTable, gpu: _Gpu) -> None:
+    """Steps N and N+1 both launch before the filler thread reaches fill N."""
+    gate = threading.Event()
+    t._filler().submit(gate.wait)
+    for prev, new in (([1, 2, 3], 7), ([1, 2, 3, 7], 8)):
+        with t.forward_host_ctx(_decode_batch(prev, new), use_graph=True):
+            gpu.launch()
+    gate.set()
+    assert gpu.wait_completed(2), "decode deadlocked"
+    t._filler().submit(lambda: None).result()  # every submitted fill has finished
+    gpu.close()
+
+
+def test_each_fill_waits_on_its_own_steps_readback(monkeypatch):
+    """A readback event shared across steps is re-recorded by step N+1 behind graph N, so
+    fill N would wait on the graph that is parked on fill N's own WAIT."""
+    t = _table(monkeypatch)
+    gpu = _Gpu(t._flag)
+    monkeypatch.setattr(ple_disk.torch.cuda, "Event", lambda: _StreamEvent(gpu))
+    _two_steps_behind_a_slow_filler(t, gpu)
+    t._raise_failed_fill()
+    _close(t)
+    assert not gpu.stalled
+    # the fake D2H readback is not stream-ordered, so compare only the contexts
+    assert [c[1][:2] for c in t._store.calls if c[0] == "stage"] == [[2, 3], [3, 7]]
+
+
+def test_a_failed_fill_is_raised_after_the_next_step_was_submitted(monkeypatch):
+    """Fill N fails (its graph runs on stale rows) after step N+1 already submitted: the error
+    must still reach the engine thread at the next launch."""
+    t = _table(monkeypatch)
+    gpu = _Gpu(t._flag)
+    monkeypatch.setattr(ple_disk.torch.cuda, "Event", lambda: _StreamEvent(gpu))
+    flush = t._store.flush
+
+    def fail_step_n(signal_addr):
+        if t._store.calls[-1][1][:2] == [2, 3]:  # the run staged just before is step N's
+            raise OSError("PLE row read failed")
+        flush(signal_addr)
+
+    t._store.flush = fail_step_n
+    _two_steps_behind_a_slow_filler(t, gpu)
+    req = SimpleNamespace(input_ids=torch.tensor([1, 2, 3, 4]), cached_len=1, device_len=4)
+    with pytest.raises(OSError, match="PLE row read failed"):
+        t.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[req]), use_graph=False)
     _close(t)
