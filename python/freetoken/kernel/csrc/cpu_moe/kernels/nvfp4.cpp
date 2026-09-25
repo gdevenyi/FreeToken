@@ -556,6 +556,13 @@ class Nvfp4Format final : public MoeFormat {
 
   std::string isa_name() const override { return isa_; }
 
+  const void* gate_up_row(int layer, int e, int row) const override {
+    return static_cast<const uint8_t*>(tbl_at(gate_up_, layer)) + ((size_t)e * 2 * p.I + row) * (p.H / 2);
+  }
+  const void* down_row(int layer, int e, int row) const override {
+    return static_cast<const uint8_t*>(tbl_at(down_, layer)) + ((size_t)e * p.H + row) * (p.I / 2);
+  }
+
 
   void prep_input(int tok, const bf16_t* x) override {
     float* xe = xe_.data() + (size_t)tok * (p.H / 2);

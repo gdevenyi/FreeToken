@@ -143,6 +143,13 @@ class Bf16Format final : public MoeFormat {
         out[j * kRowBlock + h - h0] = dot_(w + ((size_t)routes[j].e * p.H + h) * p.I, routes[j].g, p.I);
   }
 
+  const void* gate_up_row(int layer, int e, int row) const override {
+    return static_cast<const bf16_t*>(tbl_at(gate_up_, layer)) + ((size_t)e * 2 * p.I + row) * p.H;
+  }
+  const void* down_row(int layer, int e, int row) const override {
+    return static_cast<const bf16_t*>(tbl_at(down_, layer)) + ((size_t)e * p.H + row) * p.I;
+  }
+
  private:
   dot_fn dot_;
   // bf16 rows: gate_up [E, 2I, H], down [E, H, I].

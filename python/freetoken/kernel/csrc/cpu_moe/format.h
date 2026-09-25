@@ -23,8 +23,6 @@ namespace freetoken::cpu_moe {
 //     only pay off in a grouped/batched (dedup) path.
 //   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
 //     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
-//   - NUMA: a single node is assumed. Multi-socket machines would split each
-//     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int kRowBlock = 32;
 
 struct MoeParams {
@@ -123,6 +121,10 @@ class MoeFormat {
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
   // Round each router-weighted down output to bf16 before the sum over routes.
   virtual bool rounds_routes() const { return false; }
+  // Address of a row-major gate_up / down row, for NUMA tile scheduling; nullptr if the
+  // format does not store whole rows.
+  virtual const void* gate_up_row(int /*layer*/, int /*e*/, int /*row*/) const { return nullptr; }
+  virtual const void* down_row(int /*layer*/, int /*e*/, int /*row*/) const { return nullptr; }
 
  protected:
   const MoeParams& p;

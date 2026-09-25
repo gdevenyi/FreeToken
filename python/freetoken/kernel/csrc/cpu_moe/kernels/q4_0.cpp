@@ -184,6 +184,13 @@ class Q4_0Format final : public MoeFormat {
     });
   }
 
+  const void* gate_up_row(int layer, int e, int row) const override {
+    return static_cast<const uint8_t*>(tbl_at(gate_up_, layer)) + ((size_t)e * 2 * p.I + row) * (size_t)gu_row_bytes_;
+  }
+  const void* down_row(int layer, int e, int row) const override {
+    return static_cast<const uint8_t*>(tbl_at(down_, layer)) + ((size_t)e * p.H + row) * (size_t)dn_row_bytes_;
+  }
+
   void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const override {
     const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(down_, layer));
     for (int h = h0; h < h1; ++h) {
