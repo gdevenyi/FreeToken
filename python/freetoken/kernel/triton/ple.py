@@ -21,6 +21,7 @@ from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
 
 # Latency-bound over PCIe, so keep the block small and let many of them be in flight.
 _NUM_WARPS = 1
+_TL_TABLE_DTYPES = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 
 @triton.jit
@@ -33,6 +34,7 @@ def _ple_gather_kernel(
     EMB_DIM: tl.constexpr,
     IS_FP8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    TABLE_DTYPE: tl.constexpr,
 ):
     row = tl.program_id(0)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -50,7 +52,7 @@ def _ple_gather_kernel(
             base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
             values = e4m3_u8_to_f32(tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0))
     else:
-        base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+        base = table_ptr.to(tl.int64).to(tl.pointer_type(TABLE_DTYPE))
         values = tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0.0).to(tl.float32)
     values = tl.where(in_range, values * scale, 0.0)
     tl.store(
@@ -68,11 +70,12 @@ def ple_gather_rows(
     out: torch.Tensor,
     scale: float = 1.0,
     is_fp8: bool = True,
+    table_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Gather ``row_ids`` from the host-resident table at ``table_ptr`` into ``out``.
 
     ``row_ids`` is a flat device int tensor; ``out`` is ``[row_ids.numel(), embed_dim]``
-    bf16 on the same device. ``table_ptr`` is the address the GPU must dereference
+    on the same device. A non-fp8 table holds ``table_dtype`` elements. ``table_ptr`` is the address the GPU must dereference
     (``kernel/pinned.device_ptr``), not necessarily the host ``data_ptr``.
     """
     n = row_ids.numel()
@@ -87,6 +90,7 @@ def ple_gather_rows(
             EMB_DIM=embed_dim,
             IS_FP8=is_fp8,
             BLOCK_D=triton.next_power_of_2(embed_dim),
+            TABLE_DTYPE=_TL_TABLE_DTYPES[table_dtype],
             num_warps=_NUM_WARPS,
         )
     return out
