@@ -5,7 +5,9 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flashlib.kernels.slot_cache import lru_ensure
+from flashlib.kernels.slot_cache import Stat, lru_ensure
+
+from freetoken.utils.arch import is_sm70_supported
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
@@ -25,6 +27,12 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    stats = cache.lru_stats[layer_id] if cache.collect_stats else None
+    # flashlib accumulates the stats with tl.atomic_add, which ptxas rejects below sm_70;
+    # there the same counters are kept with torch ops around the launch instead.
+    torch_stats = stats is not None and not is_sm70_supported()
+    if torch_stats:
+        active = _distinct_count(expert_ids)  # before the kernel rewrites ids to slots
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
@@ -35,9 +43,24 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        stats=None if torch_stats else stats,
         id_base=layer_id * cache.num_experts,
     )
+    if torch_stats:
+        _accumulate_lru_stats(stats, active, cache.num_indices)
+
+
+def _distinct_count(ids: torch.Tensor) -> torch.Tensor:
+    """Number of distinct values in ``ids`` as a 0-d int64 tensor: fixed shapes, no host sync."""
+    s, _ = torch.sort(ids.reshape(-1))
+    return (s[1:] != s[:-1]).sum() + int(s.numel() > 0)
+
+
+def _accumulate_lru_stats(row: torch.Tensor, active: torch.Tensor, num_copy: torch.Tensor) -> None:
+    """``lru_ensure``'s stats update for one call: ``num_copy`` holds its distinct miss count."""
+    row[Stat.ACTIVE] += active
+    row[Stat.MISS] += num_copy.reshape(())
+    row[Stat.CALLS] += 1
 
 
 def ensure_experts_hybrid(

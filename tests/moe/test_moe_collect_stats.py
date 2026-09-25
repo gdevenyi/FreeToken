@@ -10,6 +10,7 @@ import contextlib
 import io
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.engine.engine import MOE_STATS_INTERVAL, Engine
@@ -129,3 +130,105 @@ def test_static_topk_hit_is_not_an_upper_bound_on_lru():
     assert stats["static_topk_hit_at_slots"] == 0.25
     assert "oracle_hit_at_slots" not in stats
     assert lru_hits / len(trace) == 0.75
+
+
+def _reference_lru_ensure(query, slot_of_id, id_of_slot, lru_usage, lru_step, out_indices,
+                          src_indices, dst_indices, num_copy, stats=None, id_base=0):
+    """Python stand-in for flashlib's lru_ensure: same maps, plan and in-place rewrite."""
+    assert stats is None, "below sm_70 the stats atomic must stay out of the kernel"
+    lru_step += 1
+    step = int(lru_step)
+    ids = [int(q) + id_base for q in query.tolist()]
+    missing = []
+    for g in ids:
+        s = int(slot_of_id[g])
+        if s >= 0:
+            lru_usage[s] = step
+        elif g not in missing:
+            missing.append(g)
+    # misses take victims in ascending id order, victims in ascending (usage, slot) order
+    for i, g in enumerate(sorted(missing)):
+        free = [c for c in range(id_of_slot.numel()) if int(lru_usage[c]) != step]
+        victim = min(free, key=lambda c: (int(lru_usage[c]), c))
+        old = int(id_of_slot[victim])
+        if old >= 0:
+            slot_of_id[old] = -1
+        id_of_slot[victim], slot_of_id[g], lru_usage[victim] = g, victim, step
+        src_indices[i], dst_indices[i] = g - id_base, victim
+    num_copy[0] = len(missing)
+    out_indices.copy_(torch.tensor([int(slot_of_id[g]) for g in ids], dtype=out_indices.dtype))
+
+
+def _stats_trace(num_experts):
+    g = torch.Generator().manual_seed(0)
+    trace = []
+    for step in range(12):
+        for layer in (0, 1):
+            ids = torch.randint(0, num_experts, (6,), generator=g, dtype=torch.int32)
+            ids[1] = ids[0]  # duplicates collapse to one active expert and one copy
+            trace.append((layer, ids))
+    return trace
+
+
+def test_pre_sm70_stats_match_the_kernel_counters(monkeypatch):
+    """On Pascal is_sm70_supported() is False, so ensure_experts keeps the stats itself.
+    ACTIVE must be counted from the raw ids, before the in-place slot rewrite."""
+    from freetoken.moe import offload_kernels
+
+    monkeypatch.setattr(offload_kernels, "is_sm70_supported", lambda: False, raising=False)
+    monkeypatch.setattr(offload_kernels, "lru_ensure", _reference_lru_ensure)
+    E = 8
+    cache = OffloadMoeCache(num_layers=2, num_experts=E, cache_size=12,
+                            device=torch.device("cpu"), quant_format="bf16")
+    cache.collect_stats = True
+    expected = torch.zeros_like(cache.lru_stats)
+    for layer, ids in _stats_trace(E):
+        raw = ids.tolist()
+        cache.ensure_experts(layer, ids)
+        assert ids.tolist() != raw or len(set(raw)) == 1  # rewritten to slot ids in place
+        expected[layer] += torch.tensor([len(set(raw)), int(cache.num_indices[0]), 1])
+    assert torch.equal(cache.lru_stats, expected)
+    assert cache.decode_miss_stats()["layer_calls"] == 24
+
+
+def test_distinct_count_matches_unique():
+    from freetoken.moe.offload_kernels import _distinct_count
+
+    g = torch.Generator().manual_seed(1)
+    for n in (0, 1, 2, 7, 40):
+        ids = torch.randint(0, 6, (n,), generator=g, dtype=torch.int32)
+        assert int(_distinct_count(ids)) == torch.unique(ids).numel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_pre_sm70_stats_path_on_the_gpu(monkeypatch):
+    """The torch stats path against the in-kernel counters; on a pre-sm_70 GPU (where the
+    kernel counters cannot compile) against the Python reference instead."""
+    from freetoken.moe import offload_kernels
+
+    E, dev = 8, torch.device("cuda")
+    kernel_ok = offload_kernels.is_sm70_supported()
+
+    def run(torch_stats: bool, ensure=None):
+        monkeypatch.setattr(offload_kernels, "is_sm70_supported", lambda: not torch_stats)
+        if ensure is not None:
+            monkeypatch.setattr(offload_kernels, "lru_ensure", ensure)
+        cache = OffloadMoeCache(num_layers=2, num_experts=E, cache_size=12, device=dev,
+                                quant_format="bf16")
+        cache.collect_stats = True
+        for layer, ids in _stats_trace(E):
+            cache.ensure_experts(layer, ids.to(dev))
+        torch.cuda.synchronize()
+        return cache.lru_stats.cpu()
+
+    got = run(torch_stats=True)
+    if kernel_ok:
+        assert torch.equal(got, run(torch_stats=False))
+    else:
+        cpu = OffloadMoeCache(num_layers=2, num_experts=E, cache_size=12,
+                              device=torch.device("cpu"), quant_format="bf16")
+        cpu.collect_stats = True
+        monkeypatch.setattr(offload_kernels, "lru_ensure", _reference_lru_ensure)
+        for layer, ids in _stats_trace(E):
+            cpu.ensure_experts(layer, ids.clone())
+        assert torch.equal(got, cpu.lru_stats)
