@@ -398,6 +398,44 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     assert captured["max_slots"] == 5
 
 
+
+def test_rebuild_fit_check_reserves_the_gdn_prefill_workspace():
+    """The runtime-rebuild fit-check prices the GDN prefill workspace like the startup sizing,
+    so a rebuild cannot grow the pools back into the space reserved for it."""
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.linear_state_pool import gdn_prefill_workspace_bytes, state_pool_bytes
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(linear_attention_group=lambda: group),
+        dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        max_extend_tokens=1024, max_seq_len=4096,
+    )
+    captured = {}
+
+    def validate_rebuild(config, **kwargs):
+        captured.update(kwargs)
+        raise CacheRebuildRejected("stop before teardown")
+
+    engine = SimpleNamespace(
+        config=config, moe_offload_cache=None, kv_offloader=None,
+        linear_state_pool=SimpleNamespace(num_slots=5),
+        kv_cache=SimpleNamespace(validate_rebuild=validate_rebuild),
+        _baseline_free=1 << 30, _weights_bytes=0, num_pages=64,
+    )
+    engine._target_moe_and_expert_bytes = lambda size: (0, 0)
+    with pytest.raises(CacheRebuildRejected):
+        Engine.rebuild_runtime_cache(engine, num_pages=32)
+
+    workspace = gdn_prefill_workspace_bytes(config)
+    assert workspace > 0
+    assert captured["extra_fixed_bytes"] == state_pool_bytes(config, 5) + workspace
+
 # ---------------------------------------------------------------------------
 # offload-cache sizing guard + auto-resolution (_require_offload_cache_size / _adjust_config),
 # the floor rule compute_cache_floors documents above.
