@@ -19,10 +19,14 @@ def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32, cache_
                             prefix="model.layers.0.mlp.experts")
     cache = OffloadMoeCache(num_layers=1, num_experts=num_experts, cache_size=cache_size or num_experts, device=device)
     g = torch.Generator().manual_seed(0)
-    cache.set_bank_sources({
-        "gate_up": [torch.randn(num_experts, 2 * inter, hidden, generator=g, dtype=torch.bfloat16) * 0.1],
-        "down": [torch.randn(num_experts, hidden, inter, generator=g, dtype=torch.bfloat16) * 0.1],
-    })
+    banks = {
+        "gate_up": torch.randn(num_experts, 2 * inter, hidden, generator=g, dtype=torch.bfloat16) * 0.1,
+        "down": torch.randn(num_experts, hidden, inter, generator=g, dtype=torch.bfloat16) * 0.1,
+    }
+    if device.type == "cuda":
+        # the fetch reads host rows zero-copy: pageable memory only works where the driver maps it (HMM)
+        banks = {k: v.pin_memory() for k, v in banks.items()}
+    cache.set_bank_sources({k: [v] for k, v in banks.items()})
     layer.offload_cache = cache
     return layer, cache
 
