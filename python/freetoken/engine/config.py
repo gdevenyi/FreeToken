@@ -181,6 +181,12 @@ class EngineConfig:
             return quant
         if quant is None:
             raise ValueError("--dense-quant/--hc-quant/--lm-head-quant are not supported for GGUF checkpoints")
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if is_ftw_checkpoint(self.model_path):
+            # the FTW replay yields the stored layout and never runs the family reader's requantization
+            raise ValueError("--dense-quant/--hc-quant/--lm-head-quant requantize the original checkpoint at load; "
+                             "serve the source checkpoint, not an FTW conversion")
         from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig
 
         return LoadTimeQuantConfig(quant, targets)

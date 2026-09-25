@@ -702,3 +702,15 @@ def test_lm_head_quant_is_refused_for_a_tied_head():
 
     with pytest.raises(ValueError, match="untied lm_head"):
         _load_time_quant(QWEN4_EXP, NoQuantConfig(NameMap()), tied=True, lm_head_quant="mxfp8")
+
+
+@pytest.mark.parametrize("flag", ["dense_quant", "hc_quant", "lm_head_quant"])
+def test_load_time_quant_is_refused_for_an_ftw_checkpoint(tmp_path, flag):
+    """The FTW replay stores the non-overlay layout and never runs the reader that requantizes."""
+    from freetoken.checkpoint.ftw import INDEX_NAME
+    from freetoken.layers.quantization import NameMap
+
+    (tmp_path / INDEX_NAME).write_text("{}")
+    with pytest.raises(ValueError, match="FTW"):
+        _load_time_quant(QWEN4_EXP, NoQuantConfig(NameMap()), model_path=str(tmp_path), **{flag: "mxfp8"})
+    assert _load_time_quant(QWEN4_EXP, None, model_path=str(tmp_path)) is None  # no flag: nothing to refuse
