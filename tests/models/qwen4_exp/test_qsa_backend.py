@@ -107,7 +107,10 @@ def test_decode_is_dense_below_the_budget(monkeypatch):
 @requires_cuda
 def test_flashinfer_dense_matches_the_sparse_path():
     """The engine's dense FULL backend over the same pool, as an independent oracle."""
-    pytest.importorskip("flashinfer")
+    from freetoken.kernel.backend import is_flashinfer_installed
+
+    if not is_flashinfer_installed():
+        pytest.skip("flashinfer is not usable on this device")
     from freetoken.attention.fi import FlashInferBackend
 
     config = parsed_config()
