@@ -32,8 +32,8 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
-    # (group, checkpoint-name regexes) of the bf16 modules --dense-quant ("dense") and --hc-quant ("hc")
-    # may requantize at load
+    # (group, checkpoint-name regexes) of the bf16 modules --dense-quant ("dense"), --hc-quant ("hc") and
+    # --lm-head-quant ("lm_head") may requantize at load; only a reader that requantizes declares them
     load_quant_targets: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
@@ -203,6 +203,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
                 r"^model\.language_model\.(layers\.\d+\.(attn|mlp)_hyper_connection|hyper_connection_mixer)"
                 r"\.(input_mix_weight_down|input_mix_weight_up|block_inject_weight)$",
             )),
+            ("lm_head", (r"^lm_head$",)),
         ),
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the

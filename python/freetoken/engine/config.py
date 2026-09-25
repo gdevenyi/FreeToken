@@ -167,18 +167,20 @@ class EngineConfig:
     def _load_time_quant(self, quant, spec: ModelSpec, hf_config):
         targets: tuple[str, ...] = ()
         groups = dict(spec.load_quant_targets)
-        for flag, group, value in (("--dense-quant", "dense", self.dense_quant), ("--hc-quant", "hc", self.hc_quant)):
+        for flag, group, value in (("--dense-quant", "dense", self.dense_quant), ("--hc-quant", "hc", self.hc_quant),
+                                   ("--lm-head-quant", "lm_head", self.lm_head_quant)):
             if value == "mxfp8":
                 if group not in groups:
-                    raise ValueError(f"{flag} is not supported for {self.hf_config.architectures[0]}")
+                    raise ValueError(f"{flag} is not supported for {hf_config.architectures[0]}")
                 targets += groups[group]
         if self.lm_head_quant == "mxfp8":
             text = getattr(hf_config, "text_config", hf_config)
             if getattr(text, "tie_word_embeddings", False) or getattr(hf_config, "tie_word_embeddings", False):
                 raise ValueError("--lm-head-quant needs an untied lm_head (a tied head shares the embedding table)")
-            targets += (r"^lm_head$",)
         if not targets:
             return quant
+        if quant is None:
+            raise ValueError("--dense-quant/--hc-quant/--lm-head-quant are not supported for GGUF checkpoints")
         from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig
 
         return LoadTimeQuantConfig(quant, targets)

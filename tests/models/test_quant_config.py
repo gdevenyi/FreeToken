@@ -661,3 +661,44 @@ def test_load_time_overlay_keeps_checkpoint_schemes_and_adds_mxfp8_to_targets():
     assert overlay.quantize_at_load("m.layers.0.linear_attn.out_proj")
     assert not overlay.quantize_at_load("m.layers.0.linear_attn.in_proj_b")
     assert not overlay.quantize_at_load("m.layers.0.mlp.experts")
+
+
+QWEN4_EXP = "Qwen4ExpForConditionalGeneration"
+
+
+def _load_time_quant(arch: str, quant, *, model_path: str = "/nonexistent", tied: bool = False, **flags):
+    """EngineConfig._load_time_quant for ``arch`` with ``flags`` (dense_quant=..., ...) set."""
+    from freetoken.distributed import DistributedInfo
+
+    config = EngineConfig(model_path=model_path, tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, **flags)
+    hf = SimpleNamespace(architectures=[arch], tie_word_embeddings=tied)
+    object.__setattr__(config, "hf_config", hf)
+    return config._load_time_quant(quant, get_model_spec(arch), hf)
+
+
+def test_lm_head_quant_targets_the_lm_head_of_a_family_that_requantizes():
+    from freetoken.layers.quantization import NameMap
+
+    overlay = _load_time_quant(QWEN4_EXP, NoQuantConfig(NameMap()), lm_head_quant="mxfp8")
+    assert overlay.scheme_for_name("lm_head").kind is QuantKind.MXFP8
+    assert overlay.scheme_for_name("model.language_model.layers.0.self_attn.o_proj") is None
+
+
+@pytest.mark.parametrize("flag", ["dense_quant", "hc_quant", "lm_head_quant"])
+def test_load_time_quant_is_refused_for_a_family_whose_reader_never_requantizes(flag):
+    from freetoken.layers.quantization import NameMap
+
+    with pytest.raises(ValueError, match=f"--{flag.replace('_', '-')} is not supported for Qwen3ForCausalLM"):
+        _load_time_quant("Qwen3ForCausalLM", NoQuantConfig(NameMap()), **{flag: "mxfp8"})
+
+
+def test_load_time_quant_is_refused_without_a_checkpoint_quant_config():
+    with pytest.raises(ValueError, match="GGUF"):
+        _load_time_quant(QWEN4_EXP, None, lm_head_quant="mxfp8")
+
+
+def test_lm_head_quant_is_refused_for_a_tied_head():
+    from freetoken.layers.quantization import NameMap
+
+    with pytest.raises(ValueError, match="untied lm_head"):
+        _load_time_quant(QWEN4_EXP, NoQuantConfig(NameMap()), tied=True, lm_head_quant="mxfp8")
