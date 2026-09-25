@@ -20,6 +20,7 @@ DEFAULT_SERVER = "http://127.0.0.1:1919"
 CODEX_PROFILE = "freetoken-launch"
 CODEX_PROVIDER_NAME = "FreeToken"
 CODEX_CATALOG_NAME = "freetoken-model.json"
+# Also the variable `ft serve` reads its --api-key from, so one exported key serves both ends.
 CODEX_PROVIDER_API_KEY_ENV = "FREETOKEN_API_KEY"
 # Used when the server reports no context length. Guessing low only costs earlier compaction.
 FALLBACK_CONTEXT_WINDOW = 128_000
@@ -167,8 +168,17 @@ def resolve_server_url(server: str | None) -> ServerURL:
     return ServerURL(origin=origin, openai_base_url=f"{origin}/v1")
 
 
+def _server_api_key(placeholder: str) -> str:
+    """The server's key when FREETOKEN_API_KEY is set, else a placeholder for agents that
+    reject an empty key (an unauthenticated server ignores it)."""
+    return os.environ.get(CODEX_PROVIDER_API_KEY_ENV) or placeholder
+
+
 def _get_json(url: str) -> object:
-    request = Request(url, headers={"Accept": "application/json"})
+    headers = {"Accept": "application/json"}
+    if key := os.environ.get(CODEX_PROVIDER_API_KEY_ENV):
+        headers["Authorization"] = f"Bearer {key}"
+    request = Request(url, headers=headers)
     with urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -408,7 +418,7 @@ def prepare_codex(ctx: LaunchContext) -> CommandSpec:
     ]
     return CommandSpec(
         argv=argv,
-        env={CODEX_PROVIDER_API_KEY_ENV: "freetoken"},
+        env={CODEX_PROVIDER_API_KEY_ENV: _server_api_key("freetoken")},
         unset_env=CODEX_CLEAR_ENV,
     )
 
@@ -423,7 +433,7 @@ def prepare_claude(ctx: LaunchContext) -> CommandSpec:
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(_max_output_tokens(ctx)),
             "ANTHROPIC_BASE_URL": ctx.server.origin,
             "ANTHROPIC_API_KEY": "",
-            "ANTHROPIC_AUTH_TOKEN": "freetoken",
+            "ANTHROPIC_AUTH_TOKEN": _server_api_key("freetoken"),
             "ANTHROPIC_MODEL": model_id,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
@@ -470,6 +480,8 @@ def _opencode_config(ctx: LaunchContext) -> str:
         },
         "model": f"{OPENCODE_PROVIDER}/{ctx.model.model_id}",
     }
+    if key := os.environ.get(CODEX_PROVIDER_API_KEY_ENV):
+        config["provider"][OPENCODE_PROVIDER]["options"]["apiKey"] = key
     return json.dumps(config)
 
 
@@ -614,7 +626,7 @@ def _patch_openclaw_config(
         new_models.append(entry)
 
     provider["baseUrl"] = ctx.server.openai_base_url
-    provider["apiKey"] = "freetoken-local"
+    provider["apiKey"] = _server_api_key("freetoken-local")
     provider["api"] = "openai-completions"
     provider["models"] = new_models
     providers[OPENCLAW_PROVIDER] = provider
@@ -697,8 +709,8 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
         model_section["default"] = ctx.model.model_id
         model_section["provider"] = "custom"
         model_section["base_url"] = ctx.server.openai_base_url
-        # A non-empty dummy: FreeToken is unauthenticated, but some clients reject an empty key.
-        model_section["api_key"] = HERMES_API_KEY
+        # A non-empty dummy unless the server has a key: some clients reject an empty one.
+        model_section["api_key"] = _server_api_key(HERMES_API_KEY)
         # Hermes' name for the window (prompt + generation). Left unset it auto-detects, and a
         # miss lands on a 32k default that trips the floor below.
         window = _context_window(ctx)
@@ -753,8 +765,8 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     ``reasoning_content``, while llm-pi-ai's JSON round-trip can change argument
     values and key order — drift that survives render canonicalization, cuts
     the prefix cache, and shows the model a rewrite of its own output. The
-    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement; FreeToken
-    itself is unauthenticated."""
+    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement unless
+    FREETOKEN_API_KEY carries the server's key."""
     settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
     patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
     if not ctx.dry_run:
@@ -808,7 +820,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
         argv=argv,
         env={
             "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
-            "DEEPSEEK_API_KEY": DSH_API_KEY,
+            "DEEPSEEK_API_KEY": _server_api_key(DSH_API_KEY),
             "DSH_TELEMETRY_DISABLED": "1",
         },
         unset_env=CLOUD_PROVIDER_API_KEY_ENV,
@@ -882,7 +894,10 @@ def print_dry_run(ctx: LaunchContext, spec: CommandSpec) -> None:
     print(f"Command: {shlex.join(spec.argv)}")
     if spec.env:
         print("Environment:")
+        secret = os.environ.get(CODEX_PROVIDER_API_KEY_ENV)
         for key, value in sorted(spec.env.items()):
+            if secret:
+                value = value.replace(secret, f"<{CODEX_PROVIDER_API_KEY_ENV}>")
             print(f"  {key}={value}")
     if spec.unset_env:
         print("Unset environment:")

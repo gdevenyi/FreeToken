@@ -40,7 +40,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
-| `--api-key` | disabled | Require `Authorization: Bearer <key>` on every route except `/health` (401 otherwise); `FREETOKEN_API_KEY` is read when the flag is absent |
+| `--api-key` | disabled | Require `Authorization: Bearer <key>` on every route except `/health` (401 otherwise); `FREETOKEN_API_KEY` is read when the flag is absent, so a shell that exports it for `ft launch` / `ft ctl` / Codex also arms the server |
 | `--dist-port` | `--port` + 1 | Internal TP rendezvous port (loopback-only regardless of `--host`) |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
@@ -228,6 +228,9 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
 | `requests [--since N] [--limit N]` | `GET /v1/requests` | Recent request ring |
 
+Against a server started with `--api-key`, export the same key as `FREETOKEN_API_KEY`;
+`ft ctl` sends it as `Authorization: Bearer`.
+
 ## ft launch
 
 ```bash
@@ -242,6 +245,9 @@ When `/v1/stats` reports `image` among `model.input_modalities`, the written
 config declares the model image-capable, which Codex, OpenCode, OpenClaw and
 dsh require before their image tools and attachments send anything; Claude
 Code and Hermes need no declaration.
+With `FREETOKEN_API_KEY` exported (the server's `--api-key`), discovery sends it
+and every agent is configured with it instead of a placeholder key; Hermes and
+OpenClaw store it in their config files.
 
 | Flag | Meaning |
 |---|---|

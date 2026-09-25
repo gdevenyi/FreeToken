@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -128,6 +129,9 @@ def _open_request(
 ) -> Any:
     data = None
     headers = {"Accept": accept}
+    # the key `ft serve` reads when --api-key is absent (and `ft launch` sends)
+    if key := os.environ.get("FREETOKEN_API_KEY"):
+        headers["Authorization"] = f"Bearer {key}"
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
