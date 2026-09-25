@@ -28,7 +28,12 @@ def _importable(name: str) -> bool:
 def is_flashinfer_installed() -> bool:
     if is_rocm():
         return False
-    return _importable("flashinfer")
+    if not _importable("flashinfer"):
+        return False
+    # flashinfer's JIT refuses to build anything below sm_75, so on Pascal/Volta an
+    # installed package is as good as absent and the call-sites take their triton paths.
+    cap = device_capability()
+    return cap == (0, 0) or cap >= (7, 5)
 
 
 @functools.cache
