@@ -10,16 +10,22 @@ import torch
 from freetoken.core import Req, SamplingParams
 from freetoken.scheduler.scheduler import Scheduler
 
-EOS = 0
+EOS, SPECIAL = 0, 1
 
 
 class _ByteTok:
-    """Byte-level ids like Qwen's BPE fallback: a 4-byte emoji is four tokens. 0 is EOS."""
+    """Byte-level ids like Qwen's BPE fallback: a 4-byte emoji is four tokens. 0 is EOS,
+    1 a special marker that skip_special_tokens drops."""
 
     def decode(self, ids, skip_special_tokens=False):
-        return b"".join(b"" if t == EOS else bytes([t]) for t in ids).decode(
-            "utf-8", errors="replace"
-        )
+        def piece(t):
+            if t == EOS:
+                return b""
+            if t == SPECIAL:
+                return b"" if skip_special_tokens else b"<s>"
+            return bytes([t])
+
+        return b"".join(piece(t) for t in ids).decode("utf-8", errors="replace")
 
 
 def _req(prompt: list[int], output_len: int, **sp) -> Req:
@@ -69,3 +75,12 @@ def test_an_eos_short_of_the_delivered_limit_stays_in_the_matched_text():
     assert req.input_ids.numel() < req.max_device_len
     assert _match(req) is None
     assert req.stop_decode_status.decoded_ids == [65, EOS]
+
+
+def test_stops_match_the_text_decoded_with_the_requests_skip_special_tokens():
+    # the frontend streams "ab" for a request that skips special tokens; the scheduler has
+    # to match the stop in that same text, not in "a<s>b"
+    req = _req([65], 8, stop_strs=["ab"], skip_special_tokens=True)
+    assert _feed(req, [ord("a"), SPECIAL, ord("b")]) == [None, None, "ab"]
+    req = _req([65], 8, stop_strs=["ab"])
+    assert _feed(req, [ord("a"), SPECIAL, ord("b")]) == [None, None, None]
