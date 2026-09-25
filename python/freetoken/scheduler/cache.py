@@ -627,9 +627,11 @@ class CacheManager:
             return None
         pool = self.linear_state_pool
         if pool.num_free_slots < 1:
-            # make room: evicting another snapshot writes IT to the host tier first
+            # make room: evicting another snapshot writes IT to the host tier first, which may
+            # drop this entry and hand its host slot to the victim, so probe again
             self.ensure_mamba_slots(1)
-            if pool.num_free_slots < 1:
+            hit = tier.lookup_exact(key)
+            if pool.num_free_slots < 1 or hit is None or hit.gdn_slot is None:
                 return None
         slot = pool.alloc(1)[0]
         tier.read_gdn(hit.gdn_slot, slot)
@@ -646,7 +648,11 @@ class CacheManager:
         pool = self.linear_state_pool
         if hit.gdn_slot is not None:
             self.ensure_mamba_slots(1)
-            if pool.num_free_slots < 1:
+            # _allocate and ensure_mamba_slots write their victims to the tier, which may drop
+            # this entry and hand its host slots to them: use what the key maps to now
+            hit = tier.lookup_exact(ids[: hit.host_len])
+            if (pool.num_free_slots < 1 or hit is None or hit.kv_pages is None
+                    or hit.gdn_slot is None):
                 self._free(kv_new)  # sem slot GDN não dá pra reidratar; devolve as páginas
                 return
             slot = pool.alloc(1)[0]
