@@ -35,6 +35,8 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #define CPU_MOE_HAS_AFFINITY 1
 #else
 #define CPU_MOE_HAS_AFFINITY 0
@@ -1390,8 +1392,6 @@ struct MoeTask {
 //     only pay off in a grouped/batched (dedup) path.
 //   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
 //     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
-//   - NUMA: a single node is assumed. Multi-socket machines would split each
-//     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int IBLK = 32;
 constexpr int HBLK = 32;
 // Down-projection tile of the generic row-major pass 2 (bf16/nvfp4/q4_0): at bs=1
@@ -1526,6 +1526,28 @@ inline const void* tbl_at(const uint64_t* tbl, int layer_id) {
   return tbl ? reinterpret_cast<const void*>(tbl[layer_id]) : nullptr;
 }
 
+// NUMA node of the page holding each address (move_pages query mode), -1 if unknown.
+static void page_nodes(const std::vector<const void*>& addrs, std::vector<int>& out) {
+  out.assign(addrs.size(), -1);
+#if CPU_MOE_HAS_AFFINITY && defined(SYS_move_pages)
+  std::vector<void*> pages(addrs.size());
+  for (size_t i = 0; i < addrs.size(); ++i)
+    pages[i] = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addrs[i]) & ~uintptr_t(4095));
+  std::vector<int> st(addrs.size(), -1);
+  if (syscall(SYS_move_pages, 0, (unsigned long)pages.size(), pages.data(), nullptr, st.data(),
+              0) == 0)
+    for (size_t i = 0; i < st.size(); ++i) out[i] = st[i] >= 0 ? st[i] : -1;
+#endif
+}
+
+static int this_cpu_node() {
+#if CPU_MOE_HAS_AFFINITY && defined(SYS_getcpu)
+  unsigned cpu = 0, node = 0;
+  if (syscall(SYS_getcpu, &cpu, &node, nullptr) == 0) return static_cast<int>(node);
+#endif
+  return -1;
+}
+
 struct CpuMoeExecutor {
   int num_threads;
   int num_layers, num_experts, top_k;
@@ -1618,6 +1640,24 @@ struct CpuMoeExecutor {
 
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
+
+  // ---- NUMA-local scheduling (bf16/nvfp4/q4_0) ----
+  // host_banks places each expert's rows in per-node chunks, so pass-1 tile ib (gate and
+  // up rows) and pass-2 tile hb (down rows) sit on one node for every expert. When the
+  // pinned pool spans several nodes, workers take their own node's tiles first and then
+  // steal; remote reads through the socket link otherwise cap the pool well below the
+  // two memory controllers. Layers without such placement use the shared counters.
+  static constexpr int kMaxNodes = 8;
+  std::vector<int> worker_node;            // tid -> node, set by each worker once pinned
+  std::atomic<int> nodes_known{0};
+  std::vector<int> pool_nodes;             // distinct worker nodes
+  bool numa_sched = false;                 // pool spans >= 2 nodes (and not opted out)
+  std::vector<std::vector<int8_t>> tile_node;  // layer -> [n_iblk + n_hblk] nodes, or empty
+  std::vector<uint8_t> tile_node_done;         // layer -> map resolved
+  bool task_numa = false;
+  std::vector<int64_t> nd_items[2][kMaxNodes];  // [pass][node] -> item ids of this task
+  int64_t nd_cnt[2][kMaxNodes] = {};
+  std::atomic<int64_t> nd_next[2][kMaxNodes];
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
   // A tiny GPU kernel bumps ready_flags[slot] at submit; this coordinator thread busy-polls
@@ -1751,8 +1791,126 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
+    worker_node.assign(num_threads, -1);
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
+    const char* numa_env = getenv("FREETOKEN_CPU_MOE_NUMA");
+    const bool numa_off = numa_env && numa_env[0] == '0';
+    if (!core_ids.empty() && !numa_off &&
+        (fmt == WF_BF16 || fmt == WF_NVFP4 || fmt == WF_Q4_0)) {
+      while (nodes_known.load(std::memory_order_acquire) < num_threads) std::this_thread::yield();
+      bool seen[kMaxNodes] = {};
+      bool ok = true;
+      for (int nd : worker_node) {
+        if (nd < 0 || nd >= kMaxNodes) { ok = false; break; }
+        if (!seen[nd]) { seen[nd] = true; pool_nodes.push_back(nd); }
+      }
+      numa_sched = ok && pool_nodes.size() > 1;
+    }
+    tile_node.assign(num_layers, {});
+    tile_node_done.assign(num_layers, 0);
+  }
+
+  // Byte address of gate_up / down row `row` of layer-local expert e (row-major formats).
+  const uint8_t* gu_row_addr(int layer, int e, int row) const {
+    const size_t rb = fmt == WF_BF16 ? (size_t)H * 2 : fmt == WF_NVFP4 ? (size_t)H / 2
+                                                                        : (size_t)q4_gu_row_bytes;
+    return reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, layer)) +
+           ((size_t)e * 2 * I + row) * rb;
+  }
+  const uint8_t* dn_row_addr(int layer, int e, int row) const {
+    const size_t rb = fmt == WF_BF16 ? (size_t)I * 2 : fmt == WF_NVFP4 ? (size_t)I / 2
+                                                                        : (size_t)q4_dn_row_bytes;
+    return reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, layer)) + ((size_t)e * H + row) * rb;
+  }
+
+  // Node of every pass-1 / pass-2 tile of this layer: the node holding the tile's rows
+  // (start and end pages) in the first, middle and last experts. Tiles that disagree go
+  // round-robin over the pool's nodes; a layer with fewer than 3/4 consistent tiles (e.g.
+  // page-interleaved banks) gets no map.
+  void resolve_tile_nodes(int layer) {
+    tile_node_done[layer] = 1;
+    std::vector<const void*> addrs;
+    const int experts[3] = {0, num_experts / 2, num_experts - 1};
+    for (int e : experts) {
+      for (int ib = 0; ib < n_iblk; ++ib) {
+        const int r0 = ib * IBLK, r1 = std::min(I, r0 + IBLK);
+        addrs.push_back(gu_row_addr(layer, e, r0));
+        addrs.push_back(gu_row_addr(layer, e, r1) - 1);
+        addrs.push_back(gu_row_addr(layer, e, I + r0));
+        addrs.push_back(gu_row_addr(layer, e, I + r1) - 1);
+      }
+      for (int hb = 0; hb < n_hblk; ++hb) {
+        const int r0 = hb * hblk, r1 = std::min(H, r0 + hblk);
+        addrs.push_back(dn_row_addr(layer, e, r0));
+        addrs.push_back(dn_row_addr(layer, e, r1) - 1);
+        addrs.push_back(dn_row_addr(layer, e, r0));  // keep 4 entries per tile
+        addrs.push_back(dn_row_addr(layer, e, r1) - 1);
+      }
+    }
+    std::vector<int> nodes;
+    page_nodes(addrs, nodes);
+    const int ntile = n_iblk + n_hblk;
+    std::vector<int8_t> map(ntile);
+    int consistent = 0;
+    for (int tile = 0; tile < ntile; ++tile) {
+      int nd = -2;
+      for (int x = 0; x < 3 && nd != -1; ++x)
+        for (int j = 0; j < 4; ++j) {
+          const int v = nodes[((size_t)x * ntile + tile) * 4 + j];
+          if (v < 0 || v >= kMaxNodes || (nd != -2 && v != nd)) { nd = -1; break; }
+          nd = v;
+        }
+      if (nd >= 0) ++consistent;
+      else nd = pool_nodes[tile % pool_nodes.size()];
+      map[tile] = static_cast<int8_t>(nd);
+    }
+    if (4 * consistent >= 3 * ntile) tile_node[layer] = std::move(map);
+  }
+
+  // Split this task's pass-1 / pass-2 items into per-node lists (single-threaded, before
+  // the workers wake). Pass-1 items of skipped routes are dropped here.
+  void build_node_lists(const MoeTask* t) {
+    task_numa = false;
+    if (!numa_sched) return;
+    if (!tile_node_done[t->layer_id]) resolve_tile_nodes(t->layer_id);
+    const std::vector<int8_t>& map = tile_node[t->layer_id];
+    if (map.empty()) return;
+    for (int nd = 0; nd < kMaxNodes; ++nd) {
+      nd_cnt[0][nd] = nd_cnt[1][nd] = 0;
+      nd_next[0][nd].store(0, std::memory_order_relaxed);
+      nd_next[1][nd].store(0, std::memory_order_relaxed);
+      if ((int64_t)nd_items[0][nd].size() < p1_total) nd_items[0][nd].resize(p1_total);
+      if ((int64_t)nd_items[1][nd].size() < p2_total) nd_items[1][nd].resize(p2_total);
+    }
+    for (int64_t p = 0; p < p1_total; ++p) {
+      const int64_t tk = p / n_iblk;
+      const int e = t->ids[tk];
+      if (e < 0 || e >= num_experts) continue;
+      const int nd = map[p % n_iblk];
+      nd_items[0][nd][nd_cnt[0][nd]++] = p;
+    }
+    for (int64_t p = 0; p < p2_total; ++p) {
+      const int nd = map[n_iblk + p % n_hblk];
+      nd_items[1][nd][nd_cnt[1][nd]++] = p;
+    }
+    task_numa = true;
+  }
+
+  // Drain pass `pass`'s per-node lists: own node first, then steal from the others.
+  template <typename F>
+  void run_node_lists(int pass, int tid, F&& fn) {
+    const int me = worker_node[tid];
+    for (int r = 0; r < kMaxNodes; ++r) {
+      const int nd = (me + r) % kMaxNodes;
+      const int64_t cnt = nd_cnt[pass][nd];
+      if (cnt == 0) continue;
+      for (;;) {
+        const int64_t i = nd_next[pass][nd].fetch_add(1, std::memory_order_relaxed);
+        if (i >= cnt) break;
+        fn(nd_items[pass][nd][i]);
+      }
+    }
   }
 
   // Quantize a bf16 activation row to Q8_0 (llama.cpp): per-32-block symmetric int8 in
@@ -1927,6 +2085,13 @@ struct CpuMoeExecutor {
     if (fp8_block_dot == dot_fp8_block_avx2) return "avx2";
 #endif
     return "scalar";
+  }
+
+  // (pool spans several NUMA nodes, layers whose tiles resolved to single nodes so far)
+  std::pair<bool, int> numa_status() const {
+    int mapped = 0;
+    for (const auto& m : tile_node) mapped += m.empty() ? 0 : 1;
+    return {numa_sched, mapped};
   }
 
   void barrier(int& local_sense) {
@@ -2208,12 +2373,16 @@ struct CpuMoeExecutor {
     }
   }
 
-  void run_task_body(const MoeTask* t) {
+  void run_task_body(const MoeTask* t, int tid) {
     int local_sense = 0;
-    for (;;) {
-      int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
-      if (p >= p1_total) break;
-      do_pass1(t, p);
+    if (task_numa) {
+      run_node_lists(0, tid, [&](int64_t p) { do_pass1(t, p); });
+    } else {
+      for (;;) {
+        int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p1_total) break;
+        do_pass1(t, p);
+      }
     }
     barrier(local_sense);
     // Prepare the intermediate rows (per token,route) for the down GEMV, see prep_g_row.
@@ -2226,6 +2395,10 @@ struct CpuMoeExecutor {
       }
       barrier(local_sense);
     }
+    if (task_numa) {
+      run_node_lists(1, tid, [&](int64_t p) { do_pass2(t, p); });
+      return;
+    }
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p2_total) break;
@@ -2236,6 +2409,8 @@ struct CpuMoeExecutor {
   // Tasks arrive once per MoE layer, sub-ms apart. Spinning skips a futex wakeup per worker per layer; parking after kSpinWindow keeps an idle server off the CPU.
   void worker_loop(int tid) {
     pin_self(tid);
+    worker_node[tid] = this_cpu_node();
+    nodes_known.fetch_add(1, std::memory_order_release);
     uint64_t my_gen = 0;
     using wclk = std::chrono::steady_clock;
     auto last_active = wclk::now();
@@ -2259,7 +2434,7 @@ struct CpuMoeExecutor {
       // submit() writes cur_task before the release store to `submitted`.
       my_gen = gen;
       MoeTask* t = cur_task;
-      run_task_body(t);
+      run_task_body(t, tid);
       last_active = wclk::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
@@ -2285,6 +2460,7 @@ struct CpuMoeExecutor {
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
+    build_node_lists(t);
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
     bar_sense.store(0, std::memory_order_relaxed);
@@ -2552,7 +2728,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_spin_wait",
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
            py::arg("enabled"))
-      .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); });
+      .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); })
+      .def("numa_status", &CpuMoeExecutor::numa_status);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));

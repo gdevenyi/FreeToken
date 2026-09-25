@@ -216,6 +216,104 @@ def alloc_layer_banks(
     }
 
 
+# Row-major expert formats whose CPU MoE row tiles the executor schedules by NUMA node.
+NUMA_PLACED_FORMATS = frozenset({"bf16", "nvfp4"})
+
+# (get_mempolicy, set_mempolicy) syscall numbers; their libc wrappers live in libnuma.
+_MEMPOLICY_SYSCALLS = {"x86_64": (239, 238), "aarch64": (236, 237)}
+_MPOL_DEFAULT, _MPOL_PREFERRED, _MPOL_INTERLEAVE = 0, 1, 3
+_MADV_POPULATE_WRITE = 23
+_NODEMASK_WORDS = 16
+
+
+def _cpu_numa_node(cpu: int) -> int | None:
+    try:
+        for name in os.listdir(f"/sys/devices/system/cpu/cpu{cpu}"):
+            if name.startswith("node") and name[4:].isdigit():
+                return int(name[4:])
+    except OSError:
+        pass
+    return None
+
+
+def numa_placement_nodes() -> list[int]:
+    """NUMA nodes to split expert rows over (see :func:`place_expert_rows`), or [] to leave
+    placement to the kernel: one node, a ``--membind``/``--preferred`` memory policy (only
+    first-touch and ``numactl --interleave`` are overridden), or ``FREETOKEN_CPU_MOE_NUMA=0``."""
+    if os.environ.get("FREETOKEN_CPU_MOE_NUMA", "").strip() == "0":
+        return []
+    nrs = _MEMPOLICY_SYSCALLS.get(os.uname().machine)
+    if nrs is None or not hasattr(os, "sched_getaffinity"):
+        return []
+    nodes = sorted({n for n in map(_cpu_numa_node, os.sched_getaffinity(0)) if n is not None})
+    if len(nodes) < 2:
+        return []
+    libc = ctypes.CDLL(None, use_errno=True)
+    mode = ctypes.c_int(0)
+    mask = (ctypes.c_ulong * _NODEMASK_WORDS)()
+    if libc.syscall(nrs[0], ctypes.byref(mode), mask, ctypes.c_ulong(_NODEMASK_WORDS * 64),
+                    None, ctypes.c_ulong(0)) != 0:
+        return []
+    policy = mode.value & 0xFF  # drop the MPOL_F_* mode flags
+    if policy == _MPOL_INTERLEAVE:
+        nodes = [n for n in nodes if n < _NODEMASK_WORDS * 64 and mask[n // 64] >> (n % 64) & 1]
+    elif policy != _MPOL_DEFAULT:
+        return []
+    return nodes if len(nodes) >= 2 else []
+
+
+def place_expert_rows(tensors: list[torch.Tensor], nodes: list[int], *,
+                      threads_per_node: int = 4) -> None:
+    """Fault in unfilled ``[num_experts, rows, ...]`` banks so each expert's rows sit on
+    ``nodes`` in chunks: the rows are cut into ``2 * len(nodes)`` equal chunks and chunk c
+    goes to ``nodes[c % len(nodes)]``. The gate and up halves of a gate_up bank split alike,
+    so every row tile of the CPU MoE executor lives on one node, and a worker pool spread
+    over the nodes can read mostly local memory (the executor schedules tiles by node).
+
+    Threads that prefer the target node first-touch the pages before the fill: the fill
+    would fault them anyway, and a per-range mbind would split the mapping into more VMAs
+    than vm.max_map_count allows. A full node falls back to the others."""
+    if len(nodes) < 2:
+        return
+    nrs = _MEMPOLICY_SYSCALLS[os.uname().machine]
+    nchunk = 2 * len(nodes)
+    ranges: dict[int, list[tuple[int, int]]] = {n: [] for n in nodes}
+    for t in tensors:
+        if t.dim() < 2 or t.numel() == 0:
+            continue
+        per = t[0].numel() * t.element_size()
+        rows = t.shape[1]
+        row_bytes = per // rows
+        for c in range(nchunk):
+            r0, r1 = c * rows // nchunk, (c + 1) * rows // nchunk
+            if r1 > r0:
+                start = t.data_ptr() + r0 * row_bytes
+                ranges[nodes[c % len(nodes)]].extend(
+                    (start + e * per, (r1 - r0) * row_bytes) for e in range(t.shape[0]))
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def touch(node: int, work: list[tuple[int, int]]) -> None:
+        mask = (ctypes.c_ulong * _NODEMASK_WORDS)()
+        mask[node // 64] = 1 << (node % 64)
+        # a thread-local policy: it ends with this thread
+        if libc.syscall(nrs[1], _MPOL_PREFERRED, mask, ctypes.c_ulong(_NODEMASK_WORDS * 64)) != 0:
+            return
+        for addr, n in work:
+            lo = addr - addr % _BLK
+            hi = -(-(addr + n) // _BLK) * _BLK
+            if libc.madvise(ctypes.c_void_p(lo), ctypes.c_size_t(hi - lo), _MADV_POPULATE_WRITE) != 0:
+                ctypes.memset(addr, 0, n)  # kernels before 5.14; the banks are still zero
+
+    threads = []
+    for node, work in ranges.items():
+        for i in range(threads_per_node):
+            threads.append(threading.Thread(target=touch, args=(node, work[i::threads_per_node])))
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+
 class _ResidencyPlan:
     """Per-layer ``HostResidency`` labels, ambiently visible to the bank settle points.
 
@@ -474,6 +572,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
 
 
 __all__ = [
+    "NUMA_PLACED_FORMATS",
     "HostBank",
     "HostResidency",
     "LayerCompletionTracker",
@@ -481,7 +580,9 @@ __all__ = [
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
+    "numa_placement_nodes",
     "pin_banks",
+    "place_expert_rows",
     "read_file_into",
     "read_range_into",
     "requested_residency",

@@ -60,8 +60,8 @@ class _FakeHostBank:
 def test_production_banks_are_reused_across_measurements(monkeypatch):
     """Registered pages are never released, so --reps must not pin a fresh set per run.
 
-    nvfp4 at H == 2 * I gives gate_up_global and down_global the same shape; the two are
-    live together and must still be distinct banks.
+    Two banks of one gather set can share a shape; they are live together and must still
+    be distinct banks.
     """
     from freetoken.moe import benchbw, host_banks
 
@@ -71,12 +71,15 @@ def test_production_banks_are_reused_across_measurements(monkeypatch):
     monkeypatch.setattr(benchbw, "_PRODUCTION_BANKS", {}, raising=False)
     monkeypatch.setattr(benchbw, "_LIVE_BENCH_BANKS", [])
 
-    first = benchbw._cpu_moe_bank_sources("nvfp4", 64, 32, 4)
+    def gather_set():
+        return {name: benchbw._alloc_bank(4, 64, dtype=torch.float16, role=("gather", "nvfp4", name))
+                for name in ("gate_up_global", "down_global")}
+
+    first = gather_set()
     assert _FakeHostBank.built == len(first)
-    assert first["gate_up_global"].shape == first["down_global"].shape
     assert first["gate_up_global"] is not first["down_global"]
 
-    second = benchbw._cpu_moe_bank_sources("nvfp4", 64, 32, 4)
+    second = gather_set()
     assert _FakeHostBank.built == len(first)
     assert all(second[k] is first[k] for k in first)
 

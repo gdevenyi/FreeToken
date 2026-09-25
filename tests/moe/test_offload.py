@@ -925,3 +925,43 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def _page_nodes(addr: int, nbytes: int) -> list[int]:
+    """NUMA node of every 4 KB page of a resident range (move_pages query mode)."""
+    import ctypes
+    import os
+
+    nr = {"x86_64": 279, "aarch64": 239}.get(os.uname().machine)
+    if nr is None:
+        pytest.skip("move_pages syscall number unknown on this arch")
+    n = nbytes // 4096
+    pages = (ctypes.c_void_p * n)(*[addr + i * 4096 for i in range(n)])
+    status = (ctypes.c_int * n)()
+    assert ctypes.CDLL(None).syscall(nr, 0, ctypes.c_ulong(n), pages, None, status, 0) == 0
+    return list(status)
+
+
+def test_place_expert_rows_puts_each_row_chunk_on_its_node():
+    # every expert's rows split in 2 * n_nodes equal chunks, chunk c on nodes[c % n]: the
+    # gate and up halves of a gate_up bank then split alike, one node per CPU MoE row tile
+    import freetoken.moe.host_banks as hb
+
+    nodes = hb.numa_placement_nodes()
+    if len(nodes) < 2:
+        pytest.skip("needs a multi-node host whose memory policy leaves placement open")
+    E, R, C = 4, 1280, 1280  # a chunk is 1280/4 rows x 1280 B = 100 pages
+    bank = hb.HostBank((E, R, C), torch.uint8, backing="mmap")
+    hb.place_expert_rows([bank.tensor], nodes)
+    status = _page_nodes(bank.addr, bank.nbytes)
+    per_chunk = R // (2 * len(nodes)) * C // 4096
+    for i, node in enumerate(status):
+        chunk = i // per_chunk
+        assert node == nodes[chunk % (2 * len(nodes)) % len(nodes)], (i, node)
+
+
+def test_numa_placement_is_opt_out(monkeypatch):
+    import freetoken.moe.host_banks as hb
+
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_NUMA", "0")
+    assert hb.numa_placement_nodes() == []
