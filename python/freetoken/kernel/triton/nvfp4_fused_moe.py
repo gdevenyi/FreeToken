@@ -37,6 +37,15 @@ _E2M1_VALUES = [
 ]
 
 
+@triton.jit
+def _e2m1_f32(code):
+    """e2m1 codes (int) -> fp32 without the LUT: exp|mant land in the fp16 field and 2**14 rescales,
+    exact for every code including the 0.5 subnormal. Pascal serves global loads from L2 only, so the
+    16-entry LUT gather costs an L2 round trip per element there; this is ALU instead."""
+    h = ((code & 0x8) << 12) | ((code & 0x7) << 9)
+    return h.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
+
+
 @functools.lru_cache(maxsize=None)
 def _e2m1_lut(device_index: int) -> torch.Tensor:
     return torch.tensor(
@@ -156,6 +165,7 @@ def _decode_nvfp4_marlin_kernel(
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
+    ARITH_E2M1: tl.constexpr,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -210,7 +220,10 @@ def _decode_nvfp4_marlin_kernel(
         acc_w = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
         for j in tl.static_range(8):
             code = (word >> (4 * j)) & 0xF
-            b = tl.load(lut_ptr + code)
+            if ARITH_E2M1:
+                b = _e2m1_f32(code)
+            else:
+                b = tl.load(lut_ptr + code)
             a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
             acc_w += a_j[:, None] * b
         partial += acc_w * scale
@@ -256,6 +269,7 @@ def _prefill_nvfp4_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    ARITH_E2M1: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -300,8 +314,12 @@ def _prefill_nvfp4_moe_kernel(
             scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
         else:
             scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
+        if ARITH_E2M1:
+            b_lo = _e2m1_f32(lo) * scale  # [BLOCK_KB, BLOCK_N]
+            b_hi = _e2m1_f32(hi) * scale
+        else:
+            b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
+            b_hi = tl.load(lut_ptr + hi) * scale
 
         a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
         a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)

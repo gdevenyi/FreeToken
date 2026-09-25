@@ -43,6 +43,16 @@ _DECODE_MARLIN_WARPS = 4
 _DECODE_MARLIN_DEEPK_BLOCK_N = 8
 _DECODE_MARLIN_DEEPK_BLOCK_KW = 128
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
+# Pascal (no L1-cached global loads): arithmetic e2m1 decode instead of the LUT gather, and the
+# tiles an sm_61 sweep over the qwen4_exp shapes picked (~12x the LUT kernel under graphs).
+_PASCAL_DECODE_MARLIN = (32, 32, 1)
+_PASCAL_DECODE_MARLIN_DEEPK = (32, 64, 2)
+
+
+def _arith_e2m1() -> bool:
+    from freetoken.kernel.backend import device_capability
+
+    return device_capability() < (7, 0)
 
 
 def _tl_dtype(dt: torch.dtype):
@@ -114,6 +124,10 @@ def _decode_gemm_marlin(
     deep_k = K > _DECODE_MARLIN_DEEPK_THRESHOLD
     block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
     block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
+    warps = _DECODE_MARLIN_WARPS
+    arith = _arith_e2m1()
+    if arith:
+        block_n, block_kw, warps = _PASCAL_DECODE_MARLIN_DEEPK if deep_k else _PASCAL_DECODE_MARLIN
     grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
@@ -132,7 +146,8 @@ def _decode_gemm_marlin(
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_tl_dtype(c.dtype),
-        num_warps=_DECODE_MARLIN_WARPS,
+        ARITH_E2M1=arith,
+        num_warps=warps,
     )
 
 
@@ -276,6 +291,7 @@ def _prefill_gemm(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
         compute_type=_tl_dtype(c.dtype),
+        ARITH_E2M1=_arith_e2m1(),
         **cfg,
     )
 
