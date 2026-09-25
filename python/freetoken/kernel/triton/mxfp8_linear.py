@@ -58,6 +58,9 @@ _GEMV_MAX_M = 256
 # Lowered in place when a device cannot allocate an M_TILE's shared memory (Pascal's 48 KB
 # fits 64): OutOfResources is raised at launch setup, before any GPU work, so a retry is safe.
 _gemv_cap = _GEMV_MAX_M
+# Weight rows dequantized per cuBLAS call past the GEMV: bounds the 16-bit transient, which for
+# a whole lm_head would be ~1.2 GiB (x2 inside mxfp8_dequant), without splitting dense projections.
+_DEQUANT_CHUNK_BYTES = 64 << 20
 
 
 def _small_m_gemv_ok() -> bool:
@@ -265,8 +268,17 @@ def mxfp8_linear(
             _gemv_cap = m_tile // 2 if m_tile > 16 else 1  # strictly lower: M=1 has its own kernel
     if out is None:
         # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
-        w = mxfp8_dequant(weight, scale_codes, dtype=x.dtype)
-        out = torch.nn.functional.linear(x.reshape(-1, K), w).reshape(*lead, N)
+        x2 = x.reshape(-1, K)
+        rows = max(1, _DEQUANT_CHUNK_BYTES // (K * x.element_size()))
+        if rows >= N:
+            out = torch.nn.functional.linear(x2, mxfp8_dequant(weight, scale_codes, dtype=x.dtype))
+        else:
+            out = torch.empty((x2.shape[0], N), dtype=x.dtype, device=x.device)
+            for n0 in range(0, N, rows):
+                w = mxfp8_dequant(weight[n0:n0 + rows], scale_codes[n0:n0 + rows], dtype=x.dtype)
+                out[:, n0:n0 + rows] = torch.nn.functional.linear(x2, w)
+                del w
+        out = out.reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out
