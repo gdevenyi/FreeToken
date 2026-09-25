@@ -87,6 +87,8 @@ serve_args() {
     )
     [ "$VISION" = "1" ] || args+=(--text-model-only)
     [ -n "$API_KEY" ] && args+=(--api-key "$API_KEY")
+    # EXTRA_ARGS: more ft serve flags, space-separated (no quoting)
+    [ -n "${EXTRA_ARGS:-}" ] && args+=($EXTRA_ARGS)
     printf '%s\n' "${args[@]}"
 }
 
