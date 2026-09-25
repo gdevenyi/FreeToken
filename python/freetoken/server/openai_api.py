@@ -155,6 +155,9 @@ def register_openai_routes(
         OpenAI-compatible clients may use this endpoint to validate a model
         name before sending completion requests.
         """
+        if not model_id:
+            # The :path converter also matches "/v1/models/", which used to redirect to the list.
+            return await v1_models()
         state = get_state()
         served_model_id = _served_model_name(state)
 
@@ -177,6 +180,7 @@ def register_openai_routes(
             supported_reasoning_efforts=efforts,
             default_reasoning_effort=default_effort,
         )
+
 
 async def handle_chat_completion(
     req: ChatCompletionRequest,
