@@ -79,3 +79,20 @@ def test_production_banks_are_reused_across_measurements(monkeypatch):
     second = benchbw._cpu_moe_bank_sources("nvfp4", 64, 32, 4)
     assert _FakeHostBank.built == len(first)
     assert all(second[k] is first[k] for k in first)
+
+
+def test_step_cost_fit_splits_fixed_and_per_expert():
+    from freetoken.moe.benchbw import _step_cost_fit
+
+    fit = _step_cost_fit(0.27, 1.60, 8)  # 0.08 fixed + 0.19/expert
+    assert fit["fit_ok"] is True
+    assert abs(fit["fixed_ms"] - 0.08) < 1e-9 and abs(fit["per_expert_ms"] - 0.19) < 1e-9
+
+
+def test_step_cost_fit_flags_a_negative_intercept():
+    """t(top_k) > top_k * t(1) is noise, not a negative fixed cost."""
+    from freetoken.moe.benchbw import _step_cost_fit
+
+    fit = _step_cost_fit(0.10, 1.20, 8)
+    assert fit["fixed_ms"] < 0
+    assert fit["fit_ok"] is False
