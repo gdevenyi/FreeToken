@@ -128,17 +128,70 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     reps = physical_core_cpus()
     if requested and requested > 0:
         n = int(requested)
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-        except AttributeError:
-            allowed = list(range(os.cpu_count() or 1))
-        # physical-core reps first, then the rest of the logical CPUs.
-        order = reps + [c for c in allowed if c not in set(reps)]
-        if not order:
-            order = [0]
+        order = _cpu_order(reps) or [0]
         core_ids = [order[i % len(order)] for i in range(n)]
         return n, core_ids
     return len(reps), list(reps)
+
+
+def _cpu_order(reps: list[int]) -> list[int]:
+    """This process's logical CPUs: physical-core reps first, then the rest (SMT siblings)."""
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        allowed = list(range(os.cpu_count() or 1))
+    return reps + [c for c in allowed if c not in set(reps)]
+
+
+def cpu_numa_node(cpu: int) -> int | None:
+    """NUMA node of a logical CPU from sysfs, or None when unknown."""
+    try:
+        for name in os.listdir(f"/sys/devices/system/cpu/cpu{cpu}"):
+            if name.startswith("node") and name[4:].isdigit():
+                return int(name[4:])
+    except OSError:
+        pass
+    return None
+
+
+def gpu_numa_node(device: torch.device) -> int | None:
+    """NUMA node of the GPU's PCIe slot, or None when unknown (or not a CUDA device)."""
+    if device.type != "cuda":
+        return None
+    try:
+        p = torch.cuda.get_device_properties(device)
+        bdf = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            node = int(f.read().strip())
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        return None
+    return node if node >= 0 else None
+
+
+def pick_coordinator_core(
+    requested: int, core_ids: list[int], order: list[int], gpu_node: int | None,
+    node_of=cpu_numa_node,
+) -> tuple[int, list[int]]:
+    """Return (coordinator CPU or -1, worker core_ids) for the flag-handshake coordinator.
+
+    Auto sizing (``requested <= 0``) hands the coordinator one of the pool's physical
+    cores (workers drop from N to N-1), preferring the last one on the GPU's NUMA node.
+    An explicit worker count keeps every worker and pins the coordinator to the first
+    CPU in ``order`` that no worker uses, again preferring the GPU's node; it stays
+    unpinned (-1) only when every CPU already hosts a worker."""
+    def on_gpu_node(cpus: list[int]) -> list[int]:
+        return [c for c in cpus if gpu_node is not None and node_of(c) == gpu_node]
+
+    if requested <= 0:
+        if len(core_ids) <= 2:
+            return -1, core_ids
+        coord = (on_gpu_node(core_ids) or core_ids)[-1]
+        return coord, [c for c in core_ids if c != coord]
+    used = set(core_ids)
+    free = [c for c in order if c not in used]
+    if not free:
+        return -1, core_ids
+    return (on_gpu_node(free) or free)[0], core_ids
 
 
 class CpuMoeExecutor:
@@ -220,12 +273,11 @@ class CpuMoeExecutor:
 
         nthreads, core_ids = resolve_threads_and_affinity(num_threads)
         coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
-            # Auto sizing: give the coordinator the last physical core instead of
-            # oversubscribing (workers drop from N to N-1).
-            coord_core = core_ids[-1]
-            nthreads -= 1
-            core_ids = core_ids[:-1]
+        if self._flag_sync:
+            coord_core, core_ids = pick_coordinator_core(
+                num_threads, core_ids, _cpu_order(physical_core_cpus()), gpu_numa_node(device)
+            )
+            nthreads = len(core_ids)
         self._coord_core = coord_core
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,

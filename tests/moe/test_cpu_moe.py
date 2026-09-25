@@ -760,3 +760,49 @@ def test_cpu_moe_executor_is_collectable():
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
 
+
+def test_pick_coordinator_core_prefers_the_gpu_node():
+    """Auto sizing takes the last worker core on the GPU's node (not the pool's last core,
+    which sits on the far socket of a 2-socket box); an explicit worker count pins the
+    coordinator to a CPU no worker uses instead of leaving it unpinned."""
+    from freetoken.moe.cpu_executor import pick_coordinator_core
+
+    node_of = {c: (0 if c < 10 or 20 <= c < 30 else 1) for c in range(40)}.get
+    reps = list(range(20))
+    order = reps + list(range(20, 40))
+
+    coord, workers = pick_coordinator_core(0, reps, order, 0, node_of=node_of)
+    assert coord == 9 and 9 not in workers and len(workers) == 19
+    coord, workers = pick_coordinator_core(0, reps, order, None, node_of=node_of)
+    assert coord == 19 and len(workers) == 19  # unknown GPU node: previous choice
+
+    coord, workers = pick_coordinator_core(4, [0, 1, 2, 3], order, 0, node_of=node_of)
+    assert coord == 4 and workers == [0, 1, 2, 3]
+    coord, workers = pick_coordinator_core(12, list(range(12)), order, 1, node_of=node_of)
+    assert coord == 12 and len(workers) == 12
+    coord, workers = pick_coordinator_core(40, order, order, 0, node_of=node_of)
+    assert coord == -1 and workers == order  # nothing free: stay unpinned
+
+
+def test_explicit_cpu_threads_pin_the_flag_coordinator(monkeypatch):
+    """--moe-cpu-threads N used to leave the flag coordinator unpinned (free to land on
+    a worker's core). Force the handshake on and check it gets a CPU of its own."""
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe import cpu_executor
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    if len(cpu_executor._cpu_order(cpu_executor.physical_core_cpus())) < 3:
+        pytest.skip("needs >= 3 logical CPUs")
+    monkeypatch.setattr(cpu_executor, "_FLAG_SYNC", True)
+    monkeypatch.setattr(_cpu_moe, "memops_probe", lambda stream, scratch_addr: True)
+    ex = CpuMoeExecutor(
+        _make_cache(2, 4, 64, 32), top_k=2, activation="silu",
+        apply_router_weight_on_input=False, num_threads=2, max_tokens=1,
+        device=torch.device("cuda"),
+    )
+    try:
+        assert ex._flag_sync
+        assert ex._coord_core >= 0 and ex._coord_core not in ex.core_ids
+        assert ex.num_threads == 2
+    finally:
+        ex._watchdog_stop = True
