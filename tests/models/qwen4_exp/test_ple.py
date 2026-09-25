@@ -339,6 +339,46 @@ def test_the_fused_hash_refuses_a_geometry_it_cannot_address(ctx_len, heads_per_
         )
 
 
+
+def test_a_host_hashing_table_skips_the_device_hash(monkeypatch):
+    """The disk table hashes on the host and reads only the row_ids shape, so neither the
+    prefetch nor the lookup path runs the device hash for it."""
+    from freetoken.models.qwen4_exp.ple import ZeroTable
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    assert DiskRowTable.reads_row_ids is False
+    config = _config()
+    args = config.qwen4_args
+    seen = []
+
+    class HostHashedTable(ZeroTable):
+        reads_row_ids = False
+
+        def lookup(self, row_ids, out=None):
+            seen.append(("lookup", tuple(row_ids.shape), row_ids.dtype))
+            return super().lookup(row_ids, out)
+
+        def prefetch(self, row_ids):
+            seen.append(("prefetch", tuple(row_ids.shape), row_ids.dtype))
+
+    layer = _make_layer(config, table=HostHashedTable(_padded_vocab(args), args.ngram_head_dim))
+    embedding = layer.ple_embedding
+
+    def no_hash(*a, **k):
+        raise AssertionError("the device hash ran for a table that never reads it")
+
+    monkeypatch.setattr(embedding, "row_ids", no_hash)
+    sequences, contexts = [[3, 4, EOS, 5], [2, 7]], [[EOS, EOS], [21, 22]]
+    meta = _meta(sequences, contexts)
+    total = sum(len(s) for s in sequences)
+    states = torch.zeros(len(sequences), args.ple_state_width, args.ple_conv_state_len)
+
+    layer.start_prefetch(None, meta)
+    _forward(layer, torch.randn(total, layer.hc_count * layer.hidden_size), meta, states)
+    embedding.forward(meta)
+    rows = (total, embedding.num_heads)
+    assert seen == [("prefetch", rows, torch.int64), ("lookup", rows, torch.int64), ("lookup", rows, torch.int64)]
+
 # --------------------------------------------------------------------------------------
 # table backends
 # --------------------------------------------------------------------------------------
