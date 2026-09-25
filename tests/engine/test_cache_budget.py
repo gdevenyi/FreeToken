@@ -682,3 +682,19 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_host_embedding_placement_reports_the_bytes_it_pinned(monkeypatch):
+    # the engine charges these bytes to the pin budget before it plans the expert banks
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.engine.engine import _place_embeddings_on_host
+    from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setattr(VocabParallelEmbedding, "place_on_host", lambda self: None)
+    embed, tied = VocabParallelEmbedding(100, 64), VocabParallelEmbedding(50, 64)
+    embed.weight = torch.empty(100, 64, dtype=torch.bfloat16)
+    head = ParallelLMHead(50, 64, tie_word_embeddings=True, tied_embedding=tied)
+    model = SimpleNamespace(embed_tokens=embed, per_layer_embed=tied, lm_head=head)
+    assert _place_embeddings_on_host(model) == 100 * 64 * 2

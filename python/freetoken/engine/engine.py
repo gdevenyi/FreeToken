@@ -100,8 +100,10 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _place_embeddings_on_host(model) -> None:
-    """--embed-weights host: every input embedding table moves to pinned host RAM, except one an lm_head is tied to."""
+def _place_embeddings_on_host(model) -> int:
+    """--embed-weights host: every input embedding table moves to pinned host RAM, except one an lm_head is tied to.
+
+    Returns the pinned bytes."""
     from freetoken.layers.base import BaseOP
     from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 
@@ -131,6 +133,7 @@ def _place_embeddings_on_host(model) -> None:
     torch.cuda.empty_cache()
     size = sum(e.weight.numel() * e.weight.element_size() for e in moved)
     logger.info_rank0(f"Token embedding in pinned host RAM ({mem_GB(size)}), gathered over PCIe")
+    return size
 
 
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
@@ -496,8 +499,7 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
-        if config.embed_weights == "host":
-            _place_embeddings_on_host(self.model)
+        embed_host_bytes = _place_embeddings_on_host(self.model) if config.embed_weights == "host" else 0
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -511,11 +513,11 @@ class Engine:
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
-        # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = 0
+        # planning sees the pin quota the table (and a host embedding) already spent.
+        self._host_tables_bytes = embed_host_bytes
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
-                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+                self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
