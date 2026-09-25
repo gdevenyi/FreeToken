@@ -418,7 +418,9 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
 
     stopped = torch.zeros_like(slab)
     _forward(layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped)
-    assert torch.equal(got, stopped[live])
+    # Same math over a different row count: CPU kernels without AVX-512 block it differently,
+    # so allow fp32 rounding rather than bit equality.
+    torch.testing.assert_close(got, stopped[live], rtol=0, atol=1e-5)
 
 
 def test_prefix_hit_matches_the_uncached_run():
