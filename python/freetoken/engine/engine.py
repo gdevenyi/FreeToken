@@ -416,6 +416,9 @@ class Engine:
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
+        from freetoken.kernel.triton.autotune_cache import bound_autotune_flush_buffer
+
+        bound_autotune_flush_buffer(self.device.index)
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
