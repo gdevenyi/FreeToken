@@ -453,7 +453,9 @@ async def anthropic_event_stream(
         block_open = "thinking"
         return _event(AnthropicStreamEvent(
             type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="thinking", thinking=""),
+            # The SDK types signature as a required string on the opening block, before any
+            # signature_delta. Local reasoning is unsigned, like the full-response path.
+            content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
         ))
 
     def _stop_block() -> list[str]:
