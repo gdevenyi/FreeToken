@@ -88,6 +88,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--decode-tokens", type=int, default=DEFAULT_DECODE_TOKENS)
     parser.add_argument(
+        "--decode-prompt-tokens",
+        type=int,
+        default=None,
+        help="prompt size for the decode run, so decode is measured at that context "
+        "(default: min(512, first --prefill-sizes entry))",
+    )
+    parser.add_argument(
         "--cache-prefix-tokens", type=int, default=DEFAULT_CACHE_PREFIX_TOKENS
     )
     parser.add_argument(
@@ -107,6 +114,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.decode_tokens < 1:
         parser.error("--decode-tokens must be positive")
+    if args.decode_prompt_tokens is not None and args.decode_prompt_tokens < 1:
+        parser.error("--decode-prompt-tokens must be positive")
     if args.cache_prefix_tokens < 1:
         parser.error("--cache-prefix-tokens must be positive")
     if args.cache_suffix_tokens < 0:
@@ -390,6 +399,10 @@ def sample_metrics(
         "client_wall_effective_prefill_tps": new_prompt_tokens / ttft_s
         if new_prompt_tokens is not None and ttft_s > 0
         else None,
+        # FreeToken omits prompt_tokens_details when nothing was cached (and always without
+        # --enable-cache-report), so the effective rate above is often unknown; the raw rate
+        # over the whole prompt is always there, and equals it for an uncached prompt.
+        "client_wall_prefill_tps": prompt_tokens / ttft_s if ttft_s > 0 else None,
         "decode_steps": decode_steps,
         "sse_token_events": len(result.token_timestamps),
     }
@@ -519,6 +532,12 @@ def run_request(
     return sample_metrics(result)
 
 
+def decode_prompt_tokens(args: argparse.Namespace) -> int:
+    if args.decode_prompt_tokens is not None:
+        return args.decode_prompt_tokens
+    return min(512, args.prefill_sizes[0])
+
+
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     origin = _origin(args.base_url)
     snapshot = snapshot_server(origin, args.request_timeout)
@@ -551,6 +570,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     prefill_fields = (
         "client_wall_ttft_ms",
         "client_wall_effective_prefill_tps",
+        "client_wall_prefill_tps",
         "client_wall_total_ms",
     )
     for target in args.prefill_sizes:
@@ -575,7 +595,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     decode_samples: list[dict[str, Any]] = []
-    decode_prompt_target = min(512, args.prefill_sizes[0])
+    decode_prompt_target = decode_prompt_tokens(args)
     for repetition in range(args.repetitions):
         prompt, _ = calibrate_prompt(
             origin,
@@ -632,6 +652,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "warmup_runs": args.warmup_runs,
             "repetitions": args.repetitions,
             "decode_tokens": args.decode_tokens,
+            "decode_prompt_tokens": decode_prompt_target,
             "cache_prefix_tokens": args.cache_prefix_tokens,
             "cache_suffix_tokens": args.cache_suffix_tokens,
         },
@@ -663,17 +684,20 @@ def _format_number(value: Any, suffix: str = "") -> str:
 
 
 def print_human_summary(result: dict[str, Any]) -> None:
-    print("\nFresh prefill\n target   median TTFT       effective tok/s", flush=True)
+    print("\nFresh prefill\n target   median TTFT         prefill tok/s", flush=True)
     for target in result["prefill"]["targets"]:
+        tps = _summary_median(target, "client_wall_effective_prefill_tps")
+        if tps is None:
+            tps = _summary_median(target, "client_wall_prefill_tps")
         print(
             f" {target['target_prompt_tokens']:>6}   "
             f"{_format_number(_summary_median(target, 'client_wall_ttft_ms'), ' ms'):>16}   "
-            f"{_format_number(_summary_median(target, 'client_wall_effective_prefill_tps')):>18}",
+            f"{_format_number(tps):>18}",
             flush=True,
         )
     decode = result["decode"]
     print(
-        "\nDecode\n"
+        f"\nDecode ({result['configuration']['decode_prompt_tokens']}-token prompt)\n"
         f" client-wall median: {_format_number(_summary_median(decode, 'client_wall_decode_tps'), ' tok/s')}\n"
         f" TTFT median:        {_format_number(_summary_median(decode, 'client_wall_ttft_ms'), ' ms')}",
         flush=True,
