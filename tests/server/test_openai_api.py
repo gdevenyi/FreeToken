@@ -523,6 +523,32 @@ def test_models_route_prefers_the_last_rebuild_over_the_load_time_pool():
     assert card["max_model_len"] == 40000
 
 
+def test_model_retrieve_route_returns_the_served_card_or_404():
+    state = FakeState([])
+    state.config.max_seq_len = 262144
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+    client = TestClient(app)
+
+    card = client.get("/v1/models/unit-model").json()
+    assert card["id"] == "unit-model" and card["context_length"] == 262144
+
+    missing = client.get("/v1/models/other-model")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "model_not_found"
+
+
+def test_models_route_with_a_trailing_slash_still_lists():
+    state = FakeState([])
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    response = TestClient(app).get("/v1/models/")
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["id"] == "unit-model"
+
+
 async def _collect(generator):
     return [chunk async for chunk in generator]
 
