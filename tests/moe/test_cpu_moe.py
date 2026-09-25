@@ -769,6 +769,33 @@ def test_cpu_moe_executor_is_collectable():
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
 
 
+def test_flag_handshake_probe_takes_32_bit_memops_when_64_bit_ones_are_rejected():
+    """Pre-Volta devices (CAN_USE_64_BIT_STREAM_MEM_OPS = 0) take only the 32-bit stream memops;
+    the probe must bring the flag handshake up on them instead of the host-func path."""
+    import ctypes
+
+    from freetoken.kernel import _cpu_moe
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    torch.cuda.init()
+    cu = ctypes.CDLL("libcuda.so.1")
+    dev = ctypes.c_int()
+    assert cu.cuDeviceGet(ctypes.byref(dev), torch.cuda.current_device()) == 0
+
+    def attr(a):
+        v = ctypes.c_int()
+        assert cu.cuDeviceGetAttribute(ctypes.byref(v), a, dev) == 0
+        return v.value
+
+    if not attr(92):  # CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS
+        pytest.skip("stream memops are disabled on this device/driver")
+    scratch = alloc_pinned_tensor(1, dtype=torch.int64)
+    scratch.zero_()
+    assert _cpu_moe.memops_probe(torch.cuda.current_stream().cuda_stream, scratch.data_ptr())
+    assert _cpu_moe.memop_bits() == (64 if attr(93) else 32)
+    assert int(scratch[0]) == 7
+
+
 def test_pick_coordinator_core_prefers_the_gpu_node():
     """Auto sizing takes the last worker core on the GPU's node (not the pool's last core,
     which sits on the far socket of a 2-socket box); an explicit worker count pins the

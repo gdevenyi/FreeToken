@@ -85,3 +85,40 @@ def test_geometry_and_bounds_are_checked_up_front(tmp_path):
     with pytest.raises(RuntimeError, match="exceeds a page"):
         _row_store.RowStore(paths=[str(path)], extent_file=[0], extent_base=[0], rows_per_extent=1,
                             row_bytes=4097, row_stride=4097, use_io_uring=False)
+
+
+def _cu_attr(attr: int) -> int:
+    import ctypes
+
+    cu = ctypes.CDLL("libcuda.so.1")
+    dev, value = ctypes.c_int(), ctypes.c_int()
+    assert cu.cuDeviceGet(ctypes.byref(dev), torch.cuda.current_device()) == 0
+    assert cu.cuDeviceGetAttribute(ctypes.byref(value), attr, dev) == 0
+    return value.value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_wait_sync_comes_up_on_32_bit_only_stream_memops():
+    """Pre-Volta devices reject the 64-bit stream memops but take the 32-bit ones; the wait
+    path must use those instead of falling back to launch gating."""
+    import threading
+
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.kernel.row_store import probe_wait_sync, signal, wait_reset
+
+    torch.cuda.init()
+    if not _cu_attr(92):  # CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS
+        pytest.skip("stream memops are disabled on this device/driver")
+    dev = torch.device("cuda")
+    assert probe_wait_sync("auto", dev)
+    assert _row_store.memop_bits() == (64 if _cu_attr(93) else 32)
+
+    flag = alloc_pinned_tensor(1, dtype=torch.int64)
+    flag.zero_()
+    stream = torch.cuda.current_stream(dev)
+    wait_reset(stream, flag)
+    marker = torch.zeros(1, device=dev)
+    marker += 1  # queued behind the WAIT
+    threading.Timer(0.05, signal, args=(flag,)).start()
+    stream.synchronize()
+    assert int(flag[0]) == 0 and float(marker) == 1.0

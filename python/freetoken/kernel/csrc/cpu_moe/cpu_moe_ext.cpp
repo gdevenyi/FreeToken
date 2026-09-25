@@ -747,8 +747,16 @@ static void* cumemop_dlsym(void* h, const char* n) { return dlsym(h, n); }
 
 using cuMemOp64_fn = int (*)(void* stream, unsigned long long addr, unsigned long long value,
                              unsigned int flags);
+using cuMemOp32_fn = int (*)(void* stream, unsigned long long addr, unsigned int value,
+                             unsigned int flags);
 static cuMemOp64_fn g_cu_write64 = nullptr;
 static cuMemOp64_fn g_cu_wait64 = nullptr;
+static cuMemOp32_fn g_cu_write32 = nullptr;
+static cuMemOp32_fn g_cu_wait32 = nullptr;
+// Width the probe settled on. Pre-Volta devices (CAN_USE_64_BIT_STREAM_MEM_OPS = 0) only
+// take the 32-bit ops; the flags only ever hold 0/1, so those act on each little-endian
+// int64 flag's low word while the host keeps writing whole int64s.
+static int g_memop_bits = 64;
 static constexpr unsigned int kCuWaitValueGeq = 0x0;   // CU_STREAM_WAIT_VALUE_GEQ
 static constexpr unsigned int kCuWriteDefault = 0x0;   // CU_STREAM_WRITE_VALUE_DEFAULT
 
@@ -758,25 +766,47 @@ static bool cumemop_resolve() {
     if (h == nullptr) return false;
     // 11.7+ made the v2 entry points the default; older drivers export only the v1
     // names with the same signature.
-    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64_v2"));
-    if (g_cu_write64 == nullptr)
-      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64"));
-    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64_v2"));
-    if (g_cu_wait64 == nullptr)
-      g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
-    return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
+    auto sym = [h](const char* v2, const char* v1) {
+      void* f = cumemop_dlsym(h, v2);
+      return f != nullptr ? f : cumemop_dlsym(h, v1);
+    };
+    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(sym("cuStreamWriteValue64_v2", "cuStreamWriteValue64"));
+    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(sym("cuStreamWaitValue64_v2", "cuStreamWaitValue64"));
+    g_cu_write32 = reinterpret_cast<cuMemOp32_fn>(sym("cuStreamWriteValue32_v2", "cuStreamWriteValue32"));
+    g_cu_wait32 = reinterpret_cast<cuMemOp32_fn>(sym("cuStreamWaitValue32_v2", "cuStreamWaitValue32"));
+    return (g_cu_write64 != nullptr && g_cu_wait64 != nullptr) ||
+           (g_cu_write32 != nullptr && g_cu_wait32 != nullptr);
   }();
   return resolved;
 }
 
-// Functional probe on a scratch pinned int64: enqueue WRITE(7) + WAIT(>=7) + sync.
-// Returns true only if the whole memop path works on THIS stream/device/driver.
+static int cumemop_write(void* s, uintptr_t addr, unsigned int value) {
+  if (g_memop_bits == 32) return g_cu_write32(s, (unsigned long long)addr, value, kCuWriteDefault);
+  return g_cu_write64(s, (unsigned long long)addr, value, kCuWriteDefault);
+}
+
+static int cumemop_wait_geq(void* s, uintptr_t addr, unsigned int value) {
+  if (g_memop_bits == 32) return g_cu_wait32(s, (unsigned long long)addr, value, kCuWaitValueGeq);
+  return g_cu_wait64(s, (unsigned long long)addr, value, kCuWaitValueGeq);
+}
+
+// Functional probe on a scratch pinned int64: enqueue WRITE(7) + WAIT(>=7) + sync, 64-bit
+// ops first, then 32-bit. Returns true only if the whole memop path works on THIS
+// stream/device/driver; a rejected enqueue (CUDA_ERROR_NOT_SUPPORTED) leaves the stream usable.
 static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   if (!cumemop_resolve()) return false;
   auto* s = reinterpret_cast<void*>(stream);
-  if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
-  if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
-  return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+  for (int bits : {64, 32}) {
+    if (bits == 64 ? g_cu_write64 == nullptr || g_cu_wait64 == nullptr
+                   : g_cu_write32 == nullptr || g_cu_wait32 == nullptr)
+      continue;
+    g_memop_bits = bits;
+    if (cumemop_write(s, scratch_addr, 7) != 0 || cumemop_wait_geq(s, scratch_addr, 7) != 0)
+      continue;
+    return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+  }
+  g_memop_bits = 64;
+  return false;
 }
 
 // GPU side of the flag handshake (see the block comment above): enqueued on the
@@ -802,19 +832,13 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
   auto* s = reinterpret_cast<void*>(stream);
   // Order matters and is preserved by the front end: reset done BEFORE raising ready,
   // so the coordinator's completion write for THIS step can never be wiped.
-  cumemop_check(g_cu_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL,
-                             kCuWriteDefault),
-                "cuStreamWriteValue64(done)");
-  cumemop_check(g_cu_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL,
-                             kCuWriteDefault),
-                "cuStreamWriteValue64(ready)");
+  cumemop_check(cumemop_write(s, done_addr + (size_t)slot * 8, 0), "cuStreamWriteValue(done)");
+  cumemop_check(cumemop_write(s, ready_addr + (size_t)slot * 8, 1), "cuStreamWriteValue(ready)");
 }
 
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
-  cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream),
-                            (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
-                            kCuWaitValueGeq),
-                "cuStreamWaitValue64(done)");
+  cumemop_check(cumemop_wait_geq(reinterpret_cast<void*>(stream), done_addr + (size_t)slot * 8, 1),
+                "cuStreamWaitValue(done)");
 }
 
 struct DotChoice {
@@ -2625,6 +2649,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("disable_numa", &CpuMoeExecutor::disable_numa)
       .def("numa_status", &CpuMoeExecutor::numa_status);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
+  m.def("memop_bits", [] { return g_memop_bits; });
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));
   m.def("memop_sync", &cumemop_sync, py::arg("stream"), py::arg("done_addr"),
