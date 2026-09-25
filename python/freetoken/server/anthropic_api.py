@@ -53,6 +53,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .openai_api import _await_watching_disconnect
 from .request_logger import log_request
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
@@ -137,9 +138,14 @@ async def handle_anthropic_messages(
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/messages")
+        # an abandoned request must not keep decoding to max_tokens (#222's watcher)
+        result = await _await_watching_disconnect(
+            generate_full(uid, spec, state, source="/v1/messages"), request, state, uid
+        )
     except GenerationError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
+    if result is None:
+        return _anthropic_error_response(499, "api_error", "client disconnected before the response was ready")
     response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
     return JSONResponse(content=response.model_dump(exclude_none=True))
 

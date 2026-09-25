@@ -294,3 +294,25 @@ def test_non_stream_connected_client_gets_result_without_abort(monkeypatch):
 
     assert result["choices"][0]["message"]["content"] == "Hi"
     assert state.aborted == []
+
+
+def test_messages_and_responses_non_stream_disconnect_delivers_abort(monkeypatch):
+    # #222 only wrapped the OpenAI handlers; the Anthropic and Responses endpoints kept
+    # decoding an abandoned non-streaming request to max_tokens.
+    from freetoken.server import anthropic_api, responses_api
+    from freetoken.server.anthropic_models import AnthropicMessagesRequest
+    from freetoken.server.responses_api import ResponsesRequest
+
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+
+    state = _ApiState(acks=None)
+    req = AnthropicMessagesRequest(model="m", max_tokens=8, messages=[{"role": "user", "content": "hi"}])
+    handler = anthropic_api.handle_anthropic_messages(req, _Request(disconnected=True), state, {})
+    resp = asyncio.run(asyncio.wait_for(handler, timeout=5))  # unwatched: hangs, then times out
+    assert resp.status_code == 499 and state.aborted == [7]
+
+    state = _ApiState(acks=None)
+    req = ResponsesRequest(model="m", input="hi", max_output_tokens=8)
+    handler = responses_api.handle_responses(req, _Request(disconnected=True), state, {})
+    resp = asyncio.run(asyncio.wait_for(handler, timeout=5))
+    assert resp.status_code == 499 and state.aborted == [7]
