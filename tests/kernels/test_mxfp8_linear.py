@@ -103,6 +103,21 @@ def test_gemv_cap_drops_with_a_warning_when_an_m_tile_overflows_shared_memory(mo
     assert not caplog.records
 
 
+def test_below_sm70_only_m1_takes_the_gemv(monkeypatch):
+    import freetoken.kernel.triton.mxfp8_linear as mod
+
+    monkeypatch.setattr(mod, "_gemv_cap", mod._GEMV_MAX_M)
+    monkeypatch.setattr(mod, "_small_m_gemv_ok", lambda: False)
+    monkeypatch.setattr(mod, "e4m3_kernel_view", lambda w: w)
+    monkeypatch.setattr(mod, "_gemv", _gemv_with_smem_for(0))  # the M=1 kernel is never out of resources
+    w8, codes = _make_mxfp8(64, 128, device="cpu")
+    x = torch.randn(4, 128, dtype=torch.bfloat16)
+    assert torch.isnan(mod.mxfp8_linear(x[:1], w8, codes)).all()
+    for m in (2, 4):
+        assert not torch.isnan(mod.mxfp8_linear(x[:m], w8, codes)).any()
+    assert mod._gemv_cap == mod._GEMV_MAX_M  # bypassing the GEMV is not an OutOfResources retry
+
+
 @cuda
 def test_gemma_plus_one_norm_matches_flashinfer_semantics():
     """Triton fallback vs the (1+w) definition; per-head 3D strided in-place."""
