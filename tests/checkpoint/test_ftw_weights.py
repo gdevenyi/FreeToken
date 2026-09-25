@@ -54,3 +54,44 @@ def test_ftw_lacks_vision(tmp_path):
     assert not ftw_lacks_vision(str(tmp_path / "vl"))
     assert not ftw_lacks_vision(str(tmp_path))
     assert ftw_tensor_names(str(tmp_path / "vl"), "weight") == ["model.a.weight", "visual.b.weight"]
+
+
+def test_ftw_banks_place_expert_rows_before_the_reads(tmp_path, monkeypatch):
+    """The FTW fast path splits every expert's rows over the NUMA nodes like the safetensors
+    path, for both row layouts, before the O_DIRECT reads fault the pages in."""
+    import freetoken.moe.host_banks as hb
+    from freetoken.checkpoint.ftw import layer_bank_entry_name, load_ftw_banks
+
+    L, E = 2, 4
+    writer = FTWWriter(str(tmp_path))
+    for layer in range(L):
+        writer.add_tensor(layer_bank_entry_name("gate_up_packed", layer),
+                          torch.ones(E, 64, 32, dtype=torch.uint8), kind="experts_bank")
+    # flat layout: layer 1 starts mid-page, so its rows are a carved view of the read window
+    writer.add_tensor("down_packed", torch.ones(L * E, 32, 16, dtype=torch.uint8), kind="experts_bank")
+    writer.finalize({"quant_format": "nvfp4", "expert_bank_num_layers": L})
+
+    events = []
+    original = FTWReader.read_into
+
+    def spy(self, dest, entry, **kwargs):
+        events.append("read")
+        return original(self, dest, entry, **kwargs)
+
+    monkeypatch.setattr(FTWReader, "read_into", spy)
+    monkeypatch.setattr(hb, "numa_placement_nodes", lambda: [0, 1])
+    monkeypatch.setattr(hb, "place_expert_rows", lambda tensors, nodes: events.append(
+        ("place", [(t.data_ptr(), tuple(t.shape)) for t in tensors], nodes)))
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    monkeypatch.delenv("FREETOKEN_BANK_CUDA_ALLOC", raising=False)
+
+    banks = load_ftw_banks(str(tmp_path), num_layers=L)
+    placed = [ev for ev in events if ev != "read"]
+    assert placed and events.index("read") > events.index(placed[-1]), events
+    assert all(nodes == [0, 1] for _, _, nodes in placed)
+    got = sorted(t for _, tensors, _ in placed for t in tensors)
+    want = sorted((t.data_ptr(), tuple(t.shape)) for per_layer in banks.sources.values() for t in per_layer)
+    assert got == want
+    for per_layer in banks.sources.values():
+        for t in per_layer:
+            assert bool((t == 1).all())
