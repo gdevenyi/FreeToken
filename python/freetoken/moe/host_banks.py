@@ -236,11 +236,17 @@ def _cpu_numa_node(cpu: int) -> int | None:
     return None
 
 
+def cpu_moe_numa_enabled() -> bool:
+    """``FREETOKEN_CPU_MOE_NUMA`` = 0/false/no/off turns off both the NUMA row placement and
+    the CPU MoE executor's per-node tile scheduling."""
+    return os.environ.get("FREETOKEN_CPU_MOE_NUMA", "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def numa_placement_nodes() -> list[int]:
     """NUMA nodes to split expert rows over (see :func:`place_expert_rows`), or [] to leave
     placement to the kernel: one node, a ``--membind``/``--preferred`` memory policy (only
     first-touch and ``numactl --interleave`` are overridden), or ``FREETOKEN_CPU_MOE_NUMA=0``."""
-    if os.environ.get("FREETOKEN_CPU_MOE_NUMA", "").strip() == "0":
+    if not cpu_moe_numa_enabled():
         return []
     nrs = _MEMPOLICY_SYSCALLS.get(os.uname().machine)
     if nrs is None or not hasattr(os, "sched_getaffinity"):
@@ -584,6 +590,7 @@ __all__ = [
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
+    "cpu_moe_numa_enabled",
     "numa_placement_nodes",
     "pin_banks",
     "place_expert_rows",

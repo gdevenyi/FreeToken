@@ -1794,9 +1794,7 @@ struct CpuMoeExecutor {
     worker_node.assign(num_threads, -1);
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
-    const char* numa_env = getenv("FREETOKEN_CPU_MOE_NUMA");
-    const bool numa_off = numa_env && numa_env[0] == '0';
-    if (!core_ids.empty() && !numa_off &&
+    if (!core_ids.empty() &&
         (fmt == WF_BF16 || fmt == WF_NVFP4 || fmt == WF_Q4_0)) {
       while (nodes_known.load(std::memory_order_acquire) < num_threads) std::this_thread::yield();
       bool seen[kMaxNodes] = {};
@@ -2086,6 +2084,10 @@ struct CpuMoeExecutor {
 #endif
     return "scalar";
   }
+
+  // FREETOKEN_CPU_MOE_NUMA is parsed once, in Python (host_banks.cpu_moe_numa_enabled).
+  // Call before the first task.
+  void disable_numa() { numa_sched = false; }
 
   // (pool spans several NUMA nodes, layers whose tiles resolved to single nodes so far)
   std::pair<bool, int> numa_status() const {
@@ -2729,6 +2731,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
            py::arg("enabled"))
       .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); })
+      .def("disable_numa", &CpuMoeExecutor::disable_numa)
       .def("numa_status", &CpuMoeExecutor::numa_status);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),

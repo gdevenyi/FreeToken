@@ -988,8 +988,10 @@ def test_place_expert_rows_holds_under_shmem_huge_pages():
     assert not wrong, f"{len(wrong)} of {len(status)} pages on the wrong node"
 
 
-def test_numa_placement_is_opt_out(monkeypatch):
+@pytest.mark.parametrize("value", ["0", " 0", "off", "FALSE", "no"])
+def test_numa_placement_is_opt_out(monkeypatch, value):
     import freetoken.moe.host_banks as hb
 
-    monkeypatch.setenv("FREETOKEN_CPU_MOE_NUMA", "0")
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_NUMA", value)
     assert hb.numa_placement_nodes() == []
+    assert not hb.cpu_moe_numa_enabled()
