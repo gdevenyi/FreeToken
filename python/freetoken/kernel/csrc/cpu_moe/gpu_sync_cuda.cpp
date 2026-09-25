@@ -1,5 +1,8 @@
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -44,8 +47,15 @@ static void* cumemop_dlsym(void* h, const char* n) { return dlsym(h, n); }
 
 using cuMemOp64_fn = int (*)(void* stream, unsigned long long addr, unsigned long long value,
                              unsigned int flags);
+using cuMemOp32_fn = int (*)(void* stream, unsigned long long addr, unsigned int value,
+                             unsigned int flags);
 static cuMemOp64_fn g_cu_write64 = nullptr;
 static cuMemOp64_fn g_cu_wait64 = nullptr;
+static cuMemOp32_fn g_cu_write32 = nullptr;
+static cuMemOp32_fn g_cu_wait32 = nullptr;
+// Width the probe settled on. Pre-Volta devices (CAN_USE_64_BIT_STREAM_MEM_OPS = 0) take only
+// the 32-bit ops, which act on the low word of each little-endian int64 flag.
+static int g_memop_bits = 64;
 static constexpr unsigned int kCuWaitValueGeq = 0x0;   // CU_STREAM_WAIT_VALUE_GEQ
 static constexpr unsigned int kCuWriteDefault = 0x0;   // CU_STREAM_WRITE_VALUE_DEFAULT
 
@@ -55,15 +65,34 @@ static bool cumemop_resolve() {
     if (h == nullptr) return false;
     // 11.7+ made the v2 entry points the default; older drivers export only the v1
     // names with the same signature.
-    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64_v2"));
-    if (g_cu_write64 == nullptr)
-      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64"));
-    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64_v2"));
-    if (g_cu_wait64 == nullptr)
-      g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
-    return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
+    auto sym = [h](const char* v2, const char* v1) {
+      void* f = cumemop_dlsym(h, v2);
+      return f != nullptr ? f : cumemop_dlsym(h, v1);
+    };
+    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(sym("cuStreamWriteValue64_v2", "cuStreamWriteValue64"));
+    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(sym("cuStreamWaitValue64_v2", "cuStreamWaitValue64"));
+    g_cu_write32 = reinterpret_cast<cuMemOp32_fn>(sym("cuStreamWriteValue32_v2", "cuStreamWriteValue32"));
+    g_cu_wait32 = reinterpret_cast<cuMemOp32_fn>(sym("cuStreamWaitValue32_v2", "cuStreamWaitValue32"));
+    return (g_cu_write64 != nullptr && g_cu_wait64 != nullptr) ||
+           (g_cu_write32 != nullptr && g_cu_wait32 != nullptr);
   }();
   return resolved;
+}
+
+static bool has_memops(int bits) {
+  return bits == 64 ? g_cu_write64 != nullptr && g_cu_wait64 != nullptr
+                    : g_cu_write32 != nullptr && g_cu_wait32 != nullptr;
+}
+
+// value fits 32 bits whenever bits == 32 (the callers see to it)
+static int cumemop_write(void* s, unsigned long long addr, uint64_t value, int bits) {
+  if (bits == 32) return g_cu_write32(s, addr, static_cast<unsigned int>(value), kCuWriteDefault);
+  return g_cu_write64(s, addr, value, kCuWriteDefault);
+}
+
+static int cumemop_wait_geq(void* s, unsigned long long addr, uint64_t value, int bits) {
+  if (bits == 32) return g_cu_wait32(s, addr, static_cast<unsigned int>(value), kCuWaitValueGeq);
+  return g_cu_wait64(s, addr, value, kCuWaitValueGeq);
 }
 
 // GPU side of the flag handshake (see the block comment above): enqueued on the
@@ -92,6 +121,31 @@ struct GpuSync::Impl {
   void* device_block = nullptr;
   volatile int64_t* ready = nullptr;
   volatile int64_t* done = nullptr;
+  // the width the last probe chose, latched so a later probe cannot change how this instance encodes ready
+  const int bits = g_memop_bits;
+  // 32-bit memops cannot write a whole task word, so ready carries its index + 1 here.
+  // Words are registered at submit (capture) time and never removed; a graph replays its index.
+  static constexpr size_t kMaxWords = 1 << 16;
+  std::mutex words_mtx;
+  std::unordered_map<uint64_t, uint32_t> index_of;
+  std::unique_ptr<std::atomic<uint64_t>[]> words{new std::atomic<uint64_t>[kMaxWords]()};
+
+  uint64_t doorbell(uint64_t task) {
+    if (bits == 64) return task;
+    std::lock_guard<std::mutex> lk(words_mtx);
+    const auto it = index_of.find(task);
+    if (it != index_of.end()) return it->second + 1;
+    const size_t i = index_of.size();
+    if (i == kMaxWords) throw std::runtime_error("CPU MoE flag sync: too many distinct tasks for 32-bit memops");
+    words[i].store(task, std::memory_order_release);
+    index_of.emplace(task, static_cast<uint32_t>(i));
+    return i + 1;
+  }
+
+  uint64_t task_of(uint64_t bell) const {
+    if (bits == 64) return bell;
+    return bell >= 1 && bell <= kMaxWords ? words[bell - 1].load(std::memory_order_acquire) : 0;
+  }
 };
 
 GpuSync::GpuSync() : impl_(std::make_unique<Impl>()) {
@@ -111,23 +165,35 @@ GpuSync::GpuSync() : impl_(std::make_unique<Impl>()) {
 
 GpuSync::~GpuSync() { cudaFreeHost(impl_->block); }
 
-// Functional probe on a scratch pinned int64: enqueue WRITE(7) + WAIT(>=7) + sync.
-// Returns true only if the whole memop path works on THIS stream/device/driver.
+// Functional probe on a scratch pinned int64: enqueue WRITE(7) + WAIT(>=7) + sync, 64-bit
+// ops first, then 32-bit. Returns true only if the whole memop path works on THIS
+// stream/device/driver; a rejected enqueue (CUDA_ERROR_NOT_SUPPORTED) leaves the stream usable.
 bool GpuSync::probe(uintptr_t stream) {
   if (!cumemop_resolve()) return false;
   void* scratch = nullptr;
   if (cudaHostAlloc(&scratch, sizeof(int64_t), cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess)
     return false;
-  *static_cast<int64_t*>(scratch) = 0;
   auto* s = reinterpret_cast<void*>(stream);
   const auto addr = reinterpret_cast<unsigned long long>(scratch);
-  const bool ok = g_cu_write64(s, addr, 7ULL, kCuWriteDefault) == 0 && g_cu_wait64(s, addr, 7ULL, kCuWaitValueGeq) == 0 &&
-                  cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
-  // a failed enqueue can leave the WRITE pending on the scratch word
-  cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
+  bool ok = false;
+  for (int bits : {64, 32}) {
+    if (!has_memops(bits)) continue;
+    *static_cast<volatile int64_t*>(scratch) = 0;
+    ok = cumemop_write(s, addr, 7, bits) == 0 && cumemop_wait_geq(s, addr, 7, bits) == 0 &&
+         cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess &&
+         *static_cast<volatile int64_t*>(scratch) == 7;
+    // a failed enqueue can leave the WRITE pending on the scratch word
+    cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
+    if (ok) {
+      g_memop_bits = bits;
+      break;
+    }
+  }
   cudaFreeHost(scratch);
   return ok;
 }
+
+int GpuSync::memop_bits() { return g_memop_bits; }
 
 bool GpuSync::host_func_capture_safe() { return true; }
 
@@ -135,16 +201,16 @@ void GpuSync::gpu_submit(uintptr_t stream, uint64_t task) {
   auto* s = reinterpret_cast<void*>(stream);
   // Order matters and is preserved by the front end: reset done BEFORE raising ready,
   // so the coordinator's completion write for THIS step can never be wiped.
-  cumemop_check(g_cu_write64(s, reinterpret_cast<unsigned long long>(impl_->done), 0ULL, kCuWriteDefault),
-                "cuStreamWriteValue64(done)");
-  cumemop_check(g_cu_write64(s, reinterpret_cast<unsigned long long>(impl_->ready), task, kCuWriteDefault),
-                "cuStreamWriteValue64(ready)");
+  const uint64_t bell = impl_->doorbell(task);
+  cumemop_check(cumemop_write(s, reinterpret_cast<unsigned long long>(impl_->done), 0, impl_->bits), "cuStreamWriteValue(done)");
+  cumemop_check(cumemop_write(s, reinterpret_cast<unsigned long long>(impl_->ready), bell, impl_->bits),
+                "cuStreamWriteValue(ready)");
 }
 
 void GpuSync::gpu_wait(uintptr_t stream) {
-  cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream), reinterpret_cast<unsigned long long>(impl_->done), 1ULL,
-                            kCuWaitValueGeq),
-                "cuStreamWaitValue64(done)");
+  cumemop_check(cumemop_wait_geq(reinterpret_cast<void*>(stream), reinterpret_cast<unsigned long long>(impl_->done), 1,
+                                 impl_->bits),
+                "cuStreamWaitValue(done)");
 }
 
 uint64_t GpuSync::cpu_poll() {
@@ -152,8 +218,10 @@ uint64_t GpuSync::cpu_poll() {
   const int64_t task = flag_load_acquire(impl_->ready);
   if (task == 0) return 0;
   flag_store_release(impl_->ready, 0);  // consume this step's doorbell
-  return static_cast<uint64_t>(task);
+  return impl_->task_of(static_cast<uint64_t>(task));
 }
+
+uint64_t GpuSync::doorbell(uint64_t task) { return impl_->doorbell(task); }
 
 void GpuSync::cpu_done() { flag_store_release(impl_->done, 1); }
 

@@ -66,8 +66,16 @@ uint8_t *page_aligned_alloc(size_t bytes) {
 // Stream memops for the flag-sync fast path, resolved from the driver at runtime.
 using CuMemOp64Fn = int (*)(void *stream, unsigned long long addr, unsigned long long value,
                             unsigned int flags);
+using CuMemOp32Fn = int (*)(void *stream, unsigned long long addr, unsigned int value,
+                            unsigned int flags);
 CuMemOp64Fn g_cu_write64 = nullptr;
 CuMemOp64Fn g_cu_wait64 = nullptr;
+CuMemOp32Fn g_cu_write32 = nullptr;
+CuMemOp32Fn g_cu_wait32 = nullptr;
+// 0 until the first write picks a width. Pre-Volta devices reject the 64-bit ops but take
+// the 32-bit ones; the flags only hold small values, so those act on the low word of the
+// little-endian int64 flag while the host keeps storing whole int64s.
+int g_memop_bits = 0;
 constexpr unsigned kCuWaitValueGeq = 0x0;
 constexpr unsigned kCuWriteDefault = 0x0;
 
@@ -76,26 +84,47 @@ bool cumemop_resolve() {
     void *h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
     if (h == nullptr) return false;
-    g_cu_write64 = reinterpret_cast<CuMemOp64Fn>(dlsym(h, "cuStreamWriteValue64_v2"));
-    if (g_cu_write64 == nullptr)
-      g_cu_write64 = reinterpret_cast<CuMemOp64Fn>(dlsym(h, "cuStreamWriteValue64"));
-    g_cu_wait64 = reinterpret_cast<CuMemOp64Fn>(dlsym(h, "cuStreamWaitValue64_v2"));
-    if (g_cu_wait64 == nullptr)
-      g_cu_wait64 = reinterpret_cast<CuMemOp64Fn>(dlsym(h, "cuStreamWaitValue64"));
-    return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
+    auto sym = [h](const char *v2, const char *v1) {
+      void *f = dlsym(h, v2);
+      return f != nullptr ? f : dlsym(h, v1);
+    };
+    g_cu_write64 = reinterpret_cast<CuMemOp64Fn>(sym("cuStreamWriteValue64_v2", "cuStreamWriteValue64"));
+    g_cu_wait64 = reinterpret_cast<CuMemOp64Fn>(sym("cuStreamWaitValue64_v2", "cuStreamWaitValue64"));
+    g_cu_write32 = reinterpret_cast<CuMemOp32Fn>(sym("cuStreamWriteValue32_v2", "cuStreamWriteValue32"));
+    g_cu_wait32 = reinterpret_cast<CuMemOp32Fn>(sym("cuStreamWaitValue32_v2", "cuStreamWaitValue32"));
+    return (g_cu_write64 != nullptr && g_cu_wait64 != nullptr) ||
+           (g_cu_write32 != nullptr && g_cu_wait32 != nullptr);
   }();
   return resolved;
 }
 
 int memop_write(uintptr_t stream, uintptr_t addr, uint64_t value) {
   if (!cumemop_resolve()) return -1;
-  return g_cu_write64(reinterpret_cast<void *>(stream), addr, value, kCuWriteDefault);
+  auto *s = reinterpret_cast<void *>(stream);
+  if (g_memop_bits == 0) {
+    // First use (the startup probe): take the 64-bit op if the device accepts it.
+    int rc = g_cu_write64 != nullptr ? g_cu_write64(s, addr, value, kCuWriteDefault) : -1;
+    if (rc == 0 || g_cu_write32 == nullptr || g_cu_wait32 == nullptr) {
+      g_memop_bits = 64;
+      return rc;
+    }
+    g_memop_bits = 32;
+  }
+  if (g_memop_bits == 32)
+    return g_cu_write32(s, addr, static_cast<unsigned int>(value), kCuWriteDefault);
+  return g_cu_write64(s, addr, value, kCuWriteDefault);
 }
 
 int memop_wait_geq(uintptr_t stream, uintptr_t addr, uint64_t value) {
   if (!cumemop_resolve()) return -1;
-  return g_cu_wait64(reinterpret_cast<void *>(stream), addr, value, kCuWaitValueGeq);
+  if (g_memop_bits == 0) g_memop_bits = g_cu_wait64 != nullptr ? 64 : 32;  // no probe ran
+  auto *s = reinterpret_cast<void *>(stream);
+  if (g_memop_bits == 32)
+    return g_cu_wait32(s, addr, static_cast<unsigned int>(value), kCuWaitValueGeq);
+  return g_cu_wait64(s, addr, value, kCuWaitValueGeq);
 }
+
+int memop_bits() { return g_memop_bits; }
 
 // WAIT(>=1) then RESET: resetting first would race a fast host signal and deadlock the stream.
 void memop_wait_reset(uintptr_t stream, uintptr_t flag_addr) {
@@ -673,5 +702,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_reset", &memop_wait_reset, py::arg("stream"), py::arg("flag_addr"));
+  m.def("memop_bits", &memop_bits);
   m.def("signal_flag", &signal_flag, py::arg("flag_addr"));
 }

@@ -597,7 +597,8 @@ struct CpuMoeExecutor {
   }
   void flag_publish(uintptr_t stream, uintptr_t x, uintptr_t ids, uintptr_t w, int layer_id, int num_tokens) {
     kernel_io->publish(stream, reinterpret_cast<const void*>(x), reinterpret_cast<const int32_t*>(ids),
-                       reinterpret_cast<const float*>(w), num_tokens, to_word(task(layer_id, num_tokens)));
+                       reinterpret_cast<const float*>(w), num_tokens,
+                       gpu_sync->doorbell(to_word(task(layer_id, num_tokens))));
   }
   void flag_combine(uintptr_t stream, uintptr_t out, int num_tokens, bool accumulate) {
     kernel_io->combine(stream, reinterpret_cast<void*>(out), num_tokens, accumulate);
@@ -725,6 +726,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("enabled"))
       .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); });
   m.def("memops_probe", &GpuSync::probe, py::arg("stream"));
+  m.def("memop_bits", &GpuSync::memop_bits);
   m.def("kernel_io_probe", &freetoken::cpu_moe::KernelIo::probe, py::arg("stream"));
   m.def("host_func_capture_safe", &GpuSync::host_func_capture_safe);
   // ABI capability marker: the highest ActKind this build implements in the

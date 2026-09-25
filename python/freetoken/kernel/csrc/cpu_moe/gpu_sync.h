@@ -52,12 +52,16 @@ class GpuSync {
 
   // Whether both contracts hold on this device and stream, including graph replay where the runtime needs a real check.
   static bool probe(uintptr_t stream);
+  // Stream memop width the last successful probe chose (CUDA: 64, or 32 on pre-Volta devices).
+  static int memop_bits();
   // Whether the cudaLaunchHostFunc fallback is replayed correctly from a captured graph.
   static bool host_func_capture_safe();
 
   // 1. submit. gpu_submit() is enqueued on `stream`, which may be capturing; cpu_poll() returns 0 when nothing is submitted.
   void gpu_submit(uintptr_t stream, uint64_t task);
   uint64_t cpu_poll();
+  // The word a writer other than gpu_submit (KernelIo) stores in ready for `task`.
+  uint64_t doorbell(uint64_t task);
 
   // 2. wait. cpu_done() also unblocks the stream on teardown and from the watchdog.
   void gpu_wait(uintptr_t stream);

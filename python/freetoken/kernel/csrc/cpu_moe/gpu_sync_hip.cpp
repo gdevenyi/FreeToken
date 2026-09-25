@@ -179,6 +179,10 @@ GpuSync::~GpuSync() {
   free_signal(impl_->done);
 }
 
+int GpuSync::memop_bits() { return 64; }
+
+uint64_t GpuSync::doorbell(uint64_t task) { return task; }
+
 bool GpuSync::probe(uintptr_t /*stream*/) {
   ProbeErrorScope errors;
   int device = 0;
