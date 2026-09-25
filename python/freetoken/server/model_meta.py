@@ -119,6 +119,25 @@ def effort_toggle_kwargs(
     return mapped
 
 
+def apply_default_thinking_mode(
+    ctk: dict[str, Any] | None,
+    default_mode: str | None,
+) -> dict[str, Any] | None:
+    """Merge the server's --default-thinking-mode into a request's template kwargs.
+
+    An explicit per-request value always wins; the server default only fills
+    in what the request left unset. "auto" (the default) is a no-op. Adapters
+    apply it after folding their protocol-level toggles (effort_toggle_kwargs),
+    so those count as explicit too.
+    """
+    if default_mode not in ("chat", "thinking"):
+        return ctk
+    ctk = dict(ctk or {})
+    if not any(key in ctk for key in _THINKING_KWARG_KEYS):
+        ctk.update(thinking_toggle_kwargs(default_mode == "thinking"))
+    return ctk
+
+
 def moe_total_experts(config: Any) -> int:
     """Total routed-expert slots the model has: experts per layer x MoE layers. Matches the
     engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a residency rate derived
