@@ -38,6 +38,9 @@ def _nvfp4_entry(value: str) -> str:
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # Bearer token every request must carry (except /health). None = no authentication,
+    # today's behaviour. Read from FREETOKEN_API_KEY when --api-key is not given.
+    api_key: str | None = None
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -358,6 +361,17 @@ def parse_args(
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
+    )
+
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=ServerArgs.api_key,
+        help=(
+            "Require `Authorization: Bearer <key>` on every route except /health "
+            "(401 otherwise). Unset: no authentication. When the flag is absent, "
+            "FREETOKEN_API_KEY is read instead so the key need not appear in `ps`."
+        ),
     )
 
     parser.add_argument(
@@ -897,6 +911,11 @@ def parse_args(
         if not os.path.isdir(media_root):
             parser.error(f"--allowed-local-media-path {media_root} is not a directory")
         kwargs["allowed_local_media_path"] = media_root
+
+    if kwargs["api_key"] is None:
+        kwargs["api_key"] = os.environ.get("FREETOKEN_API_KEY") or None
+    elif not kwargs["api_key"].strip():
+        parser.error("--api-key must not be empty (omit it to serve without authentication)")
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (
