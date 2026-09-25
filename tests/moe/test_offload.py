@@ -960,6 +960,34 @@ def test_place_expert_rows_puts_each_row_chunk_on_its_node():
         assert node == nodes[chunk % (2 * len(nodes)) % len(nodes)], (i, node)
 
 
+def test_place_expert_rows_holds_under_shmem_huge_pages():
+    # shmem_enabled=always/within_size (reproduced with MADV_HUGEPAGE) faults whole 2 MB
+    # folios on the first toucher's node, which would span several row chunks
+    import mmap
+
+    import freetoken.moe.host_banks as hb
+
+    nodes = hb.numa_placement_nodes()
+    if len(nodes) < 2:
+        pytest.skip("needs a multi-node host whose memory policy leaves placement open")
+    try:
+        with open("/sys/kernel/mm/transparent_hugepage/shmem_enabled") as f:
+            shmem_thp = f.read()
+    except OSError:
+        pytest.skip("no shmem THP on this kernel")
+    if "[never]" in shmem_thp or "[deny]" in shmem_thp:
+        pytest.skip("shmem THP is off")
+    E, R, C = 8, 1280, 1280
+    bank = hb.HostBank((E, R, C), torch.uint8, backing="mmap")
+    bank._buf.madvise(mmap.MADV_HUGEPAGE)
+    hb.place_expert_rows([bank.tensor], nodes)
+    status = _page_nodes(bank.addr, bank.nbytes)
+    per_chunk = R // (2 * len(nodes)) * C // 4096
+    wrong = [i for i, node in enumerate(status)
+             if node != nodes[i // per_chunk % (2 * len(nodes)) % len(nodes)]]
+    assert not wrong, f"{len(wrong)} of {len(status)} pages on the wrong node"
+
+
 def test_numa_placement_is_opt_out(monkeypatch):
     import freetoken.moe.host_banks as hb
 
