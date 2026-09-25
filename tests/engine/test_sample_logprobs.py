@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+from freetoken.core import SamplingParams
 from freetoken.engine.sample import BatchSamplingArgs, Sampler
 
 
@@ -137,8 +138,8 @@ def test_compute_logprobs_with_prepare_keeps_max_top_logprobs_clamped(monkeypatc
 
     batch = SimpleNamespace(
         reqs=[
-            SimpleNamespace(sampling_params=SimpleNamespace(needs_logits_processing=False, logprobs=True, top_logprobs=17, is_greedy=True)),
-            SimpleNamespace(sampling_params=SimpleNamespace(needs_logits_processing=False, logprobs=False, top_logprobs=0, is_greedy=True)),
+            SimpleNamespace(sampling_params=SamplingParams(logprobs=True, top_logprobs=17)),
+            SimpleNamespace(sampling_params=SamplingParams(logprobs=False, top_logprobs=0)),
         ]
     )
     args = sampler.prepare(batch)
