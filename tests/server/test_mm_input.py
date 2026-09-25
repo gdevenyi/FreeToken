@@ -173,3 +173,35 @@ def test_render_messages_no_system_unchanged():
         {"role": "user", "content": "Bye"},
     ])
     assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+
+
+def test_render_messages_keeps_a_leading_developer_message_ahead_of_system():
+    """[developer, system, user]: the tokenizer maps developer -> system and merges in order, so
+    render_messages must not hoist system ahead of it first. A template that knows the
+    developer role gets both messages as sent."""
+    from freetoken.tokenizer.tokenize import _map_developer_role
+
+    msgs = [
+        {"role": "developer", "content": "D"},
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "hi"},
+    ]
+    rendered = render_messages(msgs)
+    assert [m["role"] for m in rendered] == ["developer", "system", "user"]
+    mapped = _map_developer_role(rendered, "{% if message.role == 'system' %}")
+    assert [m["role"] for m in mapped] == ["system", "user"] and mapped[0]["content"] == "D\n\nS"
+    assert _map_developer_role(rendered, "{% if message.role == 'developer' %}") is rendered
+
+
+def test_render_messages_rejects_an_image_in_a_merged_system_message():
+    """Merging system messages joins text; an image part must not be pasted into the prompt as
+    the repr of its part list (with the whole data URL)."""
+    with pytest.raises(ValueError, match="System message cannot contain images"):
+        render_messages([
+            {"role": "system", "content": "A"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "B"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}},
+            ]},
+            {"role": "user", "content": "hi"},
+        ])
