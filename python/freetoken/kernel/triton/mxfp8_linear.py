@@ -21,6 +21,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
 
@@ -54,6 +55,16 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
 # 512 exceeds sm_120's shared-memory budget. Past the cap only prefill lands here,
 # where cuBLAS amortizes the transient.
 _GEMV_MAX_M = 256
+# Lowered in place when a device cannot allocate an M_TILE's shared memory (Pascal's 48 KB
+# fits 64): OutOfResources is raised at launch setup, before any GPU work, so a retry is safe.
+_gemv_cap = _GEMV_MAX_M
+
+
+def _small_m_gemv_ok() -> bool:
+    # Below sm_70 tl.dot has no tensor cores and the M>1 GEMV runs 5-30x behind dequant+cuBLAS.
+    from freetoken.kernel.backend import device_capability
+
+    return device_capability() >= (7, 0)
 
 
 @triton.jit
@@ -185,11 +196,15 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     [N, K] fp8; ``scale_codes`` [N, K//32] uint8."""
     M, K = a.shape
     N = weight.shape[0]
-    BLOCK_K = 128
+    BLOCK_K, BLOCK_N, m1_warps, programs = 128, 16, 1, 1536
+    if M == 1 and not _small_m_gemv_ok():
+        # Pascal: wide K tiles and more warps reach ~330 GB/s of fp8 (1.4-2.2x bf16 cuBLAS)
+        # where 128x16 on one warp stalls at ~100-200 GB/s.
+        BLOCK_K, BLOCK_N = 512, (8 if N <= 4096 else 16)
+        m1_warps, programs = (4 if BLOCK_N == 8 else 8), 448
     n_kb = triton.cdiv(K, BLOCK_K)
-    BLOCK_N = 16
     n_tiles = triton.cdiv(N, BLOCK_N)
-    split_k = max(1, min(1536 // n_tiles, n_kb))
+    split_k = max(1, min(programs // n_tiles, n_kb))
     split_k = 1 << (split_k.bit_length() - 1)  # pow2 -> stable reduction order
     kb_per = triton.cdiv(n_kb, split_k)
     part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
@@ -199,7 +214,7 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
             a.stride(1), weight.stride(0), weight.stride(1),
             scale_codes.stride(0), scale_codes.stride(1),
             part.stride(0), part.stride(2),
-            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=m1_warps,
         )
     else:
         # M_TILE buckets to the next pow2 >= 16 (tl.dot minimum); the whole batch
@@ -237,10 +252,18 @@ def mxfp8_linear(
     N = weight.shape[0]
     M = x.numel() // K
     assert K % MXFP8_BLOCK == 0 and scale_codes.shape == (N, K // MXFP8_BLOCK)
-    if M <= _GEMV_MAX_M:
-        w8 = e4m3_kernel_view(weight)
-        out = _gemv(x.reshape(M, K), w8, scale_codes, x.dtype).reshape(*lead, N)
-    else:
+    global _gemv_cap
+    out = None
+    while M <= _gemv_cap and (M == 1 or _small_m_gemv_ok()):
+        try:
+            out = _gemv(x.reshape(M, K), e4m3_kernel_view(weight), scale_codes, x.dtype).reshape(*lead, N)
+            break
+        except OutOfResources:
+            if M == 1:
+                raise
+            m_tile = max(16, triton.next_power_of_2(M))
+            _gemv_cap = m_tile // 2 if m_tile > 16 else 1  # strictly lower: M=1 has its own kernel
+    if out is None:
         # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
         w = mxfp8_dequant(weight, scale_codes, dtype=x.dtype)
         out = torch.nn.functional.linear(x.reshape(-1, K), w).reshape(*lead, N)
