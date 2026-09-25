@@ -162,6 +162,7 @@ class EngineConfig:
         quant = self._load_time_quant(quant, spec, hf_config)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        self._check_embed_weights(model_config)
         return replace(model_config, quant=quant)
 
     def _load_time_quant(self, quant, spec: ModelSpec, hf_config):
@@ -190,6 +191,15 @@ class EngineConfig:
         from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig
 
         return LoadTimeQuantConfig(quant, targets)
+
+    def _check_embed_weights(self, model_config) -> None:
+        # the parsed flag, not the hf key: gemma4 ties by default and gguf infers it from the tensors
+        if self.embed_weights != "host":
+            return
+        if model_config.tie_word_embeddings:
+            raise ValueError("--embed-weights host needs an untied embedding (a tied lm_head reads the table on the GPU)")
+        if self.tp_info.size > 1:
+            raise ValueError("--embed-weights host serves a single GPU only (--tensor-parallel-size 1)")
 
     @property
     def max_seq_len(self) -> int:
