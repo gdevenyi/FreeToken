@@ -155,6 +155,18 @@ def test_chunked_prefill_matches_one_shot(cut: int):
     got = attn.forward(x[cut:], fixture.batch([tail], "prefill"))
     torch.testing.assert_close(got.float(), one_shot[cut:].float(), rtol=2e-2, atol=2e-2)
 
+    # A wrong key for the group straddling the cut only swaps one block in a few rows, which
+    # the output tolerance hides; the unit-scale slab rows show it as an O(1) error.
+    ratio = config.qwen4_args.index_ratio
+    slab = fixture.pool.cmp_k_cache(0)
+    group_starts = slice(0, length - length % ratio, ratio)
+    one_shot_rows, chunked_rows = (
+        (fixture.page_table[table_idx, group_starts] // ratio).long() for table_idx in (0, 1)
+    )
+    torch.testing.assert_close(
+        slab[chunked_rows].float(), slab[one_shot_rows].float(), rtol=2e-2, atol=2e-2
+    )
+
 
 @requires_cuda
 def test_decode_graph_replay_matches_eager():
