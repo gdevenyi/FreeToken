@@ -566,35 +566,15 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 #endif
 
 // =====================================================================================
-// Stream memory operations -- the GPU side of the flag handshake: submit = WRITE_VALUE
-// (done[slot]=0 then ready[slot]=1), sync = WAIT_VALUE(done[slot] >= 1).
-// CUDA: driver API resolved via dlopen (no link-time or toolchain dependence). The wait
-// is executed by the GPU front-end (no SM-resident kernel), so GPU "utilization" stays
+// CUDA stream memory operations (driver API, resolved via dlopen -- no link-time or
+// toolchain dependence). The GPU side of the flag handshake: submit = WRITE_VALUE
+// (done[slot]=0 then ready[slot]=1), sync = WAIT_VALUE(done[slot] >= 1). The wait is
+// executed by the GPU front-end (no SM-resident kernel), so GPU "utilization" stays
 // truthful during CPU compute windows -- a resident spin kernel pinned it at 99%,
 // which laptop CPU/GPU dynamic power schedulers answered by clamping the CPU's max
-// frequency (GEMV workers -1.5x: the reported edge regression).
-// HIP: hipStreamWriteValue64 / hipStreamWaitValue64 are runtime entry points in the
-// already-linked libamdhip64. CLR services the wait with a one-lane blit kernel that
-// spins on the flag (GPU_STREAMOPS_CP_WAIT=1 would use a CP barrier-value packet, but
-// that path accepts only hipMallocSignalMemory objects); torch's pinned host memory is
-// hipHostMalloc(default) = fine-grained + SVM atomics, so the CPU's release store is
-// visible to that spin. The host-func alternative costs ~0.7 ms of callback latency
-// per call on ROCm (vs ~40 us on CUDA): 2 calls x 43 layers = ~60 ms of GPU idle per
-// decode step on DeepSeek-V4-Flash before this path was wired for HIP.
-// Availability is probed functionally at startup (memops_probe); anything unsupported
-// (Windows WDDM, vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
-#if defined(USE_ROCM)
-static bool cumemop_resolve() { return true; }
-static int cumemop_write64(void* stream, unsigned long long addr, unsigned long long value) {
-  return static_cast<int>(hipStreamWriteValue64(reinterpret_cast<hipStream_t>(stream),
-                                                reinterpret_cast<void*>(addr), value, 0u));
-}
-static int cumemop_wait64_geq(void* stream, unsigned long long addr, unsigned long long value) {
-  return static_cast<int>(hipStreamWaitValue64(reinterpret_cast<hipStream_t>(stream),
-                                               reinterpret_cast<void*>(addr), value,
-                                               hipStreamWaitValueGte, ~0ULL));
-}
-#else
+// frequency (GEMV workers -1.5x: the reported edge regression). Availability is
+// probed functionally at startup (memops_probe); anything unsupported (Windows WDDM,
+// vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
 #if defined(_WIN32)
 #include <windows.h>
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
@@ -634,21 +614,14 @@ static bool cumemop_resolve() {
   }();
   return resolved;
 }
-static int cumemop_write64(void* stream, unsigned long long addr, unsigned long long value) {
-  return g_cu_write64(stream, addr, value, kCuWriteDefault);
-}
-static int cumemop_wait64_geq(void* stream, unsigned long long addr, unsigned long long value) {
-  return g_cu_wait64(stream, addr, value, kCuWaitValueGeq);
-}
-#endif
 
 // Functional probe on a scratch pinned int64: enqueue WRITE(7) + WAIT(>=7) + sync.
 // Returns true only if the whole memop path works on THIS stream/device/driver.
 static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   if (!cumemop_resolve()) return false;
   auto* s = reinterpret_cast<void*>(stream);
-  if (cumemop_write64(s, (unsigned long long)scratch_addr, 7ULL) != 0) return false;
-  if (cumemop_wait64_geq(s, (unsigned long long)scratch_addr, 7ULL) != 0) return false;
+  if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
+  if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
   return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
 }
 
@@ -675,16 +648,19 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
   auto* s = reinterpret_cast<void*>(stream);
   // Order matters and is preserved by the front end: reset done BEFORE raising ready,
   // so the coordinator's completion write for THIS step can never be wiped.
-  cumemop_check(cumemop_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL),
-                "StreamWriteValue64(done)");
-  cumemop_check(cumemop_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL),
-                "StreamWriteValue64(ready)");
+  cumemop_check(g_cu_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL,
+                             kCuWriteDefault),
+                "cuStreamWriteValue64(done)");
+  cumemop_check(g_cu_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL,
+                             kCuWriteDefault),
+                "cuStreamWriteValue64(ready)");
 }
 
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
-  cumemop_check(cumemop_wait64_geq(reinterpret_cast<void*>(stream),
-                                   (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL),
-                "StreamWaitValue64(done)");
+  cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream),
+                            (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
+                            kCuWaitValueGeq),
+                "cuStreamWaitValue64(done)");
 }
 
 struct DotChoice {
