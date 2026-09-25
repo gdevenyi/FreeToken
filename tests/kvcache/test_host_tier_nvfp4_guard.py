@@ -42,3 +42,10 @@ def test_prefix_tier_gdn_snapshots_do_not_touch_the_kv_pool():
     tier = HostPrefixTier(_state_pool(), kv_pool=_kv_pool(block_scaled=True), gdn_slots_host=2,
                           kv_budget_bytes=0, device="cpu")
     assert tier.num_slots == 2 and not tier.has_kv
+
+
+def test_prefix_tier_refuses_kv_pages_on_a_qsa_pool():
+    # the KV-page store mirrors codes and scales, not the QSA indexer's compressed-key slab
+    pool = SimpleNamespace(**vars(_kv_pool(block_scaled=False)), _cmp_k_buffer=torch.zeros(1))
+    with pytest.raises(ValueError, match="FT_PREFIX_HOST .* index slab"):
+        HostPrefixTier(_state_pool(), kv_pool=pool, gdn_slots_host=2, kv_budget_bytes=1 << 16, device="cpu")
