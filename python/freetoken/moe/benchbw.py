@@ -679,7 +679,8 @@ def _step_cost_fit(t1: float, tk: float, top_k: int) -> dict:
 
 def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int = 0,
                        isas: list[str] | None = None) -> dict:
-    """Real CPU MoE GEMV bandwidth (GB/s) at bs=1, reading experts from pinned host banks.
+    """Real CPU MoE GEMV bandwidth (GB/s) at bs=1, reading experts from host banks allocated
+    and NUMA-placed like the serving banks (see ``_cpu_moe_bank_sources``).
 
     ``bw_gbs``/``isa`` are ALWAYS the kernel's auto-picked (best supported) tier -- what
     production actually runs -- so the recommendation never depends on a restricted ``--isa``
@@ -720,11 +721,12 @@ def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
     contention ignores it entirely. Measuring the contended pair directly gives the hybrid
     backend its bandwidth-matched fetch split: fetched : cpu-computed = pcie_ov : cpu_ov.
 
-    Both sides hammer their own pinned banks flat out for ``seconds`` from a shared
-    barrier: a worker thread loops bs=1 CPU decode steps (``run_task`` releases the GIL)
-    while the main thread loops full-layer ``copy_missing`` gathers (synchronized per copy
-    so the DMA is really in flight, not just enqueued). Each side reports bytes / its own
-    elapsed; the two windows differ by at most one CPU step + one gather.
+    Both sides hammer their own banks (the CPU its placed host banks, the GPU pinned ones)
+    flat out for ``seconds`` from a shared barrier: a worker thread loops bs=1 CPU decode
+    steps (``run_task`` releases the GIL) while the main thread loops full-layer
+    ``copy_missing`` gathers (synchronized per copy so the DMA is really in flight, not
+    just enqueued). Each side reports bytes / its own elapsed; the two windows differ by at
+    most one CPU step + one gather.
     """
     H, I = wl.hidden, wl.inter
     eb = _expert_bytes(fmt, H, I)
