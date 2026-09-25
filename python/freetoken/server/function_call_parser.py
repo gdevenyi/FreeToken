@@ -380,7 +380,27 @@ class BaseFormatDetector(ABC):
             return self._resolve_local_ref(merged, root_schema, _seen)
         return merged
 
-    def _normalize_param_schema(self, schema: Dict, root_schema: Dict) -> Dict:
+    @staticmethod
+    def _literal_schema_type(schema: Dict) -> Optional[str]:
+        """Type of an untyped ``enum``/``const`` schema, inferred from its literals."""
+        if "const" in schema:
+            values = [schema["const"]]
+        elif isinstance(schema.get("enum"), list):
+            values = schema["enum"]
+        else:
+            return None
+        values = [v for v in values if v is not None]
+        if not values:
+            return None
+        if all(isinstance(v, str) for v in values):
+            return "string"
+        if all(isinstance(v, bool) for v in values):
+            return "boolean"
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+            return "integer"
+        return "loose"
+
+    def _normalize_param_schema(self, schema: Dict, root_schema: Dict, _depth: int = 0) -> Dict:
         """Resolve the schema parts needed for tool argument typing."""
         if not isinstance(schema, dict):
             return {"type": "string"}
@@ -393,6 +413,18 @@ class BaseFormatDetector(ABC):
             return result
         if isinstance(param_type, str):
             return schema
+        all_of = schema.get("allOf")
+        if (
+            isinstance(all_of, list)
+            and len(all_of) == 1
+            and isinstance(all_of[0], dict)
+            and _depth < 16  # bounds a self-referential allOf chain
+        ):
+            # Pydantic v1 / OpenAPI 3.0 wrap a $ref in a one-element allOf to attach
+            # siblings such as default/description; type it like the bare $ref.
+            merged = dict(all_of[0])
+            merged.update({k: v for k, v in schema.items() if k != "allOf"})
+            return self._normalize_param_schema(merged, root_schema, _depth + 1)
         for keyword in ("oneOf", "anyOf"):
             branches = schema.get(keyword)
             if not isinstance(branches, list):
@@ -403,6 +435,8 @@ class BaseFormatDetector(ABC):
                     continue
                 branch = self._resolve_local_ref(branch, root_schema)
                 branch_type = branch.get("type")
+                if not isinstance(branch_type, str):
+                    branch_type = self._literal_schema_type(branch)
                 if isinstance(branch_type, str) and branch_type != "null":
                     types.append(branch_type)
             types = list(dict.fromkeys(types))
@@ -418,7 +452,7 @@ class BaseFormatDetector(ABC):
             result["type"] = "array"
             return result
         result = dict(schema)
-        result["type"] = "loose"
+        result["type"] = self._literal_schema_type(schema) or "loose"
         return result
 
     def _get_tool_schema(self, func_name: str, tools: List[Tool]) -> Dict:
