@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import itertools
 import json
 import logging
+import math
+import mmap
 import os
 import socket
 import statistics
@@ -328,12 +329,13 @@ def _synth_experts(E: int, expert_bytes: int) -> int:
     return min(E, max(1, _SYNTH_BANK_BUDGET // max(1, expert_bytes)))
 
 
-# Bench banks are allocated with cudaHostAlloc by default. Production does not: the
-# loaders build each bank as a lazy anonymous mmap, fill it, and only then
+# The PCIe gather banks are allocated with cudaHostAlloc by default. Production does not:
+# the loaders build each bank as a lazy anonymous mmap, fill it, and only then
 # cudaHostRegister it ("pin-after-fill", see moe/host_banks.HostBank). The two behave
 # differently for anything that depends on *how the pages were obtained* -- NUMA
 # placement, transparent huge pages, page-cache interaction -- so a bench that wants to
-# measure those effects has to allocate the way production does.
+# measure those effects has to allocate the way production does. The CPU MoE banks need
+# no pinning, so they are always built the loaders' way (``_cpu_moe_bank_sources``).
 #
 # It is not the default because pinned pages cannot be released (there is no
 # cudaHostUnregister binding), so every format's banks would stay resident for the whole
@@ -374,57 +376,77 @@ def _alloc_bank(*shape: int, dtype: torch.dtype, role=None) -> torch.Tensor:
     return bank.tensor
 
 
+def _host_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    """A lazy anonymous-mmap tensor like the serving banks (``HostBank``), freed with the tensor."""
+    count = math.prod(shape)
+    buf = mmap.mmap(-1, max(1, count * dtype.itemsize))
+    return torch.frombuffer(buf, dtype=dtype, count=count).view(*shape)
+
+
 def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
-    """3D pinned banks in the exact layout ``CpuMoeExecutor`` expects for ``fmt``.
+    """3D host banks in the exact layout ``CpuMoeExecutor`` expects for ``fmt``.
+
+    Allocated and NUMA-placed like the serving banks (``expert_banks.build_expert_banks``):
+    anonymous mmaps whose rows are split per node for the formats the executor schedules
+    by node. They are not page-locked: the CPU reads host memory the same either way.
 
     Scale banks that decode through an e8m0 exponent (mxfp4/ds_fp4) are set to a unit
     exponent so no weight lands in the float32 denormal range (which would slow the CPU
     GEMV and skew the timing); packed e2m1 codes are finite for any byte, so they're left
     as-is. Values otherwise don't affect the kernel's work.
     """
-    order = itertools.count()
+    from freetoken.moe.host_banks import NUMA_PLACED_FORMATS, numa_placement_nodes, place_expert_rows
 
-    def pin(*shape, dtype):
-        return _alloc_bank(*shape, dtype=dtype, role=("cpu", fmt, next(order)))
+    nodes = numa_placement_nodes() if fmt in NUMA_PLACED_FORMATS else []
 
+    def settle(banks: dict) -> dict:
+        if nodes:
+            place_expert_rows(list(banks.values()), nodes)
+        else:
+            for t in banks.values():
+                t.zero_()  # fault the pages in now, not inside the timed steps
+        return banks
+
+    alloc = _host_tensor
     if fmt == "bf16":
-        gate_up, down = pin(E, 2 * I, H, dtype=torch.bfloat16), pin(E, H, I, dtype=torch.bfloat16)
-        gate_up.fill_(0.02)  # uninitialized bf16 can be denormal -> x86 FP slowdown
-        down.fill_(0.02)
-        return {"gate_up": gate_up, "down": down}
+        b = settle({"gate_up": alloc(E, 2 * I, H, dtype=torch.bfloat16),
+                    "down": alloc(E, H, I, dtype=torch.bfloat16)})
+        b["gate_up"].fill_(0.02)  # uninitialized bf16 can be denormal -> x86 FP slowdown
+        b["down"].fill_(0.02)
+        return b
     if fmt == "nvfp4":
-        b = {
-            "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
-            "gate_up_scale": pin(E, 2 * I, H // 16, dtype=torch.uint8),
-            "gate_up_global": pin(E, 2 * I, dtype=torch.float16),
-            "down_packed": pin(E, H, I // 2, dtype=torch.uint8),
-            "down_scale": pin(E, H, I // 16, dtype=torch.uint8),
-            "down_global": pin(E, H, dtype=torch.float16),
-        }
+        b = settle({
+            "gate_up_packed": alloc(E, 2 * I, H // 2, dtype=torch.uint8),
+            "gate_up_scale": alloc(E, 2 * I, H // 16, dtype=torch.uint8),
+            "gate_up_global": alloc(E, 2 * I, dtype=torch.float16),
+            "down_packed": alloc(E, H, I // 2, dtype=torch.uint8),
+            "down_scale": alloc(E, H, I // 16, dtype=torch.uint8),
+            "down_global": alloc(E, H, dtype=torch.float16),
+        })
         b["gate_up_global"].fill_(1.0)
         b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp16
         return b
     if fmt == "mxfp4_triton":  # transposed split-K layout
-        b = {
-            "gate_up_blocks": pin(E, H // 2, 2 * I, dtype=torch.uint8),
-            "gate_up_scales": pin(E, H // 32, 2 * I, dtype=torch.uint8),
-            "gate_up_bias": pin(E, 2 * I, dtype=torch.bfloat16),
-            "down_blocks": pin(E, I // 2, H, dtype=torch.uint8),
-            "down_scales": pin(E, I // 32, H, dtype=torch.uint8),
-            "down_bias": pin(E, H, dtype=torch.bfloat16),
-        }
+        b = settle({
+            "gate_up_blocks": alloc(E, H // 2, 2 * I, dtype=torch.uint8),
+            "gate_up_scales": alloc(E, H // 32, 2 * I, dtype=torch.uint8),
+            "gate_up_bias": alloc(E, 2 * I, dtype=torch.bfloat16),
+            "down_blocks": alloc(E, I // 2, H, dtype=torch.uint8),
+            "down_scales": alloc(E, I // 32, H, dtype=torch.uint8),
+            "down_bias": alloc(E, H, dtype=torch.bfloat16),
+        })
         b["gate_up_scales"].fill_(127)  # e8m0 127 -> 2^0 = 1 (avoid denormal weights)
         b["down_scales"].fill_(127)
         b["gate_up_bias"].zero_()
         b["down_bias"].zero_()
         return b
     if fmt == "ds_fp4":
-        b = {
-            "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
-            "gate_up_scale": pin(E, 2 * I, H // 32, dtype=torch.uint8),
-            "down_packed": pin(E, H, I // 2, dtype=torch.uint8),
-            "down_scale": pin(E, H, I // 32, dtype=torch.uint8),
-        }
+        b = settle({
+            "gate_up_packed": alloc(E, 2 * I, H // 2, dtype=torch.uint8),
+            "gate_up_scale": alloc(E, 2 * I, H // 32, dtype=torch.uint8),
+            "down_packed": alloc(E, H, I // 2, dtype=torch.uint8),
+            "down_scale": alloc(E, H, I // 32, dtype=torch.uint8),
+        })
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
         return b
@@ -1002,7 +1024,7 @@ def run_benchbw(
         "gpu": {"index": device_index, "name": gpu["name"], "uuid": gpu["uuid"]},
         "cpu": {"physical_cores": len(physical_core_cpus()), "threads_used": cpu["threads"]},
         "threshold": threshold,
-        "bank_allocator": "production" if production_banks else "cudaHostAlloc",
+        "bank_allocator": "production" if production_banks else "cudaHostAlloc",  # gather banks
         "ceilings": {
             "cpu_stream_read_gbs": round(cpu["bw_gbs"], 2),
             "pcie_linear_h2d_gbs": round(pcie["h2d_gbs"], 2),
@@ -1200,10 +1222,11 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                         "the median and is withheld when the spread straddles --threshold "
                         "(default 3)")
     p.add_argument("--production-banks", action="store_true",
-                   help="allocate the synthetic banks the way the model loaders do "
-                        "(mmap -> fill -> cudaHostRegister) instead of cudaHostAlloc. "
-                        "Needed to see NUMA placement / huge-page effects, but the pages "
-                        "cannot be released, so every format's banks stay resident")
+                   help="allocate the synthetic PCIe gather banks the way the model loaders "
+                        "do (mmap -> fill -> cudaHostRegister) instead of cudaHostAlloc. "
+                        "Needed to see NUMA placement / huge-page effects on the gather, but "
+                        "the pages cannot be released, so every format's banks stay "
+                        "resident. The CPU MoE banks are always built the loaders' way")
     p.add_argument("--kernel-cpu-iters", type=_positive_int, default=64,
                    help="CPU MoE decode steps to time")
     p.add_argument("--kernel-pcie-iters", type=_positive_int, default=20,

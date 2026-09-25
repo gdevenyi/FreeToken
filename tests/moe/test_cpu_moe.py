@@ -806,3 +806,46 @@ def test_explicit_cpu_threads_pin_the_flag_coordinator(monkeypatch):
         assert ex.num_threads == 2
     finally:
         ex._watchdog_stop = True
+
+
+def test_numa_tile_scheduling_matches_the_shared_queue(monkeypatch):
+    """With the banks' rows placed per node, a pool spanning the nodes takes each tile
+    from its own node first; the output must be bit-identical to the shared-queue order."""
+    import freetoken.moe.host_banks as hb
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    nodes = hb.numa_placement_nodes()
+    if len(nodes) < 2:
+        pytest.skip("needs a multi-node host whose memory policy leaves placement open")
+    L, E, H, I, top_k, bs, layer = 2, 16, 1024, 512, 4, 2, 1
+    src = _make_nvfp4_cache(L, E, H, I, seed=3)
+    placed = {}
+    for role, per_layer in src.bank_sources.items():
+        placed[role] = []
+        for t in per_layer:
+            bank = hb.HostBank(tuple(t.shape), t.dtype, backing="mmap")
+            hb.place_expert_rows([bank.tensor], nodes)
+            bank.tensor.copy_(t)
+            placed[role].append(bank.tensor)
+    cache = SimpleNamespace(**{**vars(src), "bank_sources": placed})
+
+    dev = torch.device("cuda")
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    ids[1, 3] = -1
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    outs = []
+    for numa in ("1", "0"):
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_NUMA", numa)
+        ex = CpuMoeExecutor(
+            cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+            num_threads=0, max_tokens=bs, device=dev,
+        )
+        outs.append(ex.decode(layer, hidden, w, ids).cpu())
+        spans, mapped = ex._ext.numa_status()
+        if numa == "1" and len({hb._cpu_numa_node(c) for c in ex.core_ids}) > 1:
+            assert spans and mapped == 1, (spans, mapped)
+        if numa == "0":
+            assert not spans
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1])

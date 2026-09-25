@@ -18,7 +18,7 @@ import torch
 from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
-from .host_banks import alloc_layer_banks
+from .host_banks import NUMA_PLACED_FORMATS, alloc_layer_banks, numa_placement_nodes, place_expert_rows
 from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
@@ -84,7 +84,7 @@ def build_expert_banks(
     are pinned in the background, otherwise the sink receives them (converter). ``dummy``
     skips the pieces and fills the banks with finite random contents.
     """
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
+    from freetoken.moe.host_banks import HostResidency, LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
 
     kernel = method.kernel
@@ -93,6 +93,12 @@ def build_expert_banks(
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
     hb = alloc_layer_banks(specs, num_layers)
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
+    fmt = legacy_format_for(method.kind, kernel.name)
+    nodes = numa_placement_nodes() if fmt in NUMA_PLACED_FORMATS else []
+    if nodes:
+        place_expert_rows([b.tensor for per_layer in hb.values() for b in per_layer
+                           if b.residency is not HostResidency.PINNED], nodes)
+        logger.info_rank0(f"expert banks: rows of every expert split over NUMA nodes {nodes}")
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
@@ -107,7 +113,7 @@ def build_expert_banks(
         if torch.cuda.is_available():
             pin_banks(hb)
         return ExpertBanks(
-            legacy_format_for(method.kind, kernel.name), banks,
+            fmt, banks,
             gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
             kind=method.kind, kernel=kernel.name, layout=layout,
         )
@@ -143,7 +149,7 @@ def build_expert_banks(
         _fill(None)
 
     return ExpertBanks(
-        legacy_format_for(method.kind, kernel.name), banks,
+        fmt, banks,
         gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
         streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
     )
