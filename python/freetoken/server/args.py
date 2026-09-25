@@ -747,6 +747,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--hc-quant",
+        default=ServerArgs.hc_quant,
+        choices=["none", "mxfp8"],
+        help=(
+            "Requantize the bf16 hyper-connection mixers at load, like --dense-quant. They mix the "
+            "whole residual stream, so check quality before relying on it."
+        ),
+    )
+
+    parser.add_argument(
         "--embed-weights",
         default=ServerArgs.embed_weights,
         choices=["gpu", "host"],
