@@ -84,9 +84,12 @@ class DecodeStatus:
         return self.decoded_str + find_printable_text(new_text)
 
     def decode(self, tokenizer: PreTrainedTokenizerBase) -> str:
+        skip = self.skip_special
         return self.update(
-            tokenizer.decode(self.decoded_ids[self.surr_offset :]),
-            tokenizer.decode(self.decoded_ids[self.surr_offset : self.read_offset]),
+            tokenizer.decode(self.decoded_ids[self.surr_offset :], skip_special_tokens=skip),
+            tokenizer.decode(
+                self.decoded_ids[self.surr_offset : self.read_offset], skip_special_tokens=skip
+            ),
         )
 
 
