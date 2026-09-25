@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from freetoken.core import SamplingParams
 from freetoken.engine.sample import LogitsPlan, Sampler, apply_logits_processors
@@ -166,3 +167,18 @@ def test_repetition_penalty_ignores_multimodal_placeholder_ids_in_the_prompt():
     args = sampler.prepare(batch)
     out = apply_logits_processors(torch.ones(1, V), args.plan, V)
     assert out[0, 1] == 0.5 and out[0, 2] == 0.5 and out[0, 4] == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_min_p_with_temperature_draws_only_the_kept_tokens():
+    # min_p leaves -inf over nearly the whole row; the sampling softmax must not turn that
+    # into NaN (which the Pascal fallback then samples as a uniform row)
+    V = 32768
+    sampler = Sampler(torch.device("cuda"), V)
+    req = _req([1, 2], [], 4, temperature=0.8, min_p=0.1)
+    args = sampler.prepare(SimpleNamespace(reqs=[req]))
+    logits = torch.full((1, V), -10.0, device="cuda")
+    kept = [100, 20000, 31000]
+    logits[0, kept] = torch.tensor([5.0, 4.5, 4.0], device="cuda")
+    for _ in range(32):
+        assert sampler.sample(logits, args).item() in kept
