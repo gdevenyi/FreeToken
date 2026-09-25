@@ -34,4 +34,28 @@ autotune_cache_kwargs = (
     {"cache_results": _CACHE_RESULTS} if _SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-__all__ = ["autotune_cache_kwargs"]
+
+
+def bound_autotune_flush_buffer(device_index: int) -> None:
+    """Size triton's L2-flush buffer for autotune benchmarks to the device instead of a flat 256 MB.
+
+    A kernel autotunes on its first launch of each key, which can be the first request, after the
+    cache planner has handed out nearly all VRAM; a 256 MB transient there is an OOM on a small
+    card. Four times the L2 still evicts everything between timed runs.
+    """
+    import torch
+
+    try:
+        from triton.backends.nvidia.driver import CudaDriver
+    except ImportError:
+        return
+    l2 = int(getattr(torch.cuda.get_device_properties(device_index), "L2_cache_size", 0) or 0)
+    nbytes = min(256 << 20, max(8 << 20, 4 * l2))
+
+    def get_empty_cache_for_benchmark(self):
+        return torch.empty(nbytes // 4, dtype=torch.int, device="cuda")
+
+    CudaDriver.get_empty_cache_for_benchmark = get_empty_cache_for_benchmark
+
+
+__all__ = ["autotune_cache_kwargs", "bound_autotune_flush_buffer"]
