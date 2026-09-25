@@ -410,15 +410,23 @@ class KVHostOffloader:
 
         from freetoken.kernel.triton.qsa.offload import translate_table
 
+        # Every group's list gets its own staging offset: the H2D copies are async, and while the
+        # caller's attends back the stream up, rewriting one slot for the next group would reach
+        # the host buffer before an earlier group's queued copy had read it.
+        total = sum(pages_np.size for _, _, pages_np in groups)
+        qh = self._query_host
+        if qh is None or qh.numel() < total:
+            qh = self._query_host = torch.empty((max(total, 2048),), dtype=torch.int32, pin_memory=True)
+            self._query_buf = torch.empty_like(qh, device=self.device)
+        spans, off = [], 0
         for gstart, gend, pages_np in groups:
-            n = pages_np.size
-            qh = self._query_host
-            if qh is None or qh.numel() < n:
-                qh = self._query_host = torch.empty((max(n, 2048),), dtype=torch.int32, pin_memory=True)
-                self._query_buf = torch.empty_like(qh, device=self.device)
-            qh[:n] = torch.from_numpy(pages_np.astype(np.int32))
-            qd = self._query_buf[:n]
-            qd.copy_(qh[:n], non_blocking=True)
+            qh[off : off + pages_np.size] = torch.from_numpy(pages_np.astype(np.int32))
+            spans.append((gstart, gend, off, pages_np.size))
+            off += pages_np.size
+
+        for gstart, gend, off, n in spans:
+            qd = self._query_buf[off : off + n]
+            qd.copy_(qh[off : off + n], non_blocking=True)
             self._ensure(qd)
             eff = self._eff_buf
             if eff is None or eff.shape != block_table.shape:
