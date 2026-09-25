@@ -318,6 +318,16 @@ class HostPrefixTier:
             n -= page_size
         return None
 
+    def lookup_exact(self, key_tokens: torch.Tensor) -> HostMatch | None:
+        """The entry for exactly this prefix: one hash, where lookup re-hashes every shorter
+        page-aligned prefix on a miss."""
+        key = self._key_of(key_tokens)
+        hit = self._index.get(key)
+        if hit is None:
+            return None
+        self._index.move_to_end(key)
+        return HostMatch(key_tokens.numel(), hit.kv_slots, hit.gdn_slot)
+
     def evict_host(self, key_tokens: torch.Tensor) -> None:
         """Remove uma entrada do índice e libera os slots host (KV + GDN)."""
         ent = self._index.pop(self._key_of(key_tokens), None)
