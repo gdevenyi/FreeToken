@@ -264,18 +264,19 @@ _GDN_CHUNK_SIZE = 64  # keep in lockstep with kernel/fla/chunk_delta_h.py CHUNK_
 
 
 def gdn_prefill_workspace_bytes(config) -> int:
-    """Peak transient VRAM of one GDN prefill forward.
+    """Bytes of the GDN chunked-prefill buffers that scale with the extend length.
 
     ``chunk_gated_delta_rule_fwd_h`` materializes the per-chunk recurrent states for
     the WHOLE extend at once -- ``[NT, H, V, K]`` with ``NT = ceil(extend / 64)`` --
-    plus the ``v_new`` value buffer; ~192 MiB at an 8192-token extent for
-    ornith-class geometry. The generic ``(1 - memory_ratio)`` headroom is sized for
-    CUDA graphs; without reserving this term the GDN kernel OOMs on long prefills
-    at aggressive memory ratios. 0 for non-GDN models."""
+    plus the ``v_new`` value buffer (288 MiB at an 8192-token extend for qwen4_exp).
+    This is a lower bound on the GDN prefill peak, not the peak: w/u/A/o and the
+    in_proj/conv activations still come out of the ``(1 - memory_ratio)`` headroom.
+    0 for non-GDN models."""
     linear_group = config.model_config.linear_attention_group()
     if linear_group is None:
         return 0
-    extent = min(config.max_extend_tokens, config.max_seq_len)
+    # EngineConfig has no max_extend_tokens (the served config is a SchedulerConfig subclass)
+    extent = min(getattr(config, "max_extend_tokens", 8192), config.max_seq_len)
     nt = -(-extent // _GDN_CHUNK_SIZE)
     states = (
         nt
