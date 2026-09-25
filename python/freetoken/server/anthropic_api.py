@@ -139,7 +139,7 @@ async def handle_anthropic_messages(
     try:
         # an abandoned request must not keep decoding to max_tokens (#222's watcher)
         result = await _await_watching_disconnect(
-            generate_full(uid, spec, state, source="/v1/messages"), request, state, uid
+            generate_full(uid, spec, state, source="/v1/messages"), request, state, [uid]
         )
     except GenerationError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))

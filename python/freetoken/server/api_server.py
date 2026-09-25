@@ -367,13 +367,16 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_with_cancellation(self, generator, request: Request, uid: int):
+    async def stream_with_cancellation(self, generator, request: Request, uid):
+        """``uid`` is one request id or a sequence of them (an ``n > 1`` fan-out streams
+        several generations into one response): a disconnect aborts every one."""
+        uids = list(uid) if isinstance(uid, (list, tuple)) else [uid]
         finished = False
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
                 if await request.is_disconnected():
-                    logger.info("Client disconnected for user %s", uid)
+                    logger.info("Client disconnected for user %s", uids)
                     raise asyncio.CancelledError
                 yield chunk
             finished = True
@@ -384,10 +387,11 @@ class FrontendManager:
             # delivering GeneratorExit, or an exception out of the generator. Only a
             # stream that ran to completion leaves the engine with nothing to stop.
             if not finished:
-                try:
-                    await asyncio.shield(self.abort_user(uid))
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed to deliver abort for user %s", uid)
+                for one in uids:
+                    try:
+                        await asyncio.shield(self.abort_user(one))
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Failed to deliver abort for user %s", one)
 
     async def abort_user(self, uid: int):
         if uid in self.aborted_uids:
