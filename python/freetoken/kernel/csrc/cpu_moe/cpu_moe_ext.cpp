@@ -1272,6 +1272,9 @@ struct MoeTask {
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int IBLK = 32;
 constexpr int HBLK = 32;
+// Down-projection tile of the generic row-major pass 2 (bf16/nvfp4/q4_0): at bs=1
+// H/32 tiles leave the last wave of a ~20-worker pool mostly idle.
+constexpr int HBLK_ROW = 16;
 
 // -------------------------------- Q4_0 (W4A8) --------------------------------
 // Native GGUF Q4_0 experts (gemma4 GGUF): per-32 block = fp16 scale d + 16 packed
@@ -1483,6 +1486,7 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
   int n_iblk = 0, n_hblk = 0;
+  int hblk = HBLK;  // pass-2 output rows per work item (HBLK_ROW for do_pass2's formats)
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -1591,6 +1595,7 @@ struct CpuMoeExecutor {
     // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+    if (fmt == WF_BF16 || fmt == WF_NVFP4 || fmt == WF_Q4_0) hblk = HBLK_ROW;
     // Row-major fp4 (nvfp4/ds_fp4) pre-deinterleaves activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4);
     if (needs_di) {
@@ -1867,8 +1872,8 @@ struct CpuMoeExecutor {
     }
     const int64_t hb = p % n_hblk;
     const int tok = static_cast<int>(p / n_hblk);
-    const int h0 = static_cast<int>(hb) * HBLK;
-    const int h1 = std::min(H, h0 + HBLK);
+    const int h0 = static_cast<int>(hb) * hblk;
+    const int h1 = std::min(H, h0 + hblk);
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const bf16_t* down_l = reinterpret_cast<const bf16_t*>(tbl_at(down_tbl, t->layer_id));
     const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
@@ -1878,7 +1883,7 @@ struct CpuMoeExecutor {
     bf16_t* y_row = t->y + (size_t)tok * H;
     // Expert-outer so each expert's rows are read as one contiguous stream; every
     // output row still sums the routes in k order, so the result is unchanged.
-    float acc[HBLK];
+    float acc[HBLK_ROW];
     for (int h = h0; h < h1; ++h) acc[h - h0] = 0.0f;
     for (int k = 0; k < top_k; ++k) {
       const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
@@ -2134,7 +2139,7 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask* t) {
     n_iblk = (I + IBLK - 1) / IBLK;
-    n_hblk = (H + HBLK - 1) / HBLK;
+    n_hblk = (H + hblk - 1) / hblk;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
     // construction-time hint (CUDA-graph capture warms the largest bs first, so
     // this happens at most once, before any capture, while the pool is idle).
