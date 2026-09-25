@@ -278,9 +278,14 @@ def place_expert_rows(tensors: list[torch.Tensor], nodes: list[int], *,
     nrs = _MEMPOLICY_SYSCALLS[os.uname().machine]
     nchunk = 2 * len(nodes)
     ranges: dict[int, list[tuple[int, int]]] = {n: [] for n in nodes}
+    libc = ctypes.CDLL(None, use_errno=True)
     for t in tensors:
         if t.dim() < 2 or t.numel() == 0:
             continue
+        # shmem THP (shmem_enabled=always) would fault 2 MB folios spanning several chunks
+        lo = t.data_ptr() - t.data_ptr() % _BLK
+        hi = -(-(t.data_ptr() + t.numel() * t.element_size()) // _BLK) * _BLK
+        libc.madvise(ctypes.c_void_p(lo), ctypes.c_size_t(hi - lo), mmap.MADV_NOHUGEPAGE)
         per = t[0].numel() * t.element_size()
         rows = t.shape[1]
         row_bytes = per // rows
@@ -290,7 +295,6 @@ def place_expert_rows(tensors: list[torch.Tensor], nodes: list[int], *,
                 start = t.data_ptr() + r0 * row_bytes
                 ranges[nodes[c % len(nodes)]].extend(
                     (start + e * per, (r1 - r0) * row_bytes) for e in range(t.shape[0]))
-    libc = ctypes.CDLL(None, use_errno=True)
 
     def touch(node: int, work: list[tuple[int, int]]) -> None:
         mask = (ctypes.c_ulong * _NODEMASK_WORDS)()
