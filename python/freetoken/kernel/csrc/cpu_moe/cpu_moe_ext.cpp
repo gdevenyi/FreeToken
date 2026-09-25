@@ -1876,26 +1876,28 @@ struct CpuMoeExecutor {
     const uint16_t* dn_global_l =
         reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
-    for (int h = h0; h < h1; ++h) {
-      float acc = 0.0f;
-      for (int k = 0; k < top_k; ++k) {
-        const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-        if (e < 0 || e >= num_experts) continue;
-        const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
-        const size_t gr = (size_t)tok * top_k + k;
-        const bf16_t* g_row = g_scratch.data() + gr * I;
-        const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
-        const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
-        const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
-        const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
-                         : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
-                                      : nullptr;
-        const float* gaux = use_i8g ? gaux_scratch.data() + gr * (I / 4) : nullptr;
-        acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
-                         gas, gaux) * w_out;
-      }
-      y_row[h] = f32_to_bf16(acc);
+    // Expert-outer so each expert's rows are read as one contiguous stream; every
+    // output row still sums the routes in k order, so the result is unchanged.
+    float acc[HBLK];
+    for (int h = h0; h < h1; ++h) acc[h - h0] = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+      const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+      if (e < 0 || e >= num_experts) continue;
+      const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
+      const size_t gr = (size_t)tok * top_k + k;
+      const bf16_t* g_row = g_scratch.data() + gr * I;
+      const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
+      const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
+      const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
+      const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
+                       : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
+                                    : nullptr;
+      const float* gaux = use_i8g ? gaux_scratch.data() + gr * (I / 4) : nullptr;
+      for (int h = h0; h < h1; ++h)
+        acc[h - h0] += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge,
+                                 go, gi8, gas, gaux) * w_out;
     }
+    for (int h = h0; h < h1; ++h) y_row[h] = f32_to_bf16(acc[h - h0]);
   }
 
   // ----------------------------- mxfp4 (gpt-oss) -----------------------------
