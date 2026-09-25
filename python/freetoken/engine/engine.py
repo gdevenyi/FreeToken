@@ -660,12 +660,12 @@ class Engine:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", config.distributed_port))
         sock.listen(1024)
-        # TCPStore uses this fd directly rather than duplicating it, so it must outlive the
-        # store; kept alive on self, closed only when the process (and the store) exits.
-        self._distributed_listen_socket = sock
+        self._distributed_listen_addr = sock.getsockname()
+        # TCPStore takes ownership of the fd and closes it with the store; detach so the
+        # Python socket never closes that number again after it has been reused.
         return torch.distributed.TCPStore(
             "127.0.0.1", config.distributed_port, config.tp_info.size,
-            is_master=True, timeout=timeout, multi_tenant=True, master_listen_fd=sock.fileno(),
+            is_master=True, timeout=timeout, multi_tenant=True, master_listen_fd=sock.detach(),
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:

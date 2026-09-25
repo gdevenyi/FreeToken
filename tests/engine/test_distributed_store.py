@@ -8,7 +8,9 @@ spawned local ranks (CPU/gloo) and checks the actual bind address, not just the 
 
 from __future__ import annotations
 
+import gc
 import multiprocessing as mp
+import os
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -38,7 +40,7 @@ def _run_rank(rank: int, port: int, result_q: mp.Queue) -> None:
     )
     total = torch.tensor([float(rank)])
     dist.all_reduce(total)
-    bind_host = engine._distributed_listen_socket.getsockname()[0] if rank == 0 else None
+    bind_host = engine._distributed_listen_addr[0] if rank == 0 else None
     result_q.put((rank, total.item(), bind_host))
     dist.destroy_process_group()
 
@@ -64,3 +66,48 @@ def test_two_ranks_rendezvous_with_loopback_only_store():
     # the master's listening socket was pre-bound to loopback, not the wildcard
     # address the C10d TCPStore server binds to on its own
     assert results[0][1] == "127.0.0.1"
+
+
+def _teardown_rank(port: int, result_q: mp.Queue) -> None:
+    listen_fds = []
+    real_store = dist.TCPStore
+
+    def recording_store(*args, **kwargs):
+        listen_fds.append(kwargs.get("master_listen_fd"))
+        return real_store(*args, **kwargs)
+
+    dist.TCPStore = recording_store
+    engine = Engine.__new__(Engine)
+    config = SimpleNamespace(
+        tp_info=DistributedInfo(0, 1), distributed_timeout=TIMEOUT.total_seconds(),
+        distributed_port=port,
+    )
+    store = engine._make_distributed_store(config)
+    dist.init_process_group(backend="gloo", rank=0, world_size=1, timeout=TIMEOUT, store=store)
+    dist.destroy_process_group()
+    del store
+    gc.collect()
+    # the listening fd number is reused by an unrelated file, as a later open() would
+    fd = listen_fds[0]
+    r, w = os.pipe()
+    os.dup2(r, fd)
+    del engine
+    gc.collect()
+    try:
+        os.fstat(fd)
+        result_q.put("open")
+    except OSError as exc:
+        result_q.put(f"closed: {exc}")
+
+
+def test_the_engine_does_not_close_the_listen_fd_the_store_owns():
+    # TCPStore takes ownership of master_listen_fd and closes it itself; an engine that also
+    # kept the Python socket closed whatever file reused that number when it was freed
+    ctx = mp.get_context("spawn")
+    result_q = ctx.Queue()
+    proc = ctx.Process(target=_teardown_rank, args=(29513, result_q))
+    proc.start()
+    outcome = result_q.get(timeout=30)
+    proc.join(timeout=30)
+    assert proc.exitcode == 0
+    assert outcome == "open"
