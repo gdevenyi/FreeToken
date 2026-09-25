@@ -35,7 +35,7 @@ from freetoken.utils import (
     init_logger,
     load_generation_sampling,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 
 from .args import ServerArgs
@@ -595,7 +595,7 @@ class CacheRebuildRequest(BaseModel):
     # is deferred (needs the drain-gate machinery); constraining the Literal makes an
     # unsupported value fail fast with a 422 at the API layer instead of a generic 503.
     mode: Literal["if_idle"] = "if_idle"
-    timeout: float = 300.0
+    timeout: float = Field(default=300.0, gt=0, le=3600)
 
 
 async def dispatch_rebuild(
