@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.backend import device_capability
+
 
 @triton.jit
 def _qsa_mqa_paged_kernel(
@@ -46,6 +48,7 @@ def _qsa_mqa_paged_kernel(
     STAGES: tl.constexpr,
     MAX_N: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    KEY_EVICTION: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
@@ -103,7 +106,7 @@ def _qsa_mqa_paged_kernel(
             + dims[None, :] * stride_cache_dim,
             mask=page_valid[:, None] & (dims[None, :] < HEAD_DIM),
             other=0.0,
-            eviction_policy="evict_first",
+            eviction_policy=KEY_EVICTION,
         )
         scores = tl.dot(keys, query, out_dtype=tl.float32)
         scores = tl.where(heads[None, :] < NUM_HEADS, tl.maximum(scores, 0.0), 0.0)
@@ -183,6 +186,8 @@ def qsa_mqa_paged(
         STAGES=2,
         MAX_N=MAX_N,
         COMPRESS_RATIO=compress_ratio,
+        # ld.*.evict_first is an sm_70 PTX modifier; ptxas rejects the kernel below it.
+        KEY_EVICTION="evict_first" if device_capability() >= (7, 0) else "",
         num_warps=2,
     )
     return logits, visible_blocks
