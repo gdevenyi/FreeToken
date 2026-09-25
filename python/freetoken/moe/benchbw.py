@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -337,6 +338,10 @@ def _synth_experts(E: int, expert_bytes: int) -> int:
 # most of them -- that turns a benchmark into an allocation failure.
 _LIVE_BENCH_BANKS: list = []
 _PRODUCTION_ALLOC = False
+# (role, shape, dtype) -> registered bank. Repeated measurements (--reps, the miss sweep,
+# the overlap run) reuse the bank an earlier one built for the same role instead of
+# pinning a fresh copy that can never be released.
+_PRODUCTION_BANKS: dict = {}
 
 
 def use_production_allocator(enabled: bool) -> None:
@@ -345,16 +350,24 @@ def use_production_allocator(enabled: bool) -> None:
     _PRODUCTION_ALLOC = bool(enabled)
 
 
-def _alloc_bank(*shape: int, dtype: torch.dtype) -> torch.Tensor:
-    """A pinned host bank, either the quick way or the way the loaders build them."""
+def _alloc_bank(*shape: int, dtype: torch.dtype, role=None) -> torch.Tensor:
+    """A pinned host bank, either the quick way or the way the loaders build them.
+
+    ``role`` names the bank within the set being built; banks that are live at the same
+    time must have distinct roles, since production mode hands a role's bank back out.
+    """
     if not _PRODUCTION_ALLOC:
         return alloc_pinned_tensor(*shape, dtype=dtype)
+    key = (role, tuple(shape), dtype)
+    if key in _PRODUCTION_BANKS:
+        return _PRODUCTION_BANKS[key]
     from freetoken.moe.host_banks import HostBank
 
     bank = HostBank(tuple(shape), dtype)
     _LIVE_BENCH_BANKS.append(bank)  # pinned pages cannot be handed back; hold the ref
     bank.tensor.zero_()  # fault every page BEFORE registering -- that is the whole point
     bank.pin()
+    _PRODUCTION_BANKS[key] = bank.tensor
     return bank.tensor
 
 
@@ -366,8 +379,10 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
     GEMV and skew the timing); packed e2m1 codes are finite for any byte, so they're left
     as-is. Values otherwise don't affect the kernel's work.
     """
+    order = itertools.count()
+
     def pin(*shape, dtype):
-        return _alloc_bank(*shape, dtype=dtype)
+        return _alloc_bank(*shape, dtype=dtype, role=("cpu", fmt, next(order)))
 
     if fmt == "bf16":
         gate_up, down = pin(E, 2 * I, H, dtype=torch.bfloat16), pin(E, H, I, dtype=torch.bfloat16)
@@ -429,7 +444,7 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
     total_bytes = 0
     for name, (elems, dtype) in specs.items():
-        src = _alloc_bank(E, elems, dtype=dtype)
+        src = _alloc_bank(E, elems, dtype=dtype, role=("gather", fmt, name))
         dst = torch.empty(E, elems, dtype=dtype, device=device)
         cache.bank_sources[name] = [src]
         cache.bank_caches[name] = dst
