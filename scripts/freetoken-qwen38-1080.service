@@ -1,0 +1,16 @@
+[Unit]
+Description=FreeToken serving Qwen3.8-Flash-Next on the GTX 1080 Ti
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/FreeToken/scripts/freetoken-qwen38-1080.sh run
+ExecStop=%h/FreeToken/scripts/freetoken-qwen38-1080.sh stop --force
+KillMode=control-group
+TimeoutStartSec=900
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
