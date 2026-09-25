@@ -76,3 +76,33 @@ def test_compacted_selection_flags_rows_that_overflow_max_sel_pages(atomics, mon
 
     off.compact_all(indices[[0, 3]], token_to_req[:2], block_table)
     assert off.trunc_count() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("maxp", [8, 72])
+def test_compacted_selection_matches_a_reference_on_scattered_selections(maxp):
+    """Unsorted, duplicate-heavy selections over a wide table: the distinct pages in column
+    order (the first maxp of them), the stored counts, and a mark scratch left zeroed."""
+    from freetoken.kernel.triton.qsa.offload import compact_selected_pages
+
+    g = torch.Generator().manual_seed(maxp)
+    rows, sel, width, page = 5, 2048, 4097, 64
+    block_table = torch.randperm(10 * width, generator=g)[: 2 * width].view(2, width).int().cuda()
+    token_to_req = torch.tensor([0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    runs = torch.randint(0, width * page - 8, (rows, sel // 8), generator=g)
+    indices = (runs[:, :, None] + torch.arange(8)).view(rows, sel)
+    indices[3, 100:] = -1  # a short selection
+    indices[4] = -1  # nothing selected
+    indices = indices.int().cuda()
+    out = torch.full((rows, maxp), -7, dtype=torch.int32, device="cuda")
+    counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    marks = torch.zeros((rows, width), dtype=torch.int8, device="cuda")
+    compact_selected_pages(indices, token_to_req, block_table, out, page, 99, counts=counts, marks=marks)
+    for r in range(rows):
+        toks = indices[r][indices[r] >= 0].cpu()
+        cols = sorted(set((toks // page).tolist()))
+        want = [int(block_table[token_to_req[r], c]) for c in cols][:maxp]
+        pad = want[0] if want else 99
+        assert out[r].tolist() == want + [pad] * (maxp - len(want)), r
+        assert int(counts[r]) == len(want)
+    assert int(marks.abs().sum()) == 0

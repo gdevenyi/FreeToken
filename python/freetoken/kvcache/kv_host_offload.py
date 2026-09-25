@@ -206,6 +206,7 @@ class KVHostOffloader:
             "query": torch.zeros(max_bs * (1 + self.max_sel_pages), dtype=torch.int32, device=d),
             "eff_table": torch.zeros((max_bs, width_pages), dtype=torch.int32, device=d),
             "trunc": torch.zeros(1, dtype=torch.int32, device=d),
+            "marks": torch.zeros((max_bs, width_pages), dtype=torch.int8, device=d),
         }
 
     def invalidate_pages(self, logical_pages: torch.Tensor) -> None:
@@ -443,7 +444,8 @@ class KVHostOffloader:
         self._graph_buffers(rows, md.block_table.shape[1])
         g = self._g
         sel = g["sel_pages"][:rows]
-        compact_selected_pages(indices, md.token_to_req, md.block_table, sel, self.page_size, self.dummy_page, g["trunc"])
+        compact_selected_pages(indices, md.token_to_req, md.block_table, sel, self.page_size, self.dummy_page,
+                               g["trunc"], marks=g["marks"])
         per_row = 1 + self.max_sel_pages
         query = g["query"][: rows * per_row].view(rows, per_row)
         query[:, 0].copy_(md.write_pages)

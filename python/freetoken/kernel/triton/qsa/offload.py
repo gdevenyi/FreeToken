@@ -35,47 +35,60 @@ def write_pages(out_loc: torch.Tensor, out: torch.Tensor, page_size: int) -> Non
 
 
 @triton.jit
+def _mark_sel_cols_kernel(indices, marks, sel_width, width, page_size: tl.constexpr, BLOCK: tl.constexpr):
+    # Plain stores of the same value: concurrent writers to one column need no atomics.
+    r = tl.program_id(0)
+    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    tok = tl.load(indices + r * sel_width + j, mask=j < sel_width, other=-1)
+    col = tl.where(tok >= 0, tok // page_size, 0)
+    tl.store(marks + r.to(tl.int64) * width + col, tl.full([BLOCK], 1, tl.int8), mask=tok >= 0)
+
+
+@triton.jit
 def _compact_sel_kernel(
-    indices,        # [rows, SEL] int32: selected LOGICAL token ids, -1 padded
+    marks,          # [rows, W] int8: 1 on every page column the row selected; cleared here
     token_to_req,   # [rows] int32
     block_table,    # [reqs, W] int32: logical page ids
-    out,            # [rows, MAXP] int32: distinct logical pages per row
-    trunc,          # [1] int32: rows whose selection overflowed MAXP (0 = none dropped)
+    out,            # [rows, MAXP] int32: distinct logical pages per row, column order
+    trunc,          # [1] int32: pages dropped past MAXP (0 = none dropped)
     counts,         # [rows] int32: distinct pages stored per row (<= MAXP)
-    sel_width: tl.constexpr,
     width,          # W: block_table row stride
-    page_size: tl.constexpr,
-    maxp: tl.constexpr,      # rows of `out` per row written (<= MAXV)
+    maxp: tl.constexpr,
     maxv: tl.constexpr,      # next_pow2(maxp)
-    dummy_page,              # logical id used when a row selects nothing (never happens in practice)
+    dummy_page,              # logical id used when a row selects nothing
     HAS_ATOMICS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     r = tl.program_id(0)
     req = tl.load(token_to_req + r).to(tl.int64)
-    lanes = tl.arange(0, maxv)
-    seen = tl.full([maxv], -1, tl.int32)
-    first = tl.full((), dummy_page, tl.int32)
+    row_marks = marks + r.to(tl.int64) * width
+    lanes = tl.arange(0, BLOCK)
     count = tl.zeros((), tl.int32)
-    ndrop = tl.zeros((), tl.int32)
-    for j in range(sel_width):
-        tok = tl.load(indices + r * sel_width + j)
-        col = tok // page_size
-        pg = tl.load(block_table + req * width + col, mask=tok >= 0, other=-1)
-        new = (tok >= 0) & (tl.sum((seen == pg).to(tl.int32)) == 0)
-        take = new & (count < maxp)
-        ndrop += (new & (count >= maxp)).to(tl.int32)
-        seen = tl.where((lanes == count) & take, pg, seen)
-        first = tl.where((count == 0) & take, pg, first)
-        count += take.to(tl.int32)
-    row = tl.where(lanes < count, seen, first)
-    tl.store(out + r * maxp + lanes, row, mask=lanes < maxp)
-    tl.store(counts + r, count)
+    first = tl.full((), dummy_page, tl.int32)
+    for c0 in range(0, width, BLOCK):
+        cols = c0 + lanes
+        m = tl.load(row_marks + cols, mask=cols < width, other=0).to(tl.int32)
+        tl.store(row_marks + cols, tl.zeros([BLOCK], tl.int8), mask=(cols < width) & (m != 0))
+        pos = count + tl.cumsum(m, 0) - m
+        take = (m != 0) & (pos < maxp)
+        pg = tl.load(block_table + req * width + cols, mask=take, other=0)
+        tl.store(out + r * maxp + pos, pg, mask=take)
+        first = tl.where((count == 0) & (tl.sum(m, 0) > 0), tl.max(tl.where(take & (pos == 0), pg, -1), 0), first)
+        count += tl.sum(m, 0)
+    stored = tl.minimum(count, maxp)
+    pad = tl.arange(0, maxv)
+    tl.store(out + r * maxp + pad, tl.full([maxv], 0, tl.int32) + first, mask=(pad >= stored) & (pad < maxp))
+    tl.store(counts + r, stored)
+    ndrop = count - stored
     if HAS_ATOMICS:
         tl.atomic_max(trunc, ndrop)
     else:
         # Triton lowers every atomic to sm_70+ PTX. Racing plain stores still leave the
         # counter non-zero whenever any row dropped, which is all its readers test.
         tl.store(trunc, ndrop, mask=ndrop > 0)
+
+
+_COMPACT_BLOCK = 1024
 
 
 def compact_selected_pages(
@@ -87,17 +100,21 @@ def compact_selected_pages(
     dummy_page: int,
     trunc: torch.Tensor | None = None,
     counts: torch.Tensor | None = None,
+    marks: torch.Tensor | None = None,
 ) -> None:
-    """Per query row, the distinct logical pages its selected tokens live on.
+    """Per query row, the distinct logical pages its selected tokens live on, in page-column order.
 
     ``out`` is ``[rows, maxp]`` int32; rows with fewer hits are padded with the row's first
     page (duplicates collapse in lru_ensure), or ``dummy_page`` when the row selected nothing.
     ``trunc`` (optional [1] int32, device) accumulates how many pages were dropped per row
     because they exceeded ``maxp`` -- 0 means no truncation happened. ``counts`` (optional
-    [rows] int32, device) receives each row's stored distinct-page count.
+    [rows] int32, device) receives each row's stored distinct-page count. ``marks`` is a
+    zeroed int8 scratch of at least ``[rows, block_table.shape[1]]`` that is left zeroed; pass
+    one allocated outside CUDA-graph capture.
     """
     rows, sel = indices.shape
     maxp = out.shape[1]
+    width = block_table.shape[1]
     if trunc is None:
         trunc = getattr(compact_selected_pages, "_dummy", None)
         if trunc is None or trunc.device != out.device:
@@ -109,12 +126,27 @@ def compact_selected_pages(
                 max(rows, 4096), dtype=torch.int32, device=out.device
             )
         counts = c
+    if marks is None:
+        marks = compact_marks(rows, width, out.device)
+    assert marks.dtype == torch.int8 and marks.numel() >= rows * width
     if rows:
-        _compact_sel_kernel[(rows,)](
-            indices, token_to_req, block_table, out, trunc, counts,
-            sel, block_table.stride(0), page_size, maxp, triton.next_power_of_2(maxp),
-            dummy_page, HAS_ATOMICS=device_capability() >= (7, 0),
+        _mark_sel_cols_kernel[(rows, triton.cdiv(sel, _COMPACT_BLOCK))](
+            indices, marks, sel, width, page_size, BLOCK=_COMPACT_BLOCK,
         )
+        _compact_sel_kernel[(rows,)](
+            marks, token_to_req, block_table, out, trunc, counts,
+            width, maxp, triton.next_power_of_2(maxp), dummy_page,
+            HAS_ATOMICS=device_capability() >= (7, 0), BLOCK=_COMPACT_BLOCK, num_warps=4,
+        )
+
+
+def compact_marks(rows: int, width: int, device: torch.device) -> torch.Tensor:
+    """A zeroed mark scratch for :func:`compact_selected_pages`, grown and cached per device."""
+    cache = compact_marks.__dict__.setdefault("_bufs", {})
+    buf = cache.get(device)
+    if buf is None or buf.numel() < rows * width:
+        buf = cache[device] = torch.zeros(max(rows * width, 1 << 16), dtype=torch.int8, device=device)
+    return buf
 
 
 @triton.jit
@@ -249,4 +281,4 @@ def mirror_store_quant(
     )
 
 
-__all__ = ["write_pages", "compact_selected_pages", "translate_table", "translate_slots", "mirror_store", "mirror_store_quant"]
+__all__ = ["write_pages", "compact_selected_pages", "compact_marks", "translate_table", "translate_slots", "mirror_store", "mirror_store_quant"]
