@@ -254,6 +254,7 @@ def tokenize_worker(
                             if msg.chosen_logprob is not None
                             else None
                         ),
+                        prefill_ms=msg.prefill_ms,
                     )
                     for msg, reply, reasoning_tokens in zip(
                         detokenize_msg, replies, reasoning_counts, strict=True
