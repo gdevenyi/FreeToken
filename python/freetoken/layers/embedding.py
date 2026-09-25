@@ -47,10 +47,34 @@ class VocabParallelEmbedding(BaseOP):
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
         self._comm = DistributedCommunicator()
+        self._host_ptr: int | None = None
+
+    def place_on_host(self) -> None:
+        """Move the table into pinned host RAM; lookups then read their rows over PCIe (UVA)."""
+        from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+        from freetoken.layers.quantization.embedding.unquantized import UnquantizedEmbeddingMethod
+
+        if self.tp_size > 1:
+            raise ValueError("a host-resident embedding serves a single GPU only")
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+            raise ValueError("a host-resident embedding needs a dense (unquantized) table")
+        host = alloc_pinned_tensor(*self.weight.shape, dtype=self.weight.dtype)
+        host.copy_(self.weight)
+        self.weight = host
+        self._host_ptr = device_ptr(host)
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.quant_method.embed(self, x)
+        if self._host_ptr is not None:
+            from freetoken.kernel.triton.ple import ple_gather_rows
+
+            rows, dim = self.weight.shape
+            y = torch.empty(x.numel(), dim, dtype=self.weight.dtype, device=x.device)
+            ple_gather_rows(self._host_ptr, rows, dim, x.reshape(-1), y, is_fp8=False,
+                            table_dtype=self.weight.dtype)
+            y = y.view(*x.shape, dim)
+        else:
+            y = self.quant_method.embed(self, x)
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
         if self._embed_scale is not None:
