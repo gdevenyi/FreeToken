@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.attention import _optin_smem_bytes
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32
 from freetoken.kernel.triton.kv_nvfp4 import load_nvfp4
 
@@ -418,6 +419,12 @@ def qsa_sparse_paged_attention(
         _kv_bytes = k_cache.element_size()
         while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _lds_budget:
             block_n //= 2
+
+    # The dot operands stage q plus one k and one v tile in shared memory; halve the
+    # column tile until they fit devices with a small per-block budget (48 KB on Pascal).
+    smem = _optin_smem_bytes(q.device.index if q.device.index is not None else torch.cuda.current_device())
+    while smem and block_n > 16 and (2 * block_n + block_m) * head_dim * q.element_size() > smem:
+        block_n //= 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
