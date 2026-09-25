@@ -62,6 +62,25 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
 _KV_OFFLOAD_SERVING_MARGIN = 512 << 20
 
 
+def _kv_host_reserve_bytes(config, pool_cls) -> int:
+    """GPU bytes --kv-host-pages costs beyond the GPU-resident pages: the QSA index slab of
+    every host page (the slab is sized to the logical page space) plus the serving margin."""
+    if config.kv_host_pages <= 0:
+        return 0
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    if not issubclass(pool_cls, QSAKVCache):
+        raise ValueError(
+            f"--kv-host-pages requires the QSA paged KV pool, got {pool_cls.__name__}"
+        )
+    spec = next(s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0)
+    slab_per_page = (
+        (config.page_size // spec.index_ratio)
+        * spec.num_index_layers * spec.index_head_dim * 2
+    )
+    return config.kv_host_pages * slab_per_page + _KV_OFFLOAD_SERVING_MARGIN
+
+
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -537,22 +556,10 @@ class Engine:
             # KV host offload: the scheduler, page table and radix tree run in a LOGICAL page
             # space of num_gpu_pages + kv_host_pages; the GPU K/V buffer stays a
             # num_gpu_pages LRU cache over a pinned host mirror (kvcache/kv_host_offload.py).
-            # The QSA index slab is per LOGICAL page, so reserve its growth before solving
-            # the GPU page count.
-            from freetoken.kvcache.qsa_pool import QSAKVCache
-
-            if not issubclass(self._pool_cls, QSAKVCache):
-                raise ValueError(
-                    f"--kv-host-pages requires the QSA paged KV pool, got {self._pool_cls.__name__}"
-                )
-            spec = next(s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0)
-            slab_per_page = (
-                (config.page_size // spec.index_ratio)
-                * spec.num_index_layers * spec.index_head_dim * 2
-            )
-            # The two-pass solve prices the logical-space slab growth AND hands back the
-            # serving-margin the growth would otherwise eat (prefill transients need it).
-            reserve = config.kv_host_pages * slab_per_page + _KV_OFFLOAD_SERVING_MARGIN
+            # The QSA index slab is per LOGICAL page, so reserve its growth (and the serving
+            # margin prefill transients need) before solving the GPU page count. An auto MoE
+            # plan's num_page_override already priced the same reserve.
+            reserve = _kv_host_reserve_bytes(config, self._pool_cls)
             num_gpu_pages = self._pool_cls.solve_num_pages(config, available_memory - reserve)
             self.num_pages = num_gpu_pages + config.kv_host_pages
         else:
@@ -770,6 +777,9 @@ class Engine:
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         fixed_cache_size += gdn_prefill_workspace_bytes(config)  # GDN prefill transient
+        # The plan's page count becomes num_page_override, which the KV init honors as is,
+        # so the host tier's slab and margin must be priced here or the expert fill eats them.
+        fixed_cache_size += _kv_host_reserve_bytes(config, self._pool_cls)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(

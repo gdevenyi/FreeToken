@@ -350,6 +350,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
         num_page_override = 64
+        kv_host_pages = 0
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -396,6 +397,47 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     # the kernel's slot limit rides the same mapping
     engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert captured["max_slots"] == 5
+
+
+def test_auto_moe_plan_prices_the_kv_host_tier(monkeypatch):
+    """--kv-host-pages grows the QSA index slab to the logical page space and keeps a serving
+    margin. The plan's page count becomes num_page_override, which the KV init allocates as
+    is, so the plan itself must leave that room or the expert fill spends it."""
+    from freetoken.engine.engine import _KV_OFFLOAD_SERVING_MARGIN, Engine
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    # Qwen3.8-Flash-Next: 12 sparse layers, 128-dim index keys, one index row per 4 tokens
+    spec = SimpleNamespace(num_layers=12, index_ratio=4, num_index_layers=12, index_head_dim=128)
+
+    class StubQSA(QSAKVCache):
+        @classmethod
+        def kv_cost(cls, config):
+            return 1 << 20, 1000, config.page_size, 0
+
+    def make_config(host_pages):
+        return SimpleNamespace(
+            page_size=64, kv_host_pages=host_pages, memory_ratio=0.9,
+            moe_prefill_overlap=False, kv_reserve_tokens=0, num_page_override=None,
+            model_config=SimpleNamespace(
+                num_experts=4, num_moe_layers=2, kv_cache_group_specs=lambda: [spec],
+                linear_attention_group=lambda: None,
+            ),
+        )
+
+    captured = []
+    monkeypatch.setattr(
+        "freetoken.engine.cache_budget.resolve_moe_cache_auto",
+        lambda **kw: captured.append(kw["fixed_cache_size"]) or (8, 64, False),
+    )
+    banks = SimpleNamespace(sources={"w": [torch.zeros(4, 8, dtype=torch.float16)]})
+    engine = Engine.__new__(Engine)
+    engine._baseline_free, engine._weights_bytes, engine._pool_cls = 1 << 34, 0, StubQSA
+    engine._resolve_auto_moe_cache_size(make_config(0), banks)
+    engine._resolve_auto_moe_cache_size(make_config(3600), banks)
+
+    slab_per_page = (64 // 4) * 12 * 128 * 2
+    assert slab_per_page == 48 << 10
+    assert captured[1] - captured[0] == 3600 * slab_per_page + _KV_OFFLOAD_SERVING_MARGIN
 
 
 
