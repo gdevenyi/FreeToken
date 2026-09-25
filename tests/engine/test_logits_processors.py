@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from freetoken.core import SamplingParams
-from freetoken.engine.sample import LogitsPlan, Sampler, apply_logits_processors
+from freetoken.engine.sample import (
+    LogitsPlan,
+    RowPenalty,
+    Sampler,
+    apply_logits_processors,
+    apply_penalties,
+)
 
 V = 8
 CPU = torch.device("cpu")
@@ -34,16 +40,15 @@ def _ids(rows: list[list[int]]) -> torch.Tensor:
 
 def test_repetition_penalty_covers_prompt_and_output_with_hf_semantics():
     logits = torch.tensor([[2.0, -2.0, 2.0, -2.0, 1.0, 1.0, 1.0, 1.0]])
-    plan = _plan(
-        [0],
-        hist_ids=_ids([[0, 1]]),  # generated: 0 (positive), 1 (negative)
-        prompt_ids=_ids([[2, 3]]),  # prompt: 2 (positive), 3 (negative)
-        repetition=torch.tensor([[2.0]]),
-    )
-    out = apply_logits_processors(logits, plan, V)
+    counts = torch.zeros(V, dtype=torch.int32)
+    counts[[0, 1]] = 1  # generated: 0 (positive), 1 (negative)
+    prompt = torch.zeros(V, dtype=torch.bool)
+    prompt[[2, 3]] = True  # prompt: 2 (positive), 3 (negative)
+    out = apply_penalties(logits, [RowPenalty(0, counts, 0.0, 0.0, 2.0, prompt)])
     assert out[0, 0].item() == 1.0 and out[0, 2].item() == 1.0  # divided
     assert out[0, 1].item() == -4.0 and out[0, 3].item() == -4.0  # multiplied
     assert out[0, 4].item() == 1.0  # unseen
+    assert logits[0, 0].item() == 2.0  # the caller's logits stay untouched
 
 
 def test_logit_bias_adds_per_row():
@@ -95,6 +100,7 @@ def _req(
         sampling_params=SamplingParams(**sp),
         can_decode=True,
         output_token_counts=None,
+        prompt_token_mask=None,
     )
 
 
@@ -125,15 +131,15 @@ def test_prepare_builds_no_plan_without_processors_and_a_plan_with_them():
     plan = args.plan
     assert plan is not None
     assert plan.rows.tolist() == [1, 2, 3]
-    assert plan.hist_ids[0].tolist()[:2] == [3, 3]  # row 1's generated tokens
-    assert plan.prompt_ids[0].tolist()[:2] == [1, 2]
+    assert [pen.row for pen in args.penalties] == [1]
+    assert batch.reqs[1].prompt_token_mask.nonzero().flatten().tolist() == [1, 2]
     assert plan.bias_rows.tolist() == [0] and plan.bias_ids.tolist() == [5]
     assert plan.min_rows.tolist() == [1]  # local row of the third request only
     assert plan.min_ids[0].tolist() == [0, 7]
 
     logits = torch.zeros((4, V))
     out = apply_logits_processors(logits, plan, V)
-    assert out[1, 3].item() == 0.0  # repetition on 0 is a no-op; presence is not plan work
+    assert out[1, 3].item() == 0.0  # the penalties are not plan work
     assert out[1, 5].item() == 2.0
     assert out[2, 0].item() == float("-inf") and out[2, 7].item() == float("-inf")
     assert torch.isfinite(out[3]).all()
@@ -141,7 +147,7 @@ def test_prepare_builds_no_plan_without_processors_and_a_plan_with_them():
     assert sampler.sample(logits, args)[1].item() == 5
 
 
-def test_presence_and_frequency_ride_the_device_counts_not_the_plan():
+def test_penalties_ride_the_device_state_not_the_plan():
     # the plan must not apply them a second time on top of the sampler's own counts
     sampler = Sampler(CPU, V)
     only = SimpleNamespace(reqs=[_req([1], [], 4, presence_penalty=1.0, frequency_penalty=0.5)])
@@ -165,7 +171,7 @@ def test_repetition_penalty_ignores_multimodal_placeholder_ids_in_the_prompt():
     sampler = Sampler(CPU, V)
     batch = SimpleNamespace(reqs=[_req([1, 1_000_000, 2], [3], 4, repetition_penalty=2.0)])
     args = sampler.prepare(batch)
-    out = apply_logits_processors(torch.ones(1, V), args.plan, V)
+    out = apply_penalties(torch.ones(1, V), args.penalties)
     assert out[0, 1] == 0.5 and out[0, 2] == 0.5 and out[0, 4] == 1.0
 
 
@@ -182,3 +188,21 @@ def test_min_p_with_temperature_draws_only_the_kept_tokens():
     logits[0, kept] = torch.tensor([5.0, 4.5, 4.0], device="cuda")
     for _ in range(32):
         assert sampler.sample(logits, args).item() in kept
+
+
+def test_repetition_penalty_reads_the_prompt_once_and_counts_output_on_the_device():
+    # the prompt (up to the whole context) is uploaded once per request, not every step,
+    # and the generated side comes from the counts sample() keeps, not the host history
+    sampler = Sampler(CPU, V)
+    req = _req([1, 2], [], 4, repetition_penalty=2.0)
+    batch = SimpleNamespace(reqs=[req])
+    args = sampler.prepare(batch)
+    mask = req.prompt_token_mask
+    logits = torch.tensor([[0.0, 1.0, 1.0, 4.0, 0.5, 0.0, 0.0, 0.0]])
+    assert sampler.sample(logits, args).item() == 3
+    assert req.output_token_counts.tolist() == [0, 0, 0, 1, 0, 0, 0, 0]
+    req.input_ids = torch.tensor([9, 9, 3], dtype=torch.int32)  # a stale host view is not read
+    args = sampler.prepare(batch)
+    assert req.prompt_token_mask is mask
+    out = apply_penalties(logits, args.penalties)
+    assert out[0].tolist() == [0.0, 0.5, 0.5, 2.0, 0.5, 0.0, 0.0, 0.0]
