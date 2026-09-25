@@ -25,6 +25,7 @@ import weakref
 import torch
 
 from freetoken.kernel.pinned import alloc_pinned_tensor
+from freetoken.moe.host_banks import cpu_moe_numa_enabled
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -295,6 +296,9 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        # an extension built before disable_numa parses FREETOKEN_CPU_MOE_NUMA itself
+        if not cpu_moe_numa_enabled() and hasattr(self._ext, "disable_numa"):
+            self._ext.disable_numa()
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()

@@ -862,7 +862,7 @@ def test_numa_tile_scheduling_matches_the_shared_queue(monkeypatch):
     ids[1, 3] = -1
     w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
     outs = []
-    for placed, numa in ((True, "1"), (True, "0"), (False, "1")):
+    for placed, numa in ((True, "1"), (True, "0"), (True, "off"), (False, "1")):
         monkeypatch.setenv("FREETOKEN_CPU_MOE_NUMA", numa)
         ex = CpuMoeExecutor(
             host_cache(placed), top_k=top_k, activation="silu",
@@ -872,7 +872,7 @@ def test_numa_tile_scheduling_matches_the_shared_queue(monkeypatch):
         spans, mapped = ex._ext.numa_status()
         if numa == "1" and len({hb._cpu_numa_node(c) for c in ex.core_ids}) > 1:
             assert spans and mapped == (1 if placed else 0), (placed, spans, mapped)
-        if numa == "0":
-            assert not spans
+        if numa != "1":
+            assert not spans, numa
     torch.cuda.synchronize()
-    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+    assert all(torch.equal(outs[0], out) for out in outs[1:])
