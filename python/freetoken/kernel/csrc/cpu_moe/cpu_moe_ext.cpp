@@ -294,6 +294,9 @@ float dot_nvfp4_scalar(const uint8_t* packed, const uint8_t* scale, float global
 // activation scale (absmax/127). Result folds the e2m1*2 -> *0.5 into the scale.
 using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t*, int,
                              const float*, const float*);
+// Same plus the grouped-layout aux array (see dot_nvfp4_i8g_avx2).
+using nvi8gdot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t*, int,
+                              const float*, const float*, const float*);
 
 [[maybe_unused]] float dot_nvfp4_i8_scalar(const uint8_t* packed, const uint8_t* scale,
                           float global, const int8_t* asi8, int K, const float* e4m3,
@@ -404,10 +407,10 @@ float dot_nvfp4_avx2(const uint8_t* packed, const uint8_t* scale, float global,
   return hsum256(_mm256_add_ps(acc0, acc1)) * global;
 }
 
-// AVX-VNNI W4A8: decode 8 packed bytes (16 nibbles) of one 16-block to int8 [lo(8),hi(8)]
+// W4A8: decode 8 packed bytes (16 nibbles) of one 16-block to int8 [lo(8),hi(8)]
 // via PSHUFB against the e2m1*2 LUT (replaces the 2 vpermps fp32 expands -- ~4x less
 // port-5 traffic). lo=even-K weights, hi=odd-K, matching the [even(8),odd(8)] act layout.
-__attribute__((target("avx2,avxvnni,fma")))
+__attribute__((target("avx2")))
 inline __m128i nvfp4_decode_block_i8(const uint8_t* pk, __m128i lut) {
   __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pk));   // 8 bytes
   __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
@@ -450,9 +453,6 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
   return s * (0.5f * global);
 }
 
-#if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
-#define CPU_MOE_HAS_AVX512VNNI 1
-
 // Software-prefetch distance for the W4A8 weight stream, in 16-K blocks (8 packed
 // bytes each). Returns -1 when FREETOKEN_CPU_MOE_PF_BLOCKS is unset: the kernel then
 // uses the built-in default min(512 blocks = 4 KB, 2 rows) -- 4 KB is the empirical
@@ -470,6 +470,158 @@ static int nvfp4_pf_blocks() {
   }();
   return v;
 }
+
+// ---- AVX2 W4A8, grouped layout: four 16-K blocks (32 packed bytes) per load ----
+// Activations are stored per 4-block group as [even(8) x 4 blocks | odd(8) x 4 blocks]
+// so the low and high nibbles of one 32-byte weight load line up with two 32-byte
+// activation loads (one PSHUFB each, no per-block unpack/insert). The LUT holds
+// e2m1*2 + 12 (0..24, unsigned), so VPMADDUBSW needs no sign fix-up; the +12 offset is
+// removed exactly by subtracting 12 * (activation lane sums), precomputed per token.
+// Per group, aux holds 8 floats (the activation scale expanded to the 8 int32 lanes,
+// 2 lanes per block) then 8 int32 corrections. Blocks past the last full group keep
+// the per-block [even(8),odd(8)] layout and asb scales.
+alignas(16) const uint8_t kE2M1x2p12[16] = {12, 13, 14, 15, 16, 18, 20, 24,
+                                            12, 11, 10, 9,  8,  6,  4,  0};
+
+__attribute__((target("avx2,fma")))
+static inline __m256 nvfp4_i8g_grp(const uint8_t* packed, const uint8_t* scale,
+                                   const int8_t* asi8, const float* aux, const float* e4m3,
+                                   int g, __m256i lut, __m256i m0f, __m256i ones16,
+                                   __m256i sidx_ctrl) {
+  const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + (size_t)g * 32));
+  const __m256i we = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw, m0f));
+  const __m256i wo = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw, 4), m0f));
+  const int8_t* a = asi8 + (size_t)g * 64;
+  const __m256i ae = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+  const __m256i ao = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32));
+  const __m256i p = _mm256_add_epi16(_mm256_maddubs_epi16(we, ae), _mm256_maddubs_epi16(wo, ao));
+  const float* ax = aux + (size_t)g * 16;
+  const __m256i d = _mm256_sub_epi32(_mm256_madd_epi16(p, ones16),
+                                     _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ax + 8)));
+  int s4;
+  std::memcpy(&s4, scale + (size_t)g * 4, 4);
+  const __m256i sidx = _mm256_shuffle_epi8(_mm256_set1_epi32(s4), sidx_ctrl);
+  const __m256 sc = _mm256_mul_ps(_mm256_i32gather_ps(e4m3, sidx, 4), _mm256_loadu_ps(ax));
+  return _mm256_mul_ps(_mm256_cvtepi32_ps(d), sc);
+}
+
+__attribute__((target("avx2,fma")))
+float dot_nvfp4_i8g_avx2(const uint8_t* packed, const uint8_t* scale, float global,
+                         const int8_t* asi8, int K, const float* e4m3, const float* asb,
+                         const float* aux) {
+  const __m256i lut = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2p12)));
+  const __m256i m0f = _mm256_set1_epi8(0x0F);
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  // int32 lane pairs (0,1),(2,3),(4,5),(6,7) <- scale byte 0,1,2,3 (zero-extended)
+  const __m256i sidx_ctrl = _mm256_setr_epi8(
+      0, -1, -1, -1, 0, -1, -1, -1, 1, -1, -1, -1, 1, -1, -1, -1,
+      2, -1, -1, -1, 2, -1, -1, -1, 3, -1, -1, -1, 3, -1, -1, -1);
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  const int nb = K / 16;
+  const int ng = nb / 4;
+  const int pfb = nvfp4_pf_blocks();
+  const int pf = (pfb < 0) ? std::min(512, 2 * nb) : pfb;
+  int g = 0;
+  for (; g + 2 <= ng; g += 2) {
+    if (pf > 0)
+      _mm_prefetch(reinterpret_cast<const char*>(packed + ((size_t)g * 4 + (size_t)pf) * 8),
+                   _MM_HINT_T0);
+    acc0 = _mm256_add_ps(acc0, nvfp4_i8g_grp(packed, scale, asi8, aux, e4m3, g, lut, m0f,
+                                             ones16, sidx_ctrl));
+    acc1 = _mm256_add_ps(acc1, nvfp4_i8g_grp(packed, scale, asi8, aux, e4m3, g + 1, lut, m0f,
+                                             ones16, sidx_ctrl));
+  }
+  if (g < ng)
+    acc0 = _mm256_add_ps(acc0, nvfp4_i8g_grp(packed, scale, asi8, aux, e4m3, g, lut, m0f,
+                                             ones16, sidx_ctrl));
+  float s = hsum256(_mm256_add_ps(acc0, acc1));
+  for (int b = ng * 4; b < nb; ++b) {  // tail blocks (per-block layout)
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const int8_t* ae = asi8 + (size_t)b * 16; const int8_t* ao = ae + 8;
+    int isum = 0;
+    for (int j = 0; j < 8; ++j)
+      isum += (int)kE2M1x2[pk[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk[j] >> 4] * (int)ao[j];
+    s += (e4m3[scale[b]] * asb[b]) * (float)isum;
+  }
+  return s * (0.5f * global);
+}
+
+// Horizontal max of 8 floats.
+__attribute__((target("avx2,fma")))
+static inline float hmax256(__m256 v) {
+  __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+  m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 0x55));
+  return _mm_cvtss_f32(m);
+}
+
+// q = clamp(lround(x * inv), +-127) for 8 lanes, bit-identical to the scalar
+// std::lround (round half away from zero) path in quant_i8_pg16.
+__attribute__((target("avx2,fma")))
+static inline __m256i quant8_round(__m256 x, __m256 inv) {
+  const __m256 q = _mm256_mul_ps(x, inv);
+  const __m256 t = _mm256_round_ps(q, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+  const __m256 sgn = _mm256_and_ps(q, _mm256_set1_ps(-0.0f));
+  const __m256 frac = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_sub_ps(q, t));
+  const __m256 up = _mm256_and_ps(_mm256_cmp_ps(frac, _mm256_set1_ps(0.5f), _CMP_GE_OQ),
+                                  _mm256_or_ps(sgn, _mm256_set1_ps(1.0f)));
+  __m256 r = _mm256_add_ps(t, up);
+  r = _mm256_min_ps(_mm256_max_ps(r, _mm256_set1_ps(-127.0f)), _mm256_set1_ps(127.0f));
+  return _mm256_cvttps_epi32(r);
+}
+
+// Low byte of each int32 lane of v -> 8 contiguous int8 at dst.
+__attribute__((target("avx2")))
+static inline void store_i32_as_i8(int8_t* dst, __m256i v) {
+  const __m256i ctrl = _mm256_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+  const __m256i b = _mm256_shuffle_epi8(v, ctrl);
+  const __m128i lo = _mm256_castsi256_si128(b);
+  const __m128i hi = _mm256_extracti128_si256(b, 1);
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), _mm_unpacklo_epi32(lo, hi));
+}
+
+// Per-16-block int8 quantization (same scale and rounding as quant_i8_pg16) into the
+// grouped layout dot_nvfp4_i8g_avx2 reads: asi8 [K], asb [K/16], aux [K/4].
+__attribute__((target("avx2,fma")))
+void quant_i8_g4_avx2(const float* xe, const float* xo, int K, int8_t* asi8, float* asb,
+                      float* aux) {
+  const int nb = K / 16;
+  const int ng = nb / 4;
+  const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+  for (int b = 0; b < nb; ++b) {
+    const __m256 ve = _mm256_loadu_ps(xe + (size_t)b * 8);
+    const __m256 vo = _mm256_loadu_ps(xo + (size_t)b * 8);
+    const float amax = hmax256(_mm256_max_ps(_mm256_and_ps(ve, absmask), _mm256_and_ps(vo, absmask)));
+    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+    asb[b] = s;
+    const __m256 inv = _mm256_set1_ps(1.0f / s);
+    const int g = b / 4, j = b % 4;
+    int8_t* de = (g < ng) ? asi8 + (size_t)g * 64 + j * 8 : asi8 + (size_t)b * 16;
+    int8_t* dd = (g < ng) ? de + 32 : de + 8;
+    store_i32_as_i8(de, quant8_round(ve, inv));
+    store_i32_as_i8(dd, quant8_round(vo, inv));
+    if (g < ng) {
+      aux[(size_t)g * 16 + 2 * j] = s;
+      aux[(size_t)g * 16 + 2 * j + 1] = s;
+    }
+  }
+  const __m256i twelve = _mm256_set1_epi8(12);
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  for (int g = 0; g < ng; ++g) {
+    const int8_t* a = asi8 + (size_t)g * 64;
+    const __m256i ae = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+    const __m256i ao = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32));
+    const __m256i c = _mm256_madd_epi16(
+        _mm256_add_epi16(_mm256_maddubs_epi16(twelve, ae), _mm256_maddubs_epi16(twelve, ao)),
+        ones16);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(aux + (size_t)g * 16 + 8), c);
+  }
+}
+
+#if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
+#define CPU_MOE_HAS_AVX512VNNI 1
 
 // AVX-512 VNNI W4A8: FOUR 16-K blocks per VPDPBUSD (64 int8) -- 2x the AVX-VNNI
 // (256-bit) path. Decode 32 packed bytes -> 64 int8 with a single _mm512_shuffle_epi8
@@ -722,12 +874,18 @@ nvdot_fn select_nvdot() {
   return dot_nvfp4_scalar;
 }
 
+// FREETOKEN_CPU_MOE_NO_VNNI=1 disables the whole nvfp4 W4A8 (int8 activation) family,
+// keeping the fp32 nvdot path; unset/empty/"0" leave it on.
+inline bool w4a8_disabled() {
+  const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
+  return no && no[0] && no[0] != '0';
+}
+
 // AVX-VNNI (VEX-256 VPDPBUSD) availability: Alder/Raptor Lake, Sapphire Rapids+, Zen5.
 // Distinct from AVX-512 VNNI. Opt out with FREETOKEN_CPU_MOE_NO_VNNI=1 (A/B the W4A8 path).
 inline bool cpu_has_avxvnni() {
 #if CPU_MOE_X86
-  const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
-  if (no && no[0] && no[0] != '0') return false;  // ignore unset/empty/"0"
+  if (w4a8_disabled()) return false;
   return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("avxvnni");
 #else
   return false;
@@ -743,22 +901,33 @@ inline bool cpu_has_avx512vnni() {
 #if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
   const char* no = getenv("FREETOKEN_CPU_MOE_NO_AVX512VNNI");
   if (no && no[0] && no[0] != '0') return false;
-  const char* no_vnni = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
-  if (no_vnni && no_vnni[0] && no_vnni[0] != '0') return false;
+  if (w4a8_disabled()) return false;
   return __builtin_cpu_supports("avx512vnni");
 #else
   return false;
 #endif
 }
 
-// Best W4A8 (int8-activation) nvfp4 dot, or nullptr if no SIMD VNNI (caller keeps the
-// faithful fp32 nvdot path). The scalar i8 dot exists only as a correctness reference.
+// Best VNNI W4A8 (int8-activation) nvfp4 dot, or nullptr (caller then tries the AVX2
+// W4A8 kernel, else keeps the faithful fp32 nvdot path). The scalar i8 dot exists only
+// as a correctness reference.
 nvi8dot_fn select_nvi8dot() {
 #if CPU_MOE_X86
 #if defined(CPU_MOE_HAS_AVX512VNNI)
   if (cpu_has_avx512vnni()) return dot_nvfp4_i8_avx512vnni;
 #endif
   if (cpu_has_avxvnni()) return dot_nvfp4_i8_vnni;
+#endif
+  return nullptr;
+}
+
+// AVX2 W4A8 (grouped activation layout), used only when select_nvi8dot found no VNNI
+// kernel. Only picked at the AVX2 tier: AVX-512 CPUs without VNNI keep their fp32
+// avx512 kernel (never benchmarked against this one).
+nvi8gdot_fn select_nvi8gdot() {
+#if CPU_MOE_X86
+  if (select_nvi8dot() == nullptr && pick_isa() == ISA_AVX2 && !w4a8_disabled())
+    return dot_nvfp4_i8g_avx2;
 #endif
   return nullptr;
 }
@@ -1254,8 +1423,10 @@ struct CpuMoeExecutor {
   float swiglu_limit;          // +inf == no clamp
   dot_fn dot;
   nvdot_fn nvdot;
-  nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
-  bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
+  nvi8dot_fn nvi8dot = nullptr;    // VNNI W4A8 nvfp4 dot (per-block act layout)
+  nvi8gdot_fn nvi8gdot = nullptr;  // AVX2 W4A8 nvfp4 dot (grouped act layout)
+  bool use_vnni = false;           // nvfp4 W4A8 (either kernel); else the fp32 nvdot
+  bool use_i8g = false;            // W4A8 runs nvi8gdot: activations in the grouped layout
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
@@ -1282,6 +1453,7 @@ struct CpuMoeExecutor {
   // AVX-VNNI W4A8: per-16-block int8 activations [even(8),odd(8)] + per-block scale.
   std::vector<int8_t> xi8_scratch, gi8_scratch;  // [max_tokens*H], [max_tokens*top_k*I]
   std::vector<float> xas_scratch, gas_scratch;   // [max_tokens*H/16], [..*top_k*I/16]
+  std::vector<float> xaux_scratch, gaux_scratch; // grouped layout aux: [.. * H/4], [.. * I/4]
   std::string isa_str;
 
   std::vector<std::thread> workers;
@@ -1400,15 +1572,18 @@ struct CpuMoeExecutor {
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
     }
     isa = c.name;
-    // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
-    // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
-    // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
+    // nvfp4: W4A8 int8 decode (AVX-512 VNNI, AVX-VNNI or AVX2) unless opted out. q4_0 is
+    // always W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD /
+    // VPMADDUBSW / scalar for the tier, so the tag reflects which of those q4dot resolved to.
     nvi8dot = select_nvi8dot();
-    use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
+    nvi8gdot = select_nvi8gdot();
+    use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr || nvi8gdot != nullptr);
+    use_i8g = use_vnni && nvi8dot == nullptr;
     use_q4a8 = (weight_format == WF_Q4_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
-    const char* vnni_tag =
-        cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
+    const char* vnni_tag = cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)"
+                           : cpu_has_avxvnni()  ? "+vnni(nvfp4-w4a8)"
+                                                : "+avx2i8(nvfp4-w4a8)";
     isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
@@ -1429,6 +1604,10 @@ struct CpuMoeExecutor {
         xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 16), 0);
         gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
         gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 16), 0);
+      }
+      if (use_i8g) {
+        xaux_scratch.assign(static_cast<size_t>(max_tokens) * (H / 4), 0);
+        gaux_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 4), 0);
       }
     }
     // q4_0 W4A8: per-32-block Q8_0 activations (int8 + fp32 scale) for input + intermediate.
@@ -1489,15 +1668,27 @@ struct CpuMoeExecutor {
     }
   }
 
+  // W4A8 activation quantization in the layout the selected nvfp4 int8 kernel reads.
+  void quant_i8(const float* xe, const float* xo, int K, int8_t* asi8, float* asb, float* aux) {
+#if CPU_MOE_X86
+    if (use_i8g) {
+      quant_i8_g4_avx2(xe, xo, K, asi8, asb, aux);
+      return;
+    }
+#endif
+    (void)aux;
+    quant_i8_pg16(xe, xo, K, asi8, asb);
+  }
+
   // gate_up output row `row` (in [0, 2I)) dotted with activation over K = H. ``e`` is
   // the layer-local expert row (0..num_experts); the layer bases (already resolved
   // once per task/pass by the caller via tbl_at) pick the layer's own tensors.
   // bf16 uses the interleaved bf16 row; nvfp4 uses the pre-split fp32 even/odd halves
-  // (or, with AVX-VNNI, the per-16-block int8 activations).
+  // (or, with W4A8, the per-16-block int8 activations; xaux only for the grouped layout).
   inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
                          const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
-                         const float* xas) {
+                         const float* xas, const float* xaux) {
     if (fmt == WF_BF16) {
       const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
       return dot(w, x, H);
@@ -1508,6 +1699,9 @@ struct CpuMoeExecutor {
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
     const size_t r = (size_t)e * (2 * I) + row;
+    if (use_i8g)
+      return nvi8gdot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
+                      fp16_to_f32(gu_global_l[r]), xi8, H, e4m3_lut, xas, xaux);
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
                      fp16_to_f32(gu_global_l[r]), xi8, H, e4m3_lut, xas);
@@ -1520,7 +1714,7 @@ struct CpuMoeExecutor {
   inline float gemm2_dot(const bf16_t* down_l, const uint8_t* dn_packed_l,
                          const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
                          const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
-                         const float* gas) {
+                         const float* gas, const float* gaux) {
     if (fmt == WF_BF16) {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
@@ -1530,6 +1724,9 @@ struct CpuMoeExecutor {
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
     }
     const size_t r = (size_t)e * H + row;
+    if (use_i8g)
+      return nvi8gdot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
+                      fp16_to_f32(dn_global_l[r]), gi8, I, e4m3_lut, gas, gaux);
     if (use_vnni)
       return nvi8dot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
                      fp16_to_f32(dn_global_l[r]), gi8, I, e4m3_lut, gas);
@@ -1631,6 +1828,7 @@ struct CpuMoeExecutor {
     const float* xas = use_vnni ? xas_scratch.data() + (size_t)tok * (H / 16)
                      : use_q4a8 ? xas_scratch.data() + (size_t)tok * (H / 32)
                                   : nullptr;
+    const float* xaux = use_i8g ? xaux_scratch.data() + (size_t)tok * (H / 4) : nullptr;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
@@ -1639,10 +1837,10 @@ struct CpuMoeExecutor {
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
-      float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
+      float gate = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe,
+                             xo, xi8, xas, xaux) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                           xe, xo, xi8, xas) * w_in;
+                           xe, xo, xi8, xas, xaux) * w_in;
       if (clamped) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
         // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
@@ -1692,8 +1890,9 @@ struct CpuMoeExecutor {
         const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
                          : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
                                       : nullptr;
+        const float* gaux = use_i8g ? gaux_scratch.data() + gr * (I / 4) : nullptr;
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
-                         gas) * w_out;
+                         gas, gaux) * w_out;
       }
       y_row[h] = f32_to_bf16(acc);
     }
@@ -1830,8 +2029,9 @@ struct CpuMoeExecutor {
     float* go = go_scratch.data() + (size_t)r * (I / 2);
     deinterleave_bf16_f32(g, ge, go, I);
     if (use_vnni)
-      quant_i8_pg16(ge, go, I, gi8_scratch.data() + (size_t)r * I,
-                    gas_scratch.data() + (size_t)r * (I / 16));
+      quant_i8(ge, go, I, gi8_scratch.data() + (size_t)r * I,
+               gas_scratch.data() + (size_t)r * (I / 16),
+               use_i8g ? gaux_scratch.data() + (size_t)r * (I / 4) : nullptr);
   }
 
   void do_pass2_dsfp4(const MoeTask* t, int64_t p) {
@@ -1962,6 +2162,10 @@ struct CpuMoeExecutor {
           gi8_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
           gas_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 16));
         }
+        if (use_i8g) {
+          xaux_scratch.resize(xn / 4);
+          gaux_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 4));
+        }
       }
       const bool ds = (fmt == WF_DSFP4) && !input_prequant;
       if (ds && xn > xq_scratch.size()) xq_scratch.resize(xn);
@@ -1976,8 +2180,9 @@ struct CpuMoeExecutor {
         float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
         deinterleave_bf16_f32(src, xe, xo, H);
         if (use_vnni)
-          quant_i8_pg16(xe, xo, H, xi8_scratch.data() + (size_t)tok * H,
-                        xas_scratch.data() + (size_t)tok * (H / 16));
+          quant_i8(xe, xo, H, xi8_scratch.data() + (size_t)tok * H,
+                   xas_scratch.data() + (size_t)tok * (H / 16),
+                   use_i8g ? xaux_scratch.data() + (size_t)tok * (H / 4) : nullptr);
       }
     }
     // q4_0 W4A8: Q8_0-quantize the per-token input once (single-threaded, tiny for decode).

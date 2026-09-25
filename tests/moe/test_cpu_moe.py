@@ -111,18 +111,43 @@ def _make_nvfp4_cache(L, E, H, I, seed=0):
     )
 
 
+def _set_cpu_moe_env(monkeypatch, isa=None, w4a8=True):
+    """Force the CPU MoE ISA tier (None = auto) and the nvfp4 W4A8 path for executors
+    built afterwards (both are read from the environment at construction)."""
+    if isa is None:
+        monkeypatch.delenv("FREETOKEN_CPU_MOE_ISA", raising=False)
+    else:
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", isa)
+    if w4a8:
+        monkeypatch.delenv("FREETOKEN_CPU_MOE_NO_VNNI", raising=False)
+    else:
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_NO_VNNI", "1")
+
+
+def _cpu_has_avx2() -> bool:
+    try:
+        with open("/proc/cpuinfo") as f:
+            flags = next((ln for ln in f if ln.startswith("flags")), "").split()
+    except OSError:
+        return False
+    return "avx2" in flags and "fma" in flags
+
+
+@pytest.mark.parametrize("w4a8", [True, False], ids=["w4a8", "fp32"])
 @pytest.mark.parametrize("bs", [1, 3, 8])
-def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
+def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs, w4a8, monkeypatch):
     """CPU inline-dequant NVFP4 GEMV vs. canonical dequant_nvfp4 + bf16 GPU decode.
 
     Both paths read byte-identical quantized banks; the CPU dequantizes inside the
     K-loop (fp32), the reference materializes bf16 weights first, so the only spread
-    is weight bf16-rounding + reduction order -> tight relative tolerance.
+    is weight bf16-rounding + reduction order -> tight relative tolerance. The W4A8
+    path additionally quantizes activations to int8 per 16 values.
     """
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused import fused_experts_decode_impl
 
+    _set_cpu_moe_env(monkeypatch, w4a8=w4a8)
     torch.manual_seed(100 + bs)
     L, E, H, I, top_k = 3, 16, 1024, 512, 4
     layer = 1
@@ -138,6 +163,8 @@ def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
         max_tokens=bs,
         device=dev,
     )
+    if not w4a8:
+        assert "w4a8" not in ex.isa, ex.isa
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
     ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
@@ -222,6 +249,77 @@ def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
 
     rel = (cpu_out - ref).abs().max() / (ref.abs().max() + 1e-6)
     assert rel < 3e-2, f"nvfp4 swigluoai bs={bs} rel err {rel.item()}"
+
+
+def _quant_i8_per16(v: torch.Tensor) -> torch.Tensor:
+    """The CPU W4A8 activation grid: per 16 consecutive values, int8 = round-half-away(
+    v / (amax/127)) clamped to +-127, returned dequantized."""
+    vb = v.reshape(-1, 16)
+    amax = vb.abs().amax(dim=1, keepdim=True)
+    s = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    q = vb * (1.0 / s)
+    q = torch.sign(q) * torch.floor(q.abs() + 0.5)
+    return (q.clamp(-127, 127) * s).reshape(v.shape)
+
+
+@pytest.mark.parametrize("w4a8", [True, False], ids=["w4a8", "fp32"])
+@pytest.mark.parametrize("isa", [None, "avx2", "scalar"], ids=["auto", "avx2", "scalar"])
+@pytest.mark.parametrize("H,I", [(1024, 512), (1072, 528)])
+def test_cpu_decode_nvfp4_isa_tiers_match_their_reference(H, I, isa, w4a8, monkeypatch):
+    """Each forced ISA tier, with and without W4A8, against a float64 reference of the
+    math that path claims: the int8 kernels must equal per-16 int8 activation
+    quantization (tighter than the gap between W4A8 and fp32, so a lane or scale slip
+    fails), the fp32 path the unquantized dequant GEMV. (1072, 528) leaves 16-K blocks
+    past the AVX2 kernel's 4-block groups in both GEMVs."""
+    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    _set_cpu_moe_env(monkeypatch, isa=isa, w4a8=w4a8)
+    torch.manual_seed(7)
+    L, E, top_k, bs, layer = 2, 16, 4, 2, 1
+    dev = torch.device("cuda")
+    cache = _make_nvfp4_cache(L, E, H, I, seed=5)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=bs, device=dev,
+    )
+    quantized = "w4a8" in ex.isa
+    if not w4a8:
+        assert not quantized, ex.isa
+    elif isa == "avx2" and _cpu_has_avx2():
+        assert quantized, ex.isa  # a forced avx2 tier must run the AVX2 int8 kernel
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    ids[1, 2] = -1
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    cpu_out = ex.decode(layer, hidden, w, ids).float().cpu()
+    torch.cuda.synchronize()
+
+    b = cache.bank_sources
+    slots = torch.arange(E, device=dev, dtype=torch.int32)
+    gu = dequant_nvfp4(
+        b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
+        b["gate_up_global"][layer].to(dev), slots, dtype=torch.float32,
+    ).cpu().double()
+    dn = dequant_nvfp4(
+        b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
+        b["down_global"][layer].to(dev), slots, dtype=torch.float32,
+    ).cpu().double()
+    act_grid = _quant_i8_per16 if quantized else (lambda v: v)
+    x = hidden.float().cpu()
+    ref = torch.zeros(bs, H, dtype=torch.float64)
+    for t in range(bs):
+        for k in range(top_k):
+            e = int(ids[t, k])
+            if e < 0:
+                continue
+            h = (gu[e] @ act_grid(x[t]).double()).float()
+            g = (Fn.silu(h[:I]) * h[I:]).bfloat16().float()
+            ref[t] += float(w[t, k]) * (dn[e] @ act_grid(g).double())
+    ref = ref.float()
+    rel = (cpu_out - ref).abs().max() / (ref.abs().max() + 1e-6)
+    assert rel < 6e-3, f"isa={ex.isa} rel err {rel.item()}"
 
 
 def test_stale_extension_rejected_for_swigluoai(monkeypatch):
@@ -661,3 +759,4 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
