@@ -103,6 +103,9 @@ def test_spinning_and_parked_workers_run_every_task(cache, make_executor):
 
 
 def test_spin_ms_env_overrides_the_default(cache, make_executor, monkeypatch):
+    # an exported spin A/B setting or a small runner would move the default under test
+    monkeypatch.delenv("FREETOKEN_CPU_MOE_SPIN_MS", raising=False)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)))
     assert make_executor(cache)._ext.worker_spin_ms() == DEFAULT_SPIN_MS
     monkeypatch.setenv("FREETOKEN_CPU_MOE_SPIN_MS", "7")
     assert make_executor(cache)._ext.worker_spin_ms() == 7
