@@ -17,6 +17,7 @@ any other bf16 projection.
 
 from __future__ import annotations
 
+import logging
 
 import torch
 import triton
@@ -24,6 +25,8 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
+
+logger = logging.getLogger(__name__)
 
 FP8 = torch.float8_e4m3fn
 MXFP8_BLOCK = 32
@@ -266,6 +269,10 @@ def mxfp8_linear(
                 raise
             m_tile = max(16, triton.next_power_of_2(M))
             _gemv_cap = m_tile // 2 if m_tile > 16 else 1  # strictly lower: M=1 has its own kernel
+            logger.warning(
+                "mxfp8 GEMV: M_TILE %d does not fit the shared memory of %s; M > %d falls back to dequant + "
+                "cuBLAS, whose transient a CUDA-graph capture keeps in its pool", m_tile, x.device, _gemv_cap,
+            )
     if out is None:
         # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
         x2 = x.reshape(-1, K)
