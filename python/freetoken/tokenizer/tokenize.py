@@ -55,6 +55,16 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
+def join_system_contents(messages: list[dict[str, Any]]) -> str:
+    """The contents of several system/developer messages as one system prompt, in order.
+    Image content (a part list left by text flattening) cannot be joined into text: raise
+    the error templates give for an image in the system turn."""
+    contents = [m.get("content") for m in messages if m.get("content")]
+    if any(not isinstance(c, str) for c in contents):
+        raise ValueError("System message cannot contain images")
+    return "\n\n".join(contents)
+
+
 def _map_developer_role(
     messages: list[dict[str, Any]], chat_template: str | None
 ) -> list[dict[str, Any]]:
@@ -72,8 +82,7 @@ def _map_developer_role(
     if len(system) == 1 and mapped[0] is system[0]:
         return mapped
     rest = [m for m in mapped if m.get("role") != "system"]
-    content = "\n\n".join(str(m.get("content") or "") for m in system if m.get("content"))
-    return [{"role": "system", "content": content}] + rest
+    return [{"role": "system", "content": join_system_contents(system)}] + rest
 
 
 class TokenizeManager:
