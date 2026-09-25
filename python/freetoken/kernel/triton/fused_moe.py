@@ -8,13 +8,14 @@ def moe_align_block_size_init_kernel(
     expert_ids_ptr,
     tokens_cnts_ptr,
     cumsum_ptr,
-    sorted_token_ids_numel: tl.constexpr,
-    expert_ids_numel: tl.constexpr,
-    tokens_cnts_numel: tl.constexpr,
-    cumsum_numel: tl.constexpr,
-    sentinel: tl.constexpr,
+    sorted_token_ids_numel,
+    expert_ids_numel,
+    tokens_cnts_numel,
+    cumsum_numel,
+    sentinel,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # sizes are runtime args: as constexprs every distinct prefill length compiled a new kernel
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     tl.store(
         sorted_token_ids_ptr + offsets,
@@ -31,8 +32,8 @@ def moe_align_block_size_stage1_kernel(
     topk_ids_ptr,
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
-    numel: tl.constexpr,
-    tokens_per_thread: tl.constexpr,
+    numel,
+    tokens_per_thread,
 ):
     pid = tl.program_id(0)
     start_idx = pid * tokens_per_thread
@@ -86,8 +87,8 @@ def moe_align_block_size_stage4_kernel(
     cumsum_ptr,
     num_experts: tl.constexpr,
     block_size: tl.constexpr,
-    numel: tl.constexpr,
-    tokens_per_thread: tl.constexpr,
+    numel,
+    tokens_per_thread,
 ):
     pid = tl.program_id(0)
     start_idx = tl.load(cumsum_ptr + pid)
