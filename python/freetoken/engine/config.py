@@ -44,6 +44,7 @@ class EngineConfig:
     # lm_head) at load, "none" serves them as the checkpoint stores them.
     dense_quant: str = "none"
     lm_head_quant: str = "none"
+    hc_quant: str = "none"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -182,10 +183,12 @@ class EngineConfig:
 
     def _load_time_quant(self, quant, spec: ModelSpec, hf_config):
         targets: tuple[str, ...] = ()
-        if self.dense_quant == "mxfp8":
-            if not spec.load_quant_targets:
-                raise ValueError(f"--dense-quant is not supported for {self.hf_config.architectures[0]}")
-            targets += spec.load_quant_targets
+        groups = dict(spec.load_quant_targets)
+        for flag, group, value in (("--dense-quant", "dense", self.dense_quant), ("--hc-quant", "hc", self.hc_quant)):
+            if value == "mxfp8":
+                if group not in groups:
+                    raise ValueError(f"{flag} is not supported for {self.hf_config.architectures[0]}")
+                targets += groups[group]
         if self.lm_head_quant == "mxfp8":
             text = getattr(hf_config, "text_config", hf_config)
             if getattr(text, "tie_word_embeddings", False) or getattr(hf_config, "tie_word_embeddings", False):

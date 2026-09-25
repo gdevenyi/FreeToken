@@ -182,7 +182,10 @@ class _DenseFuser:
             return []
         del self.buf[(fused, kind)]
         rows = [slots[i] for i in range(len(parts))]
-        pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind == ".weight" else 0
+        # per-row scales (MXFP8: one row of codes per weight row) pad with the weight; block scales do not
+        scheme = self.scheme(fused)
+        per_row = scheme is not None and (scheme.weight.group or (1, 1))[0] == 1
+        pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind == ".weight" or per_row else 0
         pad = (-sum(t.shape[0] for t in rows)) % pad_to if pad_to else 0
         if pad:
             rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=rows[0].dtype, device=rows[0].device))

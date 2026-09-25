@@ -35,7 +35,7 @@ KH, VH, HD = 2, 4, 32  # GDN key / value heads, head dim: qkv rows 256, z rows 1
 QH, KVH, AHD = 4, 2, 64  # QSA q / kv heads, head dim: q rows 512, k / v rows 128
 IHD = 64  # indexer head dim
 BLOCK = 128
-E, I = 3, 6  # routed experts, moe_intermediate_size
+E, I = 3, 32  # routed experts, moe_intermediate_size (a multiple of 32 so MXFP8 can take it)
 NGRAM_DIM, NGRAM_ROWS, NGRAM_SHARDS = 4, 7, 4
 
 
@@ -532,7 +532,7 @@ def _dequant_mxfp8(weight: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
 def load_time(checkpoint) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """(emitted tensors, the model state dict the engine builds under the same config)."""
     folder, _raw = checkpoint
-    state = meta_state_dict(folder, dense_quant="mxfp8", lm_head_quant="mxfp8")  # installs the overlay
+    state = meta_state_dict(folder, dense_quant="mxfp8", lm_head_quant="mxfp8", hc_quant="mxfp8")  # installs the overlay
     loaded = {
         name: tensor.clone()
         for name, tensor in iter_weights(folder, torch.device("cpu"), include_moe_experts=True,
@@ -545,7 +545,8 @@ def test_load_time_mxfp8_fills_exactly_the_buffers_the_engine_builds(load_time):
     loaded, state = load_time
     assert set(loaded) == set(state)
     # the fixture's vocab rows are fewer than the config's, so compare the requantized modules only
-    touched = ("in_proj_qkvz", "in_proj_ba", "out_proj", "qkv_proj", "o_proj", "lm_head")
+    touched = ("in_proj_qkvz", "in_proj_ba", "out_proj", "qkv_proj", "o_proj", "lm_head", "gate_up_proj",
+               "down_proj", "input_mix_weight_down_block_inject", "input_mix_weight_down", "input_mix_weight_up")
     for name, tensor in loaded.items():
         if name.rsplit(".", 1)[0].endswith(touched):
             assert tensor.dtype is state[name].dtype, name
@@ -566,6 +567,10 @@ def test_load_time_mxfp8_dequantizes_back_to_the_bf16_parts(load_time, checkpoin
         "model.layers.1.self_attn.qkv_proj": [f"{attn}.q_proj", f"{attn}.k_proj", f"{attn}.v_proj"],
         "model.layers.1.self_attn.o_proj": [f"{attn}.o_proj"],
         "lm_head": ["lm_head"],
+        "model.layers.1.mlp.shared_expert.gate_up_proj": [f"{LM}.layers.1.mlp.shared_expert.gate_proj",
+                                                          f"{LM}.layers.1.mlp.shared_expert.up_proj"],
+        "model.layers.0.attn_hyper_connection.input_mix_weight_up": [f"{LM}.layers.0.attn_hyper_connection.input_mix_weight_up"],
+        "model.hyper_connection_mixer.input_mix_weight_down": [f"{LM}.hyper_connection_mixer.input_mix_weight_down"],
     }
     for module, parts in cases.items():
         want = torch.cat([raw[p + ".weight"].float() for p in parts])
@@ -583,8 +588,22 @@ def test_load_time_mxfp8_leaves_untargeted_modules_bf16(load_time, checkpoint):
     gdn = f"{LM}.layers.0.linear_attn"
     ba = torch.cat([raw[f"{gdn}.in_proj_b.weight"], raw[f"{gdn}.in_proj_a.weight"]])
     assert torch.equal(loaded["model.layers.0.linear_attn.in_proj_ba.weight"], ba)
-    shared = f"{LM}.layers.1.mlp.shared_expert"
-    gate_up = torch.cat([raw[f"{shared}.gate_proj.weight"], raw[f"{shared}.up_proj.weight"]])
-    assert torch.equal(loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"], gate_up)
     assert torch.equal(loaded["model.embed_tokens.weight"], raw[f"{LM}.embed_tokens.weight"])
+    assert loaded["model.layers.1.mlp.gate.weight"].dtype is torch.bfloat16
     assert loaded["model.layers.1.self_attn.indexer.index_qk_proj.weight"].dtype is torch.bfloat16
+
+
+def test_load_time_mxfp8_pads_the_hc_merge_scales_with_its_weight(load_time, checkpoint):
+    """The merged HC down|inject weight gains zero pad rows; its per-row MXFP8 codes must be padded to match."""
+    loaded, state = load_time
+    _folder, raw = checkpoint
+    hc = "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject"
+    weight, codes = loaded[hc + ".weight"], loaded[hc + ".weight_scale_inv"]
+    assert weight.shape == state[hc + ".weight"].shape and codes.shape == state[hc + ".weight_scale_inv"].shape
+    src = f"{LM}.layers.0.attn_hyper_connection"
+    parts = [raw[f"{src}.input_mix_weight_down.weight"], raw[f"{src}.block_inject_weight.weight"]]
+    rows = sum(p.shape[0] for p in parts)
+    want = torch.cat(parts).float()
+    got = _dequant_mxfp8(weight, codes)
+    assert (got[:rows] - want).norm() / want.norm() < 0.04
+    assert torch.all(got[rows:] == 0)
