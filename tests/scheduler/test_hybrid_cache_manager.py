@@ -241,5 +241,16 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def test_host_snapshot_tier_lowers_the_gpu_snapshot_floor(monkeypatch):
+    """With FT_GDN_HOST_TIER evicted snapshots live in RAM, so one GPU snapshot slot is enough."""
+    from types import SimpleNamespace
+    from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
+    c = SimpleNamespace(max_running_req=1, cache_type="hybrid_radix", linear_state_cache_ratio=0.0)
+    monkeypatch.delenv("FT_GDN_HOST_TIER", raising=False)
+    assert _linear_pool_num_slots(c) == 4 + 4 + 1
+    monkeypatch.setenv("FT_GDN_HOST_TIER", "1")
+    assert _linear_pool_num_slots(c) == 4 + 1 + 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
