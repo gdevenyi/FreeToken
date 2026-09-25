@@ -124,12 +124,16 @@ def _set_cpu_moe_env(monkeypatch, isa=None, w4a8=True):
         monkeypatch.setenv("FREETOKEN_CPU_MOE_NO_VNNI", "1")
 
 
-def _cpu_has_avx2() -> bool:
+def _cpu_flags() -> list[str]:
     try:
         with open("/proc/cpuinfo") as f:
-            flags = next((ln for ln in f if ln.startswith("flags")), "").split()
+            return next((ln for ln in f if ln.startswith("flags")), "").split()
     except OSError:
-        return False
+        return []
+
+
+def _cpu_has_avx2() -> bool:
+    flags = _cpu_flags()
     return "avx2" in flags and "fma" in flags
 
 
@@ -270,11 +274,15 @@ def test_cpu_decode_nvfp4_isa_tiers_match_their_reference(H, I, isa, w4a8, monke
     math that path claims: the int8 kernels must equal per-16 int8 activation
     quantization (tighter than the gap between W4A8 and fp32, so a lane or scale slip
     fails), the fp32 path the unquantized dequant GEMV. (1072, 528) leaves 16-K blocks
-    past the AVX2 kernel's 4-block groups in both GEMVs."""
+    past the AVX2 kernel's 4-block groups in both GEMVs. The VNNI kernels ignore the
+    forced tier, so on an AVX-VNNI CPU the AVX2 int8 kernel goes untested here."""
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     _set_cpu_moe_env(monkeypatch, isa=isa, w4a8=w4a8)
+    flags = _cpu_flags()
+    if "avx512_vnni" in flags and "avx_vnni" not in flags:
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_NO_AVX512VNNI", "1")
     torch.manual_seed(7)
     L, E, top_k, bs, layer = 2, 16, 4, 2, 1
     dev = torch.device("cuda")
@@ -286,8 +294,8 @@ def test_cpu_decode_nvfp4_isa_tiers_match_their_reference(H, I, isa, w4a8, monke
     quantized = "w4a8" in ex.isa
     if not w4a8:
         assert not quantized, ex.isa
-    elif isa == "avx2" and _cpu_has_avx2():
-        assert quantized, ex.isa  # a forced avx2 tier must run the AVX2 int8 kernel
+    elif isa == "avx2" and _cpu_has_avx2() and "avx_vnni" not in flags:
+        assert "+avx2i8" in ex.isa, ex.isa  # a forced avx2 tier must run the AVX2 int8 kernel
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
     ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
