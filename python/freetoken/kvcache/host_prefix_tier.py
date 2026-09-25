@@ -84,14 +84,22 @@ class HostPrefixTier:
             from freetoken.kvcache.kv_host_offload import _reject_block_scaled_pool
 
             _reject_block_scaled_pool(kv_pool, "FT_PREFIX_HOST")
-            if getattr(kv_pool, "_cmp_k_buffer", None) is not None:
-                # a QSA pool's indexer slab is keyed by the same pages and is not mirrored here
+            if (getattr(kv_pool, "_cmp_k_buffer", None) is not None
+                    or getattr(kv_pool, "_index_k_buffer", None) is not None):
+                # a QSA/DSA/BSA indexer slab is keyed by the same pages and is not mirrored here
                 raise ValueError(
-                    "FT_PREFIX_HOST cannot restore a sparse-attention pool's compressed index "
-                    "slab; keep FT_GDN_HOST_TIER alone for this model"
+                    "FT_PREFIX_HOST cannot restore a sparse-attention pool's index slab; "
+                    "keep FT_GDN_HOST_TIER alone for this model"
                 )
-            codes = kv_pool._kv_buffer            # [2, L, P, page, H, D]
+            codes = getattr(kv_pool, "_kv_buffer", None)      # [2, L, P, page, H, D]
             scales = getattr(kv_pool, "_scale_buffer", None)  # [2, L, P*page, H] | None (fp8)
+            if (codes is None or codes.dim() != 6 or codes.shape[0] != 2
+                    or (scales is not None and scales.dim() != 4)):
+                raise ValueError(
+                    "FT_PREFIX_HOST copies paged K/V pages [2, layers, pages, page, heads, dim]; "
+                    f"the {type(kv_pool).__name__} pool has another layout -- keep "
+                    "FT_GDN_HOST_TIER alone for this model"
+                )
             _, layers, _, page_size, heads, dim = codes.shape
             page_bytes = 2 * layers * page_size * heads * dim * codes.element_size()
             if scales is not None:
