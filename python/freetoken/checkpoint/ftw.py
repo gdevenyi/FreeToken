@@ -466,7 +466,8 @@ def load_ftw_banks(
     ``cache_budget.expert_bytes_per_slot``).
     """
     from freetoken.moe.host_banks import (
-        HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
+        NUMA_PLACED_FORMATS, HostBank, HostResidency, PinPipeline, alloc_banks,
+        born_pinned_default, numa_placement_nodes, place_expert_rows,
     )
     from freetoken.utils.progress import byte_bar
 
@@ -486,6 +487,7 @@ def load_ftw_banks(
     if not bank_entries:
         reader.close()
         return None
+    quant_format = reader.meta("quant_format")
 
     alpha_entries = [e for e in bank_entries if e["name"] in _ALPHA_NAMES]
     row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
@@ -560,6 +562,21 @@ def load_ftw_banks(
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id))
 
+    def _row_view(bank, view_args):
+        if view_args is None:  # per-layer entry: already shaped [num_experts, ...]
+            return bank.tensor
+        head_pad, layer_bytes, num_experts, row_shape, dtype = view_args
+        raw = bank.tensor[head_pad:head_pad + layer_bytes].view(dtype)
+        return raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts)
+
+    nodes = numa_placement_nodes() if quant_format in NUMA_PLACED_FORMATS else []
+    if nodes:
+        # before the reads fault the pages in; born-pinned banks are already faulted
+        place_expert_rows([_row_view(bank, args) for name, banks in row_hb.items()
+                           for bank, args in zip(banks, row_view_args[name])
+                           if bank.residency is not HostResidency.PINNED], nodes)
+        logger.info_rank0(f"expert banks: rows of every expert split over NUMA nodes {nodes}")
+
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
 
@@ -598,24 +615,14 @@ def load_ftw_banks(
         bar.close()
         reader.close()
 
-    sources: dict[str, list] = {}
-    for name, banks in row_hb.items():
-        views = []
-        for bank, view_args in zip(banks, row_view_args[name]):
-            if view_args is None:  # per-layer entry: already shaped [num_experts, ...]
-                views.append(bank.tensor)
-                continue
-            head_pad, layer_bytes, num_experts, row_shape, dtype = view_args
-            raw = bank.tensor[head_pad:head_pad + layer_bytes].view(dtype)
-            views.append(raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts))
-        sources[name] = views
+    sources = {name: [_row_view(bank, args) for bank, args in zip(banks, row_view_args[name])]
+               for name, banks in row_hb.items()}
 
     from freetoken.moe.legacy_format import canonical_role, kind_kernel_for
     from freetoken.moe.expert_banks import ExpertBanks
 
     # the file names the banks the legacy way; the quant_format tag names the (kind, kernel) they were packed for
     sources = {canonical_role(name): views for name, views in sources.items()}
-    quant_format = reader.meta("quant_format")
     kind, kernel = kind_kernel_for(quant_format) if quant_format is not None else (None, None)
 
     # a failed mlock leaves a LOCKED layer pageable; the log and labels report what the banks actually settled at
