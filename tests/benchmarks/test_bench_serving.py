@@ -7,6 +7,7 @@ from benchmarks.bench_serving import (
     StreamResult,
     aggregate,
     calibrate_prompt,
+    decode_prompt_tokens,
     generation_payload,
     parse_args,
     prompt_tolerance,
@@ -47,6 +48,14 @@ def test_parse_args_rejects_invalid_values():
         parse_args(["--prefill-sizes", "512,nope"])
     with pytest.raises(SystemExit):
         parse_args(["--decode-tokens", "0"])
+    with pytest.raises(SystemExit):
+        parse_args(["--decode-prompt-tokens", "0"])
+
+
+def test_decode_prompt_size_follows_the_flag():
+    assert decode_prompt_tokens(parse_args([])) == 512
+    assert decode_prompt_tokens(parse_args(["--prefill-sizes", "128,4096"])) == 128
+    assert decode_prompt_tokens(parse_args(["--decode-prompt-tokens", "131072"])) == 131072
 
 
 def test_generation_payload_disables_thinking_and_requests_usage():
@@ -155,6 +164,12 @@ def test_sample_metrics_missing_cache_report_is_explicit_none():
     assert metrics["cached_tokens"] is None
     assert metrics["cache_hit_ratio"] is None
     assert metrics["client_wall_effective_prefill_tps"] is None
+
+
+def test_sample_metrics_reports_raw_prefill_without_a_cache_report():
+    """FreeToken leaves prompt_tokens_details out when nothing was cached."""
+    metrics = sample_metrics(_stream_result(cached_tokens=None))
+    assert metrics["client_wall_prefill_tps"] == pytest.approx(100.0)
 
 
 def test_aggregate_reports_median_min_max_and_ignores_none():
