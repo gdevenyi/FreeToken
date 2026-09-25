@@ -39,3 +39,40 @@ def test_each_prefill_group_uploads_its_own_page_list_while_the_stream_is_busy()
     assert groups == [(r, r + 1) for r in range(rows)]
     for r, got in enumerate(received):
         assert sorted(got.tolist()) == sel[r].tolist(), (r, got.tolist())
+
+
+@pytest.mark.parametrize("atomics", [False, True])
+def test_compacted_selection_flags_rows_that_overflow_max_sel_pages(atomics, monkeypatch):
+    """Below sm_70 the dropped-page counter is a plain store, since Triton lowers atomics to
+    sm_70+ PTX; a racing row may win, but the counter is non-zero iff some row dropped."""
+    import freetoken.kernel.triton.qsa.offload as offload_kernels
+
+    if atomics and torch.cuda.get_device_capability() < (7, 0):
+        pytest.skip("atomics need sm_70")
+    monkeypatch.setattr(offload_kernels, "device_capability", lambda: (7, 0) if atomics else (6, 1))
+    off = _offloader(num_slots=13, num_logical=64)
+    off.max_sel_pages, off.page_size, off.dummy_page = 2, 4, 64
+    off._sel_all = None
+    off._trunc_eager = torch.zeros(1, dtype=torch.int32, device="cuda")
+    off._g = {}
+    block_table = (torch.arange(8, dtype=torch.int32, device="cuda") + 10).view(1, 8)
+    token_to_req = torch.zeros(4, dtype=torch.int32, device="cuda")
+
+    def tokens(*rows):
+        return torch.tensor(rows, dtype=torch.int32, device="cuda")
+
+    indices = tokens(
+        [0, 1, 2, -1, -1, -1],      # one page
+        [0, 4, 8, 12, 16, 20],      # six pages: keeps 2, drops 4
+        [4, 5, 8, 12, -1, -1],      # three pages: keeps 2, drops 1
+        [-1, -1, -1, -1, -1, -1],   # nothing selected
+    )
+    sel = off.compact_all(indices, token_to_req, block_table)
+    assert sel.tolist() == [[10, 10], [10, 11], [11, 12], [64, 64]]
+    assert off._counts_dev[:4].tolist() == [1, 2, 2, 0]
+    dropped = off.trunc_count()
+    assert dropped == 4 if atomics else dropped in (4, 1)
+    assert off.trunc_count() == 0  # read resets
+
+    off.compact_all(indices[[0, 3]], token_to_req[:2], block_table)
+    assert off.trunc_count() == 0
