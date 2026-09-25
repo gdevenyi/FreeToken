@@ -202,7 +202,7 @@ def test_sdk_classifies_invalid_request_as_400(protocol):
         async with client(state, vendor) as sdk:
             with pytest.raises(error) as caught:
                 if protocol == "chat":
-                    await sdk.chat.completions.create(model="test", messages=[{"role": "user", "content": "Hi"}], n=2)
+                    await sdk.chat.completions.create(model="test", messages=[{"role": "user", "content": "Hi"}], n=0)
                 elif protocol == "responses":
                     await sdk.responses.create(model="test", input="Hi", background=True)
                 else:

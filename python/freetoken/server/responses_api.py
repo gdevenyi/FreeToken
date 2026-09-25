@@ -177,7 +177,7 @@ async def handle_responses(
     try:
         # an abandoned request must not keep decoding to max_tokens (#222's watcher)
         result = await _await_watching_disconnect(
-            generate_full(uid, spec, state, source="/v1/responses"), request, state, uid
+            generate_full(uid, spec, state, source="/v1/responses"), request, state, [uid]
         )
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
