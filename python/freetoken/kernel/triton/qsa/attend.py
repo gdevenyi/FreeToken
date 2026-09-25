@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
+from freetoken.kernel.backend import device_capability
 from freetoken.kernel.triton.attention import _optin_smem_bytes
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32
 from freetoken.kernel.triton.kv_nvfp4 import load_nvfp4
@@ -408,6 +409,11 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+
+    if device_capability() < (7, 0):
+        # sm_61 sweep at 2048 rows x 2048 selected tokens: tl.dot runs on FMAs there and 16-wide
+        # tiles on 4 warps reach ~4.4x the 64-wide 2-warp prefill profile
+        block_n, partial_warps = 16, 4
 
     # The dot operands stage q plus one k and one v tile in shared memory; halve the
     # column tile until they fit devices with a small per-block budget (48 KB on Pascal).
