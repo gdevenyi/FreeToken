@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.backend import device_capability
+
 
 @triton.jit
 def _write_pages_kernel(out_loc, write_pages, page_size: tl.constexpr):
@@ -46,6 +48,7 @@ def _compact_sel_kernel(
     maxp: tl.constexpr,      # rows of `out` per row written (<= MAXV)
     maxv: tl.constexpr,      # next_pow2(maxp)
     dummy_page,              # logical id used when a row selects nothing (never happens in practice)
+    HAS_ATOMICS: tl.constexpr,
 ):
     r = tl.program_id(0)
     req = tl.load(token_to_req + r).to(tl.int64)
@@ -67,7 +70,12 @@ def _compact_sel_kernel(
     row = tl.where(lanes < count, seen, first)
     tl.store(out + r * maxp + lanes, row, mask=lanes < maxp)
     tl.store(counts + r, count)
-    tl.atomic_max(trunc, ndrop)
+    if HAS_ATOMICS:
+        tl.atomic_max(trunc, ndrop)
+    else:
+        # Triton lowers every atomic to sm_70+ PTX. Racing plain stores still leave the
+        # counter non-zero whenever any row dropped, which is all its readers test.
+        tl.store(trunc, ndrop, mask=ndrop > 0)
 
 
 def compact_selected_pages(
@@ -105,7 +113,7 @@ def compact_selected_pages(
         _compact_sel_kernel[(rows,)](
             indices, token_to_req, block_table, out, trunc, counts,
             sel, block_table.stride(0), page_size, maxp, triton.next_power_of_2(maxp),
-            dummy_page,
+            dummy_page, HAS_ATOMICS=device_capability() >= (7, 0),
         )
 
 
