@@ -581,8 +581,19 @@ class NGramEmbedding(BaseOP):
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
         return torch.cat(blocks, dim=-1)
 
+    def lookup_row_ids(self, meta: PLEMetadata) -> torch.Tensor:
+        """``row_ids`` as the attached table's ``prefetch``/``lookup`` take them. A table that
+        hashes on the host (``reads_row_ids = False``) reads only their shape: skip the hash."""
+        if not getattr(self.table, "reads_row_ids", True):
+            return torch.empty(
+                (meta.input_ids.numel(), self.num_heads),
+                dtype=torch.int64,
+                device=meta.input_ids.device,
+            )
+        return self.row_ids(meta)
+
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
-        return self.table.lookup(self.row_ids(meta), out)
+        return self.table.lookup(self.lookup_row_ids(meta), out)
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -680,7 +691,7 @@ class PLELayer(BaseOP):
         """Hash this forward's n-grams and start the table gather on the side stream."""
         if meta is None:
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
-        row_ids = self.ple_embedding.row_ids(meta)
+        row_ids = self.ple_embedding.lookup_row_ids(meta)
         self._pending = (meta, row_ids)
         self.ple_embedding.table.prefetch(row_ids)
 
@@ -701,7 +712,7 @@ class PLELayer(BaseOP):
         elif pending is not None and pending[0] is meta:
             row_ids = pending[1]
         if row_ids is None:
-            row_ids = self.ple_embedding.row_ids(meta)
+            row_ids = self.ple_embedding.lookup_row_ids(meta)
 
         embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
