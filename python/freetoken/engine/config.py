@@ -37,6 +37,8 @@ class EngineConfig:
     # lm_head) at load, "none" serves them as the checkpoint stores them.
     dense_quant: str = "none"
     lm_head_quant: str = "none"
+    # --embed-weights: "host" keeps the token embedding in pinned host RAM, gathered over PCIe.
+    embed_weights: str = "gpu"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the

@@ -75,6 +75,39 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
+def _place_embeddings_on_host(model) -> None:
+    """--embed-weights host: every input embedding table moves to pinned host RAM, except one an lm_head is tied to."""
+    from freetoken.layers.base import BaseOP
+    from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+
+    found: list[VocabParallelEmbedding] = []
+    tied: set[int] = set()
+    stack, seen = [model], set()
+    while stack:
+        op = stack.pop()
+        if id(op) in seen:
+            continue
+        seen.add(id(op))
+        if isinstance(op, ParallelLMHead):
+            if op.tied_embedding is not None:
+                tied.add(id(op.tied_embedding))
+            continue
+        if isinstance(op, VocabParallelEmbedding):
+            found.append(op)
+            continue
+        for value in vars(op).values():
+            items = value if isinstance(value, (list, tuple)) else (value,)
+            stack.extend(v for v in items if isinstance(v, BaseOP))
+    moved = [e for e in found if id(e) not in tied]
+    if not moved:
+        raise ValueError("--embed-weights host: the model has no untied input embedding to move")
+    for emb in moved:
+        emb.place_on_host()
+    torch.cuda.empty_cache()
+    size = sum(e.weight.numel() * e.weight.element_size() for e in moved)
+    logger.info_rank0(f"Token embedding in pinned host RAM ({mem_GB(size)}), gathered over PCIe")
+
+
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
     what the resident model consumed. Kept as a pure function so the composition with the
@@ -433,6 +466,8 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        if config.embed_weights == "host":
+            _place_embeddings_on_host(self.model)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
