@@ -314,3 +314,6 @@ def test_mapped_developer_messages_are_merged_into_one_leading_system_message():
     assert mapped[0]["content"] == "be brief\n\nanswer in German"
     late = [{"role": "user", "content": "hi"}, {"role": "developer", "content": "be brief"}]
     assert [m["role"] for m in _map_developer_role(late, template)] == ["system", "user"]
+    image = [{"type": "text", "text": "B"}, {"type": "image", "freetoken_ref": {"kind": "url", "data": "x"}}]
+    with pytest.raises(ValueError, match="System message cannot contain images"):
+        _map_developer_role([{"role": "developer", "content": "A"}, {"role": "system", "content": image}], template)

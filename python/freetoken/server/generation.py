@@ -25,7 +25,7 @@ from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
-from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.tokenize import join_system_contents, resolve_thinking_mode
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -259,6 +259,11 @@ def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     hoist system messages to the front and merge multiples into one to satisfy
     that constraint."""
     rendered = [_render_message(m) for m in messages]
+    if any(m.get("role") == "developer" for m in rendered):
+        # The tokenizer maps developer per template and then merges in order
+        # (_map_developer_role); hoisting system alone here would put it ahead of
+        # a developer message that came first.
+        return rendered
     system_msgs = [m for m in rendered if m.get("role") == "system"]
     if system_msgs and rendered[0].get("role") != "system":
         non_system = [m for m in rendered if m.get("role") != "system"]
@@ -267,12 +272,8 @@ def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # system messages that are not at loop.first, i.e. after the first).
     system_msgs = [m for m in rendered if m.get("role") == "system"]
     if len(system_msgs) > 1:
-        sep = chr(10) + chr(10)
-        merged_content = sep.join(
-            str(m.get("content") or "") for m in system_msgs if m.get("content")
-        )
         non_system = [m for m in rendered if m.get("role") != "system"]
-        rendered = [{"role": "system", "content": merged_content}] + non_system
+        rendered = [{"role": "system", "content": join_system_contents(system_msgs)}] + non_system
     return rendered
 
 
