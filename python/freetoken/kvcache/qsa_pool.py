@@ -67,6 +67,7 @@ class QSAKVCache(MHAKVCache):
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
         kv_quant: str = "none",
+        num_index_pages: int | None = None,
     ) -> None:
         if kv_quant not in ("none", "fp8", "nvfp4"):
             raise ValueError(f"unsupported QSA kv_quant {kv_quant!r}")
@@ -96,6 +97,10 @@ class QSAKVCache(MHAKVCache):
         self._index_dtype = dtype
         self._page_size = page_size
         self._mrope = mrope
+        # KV host offload: the K/V slabs stay at num_pages PHYSICAL pages while the
+        # compressed index slab covers the (larger) logical page space, so selection keeps
+        # working for host-resident pages. None -> the slab follows the K/V pages.
+        self._num_index_pages = num_pages if num_index_pages is None else num_index_pages
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
@@ -115,7 +120,7 @@ class QSAKVCache(MHAKVCache):
             kv_quant=kv_quant,
         )
         self._zero_kv_slabs()
-        self._alloc_index_tiers(num_pages)
+        self._alloc_index_tiers(self._num_index_pages)
 
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
