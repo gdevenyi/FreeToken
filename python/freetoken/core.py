@@ -49,6 +49,10 @@ class SamplingParams:
     # Decode with skip_special_tokens. Off by default here: the reasoning and tool parsers
     # consume the <think>/tool tags from the decoded text.
     skip_special_tokens: bool = False
+    # Sampled-token logprobs (OpenAI `logprobs`/`top_logprobs`): when on, the sampler
+    # reports the chosen token's raw (pre-temperature) logprob and top-k alternatives.
+    logprobs: bool = False
+    top_logprobs: int = 0
 
     @property
     def is_greedy(self) -> bool:
