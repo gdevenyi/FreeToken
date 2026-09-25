@@ -92,7 +92,10 @@ def _sm_partial(
         x = tl.load(logits_ptr + base + offs, mask=mask, other=-float("inf")).to(tl.float32) * inv_t
         blk_max = tl.max(x, 0)
         new_m = tl.maximum(m, blk_max)
-        d = d * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), 0)
+        # A fully masked prefix (min_p / min_tokens write -inf) leaves new_m at -inf, and
+        # exp(-inf - -inf) is NaN; shift by 0 there instead, every term is exp(-inf) = 0.
+        safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+        d = d * tl.exp(m - safe_m) + tl.sum(tl.exp(x - safe_m), 0)
         m = new_m
     tl.store(pm_ptr + pid, m)
     tl.store(pl_ptr + pid, d)
@@ -117,7 +120,8 @@ def _sm_finalize(
     pm = tl.load(pm_ptr + row * G + goff, mask=gmask, other=-float("inf"))
     pl = tl.load(pl_ptr + row * G + goff, mask=gmask, other=0.0)
     gm = tl.max(pm, 0)
-    gl = tl.sum(pl * tl.exp(pm - gm), 0)
+    # a chunk that is -inf throughout holds no mass; keep its NaN-prone exp out of the sum
+    gl = tl.sum(tl.where(pm == -float("inf"), 0.0, pl * tl.exp(pm - gm)), 0)
     inv_gl = 1.0 / gl
 
     base = row * row_stride
