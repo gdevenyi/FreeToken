@@ -184,7 +184,9 @@ class Sampler:
         min_ids: list[list[int]] = []
         for local, (req, p) in enumerate(picked):
             if p.min_tokens > 0 and p.min_tokens_stop_ids:
-                generated = len(req.input_ids) - (req.max_device_len - req.output_len)
+                # device_len, not the host ids: under overlap scheduling the previous token
+                # reaches req.input_ids only after this batch is prepared
+                generated = req.device_len - (req.max_device_len - req.output_len)
                 if generated < p.min_tokens:
                     min_rows.append(local)
                     min_ids.append([t for t in p.min_tokens_stop_ids if 0 <= t < self.vocab_size])
