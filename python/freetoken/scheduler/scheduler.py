@@ -469,9 +469,11 @@ class Scheduler(SchedulerIOMixin):
         prompt_len = req.max_device_len - req.output_len
         end = len(req.input_ids)
         # The frontend omits a terminal EOS, including at the output limit with ignore_eos.
+        # The limit is the delivered length, as in hit_length: under overlap device_len (and
+        # so can_decode) runs a step ahead of the host.
         if (
             end > prompt_len
-            and not req.can_decode
+            and end >= req.max_device_len
             and int(req.input_ids[-1]) in self.eos_token_ids
         ):
             end -= 1
