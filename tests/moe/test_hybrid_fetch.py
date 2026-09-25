@@ -204,3 +204,45 @@ def test_auto_fetch_keeps_a_split_benched_on_other_sized_experts(tmp_path, monke
     engine_mod.Engine._resolve_hybrid_fetch(fake_engine, config, cache)
     assert cache.hybrid_fetch_fraction == pytest.approx(25.2 / (25.2 + 74.1))
     assert cache.hybrid_max_fetch == 512
+
+
+def test_auto_fetch_logs_one_consistent_message_per_outcome(tmp_path, monkeypatch):
+    """The other-size fallback reads the profile once: one warning that says the split is
+    approximate (not a withheld backend "verdict" next to it), and a profile from another GPU
+    is reported once."""
+    from types import SimpleNamespace
+
+    from freetoken.engine import engine as engine_mod
+    from freetoken.moe import bench_profile
+
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps({
+        "gpu": {"name": "FAKE GPU"},
+        "dtype_kernels": {"nvfp4": {
+            "expert_bytes": 7974912, "cpu_moe_overlap_gbs": 74.1, "pcie_gather_overlap_gbs": 25.2,
+        }},
+    }))
+    monkeypatch.setenv("FREETOKEN_BENCHBW_PATH", str(path))
+    monkeypatch.setattr(bench_profile, "_warned", set())
+    warnings = []
+    monkeypatch.setattr(bench_profile.logger, "warning", warnings.append)
+    monkeypatch.setattr(engine_mod.logger, "warning_rank0", warnings.append)
+    model_config = SimpleNamespace(hidden_size=2560, moe_intermediate_size=640,
+                                   num_experts=512, num_experts_per_tok=10)
+    config = SimpleNamespace(moe_hybrid_max_fetch=-1, model_config=model_config)
+
+    def resolve(gpu):
+        monkeypatch.setattr(engine_mod, "_profile_gpu", lambda index=None: (gpu, None))
+        cache = SimpleNamespace(quant_format="nvfp4", num_experts=512,
+                                hybrid_max_fetch=None, hybrid_fetch_fraction=0.0)
+        warnings.clear()
+        engine_mod.Engine._resolve_hybrid_fetch(SimpleNamespace(device=torch.device("cpu")), config, cache)
+        return cache
+
+    cache = resolve("FAKE GPU")
+    assert cache.hybrid_fetch_fraction == pytest.approx(25.2 / (25.2 + 74.1))
+    assert len(warnings) == 1 and "approximate" in warnings[0] and "verdict" not in warnings[0]
+
+    cache = resolve("OTHER GPU")
+    assert cache.hybrid_max_fetch == 1
+    assert sum("not this GPU" in w for w in warnings) == 1 and len(warnings) == 2

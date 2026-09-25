@@ -61,7 +61,7 @@ def _model_entry(prof: dict, fmt: str, geometry) -> dict | None:
     return None
 
 
-def _comparable(entry, fmt: str, expert_bytes) -> bool:
+def _comparable(entry, fmt: str, expert_bytes, *, warn: bool = True) -> bool:
     """Whether ``entry`` (a dtype_kernels / workload kernels entry) was benched on experts of a
     size comparable to ``expert_bytes``. Unknown on either side -> assumed comparable (older
     profiles carry no ``expert_bytes``; callers that pass none keep the format-only join)."""
@@ -71,6 +71,8 @@ def _comparable(entry, fmt: str, expert_bytes) -> bool:
     ratio = max(benched, expert_bytes) / min(benched, expert_bytes)
     if ratio <= EXPERT_BYTES_TOLERANCE:
         return True
+    if not warn:
+        return False
     key = (fmt, benched, expert_bytes)
     if key not in _warned:
         _warned.add(key)
@@ -219,6 +221,18 @@ def load_backend_recommendation(
     return "hybrid" if all(p == "hybrid" for p in picks) else "offload"
 
 
+def _fetch_fraction(entry) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
+    if cpu_ov and pcie_ov:
+        return min(1.0, pcie_ov / (pcie_ov + cpu_ov))
+    cpu, pcie = entry.get("cpu_moe_gbs"), entry.get("pcie_gather_gbs")
+    if cpu and pcie:
+        return min(1.0, pcie / cpu)
+    return None
+
+
 def load_hybrid_fetch_fraction(
     quant_format: str,
     gpu_name: str | None = None,
@@ -227,6 +241,7 @@ def load_hybrid_fetch_fraction(
     *,
     expert_bytes: int | None = None,
     geometry: dict | None = None,
+    other_sizes: bool = False,
 ) -> float | None:
     """Benched hybrid fetch fraction for ``quant_format``, or ``None``.
 
@@ -239,6 +254,10 @@ def load_hybrid_fetch_fraction(
     reduces to pcie/cpu. A per-model entry of the served ``geometry`` first, then the
     per-dtype entry, then any per-model entry with this format -- each only when benched on
     experts comparable to ``expert_bytes``. ``None`` = no usable profile; clamped to [0, 1].
+
+    ``other_sizes``: when only differently sized experts were benched, return the first of
+    their splits (with one warning) instead of ``None``. It is off by however much expert size
+    moves the CPU rate, which for hybrid decode still beats a fixed fetch cap.
     """
     fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
     prof = _usable_profile(gpu_name, path, gpu_uuid)
@@ -249,13 +268,22 @@ def load_hybrid_fetch_fraction(
         for wl in (prof.get("workloads") or {}).values()
         if isinstance(wl, dict)
     ]
-    for entry in entries:
-        if not isinstance(entry, dict) or not _comparable(entry, fmt, expert_bytes):
-            continue
-        cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
-        if cpu_ov and pcie_ov:
-            return min(1.0, pcie_ov / (pcie_ov + cpu_ov))
-        cpu, pcie = entry.get("cpu_moe_gbs"), entry.get("pcie_gather_gbs")
-        if cpu and pcie:
-            return min(1.0, pcie / cpu)
-    return None
+    splits = [(e, f) for e in entries if (f := _fetch_fraction(e)) is not None]
+    for entry, fraction in splits:
+        if _comparable(entry, fmt, expert_bytes, warn=not other_sizes):
+            return fraction
+    if not other_sizes or not splits:
+        return None
+    entry, fraction = splits[0]
+    benched = entry["expert_bytes"]
+    key = ("fetch", fmt, benched, expert_bytes)
+    if key not in _warned:
+        _warned.add(key)
+        logger.warning(
+            f"benchbw profile: no {fmt!r} hybrid fetch split was benched on experts of this "
+            f"model's size ({expert_bytes / 2**20:.2f} MB); using the one benched on "
+            f"{benched / 2**20:.2f} MB experts, which is only approximate here. Run "
+            f"`ft bench bw --model <preset>` for this model's geometry or pass "
+            f"--moe-hybrid-max-fetch N"
+        )
+    return fraction
