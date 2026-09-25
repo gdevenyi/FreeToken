@@ -150,6 +150,7 @@ class _PendingFill:
         pending = self._table._pending_fills()
         if self._future in pending:
             pending.remove(self._future)  # its outcome was consumed here
+        self._table._retire(self._future)
         self._table._flag.zero_()
 
 
@@ -240,12 +241,24 @@ class DiskRowTable:
     def _pending_fills(self) -> deque:
         return self.__dict__.setdefault("_pending_fill_queue", deque())
 
+    def _readback_pool(self) -> list:
+        return self.__dict__.setdefault("_readback_events", [])
+
+    def _retire(self, future: Future) -> None:
+        """Return a finished fill's readback event for reuse (engine thread only)."""
+        event = getattr(future, "readback", None)
+        if event is not None:
+            self._readback_pool().append(event)
+            future.readback = None
+
     def _raise_failed_fill(self) -> None:
         """Surface a finished graph fill's error on the engine thread, oldest first; a failed
         fill signalled its WAIT, so that graph ran on stale rows."""
         pending = self._pending_fills()
         while pending and pending[0].done():
-            exc = pending.popleft().exception()
+            future = pending.popleft()
+            self._retire(future)
+            exc = future.exception()
             if exc is not None:
                 raise exc
 
@@ -285,7 +298,10 @@ class DiskRowTable:
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 # one event per fill: a shared one re-recorded by the next step before this job
                 # reached synchronize() would wait on a graph parked on this job's own WAIT
-                readback = torch.cuda.Event()
+                # recycled, never destroyed while serving: cuEventDestroy from the filler blocks on
+                # the driver lock a blocked cuGraphLaunch holds, and the fill it waits for never runs
+                pool = self._readback_pool()
+                readback = pool.pop() if pool else torch.cuda.Event()
                 readback.record(self._current_stream())
                 cancelled = threading.Event()
 
@@ -305,6 +321,7 @@ class DiskRowTable:
                         raise
 
                 future = self._filler().submit(_job)
+                future.readback = readback
                 self._pending_fills().append(future)
                 return _PendingFill(self, future, cancelled)
             # launch-gating: this D2H is the step's readback and orders the fill after sampling

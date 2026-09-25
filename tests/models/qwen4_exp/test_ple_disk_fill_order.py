@@ -225,3 +225,28 @@ def test_a_failed_fill_is_raised_after_the_next_step_was_submitted(monkeypatch):
     with pytest.raises(OSError, match="PLE row read failed"):
         t.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[req]), use_graph=False)
     _close(t)
+
+
+def test_the_readback_event_is_never_freed_on_the_filler_thread(monkeypatch):
+    """cuEventDestroy on the filler blocks on the driver lock a blocked cuGraphLaunch holds (host
+    nodes in the graph make the launch wait for the GPU, which is parked on the next fill's WAIT)."""
+    import gc
+
+    freed_on: list[str] = []
+
+    class _TrackedEvent(_Event):
+        def __del__(self):
+            freed_on.append(threading.current_thread().name)
+
+    t = _table(monkeypatch)
+    monkeypatch.setattr(ple_disk.torch.cuda, "Event", _TrackedEvent)
+    for prev, new in (([1, 2, 3], 7), ([1, 2, 3, 7], 8)):
+        with t.forward_host_ctx(_decode_batch(prev, new), use_graph=True):
+            assert _blocking_launch(t._flag)
+    time.sleep(0.05)  # let the filler drop its work items
+    gc.collect()
+    t._raise_failed_fill()
+    gc.collect()
+    assert "ple-filler" not in freed_on, freed_on
+    assert len(t._readback_pool()) >= 1  # finished fills hand their events back for reuse
+    _close(t)
