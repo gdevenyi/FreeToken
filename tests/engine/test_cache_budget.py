@@ -456,7 +456,7 @@ def test_rebuild_fit_check_reserves_the_gdn_prefill_workspace():
     config = SimpleNamespace(
         model_config=SimpleNamespace(linear_attention_group=lambda: group),
         dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
-        max_extend_tokens=1024, max_seq_len=4096,
+        max_extend_tokens=1024, max_seq_len=4096, kv_host_pages=0,
     )
     captured = {}
 
@@ -477,6 +477,45 @@ def test_rebuild_fit_check_reserves_the_gdn_prefill_workspace():
     workspace = gdn_prefill_workspace_bytes(config)
     assert workspace > 0
     assert captured["extra_fixed_bytes"] == state_pool_bytes(config, 5) + workspace
+
+
+def test_rebuild_fit_check_prices_the_kv_host_tier_not_logical_pages():
+    """A MoE-only rebuild under --kv-host-pages: the fit-check prices the GPU-resident pages at
+    the KV page cost and the host pages at their index slab + serving margin, like startup.
+    Pricing all logical pages as GPU pages would reject every rebuild on a 262K context."""
+    from freetoken.engine.engine import _KV_OFFLOAD_SERVING_MARGIN, Engine
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    spec = SimpleNamespace(num_layers=12, index_ratio=4, num_index_layers=12, index_head_dim=128)
+    config = SimpleNamespace(
+        page_size=64, kv_host_pages=3600,
+        model_config=SimpleNamespace(
+            kv_cache_group_specs=lambda: [spec], linear_attention_group=lambda: None,
+        ),
+    )
+    captured = {}
+
+    class StubQSA(QSAKVCache):
+        def __init__(self):
+            pass
+
+        def validate_rebuild(self, config, **kwargs):
+            captured.update(kwargs)
+            raise CacheRebuildRejected("stop before teardown")
+
+    engine = SimpleNamespace(
+        config=config, kv_offloader=object(), linear_state_pool=None, kv_cache=StubQSA(),
+        moe_offload_cache=SimpleNamespace(validate_rebuild=lambda size: None),
+        _baseline_free=1 << 30, _weights_bytes=0, num_pages=1000 + 3600,
+    )
+    engine._target_moe_and_expert_bytes = lambda size: (size, 1)
+    with pytest.raises(CacheRebuildRejected):
+        Engine.rebuild_runtime_cache(engine, moe_cache_size=64)
+
+    assert captured["current_num_pages"] == 1000
+    slab_per_page = (64 // 4) * 12 * 128 * 2
+    assert captured["extra_fixed_bytes"] == 3600 * slab_per_page + _KV_OFFLOAD_SERVING_MARGIN
 
 # ---------------------------------------------------------------------------
 # offload-cache sizing guard + auto-resolution (_require_offload_cache_size / _adjust_config),

@@ -1202,14 +1202,18 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
+        # Under --kv-host-pages only the GPU-resident pages cost KV bytes; the host tier costs
+        # its index slab and serving margin, priced like the startup plan.
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            weights_bytes=self._weights_bytes,
+            current_num_pages=self.num_pages - config.kv_host_pages,
             extra_fixed_bytes=(
                 (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
                 + gdn_prefill_workspace_bytes(config)
+                + _kv_host_reserve_bytes(config, type(self.kv_cache))
             ),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
