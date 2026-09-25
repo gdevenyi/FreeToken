@@ -3,19 +3,22 @@ Gemma (1+w) norm and swigluoai activation the MiniMax-M3 modules ride on."""
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
+import triton
+from triton.runtime.errors import OutOfResources
 
-if not torch.cuda.is_available():  # pragma: no cover
-    pytest.skip("CUDA required", allow_module_level=True)
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 DEV = "cuda"
 
 
-def _make_mxfp8(N: int, K: int, seed: int = 0):
+def _make_mxfp8(N: int, K: int, seed: int = 0, device: str = DEV):
     torch.manual_seed(seed)
-    wf = torch.randn(N, K, device=DEV) * 0.05
-    codes = torch.randint(110, 132, (N, K // 32), device=DEV, dtype=torch.uint8)
+    wf = torch.randn(N, K, device=device) * 0.05
+    codes = torch.randint(110, 132, (N, K // 32), device=device, dtype=torch.uint8)
     descale = torch.exp2(codes.float() - 127.0)
     w8 = (
         (wf.view(N, -1, 32) / descale.unsqueeze(-1)).clamp(-448, 448).view(N, K)
@@ -26,6 +29,7 @@ def _make_mxfp8(N: int, K: int, seed: int = 0):
 # 1 = m1 kernel; 2..256 = dot GEMV across its M_TILE buckets {16,32,64,128,256}
 # (17/33/129 exercise row-padding masks); 257/300 = dequant+cuBLAS past
 # _GEMV_MAX_M (257 pins the boundary).
+@cuda
 @pytest.mark.parametrize("M", [1, 2, 8, 16, 17, 33, 64, 129, 256, 257, 300])
 # (511, 6144): N not a BLOCK_N multiple (n-mask tail); (640, 6112): K a multiple
 # of the 32-wide scale block but not of BLOCK_K=128 (k-mask + OOB scale codes).
@@ -42,6 +46,7 @@ def test_mxfp8_linear_matches_dequant_reference(M: int, N: int, K: int):
     assert rel.item() < 2e-2, rel.item()
 
 
+@cuda
 def test_mxfp8_linear_past_the_gemv_bounds_its_dequant_transient(monkeypatch):
     """A wide weight (lm_head-like) past the GEMV must not materialize whole in bf16."""
     import freetoken.kernel.triton.mxfp8_linear as mod
@@ -64,6 +69,41 @@ def test_mxfp8_linear_past_the_gemv_bounds_its_dequant_transient(monkeypatch):
     assert torch.allclose(y.float(), y_full.float(), rtol=1e-2, atol=1e-2)
 
 
+def _gemv_with_smem_for(max_m_tile: int):
+    """A stand-in for ``_gemv`` whose dot kernel runs out of shared memory past ``max_m_tile``; NaN marks its output."""
+
+    def gemv(a, weight, scale_codes, out_dtype):
+        m_tile = max(16, triton.next_power_of_2(a.shape[0]))
+        if a.shape[0] > 1 and m_tile > max_m_tile:
+            raise OutOfResources(m_tile * 512, max_m_tile * 512, "shared memory")
+        return torch.full((a.shape[0], weight.shape[0]), float("nan"), dtype=out_dtype)
+
+    return gemv
+
+
+def test_gemv_cap_drops_with_a_warning_when_an_m_tile_overflows_shared_memory(monkeypatch, caplog):
+    import freetoken.kernel.triton.mxfp8_linear as mod
+
+    monkeypatch.setattr(mod, "_gemv_cap", mod._GEMV_MAX_M)
+    monkeypatch.setattr(mod, "_small_m_gemv_ok", lambda: True)
+    monkeypatch.setattr(mod, "e4m3_kernel_view", lambda w: w)
+    monkeypatch.setattr(mod, "_gemv", _gemv_with_smem_for(64))
+    w8, codes = _make_mxfp8(64, 128, device="cpu")
+    x = torch.randn(100, 128, dtype=torch.bfloat16)
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        y = mod.mxfp8_linear(x, w8, codes)
+    assert mod._gemv_cap == 64
+    assert "M_TILE 128" in caplog.text and "M > 64" in caplog.text
+    ref = x.float() @ mod.mxfp8_dequant(w8, codes, torch.float32).t()
+    assert ((y.float() - ref).abs().max() / ref.abs().max()).item() < 2e-2  # the dequant fallback served it
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        assert torch.isnan(mod.mxfp8_linear(x[:64], w8, codes)).all()  # still the GEMV up to the cap
+        assert not torch.isnan(mod.mxfp8_linear(x, w8, codes)).any()  # past it, no retry
+    assert not caplog.records
+
+
+@cuda
 def test_gemma_plus_one_norm_matches_flashinfer_semantics():
     """Triton fallback vs the (1+w) definition; per-head 3D strided in-place."""
     from freetoken.kernel.triton.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
@@ -98,6 +138,7 @@ def test_gemma_plus_one_norm_matches_flashinfer_semantics():
     assert (qh.float() - ref3.float()).abs().max().item() < 2e-2
 
 
+@cuda
 def test_swigluoai_and_mul_uninterleaved():
     from freetoken.layers import swigluoai_and_mul
 
