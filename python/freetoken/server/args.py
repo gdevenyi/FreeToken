@@ -661,6 +661,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
+        help=(
+            "Where the token embedding table lives. 'host' keeps it in pinned host RAM and gathers "
+            "the rows each step needs over PCIe, freeing its VRAM (single GPU only)."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         action=_DeprecatedAlias,
         new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",
