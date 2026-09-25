@@ -626,34 +626,51 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
 
 
-@app.middleware("http")
-async def _api_key_middleware(request: Request, call_next):
+class _ApiKeyMiddleware:
     """Reject any request without ``Authorization: Bearer <api_key>`` when a key is set.
 
-    Registered after ``_record_request_middleware`` so it runs *before* it (Starlette wraps the
+    Registered after ``_RecordRequestMiddleware`` so it runs *before* it (Starlette wraps the
     last-added middleware outermost): a 401 never lands in the request ring or a handler. CORS
     preflights (OPTIONS) carry no credentials by design and pass through; the CORS middleware
     installed at startup is outer still, so it answers them. Constant-time compare, and the
-    same body shape the OpenAI-compatible routes use for errors."""
-    key = _API_KEY
-    if key is None or request.method == "OPTIONS" or request.url.path in _API_KEY_OPEN_PATHS:
-        return await call_next(request)
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(
-        token.strip().encode("utf-8"), key.encode("utf-8")
-    ):
-        return JSONResponse(
-            status_code=401,
-            headers={"WWW-Authenticate": "Bearer"},
-            content={
-                "error": {
-                    "message": "Invalid or missing API key (Authorization: Bearer <key>).",
-                    "type": "authentication_error",
-                    "code": 401,
-                }
-            },
-        )
-    return await call_next(request)
+    same body shape the OpenAI-compatible routes use for errors. Pure ASGI for the same reason
+    as the recorder: a BaseHTTPMiddleware hides the client's disconnect from the handlers."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        key = _API_KEY
+        if (
+            key is None
+            or scope["type"] != "http"
+            or scope["method"] == "OPTIONS"
+            or scope.get("path", "") in _API_KEY_OPEN_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+        authorization = Request(scope).headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(
+            token.strip().encode("utf-8"), key.encode("utf-8")
+        ):
+            response = JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                content={
+                    "error": {
+                        "message": "Invalid or missing API key (Authorization: Bearer <key>).",
+                        "type": "authentication_error",
+                        "code": 401,
+                    }
+                },
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_ApiKeyMiddleware)
 
 
 @app.post("/v1/cache/rebuild")

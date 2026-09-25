@@ -73,3 +73,51 @@ def test_non_streaming_handler_sees_the_client_leave():
         server.should_exit = True
     assert seen.get("after") is not None, "handler never saw the disconnect"
     assert seen["after"] < 2.0
+
+
+def _watching_app(middleware) -> tuple[FastAPI, dict]:
+    app = FastAPI()
+    for m in reversed(middleware):  # user_middleware[0] is outermost; re-add innermost first
+        app.add_middleware(m.cls, *m.args, **m.kwargs)
+    seen: dict[str, float | None] = {}
+
+    @app.post("/v1/completions")
+    async def slow(request: Request):
+        t0 = time.monotonic()
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if await request.is_disconnected():
+                seen["after"] = time.monotonic() - t0
+                return {"detected": True}
+        seen["after"] = None
+        return {"detected": False}
+
+    return app, seen
+
+
+def test_the_servers_middleware_stack_lets_a_handler_see_the_client_leave(monkeypatch):
+    # Every middleware api_server registers, keyed or not: one BaseHTTPMiddleware anywhere in
+    # the stack is enough to hide the disconnect from the non-streaming watcher.
+    import freetoken.server.api_server as api
+
+    for key in (None, "s3cret"):
+        monkeypatch.setattr(api, "_API_KEY", key)
+        app, seen = _watching_app(api.app.user_middleware)
+        port = _free_port()
+        server = _serve(app, port)
+        try:
+            body = b'{"prompt": "x"}'
+            with socket.create_connection(("127.0.0.1", port)) as sock:
+                sock.sendall(
+                    b"POST /v1/completions HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer s3cret\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: "
+                    + str(len(body)).encode() + b"\r\n\r\n" + body
+                )
+                time.sleep(0.2)
+            deadline = time.monotonic() + 5
+            while "after" not in seen and time.monotonic() < deadline:
+                time.sleep(0.05)
+        finally:
+            server.should_exit = True
+        assert seen.get("after") is not None, f"handler never saw the disconnect (key={key!r})"
+        assert seen["after"] < 2.0
