@@ -40,7 +40,12 @@ def is_flashinfer_installed() -> bool:
 def is_sgl_kernel_installed() -> bool:
     if is_rocm():
         return False
-    return _importable("sgl_kernel")
+    if not _importable("sgl_kernel"):
+        return False
+    # sgl_kernel wheels ship sm_80+ images only: below that it imports fine and then fails
+    # at launch with "no kernel image is available", so take the triton paths instead.
+    cap = device_capability()
+    return cap == (0, 0) or cap >= (8, 0)
 
 
 @functools.cache
