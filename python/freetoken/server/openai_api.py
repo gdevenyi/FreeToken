@@ -56,34 +56,6 @@ def _thinking_type(req: Any) -> str | None:
 
 
 
-def apply_default_thinking_mode(
-    ctk: dict[str, Any] | None,
-    default_mode: str | None,
-) -> dict[str, Any] | None:
-    """Merge the server's --default-thinking-mode into a request's template kwargs.
-
-    An explicit per-request value always wins; the server default only fills
-    in what the request left unset. "auto" (the default) is a no-op.
-    """
-    if not default_mode or default_mode == "auto":
-        return ctk
-    if ctk is None:
-        ctk = {}
-    else:
-        ctk = dict(ctk)
-    has_explicit = (
-        "enable_thinking" in ctk
-        or "thinking" in ctk
-        or "thinking_mode" in ctk
-    )
-    if not has_explicit:
-        if default_mode == "chat":
-            ctk["enable_thinking"] = False
-        elif default_mode == "thinking":
-            ctk["enable_thinking"] = True
-    return ctk
-
-
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
@@ -91,12 +63,13 @@ def chat_request_to_genspec(
     default_thinking_mode: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import effort_toggle_kwargs
+    from .model_meta import apply_default_thinking_mode, effort_toggle_kwargs
 
-    ctk = apply_default_thinking_mode(req.chat_template_kwargs, default_thinking_mode)
+    ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    ctk = apply_default_thinking_mode(ctk, default_thinking_mode)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
