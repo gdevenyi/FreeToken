@@ -932,11 +932,25 @@ class Engine:
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
         model_config = config.model_config
+        expert_bytes = _model_expert_bytes(cache.quant_format, model_config)
         fraction = load_hybrid_fetch_fraction(
             cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid,
-            expert_bytes=_model_expert_bytes(cache.quant_format, model_config),
+            expert_bytes=expert_bytes,
             geometry=_model_geometry(model_config),
         )
+        if fraction is None and expert_bytes is not None:
+            # Only benches of differently sized experts exist. Their split is off by however
+            # much expert size moves the CPU rate; a fixed cap of 1 is off by far more.
+            fraction = load_hybrid_fetch_fraction(
+                cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
+            )
+            if fraction is not None:
+                logger.warning_rank0(
+                    "--moe-hybrid-max-fetch auto: no `ft bench bw` entry for experts of this "
+                    f"size; using the {cache.quant_format!r} split benched on another size. "
+                    "Bench this model's geometry (`ft bench bw --model <preset>`) or pass "
+                    "--moe-hybrid-max-fetch N"
+                )
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(

@@ -166,3 +166,41 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+def test_auto_fetch_keeps_a_split_benched_on_other_sized_experts(tmp_path, monkeypatch):
+    """Qwen3.8-Flash-Next (2560x640, 2.64 MB experts) with only the nvfp4 dtype bench (7.97 MB):
+    the backend verdict is rightly withheld, but explicit hybrid must not drop to a fetch cap
+    of 1 -- the mis-sized split is still far closer than fetching one miss per layer."""
+    from types import SimpleNamespace
+
+    from freetoken.engine import engine as engine_mod
+
+    prof = {
+        "gpu": {"name": "FAKE GPU"},
+        "dtypes": {"nvfp4": "hybrid"},
+        "dtype_kernels": {"nvfp4": {
+            "expert_bytes": 7974912, "cpu_moe_gbs": 89.7, "pcie_gather_gbs": 25.2,
+            "cpu_moe_overlap_gbs": 74.1, "pcie_gather_overlap_gbs": 25.2,
+        }},
+    }
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    monkeypatch.setenv("FREETOKEN_BENCHBW_PATH", str(path))
+    monkeypatch.setattr(engine_mod, "_profile_gpu", lambda index=None: ("FAKE GPU", None))
+
+    model_config = SimpleNamespace(hidden_size=2560, moe_intermediate_size=640,
+                                   num_experts=512, num_experts_per_tok=10)
+    config = SimpleNamespace(moe_hybrid_max_fetch=-1, model_config=model_config)
+    cache = SimpleNamespace(quant_format="nvfp4", num_experts=512,
+                            hybrid_max_fetch=None, hybrid_fetch_fraction=0.0)
+    fake_engine = SimpleNamespace(device=torch.device("cpu"))
+
+    assert engine_mod._model_expert_bytes("nvfp4", model_config) == 2772480
+    assert load_backend_recommendation(
+        "nvfp4", path=str(path), expert_bytes=2772480,
+        geometry=engine_mod._model_geometry(model_config)) is None
+
+    engine_mod.Engine._resolve_hybrid_fetch(fake_engine, config, cache)
+    assert cache.hybrid_fetch_fraction == pytest.approx(25.2 / (25.2 + 74.1))
+    assert cache.hybrid_max_fetch == 512
