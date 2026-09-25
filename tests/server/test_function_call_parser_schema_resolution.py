@@ -375,6 +375,67 @@ SCHEMA_CASES = [
         5,
         id="ambiguous-union-loose-json",
     ),
+
+    # An enum/const with no "type" takes its type from the literals, so a
+    # numeric-looking string member is not coerced out of the enum.
+    pytest.param(
+        {"enum": ["1", "2"]},
+        None,
+        "1",
+        "1",
+        id="untyped-string-enum",
+    ),
+    pytest.param(
+        {"enum": [1, 2]},
+        None,
+        "2",
+        2,
+        id="untyped-integer-enum",
+    ),
+    pytest.param(
+        {"const": "10"},
+        None,
+        "10",
+        "10",
+        id="untyped-string-const",
+    ),
+    pytest.param(
+        {
+            "anyOf": [
+                {"enum": ["1", "2"]},
+                {"type": "null"},
+            ]
+        },
+        None,
+        "1",
+        "1",
+        id="anyof-untyped-string-enum-nullable",
+    ),
+
+    # Pydantic v1 / OpenAPI 3.0 wrap a $ref in a one-element allOf to attach
+    # siblings such as default/description.
+    pytest.param(
+        {"allOf": [{"$ref": "#/$defs/Mode"}], "default": "a"},
+        {
+            "$defs": {
+                "Mode": {"type": "string", "enum": ["a", "true"]},
+            }
+        },
+        "true",
+        "true",
+        id="allof-ref-string-enum",
+    ),
+    pytest.param(
+        {"allOf": [{"$ref": "#/$defs/Limit"}], "description": "max rows"},
+        {
+            "$defs": {
+                "Limit": {"type": "integer"},
+            }
+        },
+        "5",
+        5,
+        id="allof-ref-integer",
+    ),
 ]
 
 
@@ -453,6 +514,15 @@ REF_EDGE_CASES = [
             }
         },
         id="mutually-recursive-ref",
+    ),
+    pytest.param(
+        {"allOf": [{"$ref": "#/$defs/A"}]},
+        {
+            "$defs": {
+                "A": {"allOf": [{"$ref": "#/$defs/A"}]},
+            }
+        },
+        id="self-referential-allof",
     ),
 ]
 
