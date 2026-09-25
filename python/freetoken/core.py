@@ -28,9 +28,9 @@ class SamplingParams:
     # ---- logits processors (engine/sample.py), all off by default ----
     # min_p: drop tokens whose probability is below min_p x the top probability.
     min_p: float = 0.0
-    # OpenAI presence/frequency penalties over the generated tokens (Sampler keeps their counts
-    # on the device, Req.output_token_counts); repetition_penalty is the HF/vLLM multiplicative
-    # penalty over prompt + generated tokens (1.0 = off).
+    # OpenAI presence/frequency penalties over the generated tokens; repetition_penalty is the
+    # HF/vLLM multiplicative penalty over prompt + generated tokens (1.0 = off). The sampler
+    # keeps their state on the device (Req.output_token_counts, Req.prompt_token_mask).
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -56,11 +56,10 @@ class SamplingParams:
 
     @property
     def needs_logits_processing(self) -> bool:
-        # presence/frequency are not LogitsPlan work: the sampler applies them from its own
-        # device-side counts (Sampler.prepare's penalties).
+        # the penalties are not LogitsPlan work: the sampler applies them from its own
+        # device-side state (Sampler.prepare's penalties).
         return bool(
             self.min_p > 0.0
-            or self.repetition_penalty != 1.0
             or self.logit_bias
             or self.min_tokens > 0
         )
@@ -101,6 +100,8 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # [vocab] bool on the device: the prompt's ids, for repetition_penalty. Built once.
+    prompt_token_mask: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
