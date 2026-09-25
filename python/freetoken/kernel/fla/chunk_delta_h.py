@@ -17,12 +17,15 @@ from freetoken.kernel.fla.op import exp, safe_exp
 from freetoken.kernel.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
+    is_nvidia_pre_volta,
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+# sm_61 sweep at 2048 tokens x 48 heads: 16-wide V tiles on 8 warps run ~13x faster than 32 on 4
+_CHUNK_H_BV, _CHUNK_H_WARPS = ("16", "8") if is_nvidia_pre_volta else ("32", "4")
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", _CHUNK_H_BV))
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", _CHUNK_H_WARPS))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 

@@ -276,6 +276,9 @@ is_nvidia_hopper = is_nvidia and (
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
+# Below sm_70 tl.dot lowers to FMAs, which wants different tiles than the mma path.
+is_nvidia_pre_volta = is_nvidia and torch.cuda.get_device_capability()[0] < 7
+
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability()[0] >= 8
 is_gather_supported = hasattr(triton.language, "gather")
