@@ -571,7 +571,7 @@ def parse_args(
         default=ServerArgs.enable_metrics_report,
         help=(
             "Serve a per-request `metrics` object next to usage on /v1/chat/completions, "
-            "/v1/completions, /v1/messages and /v1/responses: ttft_ms, prefill_time_ms and "
+            "/v1/messages and /v1/responses: ttft_ms, prefill_time_ms and "
             "prefill_tokens_per_second (the prefill span measured by the scheduler itself), "
             "decode_time_ms and decode_tokens_per_second, cached_prompt_tokens and "
             "total_time_ms. Streaming responses carry it on the same final chunk as usage, so "
