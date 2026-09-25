@@ -152,6 +152,9 @@ class _PendingFill:
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
 
+    # the fill hashes on the host; lookup/prefetch read only the row_ids shape
+    reads_row_ids = False
+
     def __init__(
         self,
         source: PleRowSource,
