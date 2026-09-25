@@ -595,8 +595,8 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
-        # reserve the GDN prefill transient (chunk recurrent states + v_new); without
-        # it long prefills OOM inside the GDN kernel when memory_ratio packs the pools
+        # Reserve part of the GDN prefill transient (chunk states + v_new); the rest of the
+        # prefill activations still live in the (1 - memory_ratio) headroom.
         available_memory -= gdn_prefill_workspace_bytes(config)
         if self.spec is not None:
             # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
@@ -1345,7 +1345,11 @@ class Engine:
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
-            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
+            extra_fixed_bytes=(
+                (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
+                + gdn_prefill_workspace_bytes(config)
+                + spec_fixed
+            ),
             extra_page_bytes=draft_page,
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""

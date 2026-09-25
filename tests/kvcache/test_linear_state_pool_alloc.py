@@ -9,6 +9,7 @@ import torch
 
 from freetoken.kvcache.linear_state_pool import (
     LinearStatePool,
+    gdn_prefill_workspace_bytes,
     linear_state_bytes_per_req,
     state_pool_bytes,
 )
@@ -189,3 +190,44 @@ def test_slot_state_bytes_for_the_real_geometry():
     delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
         linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
+
+
+def _gdn_config(**fields):
+    # qwen4_exp GDN geometry: 48 value heads of 128x128
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1),
+        num_key_heads=16, num_value_heads=48,
+        key_head_dim=128, value_head_dim=128, conv_kernel_dim=4, output_gate="silu",
+    )
+    mc = SimpleNamespace(linear_attention_group=lambda: group)
+    return SimpleNamespace(model_config=mc, dtype=torch.bfloat16, max_seq_len=262144, **fields)
+
+
+def test_gdn_prefill_workspace_for_the_real_geometry():
+    # h [8192/64 chunks, 48, 128, 128] bf16 = 192 MiB, plus v_new [8192, 48, 128] = 96 MiB
+    assert gdn_prefill_workspace_bytes(_gdn_config(max_extend_tokens=8192)) == 288 * 2**20
+    assert gdn_prefill_workspace_bytes(_gdn_config(max_extend_tokens=2048)) == 72 * 2**20
+
+
+def test_gdn_prefill_workspace_without_a_scheduler_extend_budget():
+    # a bare EngineConfig has no max_extend_tokens: price the scheduler's 8192 default
+    assert gdn_prefill_workspace_bytes(_gdn_config()) == 288 * 2**20
+
+
+def test_gdn_prefill_workspace_is_capped_by_the_sequence_length():
+    config = _gdn_config(max_extend_tokens=8192)
+    config.max_seq_len = 100  # 2 chunks, 100 value rows
+    assert gdn_prefill_workspace_bytes(config) == (2 * 48 * 128 * 128 + 100 * 48 * 128) * 2
+
+
+def test_gdn_prefill_workspace_is_zero_without_a_linear_group():
+    config = _gdn_config(max_extend_tokens=8192)
+    config.model_config.linear_attention_group = lambda: None
+    assert gdn_prefill_workspace_bytes(config) == 0
+
+
+def test_gdn_prefill_workspace_chunk_matches_the_kernel():
+    from freetoken.kernel.fla.chunk_delta_h import CHUNK_SIZE
+    from freetoken.kvcache.linear_state_pool import _GDN_CHUNK_SIZE
+
+    assert _GDN_CHUNK_SIZE == CHUNK_SIZE
