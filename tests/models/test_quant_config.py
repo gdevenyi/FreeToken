@@ -601,3 +601,63 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
             mismatches.append(f"{module}: config says {kind}, tensors {sorted(suffixes)} say {sorted(k.value for k in expected)}")
     assert checked > 0
     assert not mismatches, f"{len(mismatches)}/{checked} modules disagree:\n  " + "\n  ".join(mismatches[:40])
+
+
+# ---- load-time MXFP8 (--dense-quant / --lm-head-quant)
+
+
+def _mx_dequant(q: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+    return q.float() * torch.exp2(codes.float() - 127.0).repeat_interleave(32, dim=1)
+
+
+def test_quantize_mxfp8_round_trips_values_already_on_the_grid():
+    from freetoken.layers.quantization.configs.load_time import quantize_mxfp8
+
+    grid = torch.tensor([0.0, 0.5, -1.0, 1.5, 2.0, -3.0, 448.0, -0.015625] * 4)  # e4m3 values, amax 448
+    w = torch.stack([grid * 2.0**k for k in (-20, 0, 7)])
+    q, codes = quantize_mxfp8(w)
+    assert codes.tolist() == [[107], [127], [134]]
+    assert torch.equal(_mx_dequant(q, codes), w)
+
+
+def test_quantize_mxfp8_never_saturates_the_block_max():
+    from freetoken.layers.quantization.configs.load_time import quantize_mxfp8
+
+    torch.manual_seed(0)
+    w = torch.randn(64, 256) * torch.logspace(-6, 3, 64).unsqueeze(1)
+    q, codes = quantize_mxfp8(w)
+    scaled_max = q.float().abs().view(64, -1, 32).amax(-1)
+    assert torch.all(scaled_max <= 448) and torch.all(scaled_max > 224 * (1 - 1 / 16))
+    assert (_mx_dequant(q, codes) - w).norm() / w.norm() < 0.04
+
+
+def test_quantize_mxfp8_zero_blocks_and_row_chunks():
+    from freetoken.layers.quantization.configs import load_time
+
+    w = torch.randn(100, 64)
+    w[3] = 0
+    q, codes = load_time.quantize_mxfp8(w)
+    assert torch.all(q[3].float() == 0) and torch.all(codes[3] == 0)
+    rows = [load_time.quantize_mxfp8(w[i : i + 1]) for i in range(100)]
+    assert torch.equal(q.view(torch.uint8), torch.cat([r[0] for r in rows]).view(torch.uint8))
+    assert torch.equal(codes, torch.cat([r[1] for r in rows]))
+
+
+def test_load_time_overlay_keeps_checkpoint_schemes_and_adds_mxfp8_to_targets():
+    from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig
+    from freetoken.layers.quantization.scheme import nvfp4_scheme
+
+    class Base(QuantConfig):
+        dialect = "test-base"
+        STORAGE = {}
+
+        def scheme_for_name(self, name):
+            return nvfp4_scheme(input_scale=False) if name.endswith("experts") else None
+
+    overlay = LoadTimeQuantConfig(Base(), (r"\.linear_attn\.(in_proj_qkv|out_proj)$",))
+    assert overlay.scheme_for_name("m.layers.0.linear_attn.in_proj_qkv").kind is QuantKind.MXFP8
+    assert overlay.scheme_for_name("m.layers.0.linear_attn.in_proj_b") is None
+    assert overlay.scheme_for_name("m.layers.0.mlp.experts").kind is QuantKind.NVFP4
+    assert overlay.quantize_at_load("m.layers.0.linear_attn.out_proj")
+    assert not overlay.quantize_at_load("m.layers.0.linear_attn.in_proj_b")
+    assert not overlay.quantize_at_load("m.layers.0.mlp.experts")

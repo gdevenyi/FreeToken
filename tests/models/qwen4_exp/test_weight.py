@@ -518,3 +518,73 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+# ---- --dense-quant / --lm-head-quant: bf16 projections requantized to MXFP8 while they load
+
+
+def _dequant_mxfp8(weight: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+    scale = torch.exp2(codes.float() - 127.0).repeat_interleave(32, dim=1)
+    return weight.float() * scale
+
+
+@pytest.fixture(scope="module")
+def load_time(checkpoint) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """(emitted tensors, the model state dict the engine builds under the same config)."""
+    folder, _raw = checkpoint
+    state = meta_state_dict(folder, dense_quant="mxfp8", lm_head_quant="mxfp8")  # installs the overlay
+    loaded = {
+        name: tensor.clone()
+        for name, tensor in iter_weights(folder, torch.device("cpu"), include_moe_experts=True,
+                                         include_non_moe=True, include_vision=False)
+    }
+    return loaded, state
+
+
+def test_load_time_mxfp8_fills_exactly_the_buffers_the_engine_builds(load_time):
+    loaded, state = load_time
+    assert set(loaded) == set(state)
+    # the fixture's vocab rows are fewer than the config's, so compare the requantized modules only
+    touched = ("in_proj_qkvz", "in_proj_ba", "out_proj", "qkv_proj", "o_proj", "lm_head")
+    for name, tensor in loaded.items():
+        if name.rsplit(".", 1)[0].endswith(touched):
+            assert tensor.dtype is state[name].dtype, name
+            # lm_head rows are the fixture's vocab, not the config's
+            assert tensor.shape[1:] == state[name].shape[1:] if name.startswith("lm_head") else tensor.shape == state[name].shape, name
+    assert loaded["model.layers.0.linear_attn.in_proj_qkvz.weight"].dtype is torch.float8_e4m3fn
+    assert loaded["model.layers.0.linear_attn.in_proj_ba.weight"].dtype is torch.bfloat16
+    assert loaded["lm_head.weight_scale_inv"].dtype is torch.uint8
+
+
+def test_load_time_mxfp8_dequantizes_back_to_the_bf16_parts(load_time, checkpoint):
+    loaded, _state = load_time
+    _folder, raw = checkpoint
+    gdn, attn = f"{LM}.layers.0.linear_attn", f"{LM}.layers.1.self_attn"
+    cases = {
+        "model.layers.0.linear_attn.in_proj_qkvz": [f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z"],
+        "model.layers.0.linear_attn.out_proj": [f"{gdn}.out_proj"],
+        "model.layers.1.self_attn.qkv_proj": [f"{attn}.q_proj", f"{attn}.k_proj", f"{attn}.v_proj"],
+        "model.layers.1.self_attn.o_proj": [f"{attn}.o_proj"],
+        "lm_head": ["lm_head"],
+    }
+    for module, parts in cases.items():
+        want = torch.cat([raw[p + ".weight"].float() for p in parts])
+        got = _dequant_mxfp8(loaded[module + ".weight"], loaded[module + ".weight_scale_inv"])
+        rel = (got - want).norm() / want.norm()
+        assert rel < 0.04, (module, float(rel))  # e4m3's 3 mantissa bits: ~2.7% on gaussian weights
+        got_max = got.view(got.shape[0], -1, 32).abs().amax(-1)
+        want_max = want.view(want.shape[0], -1, 32).abs().amax(-1)
+        assert torch.all((got_max - want_max).abs() <= want_max / 16), module  # no block max saturates
+
+
+def test_load_time_mxfp8_leaves_untargeted_modules_bf16(load_time, checkpoint):
+    loaded, _state = load_time
+    _folder, raw = checkpoint
+    gdn = f"{LM}.layers.0.linear_attn"
+    ba = torch.cat([raw[f"{gdn}.in_proj_b.weight"], raw[f"{gdn}.in_proj_a.weight"]])
+    assert torch.equal(loaded["model.layers.0.linear_attn.in_proj_ba.weight"], ba)
+    shared = f"{LM}.layers.1.mlp.shared_expert"
+    gate_up = torch.cat([raw[f"{shared}.gate_proj.weight"], raw[f"{shared}.up_proj.weight"]])
+    assert torch.equal(loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"], gate_up)
+    assert torch.equal(loaded["model.embed_tokens.weight"], raw[f"{LM}.embed_tokens.weight"])
+    assert loaded["model.layers.1.self_attn.indexer.index_qk_proj.weight"].dtype is torch.bfloat16

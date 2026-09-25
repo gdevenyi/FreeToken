@@ -29,6 +29,7 @@ from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
 from freetoken.layers.quantization import get_quant_config
+from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig, quantize_mxfp8
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, download_hf_weight
@@ -188,6 +189,20 @@ class _DenseFuser:
         return [(fused + kind, torch.cat(rows, dim=0))]
 
 
+def _load_time_parts(name: str, tensor: torch.Tensor, quant) -> list[tuple[str, torch.Tensor]]:
+    """A bf16 projection --dense-quant / --lm-head-quant targets, as its MXFP8 weight and scale codes; anything else unchanged."""
+    module, kind = _split_kind(name)
+    if (
+        not isinstance(quant, LoadTimeQuantConfig)
+        or kind != ".weight"
+        or tensor.dtype in _FP8_DTYPES
+        or not quant.quantize_at_load(module)
+    ):
+        return [(name, tensor)]
+    weight, codes = quantize_mxfp8(tensor)
+    return [(name, weight), (module + ".weight_scale_inv", codes)]
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -210,7 +225,8 @@ def iter_weights(
 
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    quant = get_quant_config()
+    fuser = _DenseFuser(quant, spec.packed_modules_mapping)
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -223,15 +239,18 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
-                tensor = f.get_tensor(raw_name)
-                fused = fuser.fuse(name, tensor)
-                if fused is None:
-                    fuser.check_unfused(name, tensor)
-                    yield name, tensor
-                else:
-                    yield from fused
+                for part_name, tensor in _load_time_parts(name, f.get_tensor(raw_name), quant):
+                    fused = fuser.fuse(part_name, tensor)
+                    if fused is None:
+                        fuser.check_unfused(part_name, tensor)
+                        yield part_name, tensor
+                    else:
+                        yield from fused
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    if isinstance(quant, LoadTimeQuantConfig) and device.type == "cuda":
+        # hand the bf16 originals back so the cache planner sees the requantized footprint
+        torch.cuda.empty_cache()
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:

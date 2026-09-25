@@ -32,6 +32,8 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    # checkpoint-name regexes of the bf16 projections --dense-quant may requantize at load
+    load_quant_targets: tuple[str, ...] = ()
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -189,6 +191,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        # the text tower's large projections; routers, gates, GDN b|a, the QSA indexer, the
+        # hyper-connection mixers and the small shared experts stay bf16
+        load_quant_targets=(
+            r"^model\.language_model\.layers\.\d+\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
+            r"^model\.language_model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
+        ),
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the

@@ -33,6 +33,10 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # --dense-quant / --lm-head-quant: "mxfp8" requantizes the family's bf16 projections (the
+    # lm_head) at load, "none" serves them as the checkpoint stores them.
+    dense_quant: str = "none"
+    lm_head_quant: str = "none"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -146,9 +150,27 @@ class EngineConfig:
                 setattr(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
+        quant = self._load_time_quant(quant, spec, hf_config)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         return replace(model_config, quant=quant)
+
+    def _load_time_quant(self, quant, spec: ModelSpec, hf_config):
+        targets: tuple[str, ...] = ()
+        if self.dense_quant == "mxfp8":
+            if not spec.load_quant_targets:
+                raise ValueError(f"--dense-quant is not supported for {self.hf_config.architectures[0]}")
+            targets += spec.load_quant_targets
+        if self.lm_head_quant == "mxfp8":
+            text = getattr(hf_config, "text_config", hf_config)
+            if getattr(text, "tie_word_embeddings", False) or getattr(hf_config, "tie_word_embeddings", False):
+                raise ValueError("--lm-head-quant needs an untied lm_head (a tied head shares the embedding table)")
+            targets += (r"^lm_head$",)
+        if not targets:
+            return quant
+        from freetoken.layers.quantization.configs.load_time import LoadTimeQuantConfig
+
+        return LoadTimeQuantConfig(quant, targets)
 
     @property
     def max_seq_len(self) -> int:
