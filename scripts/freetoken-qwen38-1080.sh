@@ -20,10 +20,10 @@ SERVED_NAME="${SERVED_NAME:-qwen3.8-flash-next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 API_KEY="${API_KEY:-}"
-# Budget: MXFP8 dense + lm_head + hyper-connections and the host-RAM embedding leave room for
-# ~1150 GPU expert slots with prefill overlap at 0.80; above ~0.82 a 2048-token prefill chunk's
-# activations no longer fit next to them.
-MEMORY_RATIO="${MEMORY_RATIO:-0.80}"
+# Budget: MXFP8 dense + lm_head + hyper-connections and the host-RAM embedding leave ~1130 GPU
+# expert slots at 0.86. The engine reserves the host KV tier's index slab and a 512 MiB serving
+# margin itself; below ~0.84 the slots fall under the 1024 that prefill overlap needs.
+MEMORY_RATIO="${MEMORY_RATIO:-0.86}"
 MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-2048}"
 # 262144 logical KV tokens: 32768 in fp8 on the GPU, the rest in the pinned host mirror.
 KV_GPU_TOKENS="${KV_GPU_TOKENS:-32768}"
