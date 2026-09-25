@@ -50,8 +50,11 @@ export FT_GDN_HOST_SLOTS="${FT_GDN_HOST_SLOTS:-32}"
 export FREETOKEN_MOE_SMALL_PREFILL_TOKENS="${FREETOKEN_MOE_SMALL_PREFILL_TOKENS:-256}"
 # /tmp is a RAM disk on this host: keep triton/torch scratch files off it.
 export TMPDIR="${TMPDIR_OVERRIDE:-$HOME/.cache/freetoken/tmp}"
-# nvcc 12.9 rejects the system gcc; the JIT kernels need gcc 14.
+# nvcc 12.9 rejects the system gcc; the JIT kernels need gcc 14. A systemd user session has
+# no CUDA on PATH, and the JIT builds look the toolkit up there or in CUDA_HOME.
 export NVCC_CCBIN="${NVCC_CCBIN:-/usr/bin/g++-14}"
+export CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
+export PATH="$CUDA_HOME/bin:$PATH"
 
 FT="$FT_DIR/.venv/bin/ft"
 
