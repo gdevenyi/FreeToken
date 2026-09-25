@@ -48,6 +48,9 @@ float dot_nvfp4_scalar(const uint8_t* packed, const uint8_t* scale, float global
 // activation scale (absmax/127). Result folds the e2m1*2 -> *0.5 into the scale.
 using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t*, int,
                              const float*, const float*);
+// Same plus the grouped-layout aux array (see dot_nvfp4_i8g_avx2).
+using nvi8gdot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t*, int,
+                              const float*, const float*, const float*);
 
 [[maybe_unused]] float dot_nvfp4_i8_scalar(const uint8_t* packed, const uint8_t* scale,
                           float global, const int8_t* asi8, int K, const float* e4m3,
@@ -193,8 +196,6 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
   return s * (0.5f * global);
 }
 
-#ifdef CPU_MOE_HAS_AVX512VNNI
-
 // Software-prefetch distance for the W4A8 weight stream, in 16-K blocks (8 packed
 // bytes each). Returns -1 when FREETOKEN_CPU_MOE_PF_BLOCKS is unset: the kernel then
 // uses the built-in default min(512 blocks = 4 KB, 2 rows) -- 4 KB is the empirical
@@ -212,6 +213,157 @@ static int nvfp4_pf_blocks() {
   }();
   return v;
 }
+
+// ---- AVX2 W4A8, grouped layout: four 16-K blocks (32 packed bytes) per load ----
+// Activations are stored per 4-block group as [even(8) x 4 blocks | odd(8) x 4 blocks]
+// so the low and high nibbles of one 32-byte weight load line up with two 32-byte
+// activation loads (one PSHUFB each, no per-block unpack/insert). The LUT holds
+// e2m1*2 + 12 (0..24, unsigned), so VPMADDUBSW needs no sign fix-up; the +12 offset is
+// removed exactly by subtracting 12 * (activation lane sums), precomputed per token.
+// Per group, aux holds 8 floats (the activation scale expanded to the 8 int32 lanes,
+// 2 lanes per block) then 8 int32 corrections. Blocks past the last full group keep
+// the per-block [even(8),odd(8)] layout and asb scales.
+alignas(16) const uint8_t kE2M1x2p12[16] = {12, 13, 14, 15, 16, 18, 20, 24,
+                                            12, 11, 10, 9,  8,  6,  4,  0};
+
+CPU_MOE_TARGET("avx2,fma")
+static inline __m256 nvfp4_i8g_grp(const uint8_t* packed, const uint8_t* scale,
+                                   const int8_t* asi8, const float* aux, const float* e4m3,
+                                   int g, __m256i lut, __m256i m0f, __m256i ones16,
+                                   __m256i sidx_ctrl) {
+  const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + (size_t)g * 32));
+  const __m256i we = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw, m0f));
+  const __m256i wo = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw, 4), m0f));
+  const int8_t* a = asi8 + (size_t)g * 64;
+  const __m256i ae = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+  const __m256i ao = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32));
+  const __m256i p = _mm256_add_epi16(_mm256_maddubs_epi16(we, ae), _mm256_maddubs_epi16(wo, ao));
+  const float* ax = aux + (size_t)g * 16;
+  const __m256i d = _mm256_sub_epi32(_mm256_madd_epi16(p, ones16),
+                                     _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ax + 8)));
+  int s4;
+  std::memcpy(&s4, scale + (size_t)g * 4, 4);
+  const __m256i sidx = _mm256_shuffle_epi8(_mm256_set1_epi32(s4), sidx_ctrl);
+  const __m256 sc = _mm256_mul_ps(_mm256_i32gather_ps(e4m3, sidx, 4), _mm256_loadu_ps(ax));
+  return _mm256_mul_ps(_mm256_cvtepi32_ps(d), sc);
+}
+
+CPU_MOE_TARGET("avx2,fma")
+float dot_nvfp4_i8g_avx2(const uint8_t* packed, const uint8_t* scale, float global,
+                         const int8_t* asi8, int K, const float* e4m3, const float* asb,
+                         const float* aux) {
+  const __m256i lut = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2p12)));
+  const __m256i m0f = _mm256_set1_epi8(0x0F);
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  // int32 lane pairs (0,1),(2,3),(4,5),(6,7) <- scale byte 0,1,2,3 (zero-extended)
+  const __m256i sidx_ctrl = _mm256_setr_epi8(
+      0, -1, -1, -1, 0, -1, -1, -1, 1, -1, -1, -1, 1, -1, -1, -1,
+      2, -1, -1, -1, 2, -1, -1, -1, 3, -1, -1, -1, 3, -1, -1, -1);
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  const int nb = K / 16;
+  const int ng = nb / 4;
+  const int pfb = nvfp4_pf_blocks();
+  const int pf = (pfb < 0) ? std::min(512, 2 * nb) : pfb;
+  int g = 0;
+  for (; g + 2 <= ng; g += 2) {
+    if (pf > 0)
+      _mm_prefetch(reinterpret_cast<const char*>(packed + ((size_t)g * 4 + (size_t)pf) * 8),
+                   _MM_HINT_T0);
+    acc0 = _mm256_add_ps(acc0, nvfp4_i8g_grp(packed, scale, asi8, aux, e4m3, g, lut, m0f,
+                                             ones16, sidx_ctrl));
+    acc1 = _mm256_add_ps(acc1, nvfp4_i8g_grp(packed, scale, asi8, aux, e4m3, g + 1, lut, m0f,
+                                             ones16, sidx_ctrl));
+  }
+  if (g < ng)
+    acc0 = _mm256_add_ps(acc0, nvfp4_i8g_grp(packed, scale, asi8, aux, e4m3, g, lut, m0f,
+                                             ones16, sidx_ctrl));
+  float s = hsum256(_mm256_add_ps(acc0, acc1));
+  for (int b = ng * 4; b < nb; ++b) {  // tail blocks (per-block layout)
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const int8_t* ae = asi8 + (size_t)b * 16; const int8_t* ao = ae + 8;
+    int isum = 0;
+    for (int j = 0; j < 8; ++j)
+      isum += (int)kE2M1x2[pk[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk[j] >> 4] * (int)ao[j];
+    s += (e4m3[scale[b]] * asb[b]) * (float)isum;
+  }
+  return s * (0.5f * global);
+}
+
+// Horizontal max of 8 floats.
+CPU_MOE_TARGET("avx2,fma")
+static inline float hmax256(__m256 v) {
+  __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+  m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 0x55));
+  return _mm_cvtss_f32(m);
+}
+
+// q = clamp(lround(x * inv), +-127) for 8 lanes, bit-identical to the scalar
+// std::lround (round half away from zero) path in quant_i8_pg16.
+CPU_MOE_TARGET("avx2,fma")
+static inline __m256i quant8_round(__m256 x, __m256 inv) {
+  const __m256 q = _mm256_mul_ps(x, inv);
+  const __m256 t = _mm256_round_ps(q, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+  const __m256 sgn = _mm256_and_ps(q, _mm256_set1_ps(-0.0f));
+  const __m256 frac = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_sub_ps(q, t));
+  const __m256 up = _mm256_and_ps(_mm256_cmp_ps(frac, _mm256_set1_ps(0.5f), _CMP_GE_OQ),
+                                  _mm256_or_ps(sgn, _mm256_set1_ps(1.0f)));
+  __m256 r = _mm256_add_ps(t, up);
+  r = _mm256_min_ps(_mm256_max_ps(r, _mm256_set1_ps(-127.0f)), _mm256_set1_ps(127.0f));
+  return _mm256_cvttps_epi32(r);
+}
+
+// Low byte of each int32 lane of v -> 8 contiguous int8 at dst.
+CPU_MOE_TARGET("avx2")
+static inline void store_i32_as_i8(int8_t* dst, __m256i v) {
+  const __m256i ctrl = _mm256_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+  const __m256i b = _mm256_shuffle_epi8(v, ctrl);
+  const __m128i lo = _mm256_castsi256_si128(b);
+  const __m128i hi = _mm256_extracti128_si256(b, 1);
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), _mm_unpacklo_epi32(lo, hi));
+}
+
+// Per-16-block int8 quantization (same scale and rounding as quant_i8_pg16) into the
+// grouped layout dot_nvfp4_i8g_avx2 reads: asi8 [K], asb [K/16], aux [K/4].
+CPU_MOE_TARGET("avx2,fma")
+void quant_i8_g4_avx2(const float* xe, const float* xo, int K, int8_t* asi8, float* asb,
+                      float* aux) {
+  const int nb = K / 16;
+  const int ng = nb / 4;
+  const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+  for (int b = 0; b < nb; ++b) {
+    const __m256 ve = _mm256_loadu_ps(xe + (size_t)b * 8);
+    const __m256 vo = _mm256_loadu_ps(xo + (size_t)b * 8);
+    const float amax = hmax256(_mm256_max_ps(_mm256_and_ps(ve, absmask), _mm256_and_ps(vo, absmask)));
+    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+    asb[b] = s;
+    const __m256 inv = _mm256_set1_ps(1.0f / s);
+    const int g = b / 4, j = b % 4;
+    int8_t* de = (g < ng) ? asi8 + (size_t)g * 64 + j * 8 : asi8 + (size_t)b * 16;
+    int8_t* dd = (g < ng) ? de + 32 : de + 8;
+    store_i32_as_i8(de, quant8_round(ve, inv));
+    store_i32_as_i8(dd, quant8_round(vo, inv));
+    if (g < ng) {
+      aux[(size_t)g * 16 + 2 * j] = s;
+      aux[(size_t)g * 16 + 2 * j + 1] = s;
+    }
+  }
+  const __m256i twelve = _mm256_set1_epi8(12);
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  for (int g = 0; g < ng; ++g) {
+    const int8_t* a = asi8 + (size_t)g * 64;
+    const __m256i ae = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+    const __m256i ao = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32));
+    const __m256i c = _mm256_madd_epi16(
+        _mm256_add_epi16(_mm256_maddubs_epi16(twelve, ae), _mm256_maddubs_epi16(twelve, ao)),
+        ones16);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(aux + (size_t)g * 16 + 8), c);
+  }
+}
+
+#ifdef CPU_MOE_HAS_AVX512VNNI
 
 // AVX-512 VNNI W4A8: FOUR 16-K blocks per VPDPBUSD (64 int8) -- 2x the AVX-VNNI
 // (256-bit) path. Decode 32 packed bytes -> 64 int8 with a single _mm512_shuffle_epi8
@@ -329,6 +481,24 @@ nvi8dot_fn select_nvi8dot() {
   return nullptr;
 }
 
+// FREETOKEN_CPU_MOE_NO_VNNI=1 disables the whole nvfp4 W4A8 (int8 activation) family,
+// keeping the fp32 nvdot path; unset/empty/"0" leave it on.
+inline bool w4a8_disabled() {
+  const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
+  return no && no[0] && no[0] != '0';
+}
+
+// AVX2 W4A8 (grouped activation layout), used only when select_nvi8dot found no VNNI
+// kernel. Only picked at the AVX2 tier: AVX-512 CPUs without VNNI keep their fp32
+// avx512 kernel (never benchmarked against this one).
+nvi8gdot_fn select_nvi8gdot() {
+#if CPU_MOE_X86
+  if (select_nvi8dot() == nullptr && pick_isa() == ISA_AVX2 && !w4a8_disabled())
+    return dot_nvfp4_i8g_avx2;
+#endif
+  return nullptr;
+}
+
 // Quantize the pre-deinterleaved fp32 even/odd activations to per-16-block int8 in the
 // [even(8),odd(8)] layout the VNNI dot expects. Done once per token/route (amortized over
 // every output row), so a scalar pass is fine relative to the GEMV.
@@ -355,7 +525,7 @@ void quant_i8_pg16(const float* xe, const float* xo, int K, int8_t* asi8, float*
 class Nvfp4Format final : public MoeFormat {
  public:
   Nvfp4Format(const MoeParams& p, const FormatArgs& a)
-      : MoeFormat(p), nvdot_(select_nvdot()), nvi8dot_(select_nvi8dot()) {
+      : MoeFormat(p), nvdot_(select_nvdot()), nvi8dot_(select_nvi8dot()), nvi8gdot_(select_nvi8gdot()) {
     gate_up_ = a.bank("gate_up");
     gu_scale_ = a.bank("gate_up_scale");
     gu_global_ = a.bank("gate_up_global");
@@ -367,14 +537,19 @@ class Nvfp4Format final : public MoeFormat {
     xo_.resize(tokens * (p.H / 2));
     ge_.resize(routes * (p.I / 2));
     go_.resize(routes * (p.I / 2));
-    if (nvi8dot_ != nullptr) {
+    if (w4a8()) {
       xi8_.resize(tokens * p.H);
       xas_.resize(tokens * (p.H / 16));
       gi8_.resize(routes * p.I);
       gas_.resize(routes * (p.I / 16));
     }
+    if (nvi8gdot_ != nullptr) {
+      xaux_.resize(tokens * (p.H / 4));
+      gaux_.resize(routes * (p.I / 4));
+    }
     isa_ = tier_name(pick_isa());
     if (nvi8dot_ != nullptr) isa_ += cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
+    else if (nvi8gdot_ != nullptr) isa_ += "+avx2i8(nvfp4-w4a8)";
     for (int i = 0; i < 16; ++i) e2m1_lut_[i] = kE2M1[i];
     for (int i = 0; i < 256; ++i) e4m3_lut_[i] = e4m3_decode((uint8_t)i);
   }
@@ -386,8 +561,9 @@ class Nvfp4Format final : public MoeFormat {
     float* xe = xe_.data() + (size_t)tok * (p.H / 2);
     float* xo = xo_.data() + (size_t)tok * (p.H / 2);
     deinterleave_bf16_f32(x, xe, xo, p.H);
-    if (nvi8dot_ != nullptr)
-      quant_i8_pg16(xe, xo, p.H, xi8_.data() + (size_t)tok * p.H, xas_.data() + (size_t)tok * (p.H / 16));
+    if (!w4a8()) return;
+    quant(xe, xo, p.H, xi8_.data() + (size_t)tok * p.H, xas_.data() + (size_t)tok * (p.H / 16),
+          nvi8gdot_ != nullptr ? xaux_.data() + (size_t)tok * (p.H / 4) : nullptr);
   }
 
   bool preps_inter() const override { return true; }
@@ -396,8 +572,9 @@ class Nvfp4Format final : public MoeFormat {
     float* ge = ge_.data() + (size_t)r * (p.I / 2);
     float* go = go_.data() + (size_t)r * (p.I / 2);
     deinterleave_bf16_f32(g, ge, go, p.I);
-    if (nvi8dot_ != nullptr)
-      quant_i8_pg16(ge, go, p.I, gi8_.data() + (size_t)r * p.I, gas_.data() + (size_t)r * (p.I / 16));
+    if (!w4a8()) return;
+    quant(ge, go, p.I, gi8_.data() + (size_t)r * p.I, gas_.data() + (size_t)r * (p.I / 16),
+          nvi8gdot_ != nullptr ? gaux_.data() + (size_t)r * (p.I / 4) : nullptr);
   }
 
   void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* /*x*/, float w_in,
@@ -408,10 +585,14 @@ class Nvfp4Format final : public MoeFormat {
     const uint16_t* global = static_cast<const uint16_t*>(tbl_at(gu_global_, layer));
     const float* xe = xe_.data() + (size_t)tok * (H / 2);
     const float* xo = xo_.data() + (size_t)tok * (H / 2);
-    const int8_t* xi8 = nvi8dot_ != nullptr ? xi8_.data() + (size_t)tok * H : nullptr;
-    const float* xas = nvi8dot_ != nullptr ? xas_.data() + (size_t)tok * (H / 16) : nullptr;
+    const int8_t* xi8 = w4a8() ? xi8_.data() + (size_t)tok * H : nullptr;
+    const float* xas = w4a8() ? xas_.data() + (size_t)tok * (H / 16) : nullptr;
+    const float* xaux = nvi8gdot_ != nullptr ? xaux_.data() + (size_t)tok * (H / 4) : nullptr;
     gated_rows(p, i0, i1, w_in, g, [&](int row) {
       const size_t r = (size_t)e * (2 * p.I) + row;
+      if (nvi8gdot_ != nullptr)
+        return nvi8gdot_(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16),
+                         fp16_to_f32(global[r]), xi8, H, e4m3_lut_, xas, xaux);
       if (nvi8dot_ != nullptr)
         return nvi8dot_(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16),
                         fp16_to_f32(global[r]), xi8, H, e4m3_lut_, xas);
@@ -429,7 +610,10 @@ class Nvfp4Format final : public MoeFormat {
       for (int j = 0; j < n; ++j) {
         const size_t r = (size_t)routes[j].r;
         const size_t row = (size_t)routes[j].e * p.H + h;
-        out[j * kRowBlock + h - h0] = nvi8dot_ != nullptr
+        out[j * kRowBlock + h - h0] = nvi8gdot_ != nullptr
+            ? nvi8gdot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), fp16_to_f32(global[row]),
+                        gi8_.data() + r * I, I, e4m3_lut_, gas_.data() + r * (I / 16), gaux_.data() + r * (I / 4))
+            : nvi8dot_ != nullptr
             ? nvi8dot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), fp16_to_f32(global[row]),
                        gi8_.data() + r * I, I, e4m3_lut_, gas_.data() + r * (I / 16))
             : nvdot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), fp16_to_f32(global[row]),
@@ -440,7 +624,17 @@ class Nvfp4Format final : public MoeFormat {
 
  private:
   nvdot_fn nvdot_;
-  nvi8dot_fn nvi8dot_;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
+  nvi8dot_fn nvi8dot_;    // VNNI W4A8 nvfp4 dot, per-block activation layout
+  nvi8gdot_fn nvi8gdot_;  // AVX2 W4A8 nvfp4 dot, grouped layout (only without VNNI)
+  bool w4a8() const { return nvi8dot_ != nullptr || nvi8gdot_ != nullptr; }
+  // Activations of one row to the int8 layout the chosen W4A8 dot reads.
+  void quant(const float* e, const float* o, int K, int8_t* i8, float* as, float* aux) const {
+#if CPU_MOE_X86
+    if (nvi8gdot_ != nullptr) return quant_i8_g4_avx2(e, o, K, i8, as, aux);
+#endif
+    (void)aux;
+    if (nvi8dot_ != nullptr) quant_i8_pg16(e, o, K, i8, as);
+  }
   // ModelOpt rows: packed e2m1 [E,2I,H/2], e4m3 scales per 16 along K [E,2I,H/16], fp16 row globals [E,2I]; down likewise with K = I.
   const uint64_t* gate_up_ = nullptr;
   const uint64_t* gu_scale_ = nullptr;
@@ -455,6 +649,7 @@ class Nvfp4Format final : public MoeFormat {
   AlignedVector<float> xe_, xo_, ge_, go_;
   AlignedVector<int8_t> xi8_, gi8_;
   AlignedVector<float> xas_, gas_;
+  AlignedVector<float> xaux_, gaux_;  // grouped layout aux (AVX2 W4A8): [.. * H/4], [.. * I/4]
 };
 
 }  // namespace
