@@ -600,11 +600,14 @@ def measure_cpu_moe_step_cost(fmt: str, wl: Workload, iters: int = 64,
     """Split one CPU MoE decode step into a fixed cost and a per-expert cost.
 
     The hybrid backend does not just add CPU bandwidth to PCIe bandwidth. Every layer of
-    every step it also pays a fixed toll -- activations D2H, the GPU<->CPU handshake,
-    waking the worker pool and draining its barrier, results H2D -- whether it computes
-    one expert or twenty, and the GPU stalls on it. When most experts miss, that toll is
-    amortized and hybrid wins. When the GPU cache is holding well and only a couple miss,
-    the toll is most of what hybrid contributes, and plain offload is faster.
+    every step it also pays a fixed toll whether it computes one expert or twenty, and
+    the GPU stalls on it. When most experts miss, that toll is amortized and hybrid wins.
+    When the GPU cache is holding well and only a couple miss, the toll is most of what
+    hybrid contributes, and plain offload is faster.
+
+    The timed call is the bare ``run_task``, so ``fixed_ms`` is only the pool wake and
+    barrier drain. The activation D2H, the GPU<->CPU handshake and the results H2D that
+    serving adds on top are not in it, so it is a lower bound on the real per-layer toll.
 
     Two points give the split, since ``top_k`` is fixed per executor: build one at
     ``top_k = 1`` and one at the workload's own ``top_k`` over the same banks, and solve
@@ -627,13 +630,23 @@ def measure_cpu_moe_step_cost(fmt: str, wl: Workload, iters: int = 64,
         finally:
             del ex
 
-    t1, tk = step_ms(1), step_ms(wl.top_k)
-    per_expert = (tk - t1) / (wl.top_k - 1)
+    return _step_cost_fit(step_ms(1), step_ms(wl.top_k), wl.top_k)
+
+
+def _step_cost_fit(t1: float, tk: float, top_k: int) -> dict:
+    """``t(k) = fixed + k * per_expert`` through the points ``(1, t1)`` and ``(top_k, tk)``.
+
+    Two noisy points can put the intercept below zero (t(top_k) > top_k * t(1), e.g. when
+    one expert parallelizes worse than top_k do); ``fit_ok`` marks that the split is then
+    not a cost breakdown at all.
+    """
+    per_expert = (tk - t1) / (top_k - 1)
     fixed = t1 - per_expert
     return {
         "fixed_ms": round(fixed, 4),
         "per_expert_ms": round(per_expert, 4),
-        "top_k": wl.top_k,
+        "fit_ok": fixed >= 0 and per_expert >= 0,
+        "top_k": top_k,
         "step_ms_at_1": round(t1, 4),
         "step_ms_at_top_k": round(tk, 4),
     }
@@ -847,8 +860,8 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                          f"forcing --moe-backend hybrid.")
         # The ratio says hybrid moves expert bytes faster. It does not say whether that
         # beats offload at *this* deployment's miss rate, because hybrid also pays a
-        # fixed per-layer toll the ratio cannot see. Measure the toll and report the
-        # miss count where the two break even.
+        # fixed per-layer toll the ratio cannot see. Measure the CPU side of that toll;
+        # no break-even miss count is derived from it.
         try:
             sc = measure_cpu_moe_step_cost(fmt, wl, cpu_iters, cpu_threads)
             entry["cpu_moe_step_cost"] = sc
@@ -964,7 +977,7 @@ def run_benchbw(
                 logger.info(f"benchbw: {mname}/{fmt} real kernels ...")
                 kernels[fmt] = _bench_format(
                     fmt, wl, device, threshold, reps, cpu_threads, kernel_cpu_iters,
-                kernel_pcie_iters, isas
+                    kernel_pcie_iters, isas
                 )
                 done += 1
             workloads_out[mname] = {
@@ -1034,15 +1047,19 @@ def _print_kernels(kernels: dict, iw: int) -> None:
             print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
                   f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses")
         sc = e.get("cpu_moe_step_cost")
-        if sc:
+        if sc and sc.get("fit_ok", True):
             print(f"       cpu step: {sc['fixed_ms']:.2f} ms fixed + "
-                  f"{sc['per_expert_ms']:.2f} ms/expert -- the fixed part is paid per layer "
-                  f"per step whether 1 expert misses or 20")
+                  f"{sc['per_expert_ms']:.2f} ms/expert -- the fixed part (pool wake + "
+                  f"barrier only) is paid per layer per step whether 1 expert misses or 20")
+        elif sc:
+            print(f"       cpu step: {sc['step_ms_at_1']:.2f} ms at 1 expert, "
+                  f"{sc['step_ms_at_top_k']:.2f} ms at {sc['top_k']} -- too noisy to split "
+                  f"into fixed + per-expert")
         gm = e.get("pcie_gather_by_misses")
         if gm and len(gm) > 1:
             lo, hi = gm[0], gm[-1]
-            print(f"       gather scales linearly: {lo['bw_gbs']:.1f} GB/s at "
-                  f"{lo['misses']} miss -> {hi['bw_gbs']:.1f} GB/s at {hi['misses']}")
+            print(f"       gather bw: {lo['bw_gbs']:.1f} GB/s at {lo['misses']} miss -> "
+                  f"{hi['bw_gbs']:.1f} GB/s at {hi['misses']}")
         if e.get("isa_sweep"):
             tiers = sorted(e["isa_sweep"].items(), key=lambda kv: -kv[1])
             for i, (k, v) in enumerate(tiers):
