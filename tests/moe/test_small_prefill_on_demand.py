@@ -53,6 +53,60 @@ def test_small_prefill_dispatch(monkeypatch, tokens, threshold, on_demand):
         assert "ensure" not in calls and "begin_prefill" not in calls[1:] and got["n"] == layer.num_experts
 
 
+def _record_paths(monkeypatch, layer, cache):
+    """Stub the cache movement and the GEMM; log each call and what the GEMM was handed."""
+    calls, got = [], {}
+
+    def ensure(layer_id, ids):
+        calls.append(("ensure", ids.tolist()))
+        ids.add_(100)  # the LRU kernel rewrites its query to slot ids in place
+
+    monkeypatch.setattr(cache, "ensure_experts", ensure)
+    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.append(("materialize",)))
+    monkeypatch.setattr(cache, "copy_missing", lambda: calls.append(("copy",)))
+
+    def fake_gemm(cache_, hs, w, ids, *, views, n, alphas, is_prefill):
+        got.update(ids=ids.tolist(), n=n, is_prefill=is_prefill)
+        return hs
+
+    monkeypatch.setattr(layer, "_expert_gemm", fake_gemm)
+    return calls, got
+
+
+def test_small_prefill_leaves_an_unpinned_layer_on_the_whole_layer_path(monkeypatch):
+    # an unpinned (locked) layer's copy_missing is the whole-layer pageable copy, which presumes
+    # position == expert id and cannot serve an LRU slot remap
+    layer, cache = _layer_and_cache(torch.device("cpu"))
+    monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", 8)
+    cache._unpinned_layers = frozenset({layer.layer_id})
+    calls, got = _record_paths(monkeypatch, layer, cache)
+    layer._prefill_routed(torch.randn(3, 16), torch.full((3, 2), 0.5), torch.zeros(3, 2, dtype=torch.int32))
+    assert calls == [("materialize",), ("copy",)] and got["n"] == layer.num_experts
+
+
+def test_small_prefill_path_does_not_depend_on_how_many_experts_a_layer_routes_to(monkeypatch):
+    # 6 distinct experts in an 8-slot cache: every layer of a short prefill still takes the
+    # on-demand path, so no layer can fall back into an overlap buffer that was never begun
+    layer, cache = _layer_and_cache(torch.device("cpu"))
+    monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", 8)
+    monkeypatch.setattr(moe_mod, "_ENSURE_CHUNK_IDS", 4)
+    calls, got = _record_paths(monkeypatch, layer, cache)
+    ids = torch.tensor([[5, 0], [1, 7], [2, 5], [4, 0]], dtype=torch.int32)
+    layer._prefill_routed(torch.randn(4, 16), torch.full((4, 2), 0.5), ids.clone())
+    assert calls == [("ensure", [0, 1, 2, 4]), ("copy",), ("ensure", [5, 7]), ("copy",)]
+    assert got == {"ids": (ids + 100).tolist(), "n": None, "is_prefill": False}
+
+
+def test_small_prefill_refuses_more_experts_than_the_cache_holds(monkeypatch):
+    layer, cache = _layer_and_cache(torch.device("cpu"))
+    monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", 8)
+    _record_paths(monkeypatch, layer, cache)
+    cache.cache_size = 4  # below the engine's num_experts floor
+    ids = torch.tensor([[5, 0], [1, 7], [2, 5], [4, 0]], dtype=torch.int32)
+    with pytest.raises(AssertionError, match="exceed"):
+        layer._prefill_routed(torch.randn(4, 16), torch.full((4, 2), 0.5), ids)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_small_prefill_matches_the_whole_layer_path(monkeypatch):
     from freetoken.core import get_global_ctx  # noqa: F401  (layer reads the ctx only in forward())

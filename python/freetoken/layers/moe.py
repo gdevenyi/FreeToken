@@ -362,22 +362,26 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
-        if 0 < hidden_states.shape[0] <= _SMALL_PREFILL_TOKENS and cache.decode_target in ("gpu", "hybrid"):
+        if (
+            0 < hidden_states.shape[0] <= _SMALL_PREFILL_TOKENS
+            and cache.decode_target in ("gpu", "hybrid")
+            and not cache.is_unpinned_layer(self.layer_id)
+        ):
             # A short extension (an agent turn over a cached prefix) touches a fraction of each
-            # layer's experts; fetching those beats streaming all of them (~68 GB here). The same
-            # token count holds in every layer, so the overlap double buffer is never begun.
-            slots = self._ensure_unique(cache, topk_ids)
-            if slots is not None:
-                return self._expert_gemm(
-                    cache,
-                    hidden_states,
-                    topk_weights,
-                    slots,
-                    views=cache.bank_views(),
-                    n=None,
-                    alphas=cache.alphas_for_slots(self.layer_id),
-                    is_prefill=False,
-                )
+            # layer's experts; fetching those beats streaming all of them (~68 GB here). An
+            # unpinned layer's copy_missing presumes position == expert id, so it streams below;
+            # unpinned layers only exist with the prefill overlap off, so no layer can enter
+            # the overlap double buffer after an earlier layer skipped begin_prefill.
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                self._ensure_unique(cache, topk_ids),
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -405,9 +409,8 @@ class OffloadMoELayer(MoELayer):
             is_prefill=True,
         )
 
-    def _ensure_unique(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> torch.Tensor | None:
-        """Make this layer's routed experts resident and return ``topk_ids`` mapped to slots, or
-        None (take the whole-layer path) when they cannot all be resident at once.
+    def _ensure_unique(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make this layer's routed experts resident and return ``topk_ids`` mapped to slots.
 
         The LRU kernel is sized for decode: its block is next_pow2(ids) x next_pow2(slots), so a
         prefill's tokens x top_k ids overflow Triton's element limit, and even a block under it
@@ -415,8 +418,9 @@ class OffloadMoELayer(MoELayer):
         decode-width chunks; each chunk's misses are copied before the next ensure reuses the plan."""
         uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
         n = uniq.numel()
-        if n > cache.cache_size // 2:  # leave room so a chunk never evicts the one before it
-            return None
+        # Each ensure stamps a newer LRU step, so a later chunk evicts the earlier chunks' slots
+        # only once every other slot is gone; the engine's num_experts slot floor rules that out.
+        assert n <= cache.cache_size, f"{n} routed experts exceed the {cache.cache_size}-slot cache"
         uniq = uniq.to(torch.int32)
         for start in range(0, n, _ENSURE_CHUNK_IDS):
             part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
