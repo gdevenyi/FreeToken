@@ -42,6 +42,28 @@ def test_mxfp8_linear_matches_dequant_reference(M: int, N: int, K: int):
     assert rel.item() < 2e-2, rel.item()
 
 
+def test_mxfp8_linear_past_the_gemv_bounds_its_dequant_transient(monkeypatch):
+    """A wide weight (lm_head-like) past the GEMV must not materialize whole in bf16."""
+    import freetoken.kernel.triton.mxfp8_linear as mod
+
+    N, K, M = 8192, 2560, 300
+    w8, codes = _make_mxfp8(N, K)
+    x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
+    y_full = mod.mxfp8_linear(x, w8, codes)
+    monkeypatch.setattr(mod, "_DEQUANT_CHUNK_BYTES", 2 << 20)  # 409 rows of K=2560 bf16
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    y = mod.mxfp8_linear(x, w8, codes)
+    peak = torch.cuda.max_memory_allocated() - base
+    whole_weight = N * K * 2
+    assert peak < whole_weight // 4, (peak, whole_weight)
+    ref = (x.float() @ mod.mxfp8_dequant(w8, codes, torch.float32).t()).to(torch.bfloat16)
+    rel = (y.float() - ref.float()).abs().max() / ref.float().abs().max()
+    assert rel.item() < 2e-2
+    assert torch.allclose(y.float(), y_full.float(), rtol=1e-2, atol=1e-2)
+
+
 def test_gemma_plus_one_norm_matches_flashinfer_semantics():
     """Triton fallback vs the (1+w) definition; per-head 3D strided in-place."""
     from freetoken.kernel.triton.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
