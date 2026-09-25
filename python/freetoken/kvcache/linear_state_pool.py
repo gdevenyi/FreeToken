@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from freetoken.distributed import get_tp_info
@@ -313,7 +314,10 @@ def _linear_pool_num_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    # With the host snapshot tier (FT_GDN_HOST_TIER=1) evicted snapshots spill to RAM and come
+    # back on a hit, so the GPU cache need not keep four of them resident.
+    floor = 1 if os.environ.get("FT_GDN_HOST_TIER", "0") == "1" else 4
+    n_cache = max(floor, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 
