@@ -643,6 +643,24 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dense-quant",
+        default=ServerArgs.dense_quant,
+        choices=["none", "mxfp8"],
+        help=(
+            "Requantize the model's bf16 dense projections at load. 'mxfp8' stores e4m3 weights "
+            "with a power-of-two scale per 32 inputs (half the VRAM and decode read of bf16), "
+            "served W8A16; it runs on any GPU. Only families that list the projections support it."
+        ),
+    )
+
+    parser.add_argument(
+        "--lm-head-quant",
+        default=ServerArgs.lm_head_quant,
+        choices=["none", "mxfp8"],
+        help="Requantize a bf16, untied lm_head at load, like --dense-quant. It changes every logit.",
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         action=_DeprecatedAlias,
         new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",
