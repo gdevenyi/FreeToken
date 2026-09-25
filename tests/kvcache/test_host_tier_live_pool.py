@@ -32,7 +32,7 @@ def test_read_after_a_pool_rebuild_lands_in_the_new_tensors():
     assert torch.all(pool.recurrent_states[:, 5] == 7.0)
 
 
-def test_copies_wait_for_the_engine_stream(monkeypatch):
+def _fake_copy_stream(monkeypatch):
     events = []
     engine = object()
 
@@ -45,9 +45,28 @@ def test_copies_wait_for_the_engine_stream(monkeypatch):
 
     monkeypatch.setattr(tier_module.torch.cuda, "current_stream", lambda device=None: engine)
     monkeypatch.setattr(tier_module.torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    return FakeStream(), events, engine
+
+
+def test_copies_wait_for_the_engine_stream(monkeypatch):
+    stream, events, engine = _fake_copy_stream(monkeypatch)
     pool = _pool(3)
     tier = HostPrefixTier(pool, gdn_slots_host=2, device="cpu")
-    tier.copy_stream = FakeStream()
+    tier.copy_stream = stream
     host = tier.write_gdn(1)
     tier.read_gdn(host, 2)
+    assert events == [("wait", engine), ("sync",), ("wait", engine), ("sync",)]
+
+
+def test_kv_page_copies_wait_for_the_engine_stream(monkeypatch):
+    stream, events, engine = _fake_copy_stream(monkeypatch)
+    kv_pool = SimpleNamespace(
+        _kv_buffer=torch.zeros(2, 1, 4, 4, 1, 2),  # [2, L, P, page, H, D]
+        _scale_buffer=torch.zeros(2, 1, 16, 1),    # [2, L, P*page, H]
+        _block_scale_buffer=None,
+    )
+    tier = HostPrefixTier(_pool(3), kv_pool, gdn_slots_host=2, kv_budget_bytes=1 << 12, device="cpu")
+    tier.copy_stream = stream
+    slots = tier.write_kv(torch.arange(4, 8, dtype=torch.int32))
+    tier.read_kv(slots, torch.tensor([2]))
     assert events == [("wait", engine), ("sync",), ("wait", engine), ("sync",)]
