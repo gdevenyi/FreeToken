@@ -21,7 +21,7 @@ from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
 
 # Latency-bound over PCIe, so keep the block small and let many of them be in flight.
 _NUM_WARPS = 1
-_TL_TABLE_DTYPES = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
+_TL_TABLE_DTYPES = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 
 @triton.jit
