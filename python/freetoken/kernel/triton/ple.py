@@ -36,7 +36,8 @@ def _ple_gather_kernel(
     BLOCK_D: tl.constexpr,
     TABLE_DTYPE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # the output offset row * EMB_DIM can pass 2^31 for a long prefill at a wide hidden size
+    row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
     in_range = (idx >= 0) & (idx < num_rows)
     idx = tl.where(in_range, idx, 0)
