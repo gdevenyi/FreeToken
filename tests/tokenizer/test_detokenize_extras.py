@@ -79,3 +79,19 @@ def test_reasoning_tokens_count_up_to_the_end_tag():
     assert reasoning == 3  # b, c and the tag itself
     _, none = _run(manager, 2, [1, 2, EOS])
     assert none == 0
+
+
+def test_a_batch_with_one_uid_twice_advances_its_state_in_order():
+    # each message must see the decode state the previous one left, and the reasoning
+    # counts must stay aligned with the texts
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}), think_end_id=THINK_END)
+    msgs = [
+        DetokenizeMsg(uid=1, next_token=1, finished=False),
+        DetokenizeMsg(uid=1, next_token=THINK_END, finished=False),
+        DetokenizeMsg(uid=2, next_token=3, finished=False),
+        DetokenizeMsg(uid=1, next_token=2, finished=True),
+    ]
+    texts, counts = manager.detokenize_with_meta(msgs)
+    assert texts == ["b", "</think>", "d", "c"]
+    assert counts == [0, 0, 0, 2]
+    assert manager.detokenize([DetokenizeMsg(uid=2, next_token=4, finished=True)]) == ["e"]
