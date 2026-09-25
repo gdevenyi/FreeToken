@@ -481,7 +481,12 @@ class Scheduler(SchedulerIOMixin):
             return None
         if req.stop_decode_status is None:
             req.stop_decode_status = DecodeStatus(
-                decoded_ids=[], decoded_str="", read_offset=0, surr_offset=0, sent_offset=0
+                decoded_ids=[],
+                decoded_str="",
+                read_offset=0,
+                surr_offset=0,
+                sent_offset=0,
+                skip_special=req.sampling_params.skip_special_tokens,
             )
         state = req.stop_decode_status
         state.decoded_ids.extend(req.input_ids[prompt_len + len(state.decoded_ids) : end].tolist())
