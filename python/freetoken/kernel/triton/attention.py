@@ -5,6 +5,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from freetoken.kernel.triton.e4m3_compat import KV_TILE_SCALE
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32 as _kv_load_f32
@@ -81,6 +82,35 @@ def _select_extend_tile(
     if head_dim <= 384:
         return (32, 64) if fits(32, 64) else (32, 32)
     return (32, 64) if fits(32, 64) else (16, 16)
+
+
+def _select_extend_tiles(
+    head_dim: int, block_d: int, smem_optin: int, kv_bytes: int = 2
+) -> list[tuple[int, int]]:
+    """``_select_extend_tile``'s pick, then smaller rungs down to (16, 16), largest first.
+
+    The byte estimate is a lower bound: triton's pipelining can allocate more, and pre-Volta
+    caps a block at 48KB with no opt-in. The caller retries down this ladder on
+    ``OutOfResources``; ``tl.dot`` needs N >= 16, hence the floor.
+    """
+    first = _select_extend_tile(head_dim, block_d, smem_optin, kv_bytes)
+    rungs = [(128, 64), (64, 64), (64, 32), (32, 64), (32, 32), (16, 16)]
+    return [first] + [t for t in rungs if t[0] * t[1] < first[0] * first[1]]
+
+
+def _decode_smem_cap(block_d: int, block_dv: int, smem_optin: int, kv_bytes: int) -> tuple[int, int]:
+    """Largest ``(BLOCK_N, num_stages)`` whose pipelined k/v tiles fit the device (32/2 default).
+
+    They cost about ``num_stages * BLOCK_N * (BLOCK_D + BLOCK_DV) * kv_bytes`` bytes: 128KB at
+    head_dim 512 in 16 bits, far over Pascal's 48KB. ``smem_optin == 0`` (unknown) keeps 32/2.
+    """
+    if not smem_optin:
+        return 64, 2
+    budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
+    for block_n, stages in ((64, 2), (32, 2), (32, 1), (16, 1)):
+        if stages * block_n * (block_d + block_dv) * max(kv_bytes, 2) <= budget:
+            return block_n, stages
+    return 16, 1
 
 
 @triton.jit
@@ -586,6 +616,10 @@ def decode_paged_attention(
         # A window split of several tiles in a single-wave grid is latency bound; 64-key tiles halve its serial steps.
         if split_len >= 128 and grid[0] * grid[1] * grid[2] <= _num_sms(q.device.index):
             block_n = 64
+    cap_n, decode_stages = _decode_smem_cap(
+        block_d, block_dv, _optin_smem_bytes(q.device.index), 2 if nvfp4 else k_cache.element_size()
+    )
+    block_n = min(block_n, cap_n)
 
     _decode_grouped_stage1_kernel[grid](
         q,
@@ -630,7 +664,7 @@ def decode_paged_attention(
         HAS_KV_SCALE=has_kv_scale,
         KV_NVFP4=nvfp4,
         num_warps=4,
-        num_stages=2,
+        num_stages=decode_stages,
     )
     _decode_stage2_kernel[(batch, num_q_heads)](
         attn_logits,
@@ -1170,107 +1204,114 @@ def extend_paged_attention(
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
     # NVFP4 restores full-width tiles with block scales; keep its 16-bit budget.
     kv_tile_bytes = 2 if nvfp4 else k_cache.element_size()
-    block_m, block_n = _select_extend_tile(
+    tiles = _select_extend_tiles(
         head_dim, block_d, _optin_smem_bytes(q.device.index), kv_tile_bytes
     )
-    grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
-    if k_extend is not None or v_extend is not None:
+    split = k_extend is not None or v_extend is not None
+    if split:
         assert k_extend is not None and v_extend is not None
         assert k_extend.is_cuda and v_extend.is_cuda
         assert k_extend.dim() == 3 and v_extend.dim() == 3
         assert k_extend.shape[0] == num_q_tokens and v_extend.shape[0] == num_q_tokens
         assert k_extend.shape[1] == num_kv_heads and v_extend.shape[1] == num_kv_heads
         assert k_extend.shape[-1] == head_dim and v_extend.shape[-1] == head_dim
-        _extend_attention_split_kernel[grid](
-            q,
-            k_extend,
-            v_extend,
-            k_cache,
-            v_cache,
-            k_scale_arg,
-            v_scale_arg,
-            k_block_arg,
-            v_block_arg,
-            o,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            prefix_lens,
-            block_ends_arg,
-            sm_scale,
-            sinks_arg,
-            q.stride(0),
-            q.stride(1),
-            k_extend.stride(0),
-            k_extend.stride(1),
-            v_extend.stride(0),
-            v_extend.stride(1),
-            k_cache.stride(0),
-            k_cache.stride(1),
-            v_cache.stride(0),
-            v_cache.stride(1),
-            k_scale_arg.stride(0),
-            v_scale_arg.stride(0),
-            o.stride(0),
-            o.stride(1),
-            GROUP=num_q_heads // num_kv_heads,
-            D=head_dim,
-            BLOCK_D=block_d,
-            BLOCK_DV=block_dv,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            SLIDING_WINDOW=sliding_window or 0,
-            HAS_SINKS=sinks is not None,
-            HAS_KV_SCALE=has_kv_scale,
-            KV_NVFP4=nvfp4,
-            HAS_BLOCKS=block_ends is not None,
-            num_warps=8,
-            num_stages=1,
-        )
-        return o
-
-    _extend_attention_kernel[grid](
-        q,
-        k_cache,
-        v_cache,
-        k_scale_arg,
-        v_scale_arg,
-        k_block_arg,
-        v_block_arg,
-        o,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        prefix_lens,
-        block_ends_arg,
-        sm_scale,
-        sinks_arg,
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale_arg.stride(0),
-        v_scale_arg.stride(0),
-        o.stride(0),
-        o.stride(1),
-        GROUP=num_q_heads // num_kv_heads,
-        D=head_dim,
-        BLOCK_D=block_d,
-        BLOCK_DV=block_dv,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        SLIDING_WINDOW=sliding_window or 0,
-        HAS_SINKS=sinks is not None,
-        HAS_KV_SCALE=has_kv_scale,
-        KV_NVFP4=nvfp4,
-        HAS_BLOCKS=block_ends is not None,
-        num_warps=8,
-        num_stages=1,
-    )
+    for attempt, (block_m, block_n) in enumerate(tiles):
+        grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
+        try:
+            if split:
+                _extend_attention_split_kernel[grid](
+                    q,
+                    k_extend,
+                    v_extend,
+                    k_cache,
+                    v_cache,
+                    k_scale_arg,
+                    v_scale_arg,
+                    k_block_arg,
+                    v_block_arg,
+                    o,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    prefix_lens,
+                    block_ends_arg,
+                    sm_scale,
+                    sinks_arg,
+                    q.stride(0),
+                    q.stride(1),
+                    k_extend.stride(0),
+                    k_extend.stride(1),
+                    v_extend.stride(0),
+                    v_extend.stride(1),
+                    k_cache.stride(0),
+                    k_cache.stride(1),
+                    v_cache.stride(0),
+                    v_cache.stride(1),
+                    k_scale_arg.stride(0),
+                    v_scale_arg.stride(0),
+                    o.stride(0),
+                    o.stride(1),
+                    GROUP=num_q_heads // num_kv_heads,
+                    D=head_dim,
+                    BLOCK_D=block_d,
+                    BLOCK_DV=block_dv,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    SLIDING_WINDOW=sliding_window or 0,
+                    HAS_SINKS=sinks is not None,
+                    HAS_KV_SCALE=has_kv_scale,
+                    KV_NVFP4=nvfp4,
+                    HAS_BLOCKS=block_ends is not None,
+                    num_warps=8,
+                    num_stages=1,
+                )
+            else:
+                _extend_attention_kernel[grid](
+                    q,
+                    k_cache,
+                    v_cache,
+                    k_scale_arg,
+                    v_scale_arg,
+                    k_block_arg,
+                    v_block_arg,
+                    o,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    prefix_lens,
+                    block_ends_arg,
+                    sm_scale,
+                    sinks_arg,
+                    q.stride(0),
+                    q.stride(1),
+                    k_cache.stride(0),
+                    k_cache.stride(1),
+                    v_cache.stride(0),
+                    v_cache.stride(1),
+                    k_scale_arg.stride(0),
+                    v_scale_arg.stride(0),
+                    o.stride(0),
+                    o.stride(1),
+                    GROUP=num_q_heads // num_kv_heads,
+                    D=head_dim,
+                    BLOCK_D=block_d,
+                    BLOCK_DV=block_dv,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    SLIDING_WINDOW=sliding_window or 0,
+                    HAS_SINKS=sinks is not None,
+                    HAS_KV_SCALE=has_kv_scale,
+                    KV_NVFP4=nvfp4,
+                    HAS_BLOCKS=block_ends is not None,
+                    num_warps=8,
+                    num_stages=1,
+                )
+            return o
+        except OutOfResources:
+            # raised at launch setup, before any GPU work, so a smaller tile can retry
+            if attempt == len(tiles) - 1:
+                raise
     return o
-
 
 def paged_attention(
     q: torch.Tensor,
