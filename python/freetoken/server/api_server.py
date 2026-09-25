@@ -144,6 +144,9 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    # Not in the maps above: a disconnect cancels at wait_for_ack, whose finally empties them
+    # before any abort path runs. FIFO-bounded; a duplicate AbortMsg is safe (the scheduler acks it).
+    aborted_uids: Dict[int, None] = field(default_factory=dict)
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -378,6 +381,7 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        finished = False
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
@@ -385,16 +389,25 @@ class FrontendManager:
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
                 yield chunk
-        except asyncio.CancelledError:
-            asyncio.create_task(self.abort_user(uid))
-            raise
+            finished = True
+        finally:
+            # finally, not `except CancelledError`: the abort must go out however the stream dies;
+            # only a stream that ran to completion leaves the engine with nothing to stop.
+            if not finished:
+                try:
+                    await asyncio.shield(self.abort_user(uid))
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to deliver abort for user %s", uid)
 
     async def abort_user(self, uid: int):
+        if uid in self.aborted_uids:
+            return
+        self.aborted_uids[uid] = None
+        while len(self.aborted_uids) > 65_536:
+            self.aborted_uids.pop(next(iter(self.aborted_uids)))
+        self.event_map.pop(uid, None)
+        self.ack_map.pop(uid, None)
         await asyncio.sleep(0.1)
-        if uid in self.ack_map:
-            del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
