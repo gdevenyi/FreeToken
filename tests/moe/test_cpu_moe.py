@@ -810,24 +810,43 @@ def test_explicit_cpu_threads_pin_the_flag_coordinator(monkeypatch):
 
 def test_numa_tile_scheduling_matches_the_shared_queue(monkeypatch):
     """With the banks' rows placed per node, a pool spanning the nodes takes each tile
-    from its own node first; the output must be bit-identical to the shared-queue order."""
+    from its own node first; the output must be bit-identical to the shared-queue order.
+    Page-interleaved banks get no tile map: at this shape every tile spans pages on both
+    nodes, so a map there would mean the resolver does not look at the tiles' pages."""
+    import ctypes
+    import os
+
     import freetoken.moe.host_banks as hb
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     nodes = hb.numa_placement_nodes()
     if len(nodes) < 2:
         pytest.skip("needs a multi-node host whose memory policy leaves placement open")
-    L, E, H, I, top_k, bs, layer = 2, 16, 1024, 512, 4, 2, 1
+    mbind_nr = {"x86_64": 237, "aarch64": 235}.get(os.uname().machine)
+    if mbind_nr is None:
+        pytest.skip("mbind syscall number unknown on this arch")
+    libc = ctypes.CDLL(None, use_errno=True)
+    L, E, H, I, top_k, bs, layer = 2, 16, 2560, 640, 4, 2, 1
     src = _make_nvfp4_cache(L, E, H, I, seed=3)
-    placed = {}
-    for role, per_layer in src.bank_sources.items():
-        placed[role] = []
-        for t in per_layer:
-            bank = hb.HostBank(tuple(t.shape), t.dtype, backing="mmap")
-            hb.place_expert_rows([bank.tensor], nodes)
-            bank.tensor.copy_(t)
-            placed[role].append(bank.tensor)
-    cache = SimpleNamespace(**{**vars(src), "bank_sources": placed})
+
+    def host_cache(placed: bool) -> SimpleNamespace:
+        sources = {}
+        for role, per_layer in src.bank_sources.items():
+            sources[role] = []
+            for t in per_layer:
+                bank = hb.HostBank(tuple(t.shape), t.dtype, backing="mmap")
+                if placed:
+                    hb.place_expert_rows([bank.tensor], nodes)
+                else:  # what numactl --interleave=all gives an unplaced bank
+                    mask = (ctypes.c_ulong * 16)()
+                    for n in nodes:
+                        mask[n // 64] |= 1 << (n % 64)
+                    assert libc.syscall(mbind_nr, ctypes.c_void_p(bank.addr),
+                                        ctypes.c_ulong(len(bank.memoryview())), 3, mask,
+                                        ctypes.c_ulong(16 * 64), 0) == 0, ctypes.get_errno()
+                bank.tensor.copy_(t)
+                sources[role].append(bank.tensor)
+        return SimpleNamespace(**{**vars(src), "bank_sources": sources})
 
     dev = torch.device("cuda")
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
@@ -835,17 +854,17 @@ def test_numa_tile_scheduling_matches_the_shared_queue(monkeypatch):
     ids[1, 3] = -1
     w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
     outs = []
-    for numa in ("1", "0"):
+    for placed, numa in ((True, "1"), (True, "0"), (False, "1")):
         monkeypatch.setenv("FREETOKEN_CPU_MOE_NUMA", numa)
         ex = CpuMoeExecutor(
-            cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
-            num_threads=0, max_tokens=bs, device=dev,
+            host_cache(placed), top_k=top_k, activation="silu",
+            apply_router_weight_on_input=False, num_threads=0, max_tokens=bs, device=dev,
         )
         outs.append(ex.decode(layer, hidden, w, ids).cpu())
         spans, mapped = ex._ext.numa_status()
         if numa == "1" and len({hb._cpu_numa_node(c) for c in ex.core_ids}) > 1:
-            assert spans and mapped == 1, (spans, mapped)
+            assert spans and mapped == (1 if placed else 0), (placed, spans, mapped)
         if numa == "0":
             assert not spans
     torch.cuda.synchronize()
-    assert torch.equal(outs[0], outs[1])
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
