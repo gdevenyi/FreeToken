@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from freetoken.kvcache.kv_host_offload import KVHostOffloader
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.tokenizer.detokenize import DecodeStatus
 
 
 @dataclass
@@ -106,6 +107,7 @@ class Req:
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
     # [vocab] bool on the device: the prompt's ids, for repetition_penalty. Built once.
     prompt_token_mask: torch.Tensor | None = field(default=None, init=False, repr=False)
+    stop_decode_status: DecodeStatus | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
