@@ -248,6 +248,11 @@ def _prefill_config(M: int) -> Dict[str, int]:
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
     # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
+    if _arith_e2m1():
+        # sm_61 sweep over the qwen4_exp gate_up / down shapes at 2048 tokens: ~4x the default
+        # (0.7 -> 3 TFLOPS); tl.dot runs on FMAs there and small K tiles keep the dequant cheap
+        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=16,
+                    GROUP_SIZE_M=8, num_warps=4, num_stages=1)
     if M <= 64:
         return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
                     GROUP_SIZE_M=1, num_warps=8, num_stages=4)
