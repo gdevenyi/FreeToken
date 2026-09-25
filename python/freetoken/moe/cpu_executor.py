@@ -255,7 +255,15 @@ class CpuMoeExecutor:
         except AttributeError:
             online = os.cpu_count() or 1
         busy = nthreads + (1 if coord_core >= 0 else 0)
-        if self._ext.worker_spin_ms() > 0 and busy + 2 > online:
+        # A prebuilt .so from before the spin has no spin controls; its workers always park,
+        # which is the spin_ms=0 mode, so it still serves correctly.
+        self._has_spin = hasattr(_cpu_moe.CpuMoeExecutor, "worker_spin_ms")
+        if not self._has_spin:
+            logger.info_rank0(
+                "cpu-moe worker spin unavailable: the compiled _cpu_moe extension predates it "
+                "(rebuild with `python setup.py build_ext --inplace` to enable it)"
+            )
+        elif self._ext.worker_spin_ms() > 0 and busy + 2 > online:
             self._ext.set_worker_spin_ms(0)
             logger.info_rank0(
                 f"cpu-moe worker spin disabled: {busy} pinned threads leave no headroom "
@@ -336,7 +344,7 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
             f"sync={'flag' if self._flag_sync else 'hostfunc'} "
-            f"spin_ms={self._ext.worker_spin_ms()}"
+            f"spin_ms={self._ext.worker_spin_ms() if self._has_spin else 0}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:

@@ -119,3 +119,27 @@ def test_spin_needs_a_spare_cpu_for_the_launch_thread(cache, make_executor, monk
     monkeypatch.delenv("FREETOKEN_CPU_MOE_SPIN_MS", raising=False)
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(cpus)))
     assert make_executor(cache, num_threads=2)._ext.worker_spin_ms() == spin_ms
+
+
+def test_a_pre_spin_extension_still_serves_with_parked_workers(cache, make_executor, monkeypatch):
+    """A prebuilt _cpu_moe .so from before the spin has no spin controls. Its workers always
+    park (the spin 0 mode), so the executor must build and run on it rather than die after the
+    whole model load."""
+    from freetoken.kernel import _cpu_moe
+
+    real = _cpu_moe.CpuMoeExecutor
+
+    class PreSpinExecutor:
+        def __init__(self, **kwargs):
+            self._real = real(**kwargs)
+            self._real.set_worker_spin_ms(0)
+
+        def __getattr__(self, name):
+            if name in ("worker_spin_ms", "set_worker_spin_ms"):
+                raise AttributeError(name)
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(_cpu_moe, "CpuMoeExecutor", PreSpinExecutor)
+    ex = make_executor(cache)
+    assert not ex._has_spin
+    _run_steps(ex, cache, steps=4, gap_s=0)
