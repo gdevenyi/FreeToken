@@ -183,6 +183,19 @@ def test_qsa_rejects_float32_dtype(monkeypatch):
         _adjust_config(config)
 
 
+@pytest.mark.parametrize("flag", ["dense_quant", "hc_quant", "lm_head_quant"])
+def test_float16_rejects_load_time_mxfp8(monkeypatch, flag):
+    # the load-time flags leave ModelConfig.dense_quant at the checkpoint's "none"
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="auto", **{flag: "mxfp8"})
+    object.__setattr__(config, "dtype", torch.float16)
+    with pytest.raises(ValueError, match="float16 with MXFP8"):
+        _adjust_config(config)
+    _adjust_config(_config("qsa", attention_backend="auto", **{flag: "mxfp8"}))  # bfloat16 serves it
+
+
 def test_auto_dsv4_sets_window_page_size(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 

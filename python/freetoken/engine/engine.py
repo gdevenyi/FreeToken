@@ -1914,6 +1914,10 @@ def _adjust_config(config: EngineConfig):
     if _dtype == torch.float16 and "mxfp8" in (
         getattr(model_config, "attn_quant", "none"),
         getattr(model_config, "dense_quant", "none"),
+        # the load-time flags swap only the QuantConfig; ModelConfig keeps the checkpoint's kinds
+        getattr(config, "dense_quant", "none"),
+        getattr(config, "hc_quant", "none"),
+        getattr(config, "lm_head_quant", "none"),
     ):
         # The MXFP8 GEMV folds the pow2-descaled fp8 weight into the activation
         # dtype; fp16's narrow exponent can overflow/flush what bf16 represents
