@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, NamedTuple
 
 import torch
 from freetoken.utils import is_sm90_supported, nvtx_annotate
@@ -13,32 +13,40 @@ if TYPE_CHECKING:
 @dataclass
 class LogitsPlan:
     """Inputs of the logits processors for the rows of one batch that asked for any
-    (repetition penalty, logit_bias, min_tokens, min_p). Presence and frequency
-    penalties are not here: the sampler applies them from per-request device counts.
+    (logit_bias, min_tokens, min_p). The penalties are not here: the sampler applies
+    them from per-request device state (``RowPenalty``).
 
-    Built on the host in ``Sampler.prepare`` from the requests' SamplingParams and
-    token histories, applied on the device by ``apply_logits_processors`` before the
-    sampling kernel. ``None`` when no request in the batch uses a processor, so the
-    default path stays exactly as it was. Row indices inside the plan are LOCAL (0..r-1,
-    in the order of ``rows``); ``rows`` maps them back to the batch.
+    Built on the host in ``Sampler.prepare`` from the requests' SamplingParams, applied
+    on the device by ``apply_logits_processors`` before the sampling kernel. ``None``
+    when no request in the batch uses a processor, so the default path stays exactly
+    as it was. Row indices inside the plan are LOCAL (0..r-1, in the order of ``rows``);
+    ``rows`` maps them back to the batch.
     """
 
     rows: torch.Tensor  # [r] int64 batch rows
     temps: torch.Tensor  # [r, 1] float32 temperatures (min_p works on probabilities)
-    repetition: torch.Tensor | None = None  # [r, 1] float32 (1.0 = off)
-    # Generated ids per row, right-padded with vocab_size (a scratch column that is
-    # dropped), for the repetition mask.
-    hist_ids: torch.Tensor | None = None  # [r, L] int64
-    # Prompt ids per row, same padding: repetition_penalty also covers the prompt.
-    prompt_ids: torch.Tensor | None = None  # [r, P] int64
     bias_rows: torch.Tensor | None = None  # [b] int64 local rows
     bias_ids: torch.Tensor | None = None  # [b] int64
     bias_vals: torch.Tensor | None = None  # [b] float32
-    # Rows still under min_tokens and the ids (EOS + stop_token_ids, padded) they must
-    # not sample yet.
+    # Rows still under min_tokens and the ids (EOS + stop_token_ids, padded with
+    # vocab_size, a scratch column that is dropped) they must not sample yet.
     min_rows: torch.Tensor | None = None  # [m] int64 local rows
     min_ids: torch.Tensor | None = None  # [m, S] int64
     min_p: torch.Tensor | None = None  # [r, 1] float32 (0 = off for that row)
+
+
+class RowPenalty(NamedTuple):
+    """One batch row's presence / frequency / repetition penalty. ``counts`` are the
+    request's generated-token counts ([V] int32), updated on the device after each draw so
+    overlap scheduling never sees them late; ``prompt_mask`` ([V] bool) marks the prompt's
+    ids for the repetition penalty and is None when that is off."""
+
+    row: int
+    counts: torch.Tensor
+    presence: float
+    frequency: float
+    repetition: float = 1.0
+    prompt_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -47,7 +55,7 @@ class BatchSamplingArgs:
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
-    penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    penalties: list[RowPenalty] = field(default_factory=list)
     plan: LogitsPlan | None = None
 
 
@@ -58,37 +66,38 @@ def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> 
 
 
 def _padded_rows(rows: list[list[int]], pad: int, device: torch.device) -> torch.Tensor:
-    """[len(rows), max_len] int64 with ``pad`` on the right. A synchronous copy: the
-    histories can be long (prompt + output) and a pinned buffer must not be freed under
-    an in-flight non_blocking copy."""
+    """[len(rows), max_len] int64 with ``pad`` on the right."""
     width = max(1, max((len(r) for r in rows), default=1))
-    out = torch.full((len(rows), width), pad, dtype=torch.int64)
-    for i, r in enumerate(rows):
-        if r:
-            out[i, : len(r)] = torch.as_tensor(r, dtype=torch.int64)
-    return out.to(device)
+    return make_device_tensor([r + [pad] * (width - len(r)) for r in rows], torch.int64, device)
+
+
+def apply_penalties(logits: torch.Tensor, penalties: list[RowPenalty]) -> torch.Tensor:
+    """A float32 copy of ``logits`` with each row's penalties applied in vLLM's order:
+    repetition (over prompt + generated ids), then frequency and presence (generated)."""
+    logits = logits.float().clone()
+    for row, counts, presence, frequency, repetition, prompt_mask in penalties:
+        if repetition != 1.0:
+            x = logits[row]
+            seen = counts > 0
+            if prompt_mask is not None:
+                seen = seen | prompt_mask
+            # HF / vLLM semantics: divide positive logits, multiply negative ones.
+            penalized = torch.where(x > 0, x / repetition, x * repetition)
+            logits[row] = torch.where(seen, penalized, x)
+        if presence or frequency:
+            logits[row] -= frequency * counts + presence * (counts > 0)
+    return logits
 
 
 def apply_logits_processors(
     logits: torch.Tensor, plan: LogitsPlan, vocab_size: int
 ) -> torch.Tensor:
-    """A float32 copy of ``logits`` with the plan applied to its rows, in vLLM's order:
-    repetition penalty, logit_bias, the min_tokens mask, then min_p. Rows outside the
-    plan are copied unchanged."""
+    """A float32 copy of ``logits`` with the plan applied to its rows: logit_bias, the
+    min_tokens mask, then min_p. Rows outside the plan are copied unchanged."""
     out = logits.to(torch.float32, copy=True)
     sub = out[plan.rows]  # [r, V] (advanced indexing copies)
-    r = sub.shape[0]
     device = sub.device
     neg_inf = float("-inf")
-
-    if plan.repetition is not None and plan.hist_ids is not None:
-        seen = torch.zeros((r, vocab_size + 1), dtype=torch.bool, device=device)
-        seen.scatter_(1, plan.hist_ids, torch.ones_like(plan.hist_ids, dtype=torch.bool))
-        if plan.prompt_ids is not None:
-            seen.scatter_(1, plan.prompt_ids, torch.ones_like(plan.prompt_ids, dtype=torch.bool))
-        # HF / vLLM semantics: divide positive logits, multiply negative ones.
-        penalized = torch.where(sub > 0, sub / plan.repetition, sub * plan.repetition)
-        sub = torch.where(seen[:, :vocab_size], penalized, sub)
 
     if plan.bias_ids is not None:
         sub.index_put_((plan.bias_rows, plan.bias_ids), plan.bias_vals, accumulate=True)
@@ -144,10 +153,7 @@ class Sampler:
     vocab_size: int
 
     def _plan(self, batch: Batch, params) -> LogitsPlan | None:
-        """The LogitsPlan for this batch, or None when no request asks for a processor.
-        Token histories come from the host-side ``req.input_ids``; under overlap
-        scheduling the previous step's token may not be appended yet, so the repetition
-        penalty sees the history one token late."""
+        """The LogitsPlan for this batch, or None when no request asks for a processor."""
         MIN_T = 1e-6
         rows = [i for i, p in enumerate(params) if p.needs_logits_processing]
         if not rows:
@@ -159,24 +165,6 @@ class Sampler:
             temps=make_device_tensor(temps, torch.float32, self.device),
         )
         pad = self.vocab_size
-
-        if any(p.repetition_penalty != 1.0 for _, p in picked):
-            hist: list[list[int]] = []
-            prompts: list[list[int]] = []
-            for req, p in picked:
-                prompt_len = req.max_device_len - req.output_len
-                ids = req.input_ids
-                if p.repetition_penalty != 1.0:
-                    hist.append(ids[prompt_len:].tolist())
-                    # multimodal placeholders are pseudo-ids >= vocab_size (MM_PAD_SHIFT_VALUE);
-                    # send them to the scratch column, not past the scatter target
-                    prompts.append(ids[:prompt_len].clamp(max=pad).tolist())
-                else:
-                    hist.append([])
-                    prompts.append([])
-            plan.hist_ids = _padded_rows(hist, pad, self.device)
-            plan.prompt_ids = _padded_rows(prompts, pad, self.device)
-            plan.repetition = make_device_tensor([[p.repetition_penalty] for _, p in picked], torch.float32, self.device)
 
         bias_rows: list[int] = []
         bias_ids: list[int] = []
@@ -208,20 +196,47 @@ class Sampler:
             plan.min_p = make_device_tensor([[p.min_p] for _, p in picked], torch.float32, self.device)
         return plan
 
+    def _prompt_mask(self, req) -> torch.Tensor:
+        """[V] bool marking the request's prompt ids, uploaded once per request."""
+        prompt_len = req.max_device_len - req.output_len
+        # multimodal placeholders are pseudo-ids >= vocab_size (MM_PAD_SHIFT_VALUE);
+        # send them to the scratch column, not past the scatter target
+        ids = req.input_ids[:prompt_len].to(torch.int64).clamp(max=self.vocab_size)
+        if self.device.type == "cuda":
+            ids = ids.pin_memory().to(self.device, non_blocking=True)
+        mask = torch.zeros(self.vocab_size + 1, dtype=torch.bool, device=self.device)
+        mask[ids] = True
+        return mask[: self.vocab_size]
+
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
         is_greedy = [p.is_greedy for p in params]
         penalties = []
         for row, req in enumerate(batch.reqs):
             p = req.sampling_params
-            if not (p.presence_penalty or p.frequency_penalty) or not req.can_decode:
+            repetition = p.repetition_penalty
+            if not (p.presence_penalty or p.frequency_penalty or repetition != 1.0):
+                continue
+            if not req.can_decode:
                 continue
             if req.output_token_counts is None:
                 req.output_token_counts = torch.zeros(
                     self.vocab_size, dtype=torch.int32, device=self.device
                 )
+            prompt_mask = None
+            if repetition != 1.0:
+                if req.prompt_token_mask is None:
+                    req.prompt_token_mask = self._prompt_mask(req)
+                prompt_mask = req.prompt_token_mask
             penalties.append(
-                (row, req.output_token_counts, p.presence_penalty, p.frequency_penalty)
+                RowPenalty(
+                    row,
+                    req.output_token_counts,
+                    p.presence_penalty,
+                    p.frequency_penalty,
+                    repetition,
+                    prompt_mask,
+                )
             )
         plan = self._plan(batch, params)
         if all(is_greedy):
@@ -261,9 +276,7 @@ class Sampler:
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
             if args.penalties:
-                logits = logits.float().clone()
-                for row, counts, presence, frequency in args.penalties:
-                    logits[row] -= frequency * counts + presence * (counts > 0)
+                logits = apply_penalties(logits, args.penalties)
             # after the penalties: min_p must see the final distribution
             if args.plan is not None:
                 logits = apply_logits_processors(logits, args.plan, self.vocab_size)
@@ -278,7 +291,7 @@ class Sampler:
                     tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
             # Update on the sampling stream: overlapped scheduling can prepare the next
             # batch before the previous token reaches Req.input_ids on the CPU.
-            for row, counts, _, _ in args.penalties:
+            for row, counts, *_ in args.penalties:
                 counts.scatter_add_(
                     0, tokens[row : row + 1].long(), counts.new_ones(1)
                 )
