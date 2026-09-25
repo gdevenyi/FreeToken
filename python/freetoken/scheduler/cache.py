@@ -620,10 +620,10 @@ class CacheManager:
         keep walking (the match truncates as before)."""
         tier = self.host_tier
         key = self.prefix_cache._collect_key(node)
-        hit = tier.lookup(key, self.page_size)
-        # lookup is longest-prefix; a shorter entry's state would resume this node's full
-        # depth with the tokens in between missing from the recurrence
-        if hit is None or hit.gdn_slot is None or hit.host_len != len(key):
+        # exact only: a shorter entry's state would resume this node's full depth with the
+        # tokens in between missing from the recurrence
+        hit = tier.lookup_exact(key)
+        if hit is None or hit.gdn_slot is None:
             return None
         pool = self.linear_state_pool
         if pool.num_free_slots < 1:
