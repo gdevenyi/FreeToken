@@ -591,3 +591,32 @@ def test_policy_flag_and_gpu_only():
         _cache(policy, 12, 1, 8, device="cpu")
         with pytest.raises(ValueError, match="GPU decode"):
             _cache(policy, 12, 1, 8, device="cpu", decode_target="hybrid")
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["kd", "kdfb", "rule"])
+def test_an_all_pinned_call_never_stores_past_the_slot_arrays(policy):
+    # 5 slots pad to an 8-lane block; with every slot pinned the sentinel key must not decode to lane 7.
+    # The cache enforces cache_size >= num_experts, so the kernel gets 5-slot views of a 16-slot cache.
+    from freetoken.moe.offload_kernels import ensure_experts_scored
+
+    s, pad = 5, 3
+    cache = _cache(policy, cache_size=16, num_layers=1, num_experts=16)
+    guarded = {}
+    for name in ("id_of_slot", "usage", "evict_slot_owner", "evict_slot_last_tok", "evict_slot_lc", "evict_slot_ct"):
+        t = getattr(cache, name)
+        if t is None:  # kd keeps no lc/ct mirrors
+            continue
+        buf = torch.full((s + pad,), 7, dtype=t.dtype, device=t.device)
+        buf[:s] = t[:s]
+        setattr(cache, name, buf[:s])
+        guarded[name] = buf
+    dev = cache.id_of_slot.device
+    ensure_experts_scored(cache, 0, torch.arange(s, dtype=torch.int32, device=dev), bump_tok=True, update_state=True)
+    # 6 distinct ids against 5 slots breaks the caller contract; the kernel must still stay in bounds
+    q = torch.arange(s + 1, dtype=torch.int32, device=dev)
+    ensure_experts_scored(cache, 0, q, bump_tok=True, update_state=True)
+    torch.cuda.synchronize()
+    for name, buf in guarded.items():
+        assert torch.all(buf[s:] == 7), f"{name} written past slot {s - 1}"
+    assert int(cache.num_indices) == 1 and 0 <= int(cache.evict_slots[0]) < s

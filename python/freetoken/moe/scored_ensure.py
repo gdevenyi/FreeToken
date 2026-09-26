@@ -225,7 +225,9 @@ def _scored_ensure_kernel(
             if PIN_SINCE:
                 # the score ignores recency, so slots an earlier call touched since *pin_ptr stay pinned too
                 evictable = evictable & (u <= tl.load(pin_ptr))
-            key = tl.where(evictable, key, 0x7FFFFFFFFFFFFFFF)
+            # the pinned key's slot bits are 0, so an all-pinned scan falls back to slot 0 like flashlib's argmin
+            pinned_key = 0x7FFFFFFFFFFFFFFF ^ ((1 << SLOT_BITS) - 1)
+            key = tl.where(evictable, key, pinned_key)
         for i in tl.range(num_missing):
             if POLICY == 0:
                 victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -245,7 +247,7 @@ def _scored_ensure_kernel(
             if POLICY == 0:
                 u = tl.where(c == victim, umax, u)  # claim in-register
             else:
-                key = tl.where(c == victim, 0x7FFFFFFFFFFFFFFF, key)
+                key = tl.where(c == victim, pinned_key, key)
 
     # Written from registers, never re-read from slot_of_id, so out_ptr may alias query_ptr.
     tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
