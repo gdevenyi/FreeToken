@@ -179,6 +179,7 @@ def _scored_ensure_kernel(
 ):
     if PREFETCH:
         # not an access: the clock stays, so usage == step still pins the last demand call's slots
+        # (at step 0, right after a reset, every slot reads pinned: nothing installs before a demand call)
         step = tl.load(lru_step_ptr)
         tl.store(num_copy_ptr, tl.zeros([], tl.int64))
         tl.store(pf_ready_ptr, 0)
