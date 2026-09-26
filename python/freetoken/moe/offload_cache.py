@@ -303,7 +303,15 @@ class OffloadMoeCache:
             self._init_decode_copy_overlap()
 
     def _init_decode_copy_overlap(self) -> None:
-        self.decode_copy_stream = torch.cuda.Stream(device=self.device)
+        # a dedicated stream, not one of torch's 32 pooled ones: a pooled stream can alias the engine
+        # or capture stream, and the side work would then run serially (correct, but no overlap)
+        from cuda.bindings import runtime as cudart
+
+        with torch.cuda.device(self.device):
+            err, handle = cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaStreamCreateWithFlags failed: {err}")
+        self.decode_copy_stream = torch.cuda.ExternalStream(int(handle), device=self.device)
         self._decode_copy_events = [
             (torch.cuda.Event(), torch.cuda.Event()) for _ in range(self.num_layers)
         ]
