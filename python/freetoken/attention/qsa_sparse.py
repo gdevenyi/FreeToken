@@ -309,12 +309,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
         off = self.kv_offloader
-        if off is not None and slot == 0:
-            # Bind this forward's write pages before the first store; they ride every fetch
-            # query below, so no mid-forward eviction can take them (and the write-through
-            # mirror makes any other eviction lossless).
-            md.write_pages = off.ensure_write_pages(batch.out_loc, md.is_decode)
-            md.out_loc_gpu = off.translate_slots(batch.out_loc, md.is_decode)
+        if off is not None:
+            # Bind this layer's write pages before its store; they ride every fetch query
+            # below, so no mid-forward eviction can take them (and the write-through mirror
+            # makes any other eviction lossless). Each layer keeps its own slot map.
+            if slot == 0:
+                md.write_pages = off.write_page_ids(batch.out_loc, md.is_decode)
+            md.out_loc_gpu = off.ensure_write_slots(
+                md.write_pages, batch.out_loc, md.is_decode, self.kvcache._dense(layer_id))
         self.kvcache.store_kv(k, v, batch.out_loc if off is None else md.out_loc_gpu, layer_id)
         if md.block_table is None:
             self._snapshot_decode(md, batch)
@@ -360,7 +362,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         ks = self.kvcache.k_scale(layer_id)
         vs = self.kvcache.v_scale(layer_id)
         if md.is_decode:
-            eff = off.fetch_for_attend(indices, md)
+            eff = off.fetch_for_attend(indices, md, self.kvcache._dense(layer_id))
             return attend(q, k_cache, v_cache, indices, eff, md.token_to_req,
                           torch.empty_like(q), k_scale=ks, v_scale=vs)
         rows = q.shape[0]
@@ -373,7 +375,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # pack several rows. Per group: one tight ensure + one translate + one attend.
         sel_all = off.compact_all(indices, md.token_to_req, md.block_table)
         out = torch.empty_like(q)
-        for (start, end), eff in off.iter_prefill_groups(sel_all, md.write_pages, md.block_table):
+        dense_layer = self.kvcache._dense(layer_id)
+        for (start, end), eff in off.iter_prefill_groups(sel_all, md.write_pages, md.block_table, dense_layer):
             attend(q[start:end], k_cache, v_cache, indices[start:end], eff,
                    md.token_to_req[start:end], out[start:end], k_scale=ks, v_scale=vs)
         dropped = off.trunc_count()  # one sync per layer
