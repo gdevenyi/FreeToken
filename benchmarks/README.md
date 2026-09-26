@@ -27,6 +27,36 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_scored_ensure.py`** — synthetic (no checkpoint): us per decode `ensure` call at a
+fixed miss count, flashlib `lru_ensure` vs the `--moe-cache-policy` kernels (lru, kd, kdfb,
+rule), from a CUDA graph of two decode steps on a full cache. `--stats` times it with
+`--moe-collect-stats` accumulation on.
+
+```bash
+python benchmarks/bench_scored_ensure.py --slots 1650 --k 10,20
+```
+
+**`bench_moe_copy_overlap.py`** — synthetic (no checkpoint): `FREETOKEN_MOE_COPY_OVERLAP`
+off vs on for Qwen4ExpMoE decode layers at the Qwen3.8-Flash-Next expert geometry, as CUDA
+graphs. Checks the outputs are bitwise identical, times replays ABAB, and profiles the copy's
+start after the ensure and how much of the side-stream shared expert runs inside it.
+
+```bash
+python benchmarks/bench_moe_copy_overlap.py --bs 1 --slots 160
+```
+
+**`bench_expert_copy_corun.py`** — synthetic (no checkpoint): the fused expert copy kernel
+alone and beside compute, on registered host banks with the qwen4_exp NVFP4 row sizes. Sweeps
+`fast_index_copy_multi` (threads x blocks/bank) and `fast_index_copy_multi_slim`
+(blocks x threads x unroll) over 1..10-expert plans (GB/s, "hot" back-to-back and "cold"
+spacer-separated copies), then reports the stretch sigma of bf16/fp8 GEMVs, a small matmul and
+the NVFP4 routed decode GEMV while a copy loop runs on another stream. `--json` keeps the raw
+per-trial times.
+
+```bash
+python benchmarks/bench_expert_copy_corun.py --trials 5 --json copy_corun.json
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
 
