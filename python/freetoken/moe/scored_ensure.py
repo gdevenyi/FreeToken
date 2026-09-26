@@ -177,9 +177,9 @@ def _scored_ensure_kernel(
                 held_at = tl.load(slot_of_id_ptr + id_base + ex, mask=ex < NUM_EXPERTS, other=-1)
                 near = ex < 0
                 for r in tl.static_range(NM_ROWS):
-                    routed = tl.load(query_ptr + r * nm_topk + j, mask=j < nm_topk, other=0)
+                    routed = tl.load(query_ptr + r * nm_topk + j, mask=j < nm_topk, other=-1)
                     row_ptr = logits_ptr + r * nm_stride
-                    kth = tl.min(tl.load(row_ptr + routed, mask=j < nm_topk, other=float("inf")).to(tl.float32), axis=0)
+                    kth = tl.min(tl.load(row_ptr + routed, mask=routed >= 0, other=float("inf")).to(tl.float32), axis=0)
                     row = tl.load(row_ptr + ex, mask=ex < NUM_EXPERTS, other=float("-inf")).to(tl.float32)
                     near = near | (row >= kth - nm_thr)
                 refreshed = tl.maximum(prev, tok - 1)

@@ -162,7 +162,7 @@ def test_vendored_lru_is_bit_identical_to_flashlib(rows_per_step):
     a, b = state(), state()
     queries = torch.from_numpy(stream.astype(np.int32)).to(dev)
     qa, qb = queries.clone(), queries.clone()
-    plans = {id(a): [], id(b): []}
+    plans = ([], [])
     for i in range(stream.shape[0]):
         base = int(layers[i]) * E
         lru_ensure(qa[i], a["slot_of_id"], a["id_of_slot"], a["usage"], a["step"], qa[i],
@@ -170,10 +170,10 @@ def test_vendored_lru_is_bit_identical_to_flashlib(rows_per_step):
         scored_ensure(qb[i], b["slot_of_id"], b["id_of_slot"], b["usage"], b["step"], qb[i],
                       b["src"], b["dst"], b["num"], policy=0, num_layers=L, num_experts=E,
                       stats=b["stats"], id_base=base)
-        for st in (a, b):
-            plans[id(st)].append(torch.cat([st["num"].view(1), st["src"][:k].long(), st["dst"][:k].long()]))
+        for st, plan in zip((a, b), plans):
+            plan.append(torch.cat([st["num"].view(1), st["src"][:k].long(), st["dst"][:k].long()]))
     assert torch.equal(qa, qb), "out slots differ"
-    pa, pb = torch.stack(plans[id(a)]), torch.stack(plans[id(b)])
+    pa, pb = (torch.stack(plan) for plan in plans)
     n = pa[:, 0]
     assert int(n.sum()) > 1000 and int((n == 0).sum()) > 0  # the stream exercises misses and all-hit calls
     for i in range(pa.shape[0]):
