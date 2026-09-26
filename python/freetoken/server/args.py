@@ -751,8 +751,13 @@ def parse_args(
     parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
-        choices=["lru"],
-        help="The unified MoE cache eviction policy.",
+        choices=["lru", "kd", "kdfb", "rule"],
+        help=(
+            "The unified MoE cache eviction policy. lru (default); kd: evict the expert passed "
+            "over for the most tokens, then the one whose layer comes up last; kdfb: kd plus a "
+            "decayed per-expert use count; rule: kdfb plus router near misses counted as recent "
+            "(margin FREETOKEN_MOE_NEAR_MISS_THR logits). GPU decode only."
+        ),
     )
 
     parser.add_argument(

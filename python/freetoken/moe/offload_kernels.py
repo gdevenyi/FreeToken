@@ -40,6 +40,45 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     )
 
 
+def ensure_experts_scored(
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    *,
+    bump_tok: bool,
+    update_state: bool,
+    router_logits: torch.Tensor | None = None,
+) -> None:
+    """``ensure_experts`` for the scored ``--moe-cache-policy`` kinds (kd, kdfb, rule)."""
+    from freetoken.moe.scored_ensure import scored_ensure
+
+    scored_ensure(
+        expert_ids,
+        cache.slot_for_id.view(-1),
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        expert_ids,
+        cache.src_indices,
+        cache.evict_slots,
+        cache.num_indices,
+        policy=cache.cache_policy_id,
+        num_layers=cache.num_layers,
+        num_experts=cache.num_experts,
+        tok=cache.evict_tok,
+        last_tok=cache.evict_last_tok,
+        lc=cache.evict_lc,
+        ct=cache.evict_ct,
+        g_table=cache.evict_g_table,
+        router_logits=router_logits if cache.near_miss_thr is not None else None,
+        near_miss_thr=cache.near_miss_thr or 0.0,
+        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        id_base=layer_id * cache.num_experts,
+        bump_tok=bump_tok,
+        update_state=update_state,
+    )
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:

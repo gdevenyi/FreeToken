@@ -1,0 +1,328 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 The FlashLib Authors
+# Adapted from flashlib 0.3.0 (kernels/slot_cache/triton/lru_ensure.py: _phase1, _stats,
+# _lru_ensure_kernel, _num_warps_for), https://github.com/FlashML-org/flashlib
+"""Scored-victim slot-cache admission for the MoE expert cache (``--moe-cache-policy``).
+
+flashlib's sequential-argmin ``lru_ensure`` with the victim key made pluggable. POLICY 0 is
+LRU and matches flashlib bit for bit; the others evict the lowest packed score key:
+
+- 1 ``kd``: ``-(k + beta * d / L)``. ``k`` is the tokens the expert has been passed over
+  since its last use, ``d`` the layer-steps until its layer comes up again.
+- 2 ``kdfb``: kd plus ``w * log2(decayed use count)`` with a ``halflife``-token decay.
+- 3 ``rule``: kdfb plus the near-miss refresh: this layer's experts whose router logit is
+  within a margin of the top-k-th count as used one token ago (``last_tok``), unpinned.
+
+The per-(layer, expert) state survives eviction. Scores and counts are Q16 fixed point and
+the count update ``log2(2^x + 1)`` reads a host-built table, so a CPU reference can
+reproduce every victim exactly (``tl.exp2``/``tl.log2`` are approximate).
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+POLICY_IDS = {"lru": 0, "kd": 1, "kdfb": 2, "rule": 3}
+
+# Replay-tuned on sep5_s01 at 1650 slots; the plateau is flat for beta 1-8, w 2-4, halflife 32-128.
+BETA = 4.0
+W = 3.0
+HALFLIFE = 64
+
+Q = 16  # fraction bits of scores and counts
+LAST_TOK_NEVER = -1_000_000
+LC_NEVER = -(1 << 30)
+LC_FLOOR = -(30 << Q)
+K_MAX = 1 << 24  # tokens; keeps the packed key inside int64
+DT_MAX = 1 << 30  # layer-steps
+SCORE_BIAS = 1 << 44
+MAX_SLOT_BITS = 18
+# g(u) = log2(1 + 2^-u) sampled every 2^-G_STEP_BITS for u in [0, G_RANGE]; zero beyond
+G_STEP_BITS = 6
+G_RANGE = 24
+G_LAST = G_RANGE << G_STEP_BITS
+# jit code may only read globals that are constexpr
+_Q = tl.constexpr(Q)
+_LC_NEVER = tl.constexpr(LC_NEVER)
+_LC_FLOOR = tl.constexpr(LC_FLOOR)
+_K_MAX = tl.constexpr(K_MAX)
+_DT_MAX = tl.constexpr(DT_MAX)
+_SCORE_BIAS = tl.constexpr(SCORE_BIAS)
+_G_SHIFT = tl.constexpr(Q - G_STEP_BITS)
+_G_LAST = tl.constexpr(G_LAST)
+
+
+def softplus2_table(device=None) -> torch.Tensor:
+    """Q16 ``log2(1 + 2^-u)`` at ``u = i / 64``, two entries past ``G_LAST`` for the interpolation."""
+    step = 1 << G_STEP_BITS
+    vals = [round(math.log2(1.0 + 2.0 ** (-i / step)) * (1 << Q)) for i in range(G_LAST + 2)]
+    return torch.tensor(vals, dtype=torch.int32, device=device)
+
+
+def score_params(beta: float, w: float, halflife: int, num_layers: int) -> tuple[int, int, int]:
+    """``(BETA_Q16, W_Q8, DECAY_DIV)`` shared by the kernel and the CPU reference."""
+    assert beta >= 0 and w >= 0 and halflife >= 1
+    return round(beta * (1 << Q)), round(w * 256), num_layers * int(halflife)
+
+
+@triton.jit
+def _phase1(query_ptr, slot_of_id_ptr, lru_usage_ptr, num_copy_ptr, step, K,
+            BLOCK_K: tl.constexpr, id_base):
+    """Vendored unchanged: dedup the query, split hit/miss, rank the misses, bump the hits."""
+    k = tl.arange(0, BLOCK_K)
+    kmask = k < K
+    q = tl.load(query_ptr + k, mask=kmask, other=-1) + id_base
+    s = tl.load(slot_of_id_ptr + q, mask=kmask, other=-1)
+    hit = kmask & (s >= 0)
+    miss = kmask & (s == -1)
+    same = (
+        (q[:, None] == q[None, :])
+        & (k[:, None] > k[None, :])
+        & kmask[:, None]
+        & kmask[None, :]
+    )
+    first = kmask & (tl.sum(same.to(tl.int32), axis=1) == 0)
+    first_miss = miss & first
+    smaller = (q[None, :] < q[:, None]) & first_miss[None, :]
+    rank = tl.sum(smaller.to(tl.int32), axis=1)
+    num_missing = tl.sum(first_miss.to(tl.int32))
+    tl.store(num_copy_ptr, num_missing.to(tl.int64))
+    # Duplicated hits write the same value to the same slot -- idempotent.
+    tl.store(lru_usage_ptr + s, step, mask=hit)
+    return q, kmask, miss, first, first_miss, rank, num_missing, tl.where(hit, s, -1)
+
+
+@triton.jit
+def _stats(stats_ptr, first, num_missing):
+    # One vectorized atomic over 3 lanes, not three scalar ones: a scalar atomic serializes the CTA.
+    si = tl.arange(0, 4)
+    v = tl.where(si == 0, tl.sum(first.to(tl.int32)), tl.where(si == 1, num_missing, 1))
+    tl.atomic_add(stats_ptr + si, v.to(tl.int64), mask=si < 3)
+
+
+@triton.jit
+def _decayed(lc, ct, now, DECAY_DIV: tl.constexpr):
+    """Q16 log2 count decayed from ``ct`` to ``now`` (both in layer-steps); operands of // stay >= 0."""
+    dt = tl.minimum(tl.maximum(now - ct, 0), _DT_MAX)
+    return lc.to(tl.int64) - (dt << _Q) // DECAY_DIV
+
+
+@triton.jit
+def _softplus2(x, g_ptr, mask):
+    """Q16 ``log2(2^x + 1)`` = ``max(x, 0) + g(|x|)``, g linearly interpolated from the table."""
+    u = tl.abs(x)
+    i = tl.minimum(u >> _G_SHIFT, _G_LAST)
+    frac = u & ((1 << _G_SHIFT) - 1)
+    g0 = tl.load(g_ptr + i, mask=mask, other=0).to(tl.int64)
+    g1 = tl.load(g_ptr + i + 1, mask=mask, other=0).to(tl.int64)
+    g = tl.where(i < _G_LAST, g0 + (((g1 - g0) * frac) >> _G_SHIFT), 0)
+    return tl.maximum(x, 0) + g
+
+
+@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_rows", "nm_topk", "nm_stride"])
+def _scored_ensure_kernel(
+    query_ptr, slot_of_id_ptr, id_of_slot_ptr, lru_usage_ptr, lru_step_ptr,
+    out_ptr, src_ptr, dst_ptr, num_copy_ptr, stats_ptr,
+    tok_ptr, last_tok_ptr, lc_ptr, ct_ptr, g_ptr, logits_ptr,
+    K, num_cached, id_base, nm_rows, nm_topk, nm_stride, nm_thr,
+    BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_TOPK: tl.constexpr,
+    USAGE_MAX: tl.constexpr, COLLECT_STATS: tl.constexpr,
+    POLICY: tl.constexpr, BUMP_TOK: tl.constexpr, UPDATE_STATE: tl.constexpr,
+    NUM_LAYERS: tl.constexpr, NUM_EXPERTS: tl.constexpr,
+    BETA_Q16: tl.constexpr, W_Q8: tl.constexpr, DECAY_DIV: tl.constexpr,
+    SLOT_BITS: tl.constexpr,
+):
+    step = tl.load(lru_step_ptr) + 1
+    tl.store(lru_step_ptr, step)
+    if POLICY != 0:
+        tok = tl.load(tok_ptr)
+        if BUMP_TOK:
+            tok = tok + 1
+            tl.store(tok_ptr, tok)
+        layer = id_base // NUM_EXPERTS
+        now = tok * NUM_LAYERS + layer
+        if POLICY == 3:
+            if UPDATE_STATE:
+                # Routed ids qualify too; they are pinned now and set to tok below, so that is harmless.
+                ex = tl.arange(0, BLOCK_E)
+                j = tl.arange(0, BLOCK_TOPK)
+                near = ex < 0
+                for r in tl.range(nm_rows):
+                    routed = tl.load(query_ptr + r * nm_topk + j, mask=j < nm_topk, other=0)
+                    row_ptr = logits_ptr + r * nm_stride
+                    kth = tl.min(tl.load(row_ptr + routed, mask=j < nm_topk, other=float("inf")).to(tl.float32), axis=0)
+                    row = tl.load(row_ptr + ex, mask=ex < NUM_EXPERTS, other=float("-inf")).to(tl.float32)
+                    near = near | (row >= kth - nm_thr)
+                prev = tl.load(last_tok_ptr + id_base + ex, mask=near, other=0)
+                tl.store(last_tok_ptr + id_base + ex, tl.maximum(prev, tok - 1), mask=near)
+                # the victim scan's gather and the routed update below read what this wrote
+                tl.debug_barrier()
+    q, kmask, miss, first, first_miss, rank, num_missing, out = _phase1(
+        query_ptr, slot_of_id_ptr, lru_usage_ptr, num_copy_ptr, step, K, BLOCK_K,
+        id_base)
+
+    if num_missing > 0:
+        # REQUIRED (flashlib): the reload below must see _phase1's hit bump, or a hit is evicted.
+        tl.debug_barrier()
+        c = tl.arange(0, BLOCK_C)
+        cmask = c < num_cached
+        u = tl.load(lru_usage_ptr + c, mask=cmask, other=USAGE_MAX)
+        if POLICY == 0:
+            umax = tl.full([BLOCK_C], USAGE_MAX, u.dtype)
+            u = tl.where((u == step) | (~cmask), umax, u)
+        else:
+            oid = tl.load(id_of_slot_ptr + c, mask=cmask, other=-1)
+            held = cmask & (oid >= 0)
+            lk = oid // NUM_EXPERTS
+            ahead = lk > layer
+            d = tl.where(ahead, lk - layer, NUM_LAYERS - layer + lk).to(tl.int64)
+            last = tl.load(last_tok_ptr + oid, mask=held, other=0)
+            k = tl.where(ahead, tok - 1, tok) - last
+            k = tl.minimum(tl.maximum(k, 0), _K_MAX)
+            score = -((k << _Q) + (BETA_Q16 * d) // NUM_LAYERS)
+            if POLICY >= 2:
+                lc = tl.load(lc_ptr + oid, mask=held, other=_LC_NEVER)
+                lcv = _decayed(lc, tl.load(ct_ptr + oid, mask=held, other=0), now, DECAY_DIV)
+                lcv = tl.where(lc == _LC_NEVER, _LC_FLOOR, tl.maximum(lcv, _LC_FLOOR))
+                score += (W_Q8 * lcv) >> 8
+            score = tl.minimum(tl.maximum(score, 1 - _SCORE_BIAS), _SCORE_BIAS - 1)
+            # Every key is distinct and ties go to the lowest slot; an empty slot keys below any held one.
+            key = tl.where(held, ((score + _SCORE_BIAS) << SLOT_BITS) | c, c.to(tl.int64))
+            key = tl.where(cmask & (u != step), key, 0x7FFFFFFFFFFFFFFF)
+        for i in tl.range(num_missing):
+            if POLICY == 0:
+                victim = tl.argmin(u, axis=0).to(tl.int32)
+            else:
+                victim = (tl.min(key, axis=0) & ((1 << SLOT_BITS) - 1)).to(tl.int32)
+            # Scalar load: victims are distinct, so no earlier iteration wrote this slot.
+            old = tl.load(id_of_slot_ptr + victim)
+            if old >= 0:
+                tl.store(slot_of_id_ptr + old, -1)
+            e = tl.sum(tl.where((rank == i) & first_miss, q, 0))
+            tl.store(id_of_slot_ptr + victim, e)
+            tl.store(slot_of_id_ptr + e, victim)
+            tl.store(lru_usage_ptr + victim, step)
+            tl.store(dst_ptr + i, victim)
+            tl.store(src_ptr + i, e - id_base)  # back to the caller's id space
+            out = tl.where((rank == i) & miss, victim, out)
+            if POLICY == 0:
+                u = tl.where(c == victim, umax, u)  # claim in-register
+            else:
+                key = tl.where(c == victim, 0x7FFFFFFFFFFFFFFF, key)
+
+    # Written from registers, never re-read from slot_of_id, so out_ptr may alias query_ptr.
+    tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
+    if COLLECT_STATS:
+        _stats(stats_ptr, first, num_missing)
+    if POLICY != 0:
+        if UPDATE_STATE:
+            # distinct ids only, so a duplicate at bs > 1 counts once per call
+            tl.store(last_tok_ptr + q, tok, mask=first)
+            if POLICY >= 2:
+                lc = tl.load(lc_ptr + q, mask=first, other=_LC_NEVER)
+                x = _decayed(lc, tl.load(ct_ptr + q, mask=first, other=0), now, DECAY_DIV)
+                lc_new = tl.where(lc == _LC_NEVER, 0, _softplus2(x, g_ptr, first))
+                tl.store(lc_ptr + q, lc_new.to(tl.int32), mask=first)
+                tl.store(ct_ptr + q, now, mask=first)
+
+
+def _num_warps_for(block_c: int) -> int:
+    # flashlib's rule: 8 warps from 2048 slots, more only past ~32 elements per thread.
+    warps = 8 if block_c >= 2048 else 4
+    return max(warps, min(triton.next_power_of_2(max(block_c // 1024, 1)), 32))
+
+
+def scored_ensure(
+    query: torch.Tensor,
+    slot_of_id: torch.Tensor,
+    id_of_slot: torch.Tensor,
+    lru_usage: torch.Tensor,
+    lru_step: torch.Tensor,
+    out_indices: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    num_copy: torch.Tensor,
+    *,
+    policy: int,
+    num_layers: int,
+    num_experts: int,
+    tok: torch.Tensor | None = None,
+    last_tok: torch.Tensor | None = None,
+    lc: torch.Tensor | None = None,
+    ct: torch.Tensor | None = None,
+    g_table: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    near_miss_thr: float = 0.0,
+    stats: torch.Tensor | None = None,
+    id_base: int = 0,
+    bump_tok: bool = False,
+    update_state: bool = True,
+    beta: float = BETA,
+    w: float = W,
+    halflife: int = HALFLIFE,
+) -> None:
+    """``flashlib.lru_ensure`` (sequential strategy) with the victim picked by ``policy``.
+
+    Same contract as ``lru_ensure``; ``policy`` > 0 also reads and updates the per-(layer,
+    expert) state ``last_tok``/``lc``/``ct`` (flat ``layer * num_experts + expert``) against
+    the device token counter ``tok``. ``bump_tok`` advances the counter first (once per
+    decode step); ``update_state=False`` leaves the state untouched (small-prefill ensures).
+    Policy 3 refreshes the experts whose ``router_logits`` (``[rows, num_experts]``, rows of
+    ``query``) are within ``near_miss_thr`` of their row's lowest routed logit.
+    """
+    k = query.numel()
+    num_cached = id_of_slot.numel()
+    assert query.dtype == torch.int32 and query.is_contiguous()
+    assert slot_of_id.dtype == torch.int32 and id_of_slot.dtype == torch.int32
+    assert out_indices.dtype == torch.int32 and out_indices.numel() == k
+    assert lru_usage.dtype == lru_step.dtype and lru_usage.numel() == num_cached
+    plan = min(k, num_cached)
+    assert src_indices.numel() >= plan and dst_indices.numel() >= plan
+    block_c = triton.next_power_of_2(num_cached)
+    slot_bits = max(block_c.bit_length() - 1, 1)
+    beta_q16, w_q8, decay_div = score_params(beta, w, halflife, num_layers)
+    if policy != 0:
+        assert slot_bits <= MAX_SLOT_BITS, f"{num_cached} slots overflow the packed score key"
+        assert tok is not None and last_tok is not None
+        assert last_tok.dtype == torch.int64 and last_tok.numel() == num_layers * num_experts
+    if policy >= 2:
+        assert lc is not None and ct is not None and g_table is not None
+        assert lc.dtype == torch.int32 and ct.dtype == torch.int64
+    nm_rows = nm_topk = nm_stride = 0
+    if policy == 3 and router_logits is not None:
+        assert router_logits.ndim == 2 and router_logits.shape[1] == num_experts
+        assert router_logits.stride(1) == 1 and k % router_logits.shape[0] == 0
+        nm_rows, nm_stride = router_logits.shape[0], router_logits.stride(0)
+        nm_topk = k // nm_rows
+    # unused pointers still need a tensor argument
+    dummy = lru_step
+    _scored_ensure_kernel[(1,)](
+        query, slot_of_id, id_of_slot, lru_usage, lru_step,
+        out_indices, src_indices, dst_indices, num_copy, stats,
+        dummy if tok is None else tok,
+        dummy if last_tok is None else last_tok,
+        dummy if lc is None else lc,
+        dummy if ct is None else ct,
+        dummy if g_table is None else g_table,
+        dummy if nm_rows == 0 else router_logits,
+        k, num_cached, id_base, nm_rows, nm_topk, nm_stride, float(near_miss_thr),
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_C=block_c,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+        BLOCK_TOPK=triton.next_power_of_2(max(nm_topk, 1)),
+        USAGE_MAX=torch.iinfo(lru_usage.dtype).max,
+        COLLECT_STATS=stats is not None,
+        POLICY=policy,
+        BUMP_TOK=bool(bump_tok) and policy != 0,
+        UPDATE_STATE=bool(update_state) and policy != 0,
+        NUM_LAYERS=num_layers,
+        NUM_EXPERTS=num_experts,
+        BETA_Q16=beta_q16,
+        W_Q8=w_q8,
+        DECAY_DIV=decay_div,
+        SLOT_BITS=slot_bits,
+        num_warps=_num_warps_for(block_c),
+    )

@@ -34,7 +34,7 @@ def test_small_prefill_dispatch(monkeypatch, tokens, threshold, on_demand):
     layer, cache = _layer_and_cache(torch.device("cpu"))
     monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", threshold)
     calls = []
-    monkeypatch.setattr(cache, "ensure_experts", lambda layer_id, ids: calls.append("ensure"))
+    monkeypatch.setattr(cache, "ensure_experts", lambda layer_id, ids, **kw: calls.append("ensure"))
     monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.append("materialize"))
     monkeypatch.setattr(cache, "copy_missing", lambda: calls.append("copy"))
     monkeypatch.setattr(cache, "begin_prefill", lambda: calls.append("begin_prefill"), raising=False)
@@ -96,7 +96,7 @@ def test_a_real_sized_small_prefill_fits_the_lru_kernel(monkeypatch):
         monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", threshold)
         layer, cache = _layer_and_cache(dev, num_experts=experts, top_k=top_k, cache_size=1100)
         widths, ensure = [], cache.ensure_experts
-        monkeypatch.setattr(cache, "ensure_experts", lambda lid, q: (widths.append(q.numel()), ensure(lid, q))[1])
+        monkeypatch.setattr(cache, "ensure_experts", lambda lid, q, **kw: (widths.append(q.numel()), ensure(lid, q, **kw))[1])
         outs[threshold] = _run_and_check_path(layer, hs, w, ids, on_demand=threshold > 0)
     assert widths and max(widths) <= 32, f"LRU ensure widths {sorted(set(widths))}: wider than decode's"
     torch.testing.assert_close(outs[1024], outs[0], rtol=2e-2, atol=2e-2)
