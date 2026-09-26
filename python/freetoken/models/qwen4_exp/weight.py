@@ -249,10 +249,12 @@ def _shard_vision(name: str, t: torch.Tensor, vc, rank: int, world: int) -> torc
     """TP shard of a vision-tower tensor, in the layout of the TP-aware ops in qwen3_vl/vision.py.
 
     ``attn.qkv`` (LinearQKVMerged, [q | k | v] of ``num_heads`` heads each): by head within each
-    part. ``attn.proj`` and every ``linear_fc2`` (row-parallel): the weight by input column, the
-    bias whole (added once, after the all-reduce). Every ``linear_fc1`` (column-parallel, block
-    MLP and patch merger): weight and bias by output row. Patch / position embeddings and norms
-    are replicated. Upstream's qwen3_vl reader refuses TP > 1 for the tower; qwen4_exp shards it.
+    part. ``attn.proj`` and every ``linear_fc2`` (LinearOProj / LinearRowParallel): the weight by
+    input column; the bias on rank 0 only, zeros elsewhere, because those layers add their bias
+    inside the GEMM on every rank and then all-reduce, so a whole bias per rank would be summed
+    ``world`` times. Every ``linear_fc1`` (column-parallel, block MLP and patch merger): weight and
+    bias by output row. Patch / position embeddings and norms are replicated. Upstream's qwen3_vl
+    reader refuses TP > 1 for the tower; qwen4_exp shards it.
     """
     if name.endswith((".attn.qkv.weight", ".attn.qkv.bias")):
         head = (vc.num_heads, vc.hidden_size // vc.num_heads)
@@ -260,6 +262,8 @@ def _shard_vision(name: str, t: torch.Tensor, vc, rank: int, world: int) -> torc
     if name.endswith((".attn.proj.weight", ".linear_fc2.weight")):
         assert t.shape[1] % world == 0, (name, tuple(t.shape), world)
         return t.chunk(world, dim=1)[rank].clone()
+    if name.endswith((".attn.proj.bias", ".linear_fc2.bias")):
+        return t if rank == 0 else torch.zeros_like(t)
     if name.endswith((".linear_fc1.weight", ".linear_fc1.bias")):
         assert t.shape[0] % world == 0, (name, tuple(t.shape), world)
         return t.chunk(world, dim=0)[rank].clone()

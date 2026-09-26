@@ -99,8 +99,9 @@ def _vision_cfg(heads=4, hidden=16):
 
 
 def test_vision_block_partial_sums_equal_the_whole_tower_block():
-    # the all-reduce of the row-parallel projections is a sum over ranks: the per-rank partial
-    # outputs of the sharded weights must add up to the unsharded block (bias added once)
+    # Each rank runs what LinearOProj / LinearRowParallel run: a GEMM WITH its own bias, then an
+    # all-reduce (a sum over ranks). The per-rank outputs of the sharded tensors must add up to
+    # the unsharded block, so a row-parallel bias may reach the sum only once.
     torch.manual_seed(0)
     cfg, world, heads, hidden, inter, S = _vision_cfg(), 2, 4, 16, 24, 5
     hd = hidden // heads
@@ -117,49 +118,27 @@ def test_vision_block_partial_sums_equal_the_whole_tower_block():
     }
     x = torch.randn(S, hidden)
 
-    def attn(qkv_w, qkv_b, proj_w, n):
-        q, k, v = (x @ qkv_w.T + qkv_b).view(S, 3, n, hd).unbind(1)
+    def attn(t, n):
+        qkv = x @ t[p + "attn.qkv.weight"].T + t[p + "attn.qkv.bias"]
+        q, k, v = qkv.view(S, 3, n, hd).unbind(1)
         o = torch.softmax(torch.einsum("shd,thd->hst", q, k) / hd**0.5, -1)
-        return torch.einsum("hst,thd->shd", o, v).reshape(S, n * hd) @ proj_w.T
+        o = torch.einsum("hst,thd->shd", o, v).reshape(S, n * hd)
+        return o @ t[p + "attn.proj.weight"].T + t[p + "attn.proj.bias"]
 
-    def mlp(w1, b1, w2):
-        return torch.nn.functional.gelu(x @ w1.T + b1, approximate="tanh") @ w2.T
+    def mlp(t):
+        h = torch.nn.functional.gelu(
+            x @ t[p + "mlp.linear_fc1.weight"].T + t[p + "mlp.linear_fc1.bias"],
+            approximate="tanh",
+        )
+        return h @ t[p + "mlp.linear_fc2.weight"].T + t[p + "mlp.linear_fc2.bias"]
 
-    full_attn = attn(
-        w[p + "attn.qkv.weight"],
-        w[p + "attn.qkv.bias"],
-        w[p + "attn.proj.weight"],
-        heads,
-    )
-    full_mlp = mlp(
-        w[p + "mlp.linear_fc1.weight"],
-        w[p + "mlp.linear_fc1.bias"],
-        w[p + "mlp.linear_fc2.weight"],
-    )
     sh = [{k: _shard(k, v, cfg, r, world) for k, v in w.items()} for r in range(world)]
-    for r in range(world):  # biases of the row-parallel projections stay whole
-        assert sh[r][p + "attn.proj.bias"].equal(w[p + "attn.proj.bias"])
-        assert sh[r][p + "mlp.linear_fc2.bias"].equal(w[p + "mlp.linear_fc2.bias"])
+    for r in range(world):
         assert sh[r][p + "attn.qkv.weight"].shape == (3 * hidden // world, hidden)
-    tp_attn = sum(
-        attn(
-            s[p + "attn.qkv.weight"],
-            s[p + "attn.qkv.bias"],
-            s[p + "attn.proj.weight"],
-            heads // world,
-        )
-        for s in sh
-    )
-    tp_mlp = sum(
-        mlp(
-            s[p + "mlp.linear_fc1.weight"],
-            s[p + "mlp.linear_fc1.bias"],
-            s[p + "mlp.linear_fc2.weight"],
-        )
-        for s in sh
-    )
-    torch.testing.assert_close(tp_attn, full_attn, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(tp_mlp, full_mlp, rtol=1e-4, atol=1e-4)
+    tp_attn = sum(attn(s, heads // world) for s in sh)
+    tp_mlp = sum(mlp(s) for s in sh)
+    torch.testing.assert_close(tp_attn, attn(w, heads), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(tp_mlp, mlp(w), rtol=1e-4, atol=1e-4)
 
 
 def test_vision_merger_and_replicated_tower_tensors():
