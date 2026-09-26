@@ -125,15 +125,15 @@ def _check_slim_matches_multi(feats, idx_dtype, **grid):
     n_src, n_slots, plan = 24, 16, 16
     src, src_ptrs, feat_bytes = _host_banks(feats, n_src, seed=0)
     gen = torch.Generator().manual_seed(1)
-    for num in [0, 1, 3, 10, plan]:
+    for num in [0, 1, 3, 10, plan, None]:  # None: no num_indices, the whole index length
         di, si = _random_plan(gen, n_src, n_slots, plan, idx_dtype)
-        count = torch.tensor([num], dtype=torch.int64, device="cuda")
+        count = None if num is None else torch.tensor([num], dtype=torch.int64, device="cuda")
         ref, ref_ptrs = _slot_banks(feats, n_slots)
         fast_index_copy_multi_jit(ref_ptrs, src_ptrs, feat_bytes, di, si, count)
         out, out_ptrs = _slot_banks(feats, n_slots)
         fast_index_copy_multi_slim_jit(out_ptrs, src_ptrs, feat_bytes, di, si, count, **grid)
         torch.cuda.synchronize()
-        exp = _expected(src, feats, n_slots, di, si, num)
+        exp = _expected(src, feats, n_slots, di, si, plan if num is None else num)
         for b, f in enumerate(feats):
             assert torch.equal(ref[b], exp[b]), f"multi reference wrong: bank {b} (feat={f}) num={num}"
             assert torch.equal(out[b], ref[b]), f"slim != multi: bank {b} (feat={f}) num={num} grid={grid}"
