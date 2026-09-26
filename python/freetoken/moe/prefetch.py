@@ -62,14 +62,19 @@ def default_budget(before_linear: bool) -> int:
     return GDN_BUDGET if before_linear else ATTN_BUDGET
 
 
-def dedicated_stream(device: torch.device) -> torch.cuda.ExternalStream:
+def dedicated_stream(device: torch.device, *, highest_priority: bool = False) -> torch.cuda.ExternalStream:
     # not one of torch's 32 pooled streams: a pooled one can alias the engine or capture stream
     from cuda.bindings import runtime as cudart
 
     with torch.cuda.device(device):
-        err, handle = cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)
+        if highest_priority:
+            err, _, greatest = cudart.cudaDeviceGetStreamPriorityRange()
+            if err == cudart.cudaError_t.cudaSuccess:
+                err, handle = cudart.cudaStreamCreateWithPriority(cudart.cudaStreamNonBlocking, greatest)
+        else:
+            err, handle = cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)
     if err != cudart.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"cudaStreamCreateWithFlags failed: {err}")
+        raise RuntimeError(f"creating a dedicated CUDA stream failed: {err}")
     return torch.cuda.ExternalStream(int(handle), device=device)
 
 
@@ -224,7 +229,9 @@ class ExpertPrefetcher:
         self.cache = None
         self.copy_stream = None
         if mode == "on":
-            self.copy_stream = dedicated_stream(device)
+            # the slim copy is an SM kernel: at default priority a late copy queues for SMs behind the next
+            # compute grid while the compute stream waits on it (bench --on: a 50 us slip cost 14% per step)
+            self.copy_stream = dedicated_stream(device, highest_priority=True)
             # (dcopy: after layer L-1's demand copy on the compute stream, pfcopy: after layer L's prefetch copy)
             self._copy_events = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(num_layers)]
             for pair in self._copy_events:
@@ -243,7 +250,7 @@ class ExpertPrefetcher:
         logger.info(
             f"MoE prefetch {mode}: router lookahead top-{self.k}, budget "
             + (str(self.budget_override) if self.budget_override else f"{GDN_BUDGET} before GDN / {ATTN_BUDGET} before attention layers")
-            + (", slim copies on a dedicated stream" if mode == "on" else "")
+            + (", slim copies on a dedicated high-priority stream" if mode == "on" else "")
         )
 
     def budget_for(self, wired: int) -> int:

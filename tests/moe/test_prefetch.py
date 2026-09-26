@@ -145,6 +145,12 @@ def test_prefetch_copy_stream_is_a_third_dedicated_stream():
     pooled = {torch.cuda.Stream().cuda_stream for _ in range(64)}
     assert copy not in pooled and pf.stream.cuda_stream not in pooled
     assert len({copy, pf.stream.cuda_stream, cache.decode_copy_stream.cuda_stream, torch.cuda.current_stream().cuda_stream}) == 4
+    # its CTAs go ahead of pending compute ones, so a late copy does not also wait for SMs
+    from cuda.bindings import runtime as cudart
+
+    _, _, greatest = cudart.cudaDeviceGetStreamPriorityRange()
+    assert cudart.cudaStreamGetPriority(copy)[1] == greatest < 0
+    assert cudart.cudaStreamGetPriority(pf.stream.cuda_stream)[1] == 0
 
 
 @requires_cuda
