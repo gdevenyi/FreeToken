@@ -64,16 +64,15 @@ Long context through the server (recall = three codes planted at 5%, 50% and 95%
 
 | Prompt tokens | Time to first token | Prefill tok/s | Decode tok/s (streamed) | Recall |
 |---|---|---|---|---|
-| 1,026 | 8.1 s | 126 | 17.4 | - |
-| 27,337 | 2.9 min | 158 | 16.6 | 3/3 |
-| 84,232 | 18.2 min | 77 | 11.0 | 3/3 |
-| 247,231 | 2 h 20 min | 29 | 6.8 | 3/3 |
+| 1,077 | 9.5 s | 114 | 17.7 | - |
+| 23,003 | 1.9 min | 206 | 17.3 | 3/3 |
+| 93,809 | 8.6 min | 181 | 16.7 | 3/3 |
+| 231,494 | 29.5 min | 131 | 15.6 | 3/3 |
 
-Prefill and decode slow down with depth, probably because the QSA indexer scores every earlier token and,
-past 32K tokens, the selected KV pages come from the host mirror (not profiled at this depth). At ~250K a few selections span more pages than the GPU
-pool can hold for one row (the server logs "selected pages dropped"); recall stayed 3/3.
-A cold 262K prompt is therefore a multi-hour job; agent sessions grow their context incrementally through
-the prefix cache, so each turn only prefills its new tokens.
+Before the indexer tiles and per-layer host-tier residency (both below), the same server took
+18.2 min for 84K tokens (11.0 tok/s decode) and 2 h 20 min for 247K (6.8 tok/s decode, with
+"selected pages dropped" warnings). A cold 262K prompt is still a half-hour job; agent sessions grow
+their context through the prefix cache, so each turn only prefills its new tokens.
 
 Tool-call round trips (call, tool result, answer) pass on `/v1/chat/completions`, `/v1/messages` and
 `/v1/responses`, with and without thinking.
@@ -88,6 +87,9 @@ Tool-call round trips (call, tool result, answer) pass on `/v1/chat/completions`
 - 32-bit stream memops when the device rejects the 64-bit ones (CPU MoE handshake, PLE row store).
 - PLE fill events recycled on the engine thread (a deadlock with the host-func handshake).
 - QSA selection compaction by column mark and scan (1.28 ms -> 0.17 ms per layer).
+- QSA indexer score kernel on 32-key tiles (a 2048-row chunk at 64K: 1401 -> 151 ms per layer).
+- Host KV tier slot maps per QSA layer: the 12 layers no longer evict each other every decode step,
+  and a miss copies one layer's rows instead of all 12 (a 2048-token chunk at 64K depth: 41.8 -> 13.4 s).
 
 ## Operations
 
@@ -113,4 +115,4 @@ so the prefix cache keeps hitting.
 Known test failures on this card (other models' kernels that need more than 48 KB of shared memory or sm_70+):
 MiniMax-M3 sparse attention, GLM DSA, FP8 block-scale MoE, NVFP4 sparse-MLA KV; plus
 `test_scheme_for_agrees_with_the_stored_tensors[sentence-transformers/all-MiniLM-L6-v2]`, which scans a local HF cache.
-Full suite at this commit: 2773 passed, 50 failed (all in that list), 234 skipped.
+Full suite at this commit: 2774 passed, 50 failed (all in that list), 234 skipped.
