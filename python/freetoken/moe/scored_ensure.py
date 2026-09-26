@@ -111,7 +111,8 @@ def _stats(stats_ptr, first, num_missing):
     # One vectorized atomic over 3 lanes, not three scalar ones: a scalar atomic serializes the CTA.
     si = tl.arange(0, 4)
     v = tl.where(si == 0, tl.sum(first.to(tl.int32)), tl.where(si == 1, num_missing, 1))
-    tl.atomic_add(stats_ptr + si, v.to(tl.int64), mask=si < 3)
+    # relaxed: only later kernels read the counters; flashlib's acq_rel waits on this call's stores (~0.3 us)
+    tl.atomic_add(stats_ptr + si, v.to(tl.int64), mask=si < 3, sem="relaxed")
 
 
 @triton.jit
@@ -244,8 +245,6 @@ def _scored_ensure_kernel(
 
     # Written from registers, never re-read from slot_of_id, so out_ptr may alias query_ptr.
     tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
-    if COLLECT_STATS:
-        _stats(stats_ptr, first, num_missing)
     if POLICY != 0:
         if UPDATE_STATE:
             # distinct ids only, so a duplicate at bs > 1 counts once per call; out is each id's final slot
@@ -263,6 +262,8 @@ def _scored_ensure_kernel(
         else:
             # a slot filled without a state update reads the per-id state until a decode hit re-mirrors it
             tl.store(owner_ptr + out, -1, mask=first_miss)
+    if COLLECT_STATS:
+        _stats(stats_ptr, first, num_missing)
 
 
 def _num_warps_for(block_c: int) -> int:
