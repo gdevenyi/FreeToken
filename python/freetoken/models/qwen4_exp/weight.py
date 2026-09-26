@@ -214,10 +214,13 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     ``in_proj`` [q | k | v | z | b | a] and the matching ``conv1d`` channels, ``A_log`` /
     ``dt_bias``, shared-expert ``gate_up_proj``. Row-parallel (dim 1): ``o_proj``,
     ``out_proj``, shared-expert ``down_proj``. Vocab rows: ``embed_tokens`` / ``lm_head``.
+    The vision tower follows qwen3_vl/vision.py (see ``_shard_vision``).
     Everything else (router, indexer, norms, HC, PLE, shared-expert gate) is replicated.
     """
     if world == 1:
         return t
+    if name.startswith(VISION_KEY_PREFIXES):
+        return _shard_vision(name, t, config.vision_config, rank, world)
     if name.endswith(".self_attn.qkv_proj.weight"):
         q = (config.num_qo_heads, 2 * config.head_dim)
         kv = (config.num_kv_heads, config.head_dim)
@@ -240,6 +243,27 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
         return _shard_rows(t, [(half, 1), (half, 1)], rank, world)
     # o_proj / down_proj: dim 1; embed_tokens / lm_head: vocab rows; others unchanged.
     return shard_tensor(name, t, rank=rank, world_size=world, num_kv_heads=None)
+
+
+def _shard_vision(name: str, t: torch.Tensor, vc, rank: int, world: int) -> torch.Tensor:
+    """TP shard of a vision-tower tensor, in the layout of the TP-aware ops in qwen3_vl/vision.py.
+
+    ``attn.qkv`` (LinearQKVMerged, [q | k | v] of ``num_heads`` heads each): by head within each
+    part. ``attn.proj`` and every ``linear_fc2`` (row-parallel): the weight by input column, the
+    bias whole (added once, after the all-reduce). Every ``linear_fc1`` (column-parallel, block
+    MLP and patch merger): weight and bias by output row. Patch / position embeddings and norms
+    are replicated. Upstream's qwen3_vl reader refuses TP > 1 for the tower; qwen4_exp shards it.
+    """
+    if name.endswith((".attn.qkv.weight", ".attn.qkv.bias")):
+        head = (vc.num_heads, vc.hidden_size // vc.num_heads)
+        return _shard_rows(t, [head, head, head], rank, world)
+    if name.endswith((".attn.proj.weight", ".linear_fc2.weight")):
+        assert t.shape[1] % world == 0, (name, tuple(t.shape), world)
+        return t.chunk(world, dim=1)[rank].clone()
+    if name.endswith((".linear_fc1.weight", ".linear_fc1.bias")):
+        assert t.shape[0] % world == 0, (name, tuple(t.shape), world)
+        return t.chunk(world, dim=0)[rank].clone()
+    return t
 
 
 # Load-time per-tensor FP8 (attn_quant == "fp8_dynamic", layers/fp8_dynamic.py): these keep
