@@ -88,10 +88,12 @@ class KVHostOffloader:
             self.mirror_scales.tensor.zero_()
             self.mirror_scales.pin()
 
-        # LRU slot maps (lru_ensure's id space is logical pages, slot space is buffer pages).
-        self.phys_of = torch.full((num_logical_pages + 1,), -1, dtype=torch.int32, device=device)
-        self.logical_of = torch.full((num_slots,), -1, dtype=torch.int32, device=device)
-        self.usage = torch.zeros((num_slots,), dtype=torch.int64, device=device)
+        # LRU slot maps, one per layer (lru_ensure's id space is logical pages, slot space is buffer
+        # pages): each layer selects its own pages, so a shared map made the 12 layers' selections
+        # evict each other every decode step and every miss copy all layers' rows.
+        self.phys_of = torch.full((num_layers, num_logical_pages + 1), -1, dtype=torch.int32, device=device)
+        self.logical_of = torch.full((num_layers, num_slots), -1, dtype=torch.int32, device=device)
+        self.usage = torch.zeros((num_layers, num_slots), dtype=torch.int64, device=device)
         self.step = torch.zeros((), dtype=torch.int64, device=device)
         self.src_ids = torch.empty((num_slots,), dtype=torch.int32, device=device)
         self.dst_slots = torch.empty((num_slots,), dtype=torch.int32, device=device)
@@ -162,6 +164,15 @@ class KVHostOffloader:
                 self._feats,
                 torch.full((2 * num_layers,), scale_row, dtype=torch.int64, device=device),
             ])
+        # Per-layer descriptors: a layer's miss copies only its own K/V (+ scale) rows.
+        banks = self._dst_ptrs.numel() // num_layers  # 2 (K, V), or 4 with the fp8 scales
+        kinds = banks // 2
+        def per_layer(t: torch.Tensor) -> torch.Tensor:
+            # flat order is [kind][kv][layer]; regroup to [layer][kind * 2 + kv]
+            return t.view(kinds, 2, num_layers).permute(2, 0, 1).reshape(num_layers, banks).contiguous()
+        self._dst_ptrs_l = per_layer(self._dst_ptrs)
+        self._src_ptrs_l = per_layer(self._src_ptrs)
+        self._feats_l = per_layer(self._feats)
         self.mirror_bytes = self.mirror.nbytes + (
             self.mirror_scales.nbytes if self.mirror_scales is not None else 0)
 
@@ -215,15 +226,17 @@ class KVHostOffloader:
         sem isso, um binding antigo apontaria pra um slot físico com conteúdo de outro
         inquilino e o fetch seria pulado. Só desfaz se o slot ainda aponta pra esta página."""
         lp = logical_pages.long().to(self.device)
-        old = self.phys_of[lp]
-        mask = old >= 0
-        if not bool(mask.any()):
-            return
-        old_slots = old[mask].long()
-        cur = self.logical_of[old_slots]
-        still = cur == lp[mask].long()
-        self.logical_of[old_slots[still]] = -1
-        self.phys_of[lp[mask]] = -1
+        for layer in range(self.num_layers):
+            phys_of, logical_of = self.phys_of[layer], self.logical_of[layer]
+            old = phys_of[lp]
+            mask = old >= 0
+            if not bool(mask.any()):
+                continue
+            old_slots = old[mask].long()
+            cur = logical_of[old_slots]
+            still = cur == lp[mask].long()
+            logical_of[old_slots[still]] = -1
+            phys_of[lp[mask]] = -1
 
     def trunc_count(self) -> int:
         """Dropped selection pages accumulated since the last read (0 = no truncation)."""
@@ -249,8 +262,8 @@ class KVHostOffloader:
     # (MoE's whole-layer materialize). Chunk bigger queries into calls inside that envelope.
     _ENSURE_CHUNK = 512
 
-    def _ensure(self, query: torch.Tensor) -> None:
-        """Bind every logical page in ``query`` to a physical slot and fill the misses."""
+    def _ensure(self, query: torch.Tensor, layer: int) -> None:
+        """Bind every logical page in ``query`` to a physical slot of ``layer`` and fill its misses."""
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
         n = query.numel()
@@ -267,9 +280,9 @@ class KVHostOffloader:
             k = q.numel()
             lru_ensure(
                 q,
-                self.phys_of,
-                self.logical_of,
-                self.usage,
+                self.phys_of[layer],
+                self.logical_of[layer],
+                self.usage[layer],
                 self.step,
                 self._out_scratch[:k],
                 self.src_ids,
@@ -277,38 +290,37 @@ class KVHostOffloader:
                 self.num_copy,
             )
             fast_index_copy_multi_jit(
-                self._dst_ptrs, self._src_ptrs, self._feats,
+                self._dst_ptrs_l[layer], self._src_ptrs_l[layer], self._feats_l[layer],
                 self.dst_slots, self.src_ids, self.num_copy,
             )
 
     # ----- write path ---------------------------------------------------------
-    def ensure_write_pages(self, out_loc: torch.Tensor, is_decode: bool) -> torch.Tensor:
-        """Make every page ``out_loc`` writes to resident; returns the write-page query
-        (the fetch path re-includes it so a write page can never be evicted mid-forward)."""
+    def write_page_ids(self, out_loc: torch.Tensor, is_decode: bool) -> torch.Tensor:
+        """The logical pages ``out_loc`` writes to (the fetch path re-includes them so a write
+        page can never be evicted mid-forward); layer-invariant, computed once per forward."""
         from freetoken.kernel.triton.qsa.offload import write_pages
 
         if is_decode:
             n = out_loc.numel()
             wp = self._g["write_pages"][:n]
             write_pages(out_loc, wp, self.page_size)
-            self._ensure(wp)
             return wp
         # The chunk's tokens are position-contiguous, so every 64th slot names a written
         # page exactly once -- no torch.unique (a GPU sync) needed.
-        pages = (out_loc[:: self.page_size] // self.page_size).contiguous()
-        self._ensure(pages)
-        return pages
+        return (out_loc[:: self.page_size] // self.page_size).contiguous()
 
-    def translate_slots(self, out_loc: torch.Tensor, is_decode: bool) -> torch.Tensor:
-        """Logical token slots -> physical (post-ensure; the write pages are pinned-hot)."""
+    def ensure_write_slots(self, write_pages: torch.Tensor, out_loc: torch.Tensor, is_decode: bool,
+                           layer: int) -> torch.Tensor:
+        """Make ``layer``'s write pages resident; returns its physical token slots."""
         from freetoken.kernel.triton.qsa.offload import translate_slots
 
+        self._ensure(write_pages, layer)
         if is_decode:
             n = out_loc.numel()
             out = self._g["out_loc_gpu"][:n]
         else:
             out = torch.empty_like(out_loc)
-        translate_slots(out_loc, self.phys_of, out, self.page_size)
+        translate_slots(out_loc, self.phys_of[layer], out, self.page_size)
         return out
 
     def mirror_store(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor,
@@ -362,7 +374,7 @@ class KVHostOffloader:
         return sel
 
     def iter_prefill_groups(self, sel_all: torch.Tensor, write_pages: torch.Tensor,
-                            block_table: torch.Tensor):
+                            block_table: torch.Tensor, layer: int):
         """Pack the layer's query rows into residency-feasible groups, then per group upload
         the tight query (write set + the group's REAL union), ensure, translate; yields
         ``((row_start, row_end), eff_table)`` and the caller attends between iterations.
@@ -428,14 +440,14 @@ class KVHostOffloader:
         for gstart, gend, off, n in spans:
             qd = self._query_buf[off : off + n]
             qd.copy_(qh[off : off + n], non_blocking=True)
-            self._ensure(qd)
+            self._ensure(qd, layer)
             eff = self._eff_buf
             if eff is None or eff.shape != block_table.shape:
                 eff = self._eff_buf = torch.empty_like(block_table)
-            translate_table(block_table, self.phys_of, eff)
+            translate_table(block_table, self.phys_of[layer], eff)
             yield (gstart, gend), eff
 
-    def fetch_for_attend(self, indices: torch.Tensor, md) -> torch.Tensor:
+    def fetch_for_attend(self, indices: torch.Tensor, md, layer: int) -> torch.Tensor:
         """Decode (graph-safe): ensure the selected pages resident, return the PHYSICAL
         block table for the attend kernel. Fixed shapes throughout."""
         from freetoken.kernel.triton.qsa.offload import compact_selected_pages, translate_table
@@ -450,9 +462,9 @@ class KVHostOffloader:
         query = g["query"][: rows * per_row].view(rows, per_row)
         query[:, 0].copy_(md.write_pages)
         query[:, 1:].copy_(sel)
-        self._ensure(query.view(-1))
+        self._ensure(query.view(-1), layer)
         eff = g["eff_table"][:rows]
-        translate_table(md.block_table, self.phys_of, eff)
+        translate_table(md.block_table, self.phys_of[layer], eff)
         return eff
 
 
