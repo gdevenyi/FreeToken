@@ -122,6 +122,20 @@ class RefScoredCache:
         return out, src, dst
 
 
+    def materialize(self, layer):
+        """The prefill materialize kernel: the whole layer into slots [0, E), position == expert id."""
+        base = layer * self.E
+        same = (self.id_of_slot >= base) & (self.id_of_slot < base + self.E)
+        self.id_of_slot[same] = -1
+        self.usage[same] = 0
+        old = self.id_of_slot[: self.E].copy()
+        self.slot_of_id[old[old >= 0]] = -1
+        self.step += 1
+        self.id_of_slot[: self.E] = base + np.arange(self.E)
+        self.slot_of_id[base : base + self.E] = np.arange(self.E)
+        self.usage[: self.E] = self.step
+
+
 def replay(cache: RefScoredCache, rows, logits=None, thr=0.0, near_miss=None):
     """Decode ``rows`` ``[N, L, K]`` (one step per row, all layers); per-row miss counts.
 

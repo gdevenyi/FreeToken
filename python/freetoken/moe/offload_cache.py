@@ -306,19 +306,35 @@ class OffloadMoeCache:
         It is not slot-shaped: it survives eviction and prefill invalidation, and a rebuild
         only resets it. ``evict_tok`` is the decode-step clock the first ensure of each step bumps.
         """
-        self.evict_tok = self.evict_last_tok = self.evict_lc = self.evict_ct = None
-        self.evict_g_table = None
-        if self.cache_policy_id == 0:
-            return
         from freetoken.moe import scored_ensure as se
 
-        n = self.num_layers * self.num_experts
-        self.evict_tok = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.evict_last_tok = torch.full((n,), se.LAST_TOK_NEVER, dtype=torch.int64, device=self.device)
+        self.evict_tok = self.evict_last_tok = self.evict_lc = self.evict_ct = None
+        self.evict_g_table = None
+        n, dev = self.num_layers * self.num_experts, self.device
+        if self.cache_policy_id >= 1:
+            self.evict_tok = torch.zeros((), dtype=torch.int64, device=dev)
+            self.evict_last_tok = torch.full((n,), se.LAST_TOK_NEVER, dtype=torch.int64, device=dev)
         if self.cache_policy_id >= 2:
-            self.evict_lc = torch.full((n,), se.LC_NEVER, dtype=torch.int32, device=self.device)
-            self.evict_ct = torch.zeros((n,), dtype=torch.int64, device=self.device)
-            self.evict_g_table = se.softplus2_table(self.device)
+            self.evict_lc = torch.full((n,), se.LC_NEVER, dtype=torch.int32, device=dev)
+            self.evict_ct = torch.zeros((n,), dtype=torch.int64, device=dev)
+            self.evict_g_table = se.softplus2_table(dev)
+        self._alloc_evict_mirrors()
+
+    def _alloc_evict_mirrors(self) -> None:
+        """Slot-shaped copies of each slot owner's state, read coalesced by the victim scan.
+
+        A mirror is valid while ``evict_slot_owner`` equals ``id_of_slot``; the kernel keeps it
+        so, and anything else that installs an id into a slot must set the owner to -1.
+        """
+        self.evict_slot_owner = self.evict_slot_last_tok = self.evict_slot_lc = self.evict_slot_ct = None
+        if self.evict_tok is None:
+            return
+        size, dev = self.cache_size, self.device
+        self.evict_slot_owner = torch.full((size,), -1, dtype=torch.int32, device=dev)
+        self.evict_slot_last_tok = torch.zeros((size,), dtype=torch.int64, device=dev)
+        if self.evict_lc is not None:
+            self.evict_slot_lc = torch.zeros((size,), dtype=torch.int32, device=dev)
+            self.evict_slot_ct = torch.zeros((size,), dtype=torch.int64, device=dev)
 
     def reset_evict_state(self) -> None:
         if self.evict_tok is None:
@@ -327,6 +343,7 @@ class OffloadMoeCache:
 
         self.evict_tok.zero_()
         self.evict_last_tok.fill_(se.LAST_TOK_NEVER)
+        self.evict_slot_owner.fill_(-1)
         if self.evict_lc is not None:
             self.evict_lc.fill_(se.LC_NEVER)
             self.evict_ct.zero_()
@@ -557,6 +574,7 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self._alloc_evict_mirrors()
         self.reset_evict_state()
         self.stat_missing.zero_()
         self.stat_active.zero_()
@@ -951,6 +969,8 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
+        if self.evict_slot_owner is not None:
+            self.evict_slot_owner[: self.num_experts].fill_(-1)  # it installs the layer into these slots
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache

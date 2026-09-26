@@ -54,8 +54,10 @@ def build(variant: str, slots: int, k: int, m: int, dev: torch.device):
     logits = rng.normal(size=(2 * L, k // TOP_K, E)).astype(np.float32)
     rows = queries.reshape(2 * L, k // TOP_K, -1).astype(np.int64)
     np.put_along_axis(logits, rows, np.take_along_axis(logits, rows, -1) + 3.0, -1)
+    held = id_of_slot.astype(np.int64)
     t = lambda a, dtype=None: torch.from_numpy(a).to(dev, dtype)  # noqa: E731
     state = dict(
+        owner=t(id_of_slot.copy()), slot_last=t(last_tok[held]), slot_lc=t(lc[held]), slot_ct=t(ct[held]),
         slot_of_id=t(slot_of_id), id_of_slot=t(id_of_slot), usage=t(usage),
         step=torch.tensor(step0, dtype=torch.int64, device=dev),
         tok=torch.tensor(tok0, dtype=torch.int64, device=dev),
@@ -82,6 +84,7 @@ def step_fn(variant, policy, st, logits, g_table, stats: bool):
                 q, st["slot_of_id"], st["id_of_slot"], st["usage"], st["step"], q,
                 st["src"], st["dst"], st["num"], policy=policy, num_layers=L, num_experts=E,
                 tok=st["tok"], last_tok=st["last_tok"], lc=st["lc"], ct=st["ct"], g_table=g_table,
+                slot_owner=st["owner"], slot_last_tok=st["slot_last"], slot_lc=st["slot_lc"], slot_ct=st["slot_ct"],
                 router_logits=logits[i] if policy == 3 else None, near_miss_thr=0.25,
                 stats=s, id_base=layer * E, bump_tok=layer == 0,
             )

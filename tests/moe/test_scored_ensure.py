@@ -105,6 +105,20 @@ def _assert_same_tables(cache, ref):
     if ref.policy >= 2:
         np.testing.assert_array_equal(got(cache.evict_lc), ref.lc)
         np.testing.assert_array_equal(got(cache.evict_ct), ref.ct)
+    if ref.policy:
+        _assert_mirrors_hold(cache)
+
+
+def _assert_mirrors_hold(cache):
+    """Every slot whose owner tag matches its id mirrors that id's state."""
+    got = lambda t: t.detach().cpu().numpy().astype(np.int64)  # noqa: E731
+    ids, owner = got(cache.id_of_slot), got(cache.evict_slot_owner)
+    tagged = (ids >= 0) & (owner == ids)
+    np.testing.assert_array_equal(got(cache.evict_slot_last_tok)[tagged], got(cache.evict_last_tok)[ids[tagged]])
+    if cache.evict_lc is not None:
+        np.testing.assert_array_equal(got(cache.evict_slot_lc)[tagged], got(cache.evict_lc)[ids[tagged]])
+        np.testing.assert_array_equal(got(cache.evict_slot_ct)[tagged], got(cache.evict_ct)[ids[tagged]])
+    return tagged
 
 
 def _check_against_ref(policy, rows, logits=None, dtype=torch.bfloat16):
@@ -340,6 +354,7 @@ def test_reset_and_rebuild_clear_the_state(policy):
     def assert_cold():
         assert int(cache.evict_tok) == 0
         assert bool((cache.evict_last_tok == se.LAST_TOK_NEVER).all())
+        assert bool((cache.evict_slot_owner == -1).all()) and cache.evict_slot_owner.numel() == cache.cache_size
         if cache.evict_lc is not None:
             assert bool((cache.evict_lc == se.LC_NEVER).all()) and bool((cache.evict_ct == 0).all())
 
@@ -392,7 +407,8 @@ def test_graph_replay_matches_eager(policy, rows_per_step):
     torch.cuda.synchronize()
 
     assert int(graphed.evict_tok) == steps
-    for name in ("slot_for_id", "id_of_slot", "usage", "step", "evict_tok", "evict_last_tok", "evict_lc", "evict_ct"):
+    for name in ("slot_for_id", "id_of_slot", "usage", "step", "evict_tok", "evict_last_tok", "evict_lc", "evict_ct",
+                 "evict_slot_owner", "evict_slot_last_tok", "evict_slot_lc", "evict_slot_ct"):
         assert torch.equal(getattr(eager, name), getattr(graphed, name)), name
 
 
@@ -418,6 +434,69 @@ def test_two_trace_streams_per_call_match_cpu_reference(policy):
     if policy == "rule":
         logits = np.stack([_trace_logits(li[a], lv[a]), _trace_logits(li[b], lv[b])], axis=2)
     _check_against_ref(policy, rows, logits, torch.float32)
+
+
+# the slot mirrors: foreign installs and state-free ensures fall back to the per-id state -----
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["kd", "kdfb", "rule"])
+def test_materialized_prefill_between_decodes_matches_cpu_reference(policy):
+    cache, ref = _cache(policy), _ref(policy)
+    rows = _zipf_rows(24, seed=21)
+    logits = _random_logits(rows, seed=22) if policy == "rule" else None
+    # layer 5 comes back to slots it lost to layer 9: its tags there would otherwise look current
+    for part, layer in ((slice(0, 6), 5), (slice(6, 12), 9), (slice(12, 18), 5), (slice(18, 24), None)):
+        lg = None if logits is None else logits[part]
+        np.testing.assert_array_equal(_run_gpu(cache, rows[part], lg), _run_ref(ref, rows[part], lg))
+        _assert_same_tables(cache, ref)
+        if layer is not None:
+            # the whole-layer prefill path re-seats this layer's experts at slots [0, E)
+            cache.materialize_layer(layer)
+            ref.materialize(layer)
+            assert not bool((cache.evict_slot_owner[:E] >= 0).any())
+            _assert_same_tables(cache, ref)
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["kd", "kdfb"])
+def test_materialize_untags_the_slots_it_fills(policy):
+    # expert 3 of layer 0 leaves slot 3, is used elsewhere, then materialize puts it back at slot 3
+    cache = _cache(policy, 24, 2, 8)
+    dev = torch.device("cuda")
+    ids = lambda *e: torch.tensor(e, dtype=torch.int32, device=dev)  # noqa: E731
+    cache.materialize_layer(0)
+    cache.ensure_experts(0, ids(3, 4))  # a hit at slot 3 tags it with expert 3
+    assert int(cache.evict_slot_owner[3]) == 3
+    cache.materialize_layer(1)  # slot 3 now holds layer 1's expert 3
+    cache.ensure_experts(1, ids(0, 1))
+    cache.ensure_experts(0, ids(3, 5))  # expert 3 comes back elsewhere, with new state
+    assert int(cache.slot_for_id[0, 3]) != 3
+    cache.materialize_layer(0)
+    assert int(cache.slot_for_id[0, 3]) == 3
+    _assert_mirrors_hold(cache)
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["kd", "kdfb", "rule"])
+def test_state_free_ensures_between_decodes_match_cpu_reference(policy):
+    cache, ref = _cache(policy), _ref(policy)
+    rows = _zipf_rows(12, seed=23)
+    extra = _zipf_rows(4, 3, seed=24, skew=0.3)
+    logits = _random_logits(rows, seed=25) if policy == "rule" else None
+    for r in range(rows.shape[0]):
+        lg = None if logits is None else logits[r : r + 1]
+        np.testing.assert_array_equal(_run_gpu(cache, rows[r : r + 1], lg), _run_ref(ref, rows[r : r + 1], lg))
+        if r % 3 == 2:
+            for layer in range(0, L, 7):  # a small prefill's chunked ensures
+                ids = np.unique(extra[r // 3, layer])
+                q = torch.from_numpy(ids.astype(np.int32)).cuda()
+                cache.ensure_experts(layer, q, update_state=False)
+                out, _, dst = ref.ensure(layer, ids, update_state=False)
+                assert q.tolist() == out.tolist()
+                assert bool((cache.evict_slot_owner[torch.from_numpy(dst).cuda()] == -1).all())
+        _assert_same_tables(cache, ref)
+    assert not _assert_mirrors_hold(cache).all()  # some slots still read the per-id state
 
 
 # rule: the near misses come from the router logits ----------------------------------------

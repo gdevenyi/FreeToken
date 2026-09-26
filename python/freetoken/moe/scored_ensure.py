@@ -13,9 +13,11 @@ LRU and matches flashlib bit for bit; the others evict the lowest packed score k
 - 3 ``rule``: kdfb plus the near-miss refresh: this layer's experts whose router logit is
   within a margin of the top-k-th count as used one token ago (``last_tok``), unpinned.
 
-The per-(layer, expert) state survives eviction. Scores and counts are int32 Q16 fixed point
-and the count update ``log2(2^x + 1)`` reads a host-built table, so a CPU reference can
-reproduce every victim exactly (``tl.exp2``/``tl.log2`` are approximate).
+The per-(layer, expert) state survives eviction; slot-indexed mirrors of it (tagged with the
+owning id) let the victim scan read it coalesced instead of gathering by id. Scores and
+counts are int32 Q16 fixed point and the count update ``log2(2^x + 1)`` reads a host-built
+table, so a CPU reference can reproduce every victim exactly (``tl.exp2``/``tl.log2`` are
+approximate).
 """
 from __future__ import annotations
 
@@ -131,11 +133,22 @@ def _softplus2(x, g_ptr, mask):
     return tl.maximum(x, 0) + g
 
 
+@triton.jit
+def _owner_state(mirror_ptr, state_ptr, c, oid, mirrored, stale, other):
+    """The slot owner's state: its coalesced mirror, or a gather by id where the mirror is stale."""
+    return tl.where(
+        mirrored,
+        tl.load(mirror_ptr + c, mask=mirrored, other=other),
+        tl.load(state_ptr + oid, mask=stale, other=other),
+    )
+
+
 @triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_topk", "nm_stride"])
 def _scored_ensure_kernel(
     query_ptr, slot_of_id_ptr, id_of_slot_ptr, lru_usage_ptr, lru_step_ptr,
     out_ptr, src_ptr, dst_ptr, num_copy_ptr, stats_ptr,
     tok_ptr, last_tok_ptr, lc_ptr, ct_ptr, g_ptr, logits_ptr,
+    owner_ptr, slot_last_ptr, slot_lc_ptr, slot_ct_ptr,
     K, num_cached, id_base, nm_topk, nm_stride, nm_thr,
     BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_TOPK: tl.constexpr,
     NM_ROWS: tl.constexpr,
@@ -160,6 +173,7 @@ def _scored_ensure_kernel(
                 ex = tl.arange(0, BLOCK_E)
                 j = tl.arange(0, BLOCK_TOPK)
                 prev = tl.load(last_tok_ptr + id_base + ex, mask=ex < NUM_EXPERTS, other=0)
+                held_at = tl.load(slot_of_id_ptr + id_base + ex, mask=ex < NUM_EXPERTS, other=-1)
                 near = ex < 0
                 for r in tl.static_range(NM_ROWS):
                     routed = tl.load(query_ptr + r * nm_topk + j, mask=j < nm_topk, other=0)
@@ -167,8 +181,10 @@ def _scored_ensure_kernel(
                     kth = tl.min(tl.load(row_ptr + routed, mask=j < nm_topk, other=float("inf")).to(tl.float32), axis=0)
                     row = tl.load(row_ptr + ex, mask=ex < NUM_EXPERTS, other=float("-inf")).to(tl.float32)
                     near = near | (row >= kth - nm_thr)
-                tl.store(last_tok_ptr + id_base + ex, tl.maximum(prev, tok - 1), mask=near)
-                # the victim scan's gather and the routed update below read what this wrote
+                refreshed = tl.maximum(prev, tok - 1)
+                tl.store(last_tok_ptr + id_base + ex, refreshed, mask=near)
+                tl.store(slot_last_ptr + held_at, refreshed, mask=near & (held_at >= 0))
+                # the victim scan and the routed update below read and rewrite what this wrote
                 tl.debug_barrier()
     q, kmask, miss, first, first_miss, rank, num_missing, out = _phase1(
         query_ptr, slot_of_id_ptr, lru_usage_ptr, num_copy_ptr, step, K, BLOCK_K,
@@ -186,16 +202,20 @@ def _scored_ensure_kernel(
         else:
             oid = tl.load(id_of_slot_ptr + c, mask=cmask, other=-1)
             held = cmask & (oid >= 0)
+            owner = tl.load(owner_ptr + c, mask=cmask, other=-1)
+            mirrored = held & (owner == oid)
+            stale = held & (owner != oid)
             lk = oid // NUM_EXPERTS
             ahead = lk > layer
             d = tl.where(ahead, lk - layer, NUM_LAYERS - layer + lk)
-            last = tl.load(last_tok_ptr + oid, mask=held, other=0)
+            last = _owner_state(slot_last_ptr, last_tok_ptr, c, oid, mirrored, stale, 0)
             k = tl.minimum(tl.maximum(tl.where(ahead, tok - 1, tok) - last, 0), _K_MAX).to(tl.int32)
             # int32 throughout: |score| < 2^31 by the caps on k, beta and w
             score = -((k << _Q) + d * BETA_STEP)
             if POLICY >= 2:
-                lc = tl.load(lc_ptr + oid, mask=held, other=_LC_NEVER)
-                lcv = _decayed(lc, tl.load(ct_ptr + oid, mask=held, other=0), now, DECAY_MUL, DT_MAX)
+                lc = _owner_state(slot_lc_ptr, lc_ptr, c, oid, mirrored, stale, _LC_NEVER)
+                ct = _owner_state(slot_ct_ptr, ct_ptr, c, oid, mirrored, stale, 0)
+                lcv = _decayed(lc, ct, now, DECAY_MUL, DT_MAX)
                 lcv = tl.where(lc == _LC_NEVER, _LC_FLOOR, tl.maximum(lcv, _LC_FLOOR))
                 score += (W_Q4 * lcv) >> 4
             # Every key is distinct and ties go to the lowest slot; an empty slot keys below any held one.
@@ -228,14 +248,21 @@ def _scored_ensure_kernel(
         _stats(stats_ptr, first, num_missing)
     if POLICY != 0:
         if UPDATE_STATE:
-            # distinct ids only, so a duplicate at bs > 1 counts once per call
+            # distinct ids only, so a duplicate at bs > 1 counts once per call; out is each id's final slot
             tl.store(last_tok_ptr + q, tok, mask=first)
+            tl.store(owner_ptr + out, q, mask=first)
+            tl.store(slot_last_ptr + out, tok, mask=first)
             if POLICY >= 2:
                 lc = tl.load(lc_ptr + q, mask=first, other=_LC_NEVER)
                 x = _decayed(lc, tl.load(ct_ptr + q, mask=first, other=0), now, DECAY_MUL, DT_MAX)
                 lc_new = tl.where(lc == _LC_NEVER, 0, _softplus2(x, g_ptr, first))
                 tl.store(lc_ptr + q, lc_new, mask=first)
                 tl.store(ct_ptr + q, now, mask=first)
+                tl.store(slot_lc_ptr + out, lc_new, mask=first)
+                tl.store(slot_ct_ptr + out, now, mask=first)
+        else:
+            # a slot filled without a state update reads the per-id state until a decode hit re-mirrors it
+            tl.store(owner_ptr + out, -1, mask=first_miss)
 
 
 def _num_warps_for(block_c: int) -> int:
@@ -263,6 +290,10 @@ def scored_ensure(
     lc: torch.Tensor | None = None,
     ct: torch.Tensor | None = None,
     g_table: torch.Tensor | None = None,
+    slot_owner: torch.Tensor | None = None,
+    slot_last_tok: torch.Tensor | None = None,
+    slot_lc: torch.Tensor | None = None,
+    slot_ct: torch.Tensor | None = None,
     router_logits: torch.Tensor | None = None,
     near_miss_thr: float = 0.0,
     stats: torch.Tensor | None = None,
@@ -277,8 +308,10 @@ def scored_ensure(
 
     Same contract as ``lru_ensure``; ``policy`` > 0 also reads and updates the per-(layer,
     expert) state ``last_tok``/``lc``/``ct`` (flat ``layer * num_experts + expert``) against
-    the device token counter ``tok``. ``bump_tok`` advances the counter first (once per
-    decode step); ``update_state=False`` leaves the state untouched (small-prefill ensures).
+    the device token counter ``tok``, and keeps its ``[num_cached]`` mirrors ``slot_last_tok``/
+    ``slot_lc``/``slot_ct`` valid where ``slot_owner`` equals ``id_of_slot`` (-1 marks a stale
+    mirror). ``bump_tok`` advances the counter first (once per decode step);
+    ``update_state=False`` leaves the state untouched (small-prefill ensures).
     Policy 3 refreshes the experts whose ``router_logits`` (``[rows, num_experts]``, rows of
     ``query``) are within ``near_miss_thr`` of their row's lowest routed logit.
     """
@@ -297,9 +330,14 @@ def scored_ensure(
         assert slot_bits <= MAX_SLOT_BITS, f"{num_cached} slots overflow the packed score key"
         assert tok is not None and last_tok is not None
         assert last_tok.dtype == torch.int64 and last_tok.numel() == num_layers * num_experts
+        assert slot_owner is not None and slot_last_tok is not None
+        assert slot_owner.dtype == torch.int32 and slot_owner.numel() == num_cached
+        assert slot_last_tok.dtype == torch.int64 and slot_last_tok.numel() == num_cached
     if policy >= 2:
         assert lc is not None and ct is not None and g_table is not None
         assert lc.dtype == torch.int32 and ct.dtype == torch.int64
+        assert slot_lc is not None and slot_lc.dtype == torch.int32 and slot_lc.numel() == num_cached
+        assert slot_ct is not None and slot_ct.dtype == torch.int64 and slot_ct.numel() == num_cached
     nm_rows = nm_topk = nm_stride = 0
     if policy == 3 and router_logits is not None:
         assert router_logits.ndim == 2 and router_logits.shape[1] == num_experts
@@ -317,6 +355,10 @@ def scored_ensure(
         dummy if ct is None else ct,
         dummy if g_table is None else g_table,
         dummy if nm_rows == 0 else router_logits,
+        dummy if slot_owner is None else slot_owner,
+        dummy if slot_last_tok is None else slot_last_tok,
+        dummy if slot_lc is None else slot_lc,
+        dummy if slot_ct is None else slot_ct,
         k, num_cached, id_base, nm_topk, nm_stride, float(near_miss_thr),
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_C=block_c,
