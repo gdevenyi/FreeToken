@@ -479,11 +479,13 @@ def _copy_overlap_run(kind, banks, overlap, bs, graph, inputs, monkeypatch):
     import freetoken.models.qwen4_exp.moe as qmoe
 
     copy_streams, gate_streams = [], []
-    real_copy, real_gate = fic.fast_index_copy_multi_jit, qmoe.shared_gate_sigmoid
-    monkeypatch.setattr(
-        fic, "fast_index_copy_multi_jit",
-        lambda *a, **k: (copy_streams.append(torch.cuda.current_stream().cuda_stream), real_copy(*a, **k))[1],
-    )
+    real_gate = qmoe.shared_gate_sigmoid
+    for name in ("fast_index_copy_multi_jit", "fast_index_copy_multi_slim_jit"):  # FREETOKEN_MOE_SLIM_COPY
+        real_copy = getattr(fic, name)
+        monkeypatch.setattr(
+            fic, name,
+            lambda *a, _real=real_copy, **k: (copy_streams.append(torch.cuda.current_stream().cuda_stream), _real(*a, **k))[1],
+        )
     monkeypatch.setattr(
         qmoe, "shared_gate_sigmoid",
         lambda *a, **k: (gate_streams.append(torch.cuda.current_stream().cuda_stream), real_gate(*a, **k))[1],
