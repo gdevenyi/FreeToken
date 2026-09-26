@@ -858,6 +858,33 @@ def test_prefetch_installs_only_into_evictable_slots(policy):
 
 
 @_cuda
+@pytest.mark.parametrize("policy", ["kd", "kdfb", "rule"])
+def test_prefetch_scores_victims_from_the_previous_layers_position(policy):
+    """prefetch_ensure(L) runs right after layer L-1's demand call and scores victims from there:
+    layer L's residents are next up (d = 1), so one used last token outlives an older resident of
+    a later layer instead of looking a whole pass away."""
+    num_layers, num_experts, size = 8, 16, 16
+    cache, ref = _pf_cache(policy, size, num_layers, num_experts), _ref(policy, size, num_layers, num_experts)
+    cache.step.fill_(7)
+    ref.step = 7
+    cache.evict_tok.fill_(10)
+    ref.tok = 10
+    cache.evict_slot_owner.fill_(-1)
+    # slots 0-13: layer 1's routed experts (pinned), slot 14: a layer-2 expert used last token,
+    # slot 15: a layer-5 expert last used three tokens ago; all with the same (never-counted) use count
+    planted = [(slot, 16 + slot, 7, 10) for slot in range(14)] + [(14, 2 * 16 + 3, 6, 9), (15, 5 * 16 + 4, 5, 7)]
+    for slot, flat, usage, last in planted:
+        _plant(cache, ref, slot, flat, usage)
+        cache.evict_last_tok[flat] = last
+        ref.last_tok[flat] = last
+    stats = torch.zeros(8, dtype=torch.int64, device="cuda")
+    src, dst, _ = _gpu_prefetch(cache, 2, [9], stats)
+    assert src.tolist() == [9] and dst.tolist() == [15], "the prefetch evicted the target layer's fresh resident"
+    np.testing.assert_array_equal(np.stack(ref.prefetch(2, [9])), np.stack([src, dst]))
+    _assert_same_tables(cache, ref)
+
+
+@_cuda
 @pytest.mark.parametrize("rows_per_step", [1, 2])
 def test_lowpri_lru_without_prefetches_is_flashlib(rows_per_step):
     """Prefetch on routes LRU through the vendored kernel with the low-priority key; while no slot is

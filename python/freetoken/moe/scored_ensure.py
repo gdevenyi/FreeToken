@@ -192,6 +192,10 @@ def _scored_ensure_kernel(
             tok = tok + 1
             tl.store(tok_ptr, tok)
         layer = id_base // NUM_EXPERTS
+        if PREFETCH:
+            # score from where the pass is, right after layer - 1's demand call: the target layer's
+            # residents are next up, not a whole pass away (else it evicts what the layer is about to route)
+            layer = layer - 1
         now = tok * NUM_LAYERS + layer
         if POLICY == 3:
             if UPDATE_STATE:
@@ -511,7 +515,8 @@ def prefetch_ensure(
 
     Unlike a demand call it bumps no clock, touches no hit and no per-id state, and so keeps
     every slot of the last demand call (usage == step) pinned; victims follow the demand key
-    (empty, then earlier unconsumed prefetches, then the coldest residents). With fewer
+    (empty, then earlier unconsumed prefetches, then the coldest residents), scored as of the
+    previous layer's call, the position the prefetch runs at. With fewer
     evictable slots than misses it installs only the first ones, in query order. Adds the
     installs to ``pf_stats[0]`` and clears ``pf_ready``.
     """

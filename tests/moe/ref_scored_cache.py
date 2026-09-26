@@ -140,13 +140,14 @@ class RefScoredCache:
         slots (usage == step) stay pinned. Returns ``(src_ids, dst_slots)``, the copy plan."""
         base = layer * self.E
         tok = self.tok if self.policy else 0
-        now = tok * self.L + layer
+        pos = layer - 1  # the kernel scores from the previous layer's call, where the prefetch runs
+        now = tok * self.L + pos
         order = []
         for e in sel:
             if e >= 0 and e + base not in order:
                 order.append(int(e) + base)
         missing = [i for i in order if self.slot_of_id[i] < 0]
-        keys = self._keys(layer, tok, now, lowpri=True)
+        keys = self._keys(pos, tok, now, lowpri=True)
         n = min(len(missing), int((keys != _KEY_MAX).sum()))
         victims = np.argsort(keys, kind="stable")[:n]
         for e, v in zip(missing[:n], victims):
