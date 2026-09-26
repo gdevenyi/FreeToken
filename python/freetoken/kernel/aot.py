@@ -124,6 +124,23 @@ def _fast_index_copy_multi_spec(num_threads: int, blocks_per_bank: int) -> Kerne
     return KernelSpec(name=_make_name("fast_index_copy_multi", *args), build=build)
 
 
+def _fast_index_copy_multi_slim_spec() -> KernelSpec:
+    from .fast_index_copy import SLIM_COPY_BLOCKS, SLIM_COPY_THREADS, SLIM_COPY_UNROLL
+
+    args = make_cpp_args(SLIM_COPY_BLOCKS, SLIM_COPY_THREADS, SLIM_COPY_UNROLL)
+
+    def build(build_directory: pathlib.Path) -> object:
+        return load_jit(
+            "fast_index_copy_multi_slim",
+            *args,
+            cuda_files=["fast_index_copy.cuh"],
+            cuda_wrappers=[("launch", f"&MultiIndexCopySlimKernel<{args}>::run")],
+            build_directory=str(build_directory),
+        )
+
+    return KernelSpec(name=_make_name("fast_index_copy_multi_slim", *args), build=build)
+
+
 def _batch_memcpy_spec() -> KernelSpec:
     def build(build_directory: pathlib.Path) -> object:
         return load_jit(
@@ -155,6 +172,8 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=8))
     # prefill hit-D2D gather (HBM-bound: wide grid) + its miss-side batch H2D binding.
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=64))
+    # opt-in decode copy (FREETOKEN_MOE_SLIM_COPY=1)
+    specs.append(_fast_index_copy_multi_slim_spec())
     specs.append(_batch_memcpy_spec())
     specs.append(_radix_spec())
 
