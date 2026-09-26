@@ -506,6 +506,20 @@ def test_decode_side_applies_only_to_gpu_decode(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_decode_side_stream_never_aliases_a_pooled_stream():
+    # torch.cuda.Stream() hands out 32 pooled streams per priority round robin; a pooled side stream
+    # can come back as the engine or capture stream, and then the side work silently runs serially
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=4, device=torch.device("cuda"), decode_copy_overlap=True
+    )
+    side = cache.decode_copy_stream.cuda_stream
+    pooled = {torch.cuda.Stream().cuda_stream for _ in range(64)}
+    assert side not in pooled and side != torch.cuda.current_stream().cuda_stream
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_decode_side_survives_a_rebuild():
     # the side stream and events are not cache_size-shaped, so a runtime rebuild keeps them working
     from freetoken.moe.offload_cache import OffloadMoeCache
