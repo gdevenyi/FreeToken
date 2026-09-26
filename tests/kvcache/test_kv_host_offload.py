@@ -15,7 +15,7 @@ def _offloader(num_slots: int, num_logical: int) -> KVHostOffloader:
     off.num_logical = num_logical
     off.max_sel_pages = 4
     off._sel_host = off._counts_host = off._query_host = off._query_buf = off._eff_buf = None
-    off.phys_of = torch.zeros(num_logical + 1, dtype=torch.int32, device="cuda")
+    off.phys_of = torch.zeros((1, num_logical + 1), dtype=torch.int32, device="cuda")
     return off
 
 
@@ -27,11 +27,11 @@ def test_each_prefill_group_uploads_its_own_page_list_while_the_stream_is_busy()
     sel = torch.arange(rows * pages_per_row, dtype=torch.int32, device="cuda").view(rows, pages_per_row)
     off._counts_dev = torch.full((rows,), pages_per_row, dtype=torch.int32, device="cuda")
     received = []
-    off._ensure = lambda q: received.append(q.clone())  # a stream-ordered read of what the copy delivered
+    off._ensure = lambda q, layer: received.append(q.clone())  # a stream-ordered read of what the copy delivered
     block_table = torch.zeros(1, 8, dtype=torch.int32, device="cuda")
 
     groups = []
-    for span, _eff in off.iter_prefill_groups(sel, torch.empty(0, dtype=torch.int64), block_table):
+    for span, _eff in off.iter_prefill_groups(sel, torch.empty(0, dtype=torch.int64), block_table, 0):
         groups.append(span)
         torch.cuda._sleep(20_000_000)  # a slow attend: later CPU writes race the queued copies
     torch.cuda.synchronize()
@@ -106,3 +106,36 @@ def test_compacted_selection_matches_a_reference_on_scattered_selections(maxp):
         assert out[r].tolist() == want + [pad] * (maxp - len(want)), r
         assert int(counts[r]) == len(want)
     assert int(marks.abs().sum()) == 0
+
+
+def test_each_layer_keeps_its_own_residency_and_copies_only_its_rows():
+    """A shared slot map made the layers' selections evict each other every decode step and
+    copied every layer's rows per miss; each layer now binds and fills only its own slots."""
+    from types import SimpleNamespace
+
+    layers, slots, logical, page, heads, dim = 3, 5, 20, 16, 1, 8
+    buf = torch.zeros((2, layers, slots, page, heads, dim), dtype=torch.bfloat16, device="cuda")
+    off = KVHostOffloader(SimpleNamespace(_kv_buffer=buf, _dense=lambda i: i), logical, torch.device("cuda"))
+    host = off.mirror.tensor
+    for layer in range(layers):
+        for p in range(logical):
+            host[:, layer, p] = 100 * layer + p + 1
+
+    off._ensure(torch.tensor([3, 4], dtype=torch.int32, device="cuda"), 1)
+    torch.cuda.synchronize()
+    assert int((off.phys_of[1] >= 0).sum()) == 2
+    assert int((off.phys_of[0] >= 0).sum()) == 0 and int((off.phys_of[2] >= 0).sum()) == 0
+    for p in (3, 4):
+        s = int(off.phys_of[1, p])
+        assert torch.equal(buf[:, 1, s], host[:, 1, p].cuda())
+    assert int(buf[:, 0].abs().sum()) == 0 and int(buf[:, 2].abs().sum()) == 0
+
+    # filling layer 0's whole pool leaves layer 1's bindings in place
+    off._ensure(torch.tensor([7, 8, 9, 10, 11], dtype=torch.int32, device="cuda"), 0)
+    torch.cuda.synchronize()
+    assert int((off.phys_of[1] >= 0).sum()) == 2
+    s = int(off.phys_of[0, 9])
+    assert torch.equal(buf[:, 0, s], host[:, 0, 9].cuda())
+
+    off.invalidate_pages(torch.tensor([4, 9]))
+    assert int(off.phys_of[1, 4]) == -1 and int(off.phys_of[0, 9]) == -1 and int(off.phys_of[1, 3]) >= 0
