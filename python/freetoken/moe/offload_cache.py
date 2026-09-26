@@ -146,9 +146,15 @@ class OffloadMoeCache:
     max_slots: int | None = None
 
     def __post_init__(self) -> None:
-        policy_ids = {"lru": 0}
-        assert self.cache_policy in policy_ids
+        from freetoken.moe.scored_ensure import POLICY_IDS
+
+        assert self.cache_policy in POLICY_IDS, self.cache_policy
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
+        if self.cache_policy != "lru" and self.decode_target != "gpu":
+            # the hybrid and CPU decode paths run their own kernels and would silently stay LRU
+            raise ValueError(
+                f"--moe-cache-policy {self.cache_policy} needs GPU decode, not {self.decode_target!r}"
+            )
         if self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
@@ -165,7 +171,11 @@ class OffloadMoeCache:
             "cache, so cache_size must be at least 2 * num_experts "
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
-        self.cache_policy_id = policy_ids[self.cache_policy]
+        self.cache_policy_id = POLICY_IDS[self.cache_policy]
+        # rule: an unrouted expert within this many logits of the top-k-th is a near miss
+        self.near_miss_thr = (
+            float(os.getenv("FREETOKEN_MOE_NEAR_MISS_THR", "0.25")) if self.cache_policy == "rule" else None
+        )
         self.slot_for_id = torch.full(
             (self.num_layers, self.num_experts),
             -1,
@@ -199,6 +209,7 @@ class OffloadMoeCache:
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
         )
+        self._init_evict_state()
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
@@ -288,6 +299,60 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+
+    def _init_evict_state(self) -> None:
+        """Scored policies' per-(layer, expert) state (moe/scored_ensure.py); None under LRU.
+
+        It is not slot-shaped: it survives eviction and prefill invalidation, and a rebuild
+        only resets it. ``evict_tok`` is the decode-step clock the first ensure of each step bumps.
+        """
+        from freetoken.moe import scored_ensure as se
+
+        self.evict_tok = self.evict_last_tok = self.evict_lc = self.evict_ct = None
+        self.evict_g_table = None
+        n, dev = self.num_layers * self.num_experts, self.device
+        if self.cache_policy_id >= 1:
+            self.evict_tok = torch.zeros((), dtype=torch.int64, device=dev)
+            self.evict_last_tok = torch.full((n,), se.LAST_TOK_NEVER, dtype=torch.int64, device=dev)
+        if self.cache_policy_id >= 2:
+            self.evict_lc = torch.full((n,), se.LC_NEVER, dtype=torch.int32, device=dev)
+            self.evict_ct = torch.zeros((n,), dtype=torch.int64, device=dev)
+            self.evict_g_table = se.softplus2_table(dev)
+        self._alloc_evict_mirrors()
+
+    def _alloc_evict_mirrors(self) -> None:
+        """Slot-shaped copies of each slot owner's state, read coalesced by the victim scan.
+
+        A mirror is valid while ``evict_slot_owner`` equals ``id_of_slot``; the kernel keeps it
+        so, and anything else that installs an id into a slot must set the owner to -1.
+        """
+        self.evict_slot_owner = self.evict_slot_last_tok = self.evict_slot_lc = self.evict_slot_ct = None
+        if self.evict_tok is None:
+            return
+        size, dev = self.cache_size, self.device
+        self.evict_slot_owner = torch.full((size,), -1, dtype=torch.int32, device=dev)
+        self.evict_slot_last_tok = torch.zeros((size,), dtype=torch.int64, device=dev)
+        if self.evict_lc is not None:
+            self.evict_slot_lc = torch.zeros((size,), dtype=torch.int32, device=dev)
+            self.evict_slot_ct = torch.zeros((size,), dtype=torch.int64, device=dev)
+
+    def reset_evict_state(self) -> None:
+        if self.evict_tok is None:
+            return
+        from freetoken.moe import scored_ensure as se
+
+        self.evict_tok.zero_()
+        self.evict_last_tok.fill_(se.LAST_TOK_NEVER)
+        self.evict_slot_owner.fill_(-1)
+        if self.evict_lc is not None:
+            self.evict_lc.fill_(se.LC_NEVER)
+            self.evict_ct.zero_()
+
+    def evict_clock_layer(self) -> int:
+        """The first layer that ensures on the GPU each decode step; its call bumps ``evict_tok``."""
+        if not self.cpu_layer_ids:
+            return 0
+        return min(set(range(self.num_layers)) - self.cpu_layer_ids, default=0)
 
     def set_bank_sources(
         self,
@@ -509,6 +574,8 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self._alloc_evict_mirrors()
+        self.reset_evict_state()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -843,8 +910,21 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        from freetoken.moe.offload_kernels import ensure_experts
+    def ensure_experts(
+        self,
+        layer_id: int,
+        expert_ids: torch.Tensor,
+        *,
+        update_state: bool = True,
+        router_logits: torch.Tensor | None = None,
+        pin_since: torch.Tensor | None = None,
+    ) -> None:
+        """``update_state=False`` (small-prefill ensures) keeps a scored policy's state and
+        decode-step clock still; ``router_logits`` (``[rows, num_experts]``) feed the ``rule``
+        policy's near misses; ``pin_since`` (a ``step`` value) keeps every slot touched after it
+        (a small prefill's earlier chunks). All are ignored under LRU, whose recency order
+        already keeps those slots."""
+        from freetoken.moe.offload_kernels import ensure_experts, ensure_experts_scored
 
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
@@ -853,7 +933,18 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        if self.cache_policy_id == 0:
+            ensure_experts(self, layer_id, expert_ids)
+            return
+        ensure_experts_scored(
+            self,
+            layer_id,
+            expert_ids,
+            bump_tok=update_state and layer_id == self.evict_clock_layer(),
+            update_state=update_state,
+            router_logits=router_logits,
+            pin_since=pin_since,
+        )
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -882,6 +973,8 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
+        if self.evict_slot_owner is not None:
+            self.evict_slot_owner[: self.num_experts].fill_(-1)  # it installs the layer into these slots
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
@@ -890,6 +983,7 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self.reset_evict_state()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0

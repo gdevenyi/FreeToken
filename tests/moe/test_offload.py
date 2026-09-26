@@ -387,7 +387,7 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
     )
 
-    def fake_ensure(layer_id, expert_ids):
+    def fake_ensure(layer_id, expert_ids, **kw):
         calls["ensure_layer_id"] = layer_id
         calls["ensure_expert_ids"] = expert_ids.clone()
         expert_ids.copy_(torch.tensor([[5, 0]], dtype=torch.int32))
