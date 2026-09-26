@@ -17,7 +17,7 @@ class RefScoredCache:
     def __init__(self, num_layers, num_experts, cache_size, policy,
                  beta=se.BETA, w=se.W, halflife=se.HALFLIFE):
         self.L, self.E, self.S, self.policy = num_layers, num_experts, cache_size, policy
-        self.beta_q16, self.w_q8, self.decay_div = se.score_params(beta, w, halflife, num_layers)
+        self.beta_step, self.w_q4, self.decay_mul, self.dt_max = se.score_params(beta, w, halflife, num_layers)
         block_c = 1 << max(cache_size - 1, 1).bit_length()
         self.slot_bits = max(block_c.bit_length() - 1, 1)
         self.g = se.softplus2_table().numpy().astype(np.int64)
@@ -35,8 +35,8 @@ class RefScoredCache:
         self.ct = np.zeros(n, np.int64)
 
     def _decayed(self, ids, now):
-        dt = np.minimum(np.maximum(now - self.ct[ids], 0), se.DT_MAX)
-        return self.lc[ids] - (dt << se.Q) // self.decay_div
+        dt = np.minimum(np.maximum(now - self.ct[ids], 0), self.dt_max)
+        return self.lc[ids] - ((dt * self.decay_mul) >> se.DECAY_SHIFT)
 
     def _softplus2(self, x):
         shift = se.Q - se.G_STEP_BITS
@@ -60,13 +60,13 @@ class RefScoredCache:
             d = np.where(ahead, lk - layer, self.L - layer + lk)
             k = np.where(ahead, tok - 1, tok) - self.last_tok[ids]
             k = np.minimum(np.maximum(k, 0), se.K_MAX)
-            score = -((k << se.Q) + (self.beta_q16 * d) // self.L)
+            score = -((k << se.Q) + d * self.beta_step)
             if self.policy >= 2:
                 lc = self.lc[ids]
                 lcv = self._decayed(ids, now)
                 lcv = np.where(lc == se.LC_NEVER, se.LC_FLOOR, np.maximum(lcv, se.LC_FLOOR))
-                score = score + ((self.w_q8 * lcv) >> 8)
-            score = np.clip(score, 1 - se.SCORE_BIAS, se.SCORE_BIAS - 1)
+                score = score + ((self.w_q4 * lcv) >> 4)
+            assert np.abs(score).max() < 2**31  # the kernel computes it in int32
             key = np.where(held, ((score + se.SCORE_BIAS) << self.slot_bits) | c, c)
         return np.where(self.usage != self.step, key, _KEY_MAX)
 

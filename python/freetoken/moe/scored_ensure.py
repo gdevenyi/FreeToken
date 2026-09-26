@@ -13,8 +13,8 @@ LRU and matches flashlib bit for bit; the others evict the lowest packed score k
 - 3 ``rule``: kdfb plus the near-miss refresh: this layer's experts whose router logit is
   within a margin of the top-k-th count as used one token ago (``last_tok``), unpinned.
 
-The per-(layer, expert) state survives eviction. Scores and counts are Q16 fixed point and
-the count update ``log2(2^x + 1)`` reads a host-built table, so a CPU reference can
+The per-(layer, expert) state survives eviction. Scores and counts are int32 Q16 fixed point
+and the count update ``log2(2^x + 1)`` reads a host-built table, so a CPU reference can
 reproduce every victim exactly (``tl.exp2``/``tl.log2`` are approximate).
 """
 from __future__ import annotations
@@ -36,10 +36,11 @@ Q = 16  # fraction bits of scores and counts
 LAST_TOK_NEVER = -1_000_000
 LC_NEVER = -(1 << 30)
 LC_FLOOR = -(30 << Q)
-K_MAX = 1 << 24  # tokens; keeps the packed key inside int64
-DT_MAX = 1 << 30  # layer-steps
-SCORE_BIAS = 1 << 44
-MAX_SLOT_BITS = 18
+K_MAX = 1 << 14  # tokens; with the caps on beta and w below, a score fits int32
+MAX_BETA, MAX_W = 64.0, 16.0
+DECAY_SHIFT = 8
+SCORE_BIAS = 1 << 31
+MAX_SLOT_BITS = 30
 # g(u) = log2(1 + 2^-u) sampled every 2^-G_STEP_BITS for u in [0, G_RANGE]; zero beyond
 G_STEP_BITS = 6
 G_RANGE = 24
@@ -49,7 +50,7 @@ _Q = tl.constexpr(Q)
 _LC_NEVER = tl.constexpr(LC_NEVER)
 _LC_FLOOR = tl.constexpr(LC_FLOOR)
 _K_MAX = tl.constexpr(K_MAX)
-_DT_MAX = tl.constexpr(DT_MAX)
+_DECAY_SHIFT = tl.constexpr(DECAY_SHIFT)
 _SCORE_BIAS = tl.constexpr(SCORE_BIAS)
 _G_SHIFT = tl.constexpr(Q - G_STEP_BITS)
 _G_LAST = tl.constexpr(G_LAST)
@@ -62,10 +63,18 @@ def softplus2_table(device=None) -> torch.Tensor:
     return torch.tensor(vals, dtype=torch.int32, device=device)
 
 
-def score_params(beta: float, w: float, halflife: int, num_layers: int) -> tuple[int, int, int]:
-    """``(BETA_Q16, W_Q8, DECAY_DIV)`` shared by the kernel and the CPU reference."""
-    assert beta >= 0 and w >= 0 and halflife >= 1
-    return round(beta * (1 << Q)), round(w * 256), num_layers * int(halflife)
+def score_params(beta: float, w: float, halflife: int, num_layers: int) -> tuple[int, int, int, int]:
+    """``(BETA_STEP, W_Q4, DECAY_MUL, DT_MAX)`` shared by the kernel and the CPU reference.
+
+    ``beta * d / L`` is ``d * BETA_STEP`` in Q16; the decay over ``dt`` layer-steps is
+    ``(dt * DECAY_MUL) >> DECAY_SHIFT``, with ``dt`` capped at 64 half-lives (past the -30 floor).
+    """
+    assert 0 <= beta <= MAX_BETA and 0 <= w <= MAX_W and halflife >= 1
+    span = num_layers * int(halflife)
+    decay_mul = round((1 << (Q + DECAY_SHIFT)) / span)
+    dt_max = 64 * span
+    assert dt_max * decay_mul < (1 << 31)
+    return round(beta * (1 << Q) / num_layers), round(w * 16), decay_mul, dt_max
 
 
 @triton.jit
@@ -104,10 +113,10 @@ def _stats(stats_ptr, first, num_missing):
 
 
 @triton.jit
-def _decayed(lc, ct, now, DECAY_DIV: tl.constexpr):
-    """Q16 log2 count decayed from ``ct`` to ``now`` (both in layer-steps); operands of // stay >= 0."""
-    dt = tl.minimum(tl.maximum(now - ct, 0), _DT_MAX)
-    return lc.to(tl.int64) - (dt << _Q) // DECAY_DIV
+def _decayed(lc, ct, now, DECAY_MUL: tl.constexpr, DT_MAX: tl.constexpr):
+    """int32 Q16 log2 count decayed from ``ct`` to ``now`` (int64 layer-steps)."""
+    dt = tl.minimum(tl.maximum(now - ct, 0), DT_MAX).to(tl.int32)
+    return lc - ((dt * DECAY_MUL) >> _DECAY_SHIFT)
 
 
 @triton.jit
@@ -116,23 +125,24 @@ def _softplus2(x, g_ptr, mask):
     u = tl.abs(x)
     i = tl.minimum(u >> _G_SHIFT, _G_LAST)
     frac = u & ((1 << _G_SHIFT) - 1)
-    g0 = tl.load(g_ptr + i, mask=mask, other=0).to(tl.int64)
-    g1 = tl.load(g_ptr + i + 1, mask=mask, other=0).to(tl.int64)
+    g0 = tl.load(g_ptr + i, mask=mask, other=0)
+    g1 = tl.load(g_ptr + i + 1, mask=mask, other=0)
     g = tl.where(i < _G_LAST, g0 + (((g1 - g0) * frac) >> _G_SHIFT), 0)
     return tl.maximum(x, 0) + g
 
 
-@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_rows", "nm_topk", "nm_stride"])
+@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_topk", "nm_stride"])
 def _scored_ensure_kernel(
     query_ptr, slot_of_id_ptr, id_of_slot_ptr, lru_usage_ptr, lru_step_ptr,
     out_ptr, src_ptr, dst_ptr, num_copy_ptr, stats_ptr,
     tok_ptr, last_tok_ptr, lc_ptr, ct_ptr, g_ptr, logits_ptr,
-    K, num_cached, id_base, nm_rows, nm_topk, nm_stride, nm_thr,
+    K, num_cached, id_base, nm_topk, nm_stride, nm_thr,
     BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_TOPK: tl.constexpr,
+    NM_ROWS: tl.constexpr,
     USAGE_MAX: tl.constexpr, COLLECT_STATS: tl.constexpr,
     POLICY: tl.constexpr, BUMP_TOK: tl.constexpr, UPDATE_STATE: tl.constexpr,
     NUM_LAYERS: tl.constexpr, NUM_EXPERTS: tl.constexpr,
-    BETA_Q16: tl.constexpr, W_Q8: tl.constexpr, DECAY_DIV: tl.constexpr,
+    BETA_STEP: tl.constexpr, W_Q4: tl.constexpr, DECAY_MUL: tl.constexpr, DT_MAX: tl.constexpr,
     SLOT_BITS: tl.constexpr,
 ):
     step = tl.load(lru_step_ptr) + 1
@@ -149,14 +159,14 @@ def _scored_ensure_kernel(
                 # Routed ids qualify too; they are pinned now and set to tok below, so that is harmless.
                 ex = tl.arange(0, BLOCK_E)
                 j = tl.arange(0, BLOCK_TOPK)
+                prev = tl.load(last_tok_ptr + id_base + ex, mask=ex < NUM_EXPERTS, other=0)
                 near = ex < 0
-                for r in tl.range(nm_rows):
+                for r in tl.static_range(NM_ROWS):
                     routed = tl.load(query_ptr + r * nm_topk + j, mask=j < nm_topk, other=0)
                     row_ptr = logits_ptr + r * nm_stride
                     kth = tl.min(tl.load(row_ptr + routed, mask=j < nm_topk, other=float("inf")).to(tl.float32), axis=0)
                     row = tl.load(row_ptr + ex, mask=ex < NUM_EXPERTS, other=float("-inf")).to(tl.float32)
                     near = near | (row >= kth - nm_thr)
-                prev = tl.load(last_tok_ptr + id_base + ex, mask=near, other=0)
                 tl.store(last_tok_ptr + id_base + ex, tl.maximum(prev, tok - 1), mask=near)
                 # the victim scan's gather and the routed update below read what this wrote
                 tl.debug_barrier()
@@ -178,19 +188,18 @@ def _scored_ensure_kernel(
             held = cmask & (oid >= 0)
             lk = oid // NUM_EXPERTS
             ahead = lk > layer
-            d = tl.where(ahead, lk - layer, NUM_LAYERS - layer + lk).to(tl.int64)
+            d = tl.where(ahead, lk - layer, NUM_LAYERS - layer + lk)
             last = tl.load(last_tok_ptr + oid, mask=held, other=0)
-            k = tl.where(ahead, tok - 1, tok) - last
-            k = tl.minimum(tl.maximum(k, 0), _K_MAX)
-            score = -((k << _Q) + (BETA_Q16 * d) // NUM_LAYERS)
+            k = tl.minimum(tl.maximum(tl.where(ahead, tok - 1, tok) - last, 0), _K_MAX).to(tl.int32)
+            # int32 throughout: |score| < 2^31 by the caps on k, beta and w
+            score = -((k << _Q) + d * BETA_STEP)
             if POLICY >= 2:
                 lc = tl.load(lc_ptr + oid, mask=held, other=_LC_NEVER)
-                lcv = _decayed(lc, tl.load(ct_ptr + oid, mask=held, other=0), now, DECAY_DIV)
+                lcv = _decayed(lc, tl.load(ct_ptr + oid, mask=held, other=0), now, DECAY_MUL, DT_MAX)
                 lcv = tl.where(lc == _LC_NEVER, _LC_FLOOR, tl.maximum(lcv, _LC_FLOOR))
-                score += (W_Q8 * lcv) >> 8
-            score = tl.minimum(tl.maximum(score, 1 - _SCORE_BIAS), _SCORE_BIAS - 1)
+                score += (W_Q4 * lcv) >> 4
             # Every key is distinct and ties go to the lowest slot; an empty slot keys below any held one.
-            key = tl.where(held, ((score + _SCORE_BIAS) << SLOT_BITS) | c, c.to(tl.int64))
+            key = tl.where(held, ((score.to(tl.int64) + _SCORE_BIAS) << SLOT_BITS) | c, c.to(tl.int64))
             key = tl.where(cmask & (u != step), key, 0x7FFFFFFFFFFFFFFF)
         for i in tl.range(num_missing):
             if POLICY == 0:
@@ -223,9 +232,9 @@ def _scored_ensure_kernel(
             tl.store(last_tok_ptr + q, tok, mask=first)
             if POLICY >= 2:
                 lc = tl.load(lc_ptr + q, mask=first, other=_LC_NEVER)
-                x = _decayed(lc, tl.load(ct_ptr + q, mask=first, other=0), now, DECAY_DIV)
+                x = _decayed(lc, tl.load(ct_ptr + q, mask=first, other=0), now, DECAY_MUL, DT_MAX)
                 lc_new = tl.where(lc == _LC_NEVER, 0, _softplus2(x, g_ptr, first))
-                tl.store(lc_ptr + q, lc_new.to(tl.int32), mask=first)
+                tl.store(lc_ptr + q, lc_new, mask=first)
                 tl.store(ct_ptr + q, now, mask=first)
 
 
@@ -283,7 +292,7 @@ def scored_ensure(
     assert src_indices.numel() >= plan and dst_indices.numel() >= plan
     block_c = triton.next_power_of_2(num_cached)
     slot_bits = max(block_c.bit_length() - 1, 1)
-    beta_q16, w_q8, decay_div = score_params(beta, w, halflife, num_layers)
+    beta_step, w_q4, decay_mul, dt_max = score_params(beta, w, halflife, num_layers)
     if policy != 0:
         assert slot_bits <= MAX_SLOT_BITS, f"{num_cached} slots overflow the packed score key"
         assert tok is not None and last_tok is not None
@@ -308,11 +317,12 @@ def scored_ensure(
         dummy if ct is None else ct,
         dummy if g_table is None else g_table,
         dummy if nm_rows == 0 else router_logits,
-        k, num_cached, id_base, nm_rows, nm_topk, nm_stride, float(near_miss_thr),
+        k, num_cached, id_base, nm_topk, nm_stride, float(near_miss_thr),
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_C=block_c,
         BLOCK_E=triton.next_power_of_2(num_experts),
         BLOCK_TOPK=triton.next_power_of_2(max(nm_topk, 1)),
+        NM_ROWS=nm_rows,
         USAGE_MAX=torch.iinfo(lru_usage.dtype).max,
         COLLECT_STATS=stats is not None,
         POLICY=policy,
@@ -320,9 +330,10 @@ def scored_ensure(
         UPDATE_STATE=bool(update_state) and policy != 0,
         NUM_LAYERS=num_layers,
         NUM_EXPERTS=num_experts,
-        BETA_Q16=beta_q16,
-        W_Q8=w_q8,
-        DECAY_DIV=decay_div,
+        BETA_STEP=beta_step,
+        W_Q4=w_q4,
+        DECAY_MUL=decay_mul,
+        DT_MAX=dt_max,
         SLOT_BITS=slot_bits,
         num_warps=_num_warps_for(block_c),
     )
