@@ -201,8 +201,11 @@ def resolve_sampling(
     if not math.isfinite(resolved_top_p) or not 0 < resolved_top_p <= 1:
         raise ValueError(f"top_p must be in (0, 1], got {resolved_top_p}")
     resolved_top_k = pick(top_k, "top_k", -1)
-    if resolved_top_k != -1 and resolved_top_k < 1:
-        raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {resolved_top_k}")
+    # Any top_k <= 0 means "no top-k filter", as in vLLM and the other OpenAI-compatible
+    # servers: Ollama-style clients (Open WebUI) and some SDKs send top_k=0 for "off", and a
+    # checkpoint's generation_config.json can carry it too. Map it to the engine's -1.
+    if resolved_top_k <= 0:
+        resolved_top_k = -1
     resolved_min_p = float(pick(min_p, "min_p", 0.0))
     resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
     if not 0.0 <= resolved_min_p <= 1.0:
