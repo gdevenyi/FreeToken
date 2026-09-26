@@ -723,6 +723,71 @@ def test_prefetch_mode_matches_cpu_reference(policy, rows_per_step):
     assert got[:, COPIED].sum() > got[:, LATE].sum()
 
 
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "rule"])
+@pytest.mark.parametrize("rows_per_step", [1, 2, 8])
+def test_prefetch_mode_matches_cpu_reference_at_production_geometry(policy, rows_per_step):
+    """The same victim-for-victim check at the deployment's shape: 48 layers x 512 experts, 1480
+    slots (a 2048-wide, 8-warp victim scan), top-10, up to 8 rows (every graph size that forks)
+    and 32-wide prefetch queries, with small-prefill ensures (pinned since their first chunk) and a
+    materialized layer in between. No prefetch ever evicts a slot of the last demand call."""
+    from freetoken.moe.offload_kernels import ensure_experts_scored
+
+    num_layers, num_experts, size, width = L, E, 1480, 32
+    rng = np.random.default_rng(71 + rows_per_step)
+    rows = _zipf_rows(4, rows_per_step, seed=72, num_layers=num_layers, num_experts=num_experts, top_k=TOP_K)
+    logits = _random_logits(rows, seed=73, num_experts=num_experts) if policy == "rule" else None
+    cache, ref = _pf_cache(policy, size, num_layers, num_experts), _ref(policy, size, num_layers, num_experts)
+    dev = cache.id_of_slot.device
+    stats = torch.zeros((num_layers, 8), dtype=torch.int64, device=dev)
+    ready = torch.zeros(1, dtype=torch.int32, device=dev)
+    installs = 0
+    for r in range(rows.shape[0]):
+        if r == 2:
+            cache.materialize_layer(5)
+            ref.materialize(5)
+        for layer in range(num_layers):
+            ids = rows[r, layer]
+            plan = None
+            if layer:
+                routed = list(dict.fromkeys(ids.ravel().tolist()))
+                held = [e for e in range(num_experts) if ref.slot_of_id[layer * num_experts + e] >= 0]
+                sel = rng.choice(routed, size=min(6, len(routed)), replace=False).tolist()
+                sel += rng.choice(num_experts, size=16).tolist() + held[:4] + sel[:2] + [-1, -1]
+                sel = sel[:width]
+                rng.shuffle(sel)
+                pinned = set(np.flatnonzero((ref.usage == ref.step) & (ref.id_of_slot >= 0)).tolist())
+                src, dst, plan = _gpu_prefetch(cache, layer, sel, stats[layer], width=width)
+                want_src, want_dst = ref.prefetch(layer, sel)
+                np.testing.assert_array_equal(src, want_src)
+                np.testing.assert_array_equal(dst, want_dst)
+                assert not pinned & set(dst.tolist()), "a prefetch evicted a slot of the last demand call"
+                installs += len(dst)
+                _assert_same_tables(cache, ref)
+            q = torch.from_numpy(np.ascontiguousarray(ids, dtype=np.int32)).to(dev).view(-1)
+            lg = None if logits is None else torch.from_numpy(np.ascontiguousarray(logits[r, layer])).to(dev, torch.bfloat16)
+            ensure_experts_scored(
+                cache, layer, q, bump_tok=layer == 0, update_state=True, router_logits=lg, lowpri=True,
+                pf_count=None if plan is None else (stats[layer], ready, plan, rows_per_step),
+            )
+            out, _, _ = ref.ensure(layer, ids, bump_tok=layer == 0, logits=None if lg is None else lg.float().cpu().numpy(),
+                                   thr=NEAR_MISS_THR, lowpri=True)
+            np.testing.assert_array_equal(q.cpu().numpy(), out)
+            _assert_same_tables(cache, ref)
+        # a short prefill of one layer between decode steps: chunked, pinned since its first chunk
+        layer = int(rng.integers(num_layers))
+        uniq = np.unique(rng.choice(num_experts, size=60, replace=False))
+        pin = cache.step.clone() if policy != "lru" else None
+        ref_pin = ref.step if policy != "lru" else None
+        for start in range(0, uniq.size, 32):
+            part = torch.from_numpy(uniq[start : start + 32].astype(np.int32)).to(dev)
+            cache.ensure_experts(layer, part, update_state=False, pin_since=pin)
+            out, _, _ = ref.ensure(layer, uniq[start : start + 32], update_state=False, pin_since=ref_pin, lowpri=True)
+            np.testing.assert_array_equal(part.cpu().numpy(), out)
+            _assert_same_tables(cache, ref)
+    assert installs > 0 and int((ref.id_of_slot >= 0).sum()) == size, "the cache must be full and evicting"
+
+
 def _plant(cache, ref, slot, flat_id, usage):
     for t_id, t_slot in ((cache.id_of_slot, cache.slot_for_id.view(-1)), (ref.id_of_slot, ref.slot_of_id)):
         t_id[slot] = flat_id
