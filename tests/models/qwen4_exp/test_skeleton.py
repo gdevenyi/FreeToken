@@ -993,26 +993,34 @@ _PF_DELAY_CYCLES = 1_000_000
 def test_moe_prefetch_on_joins_hold_when_the_prefetch_streams_run_late(graph, bs, policy, delay, monkeypatch):
     """Race test: a sleep on the prefetch copy stream (every copy lands after its layer's ensure) or on
     the predictor stream (prefetch_ensure runs long after the fork) must not change a bit. The
-    candidates include each layer's routed ids, so GEMMs do read prefetched slots."""
-    from freetoken.moe.prefetch import COPIED, LATE, USEFUL
+    candidates include each layer's routed ids, so GEMMs do read prefetched slots. The joins also
+    make the slot maps timing-free: the delayed run ends with the undelayed run's maps and counts."""
+    from freetoken.moe.prefetch import COPIED, LATE, NUM_STAT_COLS, USEFUL
 
     banks = _prefetch_banks("nvfp4")
     inputs = _prefetch_inputs(bs, steps=_PF_ON_STEPS, seed=7)
     moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True, policy=policy)
     off = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
-    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True, budget=8)
-    steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=bs + 10)
-    delays = {"delay_copy_cycles": _PF_DELAY_CYCLES * (delay in ("copy", "both")),
-              "delay_predict_cycles": _PF_DELAY_CYCLES * (delay in ("predict", "both"))}
-    on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0, before_step=_with_override(cache, steps, **delays))
-    _assert_same_outputs(on[0], off[0])
-    _assert_slots_hold_their_experts(cache)
-    stats = cache.prefetch.stats.cpu()
+    runs = []
+    for cycles in (0, _PF_DELAY_CYCLES):
+        moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True, budget=8)
+        steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=bs + 10)
+        delays = {"delay_copy_cycles": cycles * (delay in ("copy", "both")),
+                  "delay_predict_cycles": cycles * (delay in ("predict", "both"))}
+        on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0, before_step=_with_override(cache, steps, **delays))
+        _assert_same_outputs(on[0], off[0])
+        _assert_slots_hold_their_experts(cache)
+        runs.append((on[1][:3], cache.prefetch.stats.cpu()))
+    (maps, stats), (delayed_maps, delayed_stats) = runs
     assert int(stats[:, USEFUL].sum()) > 0
+    for a, b in zip(maps, delayed_maps):
+        assert torch.equal(a, b)
+    cols = [c for c in range(NUM_STAT_COLS) if c != LATE]
+    assert torch.equal(stats[:, cols], delayed_stats[:, cols])
     if delay == "copy":
         # the late counter sees what the join waited for: the copies were still sleeping at ensure(L)
         # (all of them under replay; an eager host gap longer than the sleep can let one land first)
-        late, copied = int(stats[:, LATE].sum()), int(stats[:, COPIED].sum())
+        late, copied = int(delayed_stats[:, LATE].sum()), int(delayed_stats[:, COPIED].sum())
         assert copied > 0 and (late == copied if graph else late >= 0.9 * copied)
 
 
