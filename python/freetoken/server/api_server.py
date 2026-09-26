@@ -37,6 +37,8 @@ from freetoken.utils import (
 from pydantic import BaseModel, Field
 
 from .args import ServerArgs
+from .bind import bind_sockets, split_hosts
+from .bind import serve as serve_bound
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
@@ -975,11 +977,17 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None = None) -> No
     # Resolved before anything is started, so a bad address fails while there is still nothing
     # to tear down. 0.0.0.0/:: are bind addresses, not destinations; resolve_server_url maps
     # them to loopback. An IPv6 bind host has to be bracketed before it can go into a URL.
+    # With several --host addresses the shell talks to the first one.
+    hosts = split_hosts(host)
+    host = hosts[0]
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
-    thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
+    run_kwargs = {"sockets": bind_sockets(hosts, port)} if len(hosts) > 1 else {}
+    thread = threading.Thread(
+        target=server.run, kwargs=run_kwargs, name="freetoken-uvicorn", daemon=True
+    )
     thread.start()
     _install_shell_stop_handlers()
     try:
@@ -1120,4 +1128,5 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port, config.api_key)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    # --host may name several addresses (e.g. loopback + the docker bridge); see bind.py.
+    serve_bound(app, host, port)

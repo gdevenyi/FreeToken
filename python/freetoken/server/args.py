@@ -344,7 +344,8 @@ def parse_args(
         type=str,
         dest="server_host",
         default=ServerArgs.server_host,
-        help="The host address for the server.",
+        help="The host address for the server. A comma-separated list binds each address, "
+        "e.g. 127.0.0.1,172.17.0.1 for loopback plus containers on the docker bridge.",
     )
 
     parser.add_argument(
