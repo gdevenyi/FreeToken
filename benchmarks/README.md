@@ -52,11 +52,20 @@ stack (512 experts, rule eviction, copy overlap on) with forced routing that mis
 experts per layer, as CUDA graphs. `--on` times whole 48-layer decode steps with prefetch off vs
 on instead: a GEMV per layer stands in for attention (`--filler-us`), each layer prefetches 3 or
 4 candidates of which `--useful` are its misses, and `--delay-us` holds every prefetch copy back
-to price a late one. It reports ms/step, demand misses/step and the late fraction.
+to price a late one. It reports ms/step, demand misses/step and the late fraction. `--steady
+--trace DIR` runs steady-state decode on a recorded routing trace instead (experts.npy,
+logit_idx.npy, logit_val.npy, req_index.npy): no cache restore, so wrong prefetches and evictions
+carry over, and a noisy copy of each layer's traced logits (`--sigma`) stands in for the
+lookahead. Arms such as `off,measure,on,on:4/4` (budgets before GDN / QSA layers) replay step by
+step in turn, each on its own copy of the cache state; it adds pollution (non-resident demands
+per layer against off's misses) and the late fraction per layer kind. Slots and sigma were
+calibrated to production's measure line (misses/layer ~4.3, precision ~0.56) at 24 layers.
 
 ```bash
 python benchmarks/bench_moe_prefetch.py --bs 1,2 --misses 0,4
 python benchmarks/bench_moe_prefetch.py --on --bs 1,2 --misses 4 --delay-us 0,50,150,300
+python benchmarks/bench_moe_prefetch.py --steady --trace DIR --bs 1,2 --steady-slots 740 --sigma 0.55 \
+    --arms off,measure,on,on:empty,on:3/3,on:4/4,on:4/5
 ```
 
 **`bench_expert_copy_corun.py`** — synthetic (no checkpoint): the fused expert copy kernel
