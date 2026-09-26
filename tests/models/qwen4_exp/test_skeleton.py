@@ -819,6 +819,40 @@ def test_moe_prefetch_survives_a_rebuild(monkeypatch):
 
 
 @requires_cuda
+@pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("bs", [1, 2])
+def test_moe_prefetch_predicts_layer_l_from_layer_l_minus_1_input(kind, bs, monkeypatch):
+    """With a distinct input per layer, the prediction for layer L reads exactly layer L-1's router
+    input through layer L's router, and the select sees those logits and layer L's residency."""
+    import freetoken.moe.prefetch as pf_mod
+
+    banks = _prefetch_banks(kind)
+    inputs = _prefetch_inputs(bs, steps=3, seed=4)
+    moes, cache = _prefetch_stack(kind, banks, "measure", monkeypatch)
+    forks, selects = [], []
+    real_fork, real_select = cache.prefetch.fork, pf_mod.lookahead_select
+
+    def spy_fork(target, x, gate, resident, budget):
+        forks.append((target, x.clone(), gate, resident.data_ptr()))
+        return real_fork(target, x, gate, resident, budget)
+
+    def spy_select(logits, resident, sel, res, *, k, budget):
+        selects.append(logits.clone())
+        return real_select(logits, resident, sel, res, k=k, budget=budget)
+
+    def install():
+        monkeypatch.setattr(cache.prefetch, "fork", spy_fork)
+        monkeypatch.setattr(pf_mod, "lookahead_select", spy_select)
+
+    _prefetch_run(moes, cache, bs, False, inputs, before_decode=install)
+    assert [f[0] for f in forks] == list(range(1, _PF_LAYERS)) * len(inputs) and len(selects) == len(forks)
+    for call, ((target, x, gate, resident), logits) in enumerate(zip(forks, selects)):
+        assert torch.equal(x, inputs[call // (_PF_LAYERS - 1)][target - 1])
+        assert gate is moes[target].gate and resident == cache.slot_for_id[target].data_ptr()
+        assert torch.equal(logits, F.linear(x, moes[target].gate.weight))
+
+
+@requires_cuda
 def test_decoder_stack_prefill_and_decode(monkeypatch):
     """Ragged bs=3 prefill then a bs=3 decode step through the whole model with dummy weights."""
     from freetoken.kvcache.linear_state_pool import LinearStatePool
