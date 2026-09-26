@@ -566,7 +566,7 @@ def _prefetch_banks(kind):
     return build_expert_banks(method, _PF_LAYERS, None, device=torch.device("cuda"), dummy=True)
 
 
-def _prefetch_stack(kind, banks, mode, monkeypatch, *, k=6, budget=0, wire=True, overlap=False):
+def _prefetch_stack(kind, banks, mode, monkeypatch, *, k=6, budget=0, wire=True, overlap=False, policy="rule"):
     from freetoken.env import ENV
     from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE, wire_router_lookahead
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -587,7 +587,7 @@ def _prefetch_stack(kind, banks, mode, monkeypatch, *, k=6, budget=0, wire=True,
     experts = [_offload_experts(kind, i, _PF_EXPERTS, _PF_TOPK, _PF_HIDDEN, _PF_INTER) for i in range(_PF_LAYERS)]
     cache = OffloadMoeCache(
         num_layers=_PF_LAYERS, num_experts=_PF_EXPERTS, cache_size=_PF_EXPERTS, device=device,
-        cache_policy="rule", quant_format=banks.quant_format, layout=banks.layout,
+        cache_policy=policy, quant_format=banks.quant_format, layout=banks.layout,
         max_slots=experts[0].quant_method.slot_limit(), prefetch_mode=mode, decode_copy_overlap=overlap,
     )
     cache.set_bank_sources(banks.sources)
@@ -657,15 +657,15 @@ def _prefetch_inputs(bs, steps=8, chain=False, seed=0):
 @pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("bs", [1, 2])
-@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
-def test_moe_prefetch_measure_is_bitwise_identical(kind, graph, bs, overlap, monkeypatch):
+@pytest.mark.parametrize("overlap,policy", [(False, "rule"), (True, "rule"), (True, "lru")], ids=["serial", "overlap", "overlap-lru"])
+def test_moe_prefetch_measure_is_bitwise_identical(kind, graph, bs, overlap, policy, monkeypatch):
     """FREETOKEN_MOE_PREFETCH=measure predicts and counts beside the decode (with and without
     FREETOKEN_MOE_COPY_OVERLAP's side stream); the MoE outputs, the slot map, the usage clock and
     the slot contents must not change by a single bit."""
     banks = _prefetch_banks(kind)
     inputs = _prefetch_inputs(bs)
-    off = _prefetch_run(*_prefetch_stack(kind, banks, "off", monkeypatch, overlap=overlap), bs, graph, inputs)
-    on = _prefetch_run(*_prefetch_stack(kind, banks, "measure", monkeypatch, overlap=overlap), bs, graph, inputs)
+    off = _prefetch_run(*_prefetch_stack(kind, banks, "off", monkeypatch, overlap=overlap, policy=policy), bs, graph, inputs)
+    on = _prefetch_run(*_prefetch_stack(kind, banks, "measure", monkeypatch, overlap=overlap, policy=policy), bs, graph, inputs)
 
     assert off[2] is None and int(off[3].sum()) > 0 and torch.equal(on[3], off[3])
     for got, want in zip(on[0], off[0]):
