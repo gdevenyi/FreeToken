@@ -338,6 +338,27 @@ def test_small_prefill_ensures_leave_the_state_alone(monkeypatch):
         assert torch.equal(b, a)
 
 
+@_cuda
+def test_dsv4_on_demand_prefill_leaves_the_state_alone():
+    from types import SimpleNamespace
+
+    from freetoken.models.deepseek_v4.moe import DSV4OffloadMoELayer
+
+    experts, top_k = 64, 4
+    cache = _cache("kdfb", 96, 1, experts)
+    cache.set_bank_sources({"gate_up": [torch.zeros(experts, 2, 4)], "down": [torch.zeros(experts, 4, 2)]})
+    cache.ensure_experts(0, torch.tensor([1, 2, 3, 4], dtype=torch.int32, device="cuda"))
+    before = [t.clone() for t in (cache.evict_tok, cache.evict_last_tok, cache.evict_lc, cache.evict_ct)]
+    # few enough routes (3 x 4 < 64) for the slot path rather than whole-layer streaming
+    layer = SimpleNamespace(offload_cache=cache, num_experts=experts, top_k=top_k, layer_id=0,
+                            _expert_gemm=lambda *a, **kw: None)
+    ids = torch.tensor([[5, 6, 7, 8], [9, 10, 11, 12], [5, 13, 14, 15]], dtype=torch.int32, device="cuda")
+    DSV4OffloadMoELayer._prefill_routed(layer, torch.zeros(3, 8, device="cuda"), torch.full((3, top_k), 0.25), ids)
+    assert bool((cache.slot_for_id[0, 5:16] >= 0).all())
+    for b, a in zip(before, (cache.evict_tok, cache.evict_last_tok, cache.evict_lc, cache.evict_ct)):
+        assert torch.equal(b, a)
+
+
 # (e) reset() and rebuild() -----------------------------------------------------------------
 
 
