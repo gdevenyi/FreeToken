@@ -159,6 +159,12 @@ def qsa_mqa_paged(
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
     # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
     tiles_per_program = 1 if q.shape[0] <= 32 else 8
+    num_warps = 2
+    if device_capability() < (7, 0):
+        # sm_61 sweep at 64K context (4 heads x 128): tl.dot runs on FMAs there, and 32-key
+        # tiles cut a 2048-row chunk from 1334 to 86 ms and a decode row from 0.84 to 0.16 ms
+        BLOCK_N = 32
+        tiles_per_program, num_warps = (1, 4) if q.shape[0] <= 32 else (32, 1)
     _qsa_mqa_paged_kernel[
         (q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))
     ](
@@ -196,7 +202,7 @@ def qsa_mqa_paged(
         COMPRESS_RATIO=compress_ratio,
         # ld.*.evict_first is an sm_70 PTX modifier; ptxas rejects the kernel below it.
         KEY_EVICTION="evict_first" if device_capability() >= (7, 0) else "",
-        num_warps=2,
+        num_warps=num_warps,
     )
     return logits, visible_blocks
 
