@@ -7,7 +7,7 @@ with fewer experts per layer than the model so host and GPU memory stay small. E
   1. bitwise check of the two arms over the same fresh inputs,
   2. replay time per step with CUDA events, arms interleaved ABAB, fresh inputs every round,
   3. a torch.profiler (CUPTI) trace of graph replays: per layer, the copy kernel's start slip
-     after the ensure, the shared expert's span and whether it ends inside the copy, the join
+     after the ensure, the shared expert's span (side stream) and whether it ends inside the copy, the join
      gap, and the copy's duration against the off arm.
 No attention or hyper-connection work runs, so the percentages overstate the model's.
 
@@ -155,14 +155,12 @@ def layer_calls(ev, overlap: bool) -> list[dict]:
         gemm = next((k for k in ev[i + 1:] if "_decode_nvfp4" in k[2]), None)
         if copy is None or gemm is None:
             continue
-        # the shared expert chain starts at the gate kernel: after the ensure with the overlap, before it without
-        if overlap:
-            j = next(j for j in range(i + 1, len(ev)) if "_gate_sigmoid_kernel" in ev[j][2])
-            chain = [k for k in ev[j:] if k[1] <= gemm[0] and "fast_index_copy" not in k[2]]
-        else:
-            j = max(j for j in range(i) if "_gate_sigmoid_kernel" in ev[j][2])
-            router = next(k for k in ev[j:] if "_router_triton_kernel" in k[2])
-            chain = [k for k in ev[j:] if k[1] <= router[0]]
+        # the shared expert chain starts at the gate kernel before the ensure; with the overlap it runs on
+        # the side stream beside the routed path, without it serially ahead of that path's topk
+        j = max(j for j in range(i) if "_gate_sigmoid_kernel" in ev[j][2])
+        routed_path = ("router", "topk", "ensure", "fast_index_copy")
+        chain = [k for k in (ev[j:] if overlap else ev[j:i]) if k[1] <= gemm[0]
+                 and not any(m in k[2] for m in routed_path)]
         rows.append({
             "copy_us": copy[1] - copy[0],
             "slip_us": copy[0] - ens_end,

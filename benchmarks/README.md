@@ -39,7 +39,7 @@ python benchmarks/bench_scored_ensure.py --slots 1650 --k 10,20
 **`bench_moe_copy_overlap.py`** — synthetic (no checkpoint): `FREETOKEN_MOE_COPY_OVERLAP`
 off vs on for Qwen4ExpMoE decode layers at the Qwen3.8-Flash-Next expert geometry, as CUDA
 graphs. Checks the outputs are bitwise identical, times replays ABAB, and profiles the copy's
-start after the ensure and how much shared-expert work runs inside it.
+start after the ensure and how much of the side-stream shared expert runs inside it.
 
 ```bash
 python benchmarks/bench_moe_copy_overlap.py --bs 1 --slots 160

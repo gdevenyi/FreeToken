@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -148,8 +149,8 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
-    # GPU decode only: layers that call OffloadMoELayer.decode_begin/decode_finish copy their
-    # misses on decode_copy_stream while the caller computes. None = FREETOKEN_MOE_COPY_OVERLAP.
+    # GPU decode only: the caller's work that is independent of the routed experts (qwen4_exp: the
+    # shared expert) runs on decode_copy_stream beside the miss copy. None = FREETOKEN_MOE_COPY_OVERLAP.
     decode_copy_overlap: bool | None = None
 
     def __post_init__(self) -> None:
@@ -306,7 +307,7 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
-        # Decode copy overlap: one side stream plus a (forked, copied) event pair per layer.
+        # Decode copy overlap: one side stream plus a (forked, done) event pair per layer.
         # Neither is cache_size-shaped, so rebuild() keeps them.
         if self.decode_copy_overlap is None:
             self.decode_copy_overlap = bool(ENV.MOE_COPY_OVERLAP)
@@ -1179,24 +1180,23 @@ class OffloadMoeCache:
                 self.num_indices,
             )
 
-    def fork_copy_missing(self, layer_id: int) -> None:
-        """``copy_missing(layer_id)`` on ``decode_copy_stream``, ordered after the ensure just
-        enqueued on the current stream; ``join_copy_missing`` must follow before the slots are read.
+    @contextmanager
+    def decode_side(self, layer_id: int) -> Iterator[None]:
+        """Run the body on ``decode_copy_stream``, ordered after the work already on the current
+        stream; ``join_decode_side`` must follow before its results are read.
 
-        The plan buffers (evict_slots/src_indices/num_indices) are shared by every layer: this is
-        sound only because the next ensure_experts runs on the current stream after the join.
+        The copy stays on the current stream right after its ensure, so it never waits on a
+        cross-stream edge; the side work (slack-rich) takes that latency and any SM contention.
         Under capture the event pair becomes a fork and a join edge of the graph."""
-        forked, copied = self._decode_copy_events[layer_id]
+        forked, done = self._decode_copy_events[layer_id]
         forked.record(torch.cuda.current_stream(self.device))
         self.decode_copy_stream.wait_event(forked)
-        # no record_stream: the copy only touches the persistent plan, descriptor and slot tensors
         with torch.cuda.stream(self.decode_copy_stream):
-            self.copy_missing(layer_id)
-            copied.record(self.decode_copy_stream)
+            yield
+            done.record(self.decode_copy_stream)
 
-    def join_copy_missing(self, layer_id: int) -> None:
+    def join_decode_side(self, layer_id: int) -> None:
         torch.cuda.current_stream(self.device).wait_event(self._decode_copy_events[layer_id][1])
-
 
 def iter_offload_moe_layers(model) -> Iterator:
     from freetoken.layers import BaseOP, OffloadMoELayer

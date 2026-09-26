@@ -474,8 +474,8 @@ def test_copy_missing_takes_an_explicit_layer_id():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_decode_begin_declines_outside_gpu_decode(monkeypatch):
-    # prefill, CPU-routed layers, TP > 1 and the flag off keep the plain forward: decode_begin launches nothing
+def test_decode_side_applies_only_to_gpu_decode(monkeypatch):
+    # prefill, CPU-routed layers, TP > 1 and the flag off keep the shared expert on the compute stream
     from types import SimpleNamespace
 
     import freetoken.core as core
@@ -484,81 +484,49 @@ def test_decode_begin_declines_outside_gpu_decode(monkeypatch):
 
     _init_tp()
     layer = _bf16_offload_layer(0, 4, 2, 8, 16)
-    hidden, logits = torch.randn(1, 8, device="cuda"), torch.randn(1, 4, device="cuda")
     ctx = Context(page_size=1)
     monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
 
-    def routed(**kwargs):
-        raise AssertionError("decode_begin routed")
-
-    monkeypatch.setattr("freetoken.layers.moe.fused_topk", routed)
-
-    def begin(is_prefill=False, cpu_layers=(), **cache_kw):
+    def applies(is_prefill=False, cpu_layers=(), **cache_kw):
         layer.offload_cache = OffloadMoeCache(
             num_layers=1, num_experts=4, cache_size=4, device=torch.device("cuda"), **cache_kw
         )
         layer.offload_cache.cpu_layer_ids = frozenset(cpu_layers)
         ctx._batch = SimpleNamespace(is_prefill=is_prefill)
-        return layer.decode_begin(hidden, logits)
+        return layer.decode_side_applies()
 
-    assert begin(decode_copy_overlap=False) is None
-    assert begin(decode_copy_overlap=True, decode_target="hybrid") is None
-    assert begin(is_prefill=True, decode_copy_overlap=True) is None
-    assert begin(cpu_layers=(0,), decode_copy_overlap=True) is None
+    assert not applies(decode_copy_overlap=False)
+    assert not applies(decode_copy_overlap=True, decode_target="hybrid")
+    assert not applies(is_prefill=True, decode_copy_overlap=True)
+    assert not applies(cpu_layers=(0,), decode_copy_overlap=True)
     monkeypatch.setattr(layer, "tp_size", 2)
-    assert begin(decode_copy_overlap=True) is None
+    assert not applies(decode_copy_overlap=True)
     monkeypatch.setattr(layer, "tp_size", 1)
-    with pytest.raises(AssertionError, match="decode_begin routed"):
-        begin(decode_copy_overlap=True)
+    assert applies(decode_copy_overlap=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_decode_begin_finish_match_decode_forward_after_rebuild(monkeypatch):
-    # the copy stream and events are not cache_size-shaped, so a runtime rebuild keeps them working
-    from types import SimpleNamespace
-
-    import freetoken.core as core
-    from freetoken.core import Context
+def test_decode_side_survives_a_rebuild():
+    # the side stream and events are not cache_size-shaped, so a runtime rebuild keeps them working
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    _init_tp()
-    num_layers, num_experts, top_k, hidden_size, inter = 2, 8, 2, 64, 32
-    g = torch.Generator().manual_seed(3)
-    sources = {
-        "gate_up": [(torch.randn(num_experts, 2 * inter, hidden_size, generator=g) * 0.1).bfloat16().pin_memory()
-                    for _ in range(num_layers)],
-        "down": [(torch.randn(num_experts, hidden_size, inter, generator=g) * 0.1).bfloat16().pin_memory()
-                 for _ in range(num_layers)],
-    }
-    steps = [
-        (torch.randn(2, hidden_size, generator=g).bfloat16().cuda(), torch.randn(2, num_experts, generator=g).cuda())
-        for _ in range(4)
-    ]
-    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
-    core._GLOBAL_CTX._batch = SimpleNamespace(is_prefill=False)
-    outs = {}
-    for overlap in (False, True):
-        cache = OffloadMoeCache(
-            num_layers=num_layers, num_experts=num_experts, cache_size=num_experts,
-            device=torch.device("cuda"), decode_copy_overlap=overlap,
-        )
-        cache.set_bank_sources(sources)
-        stream = cache.decode_copy_stream
-        cache.rebuild(num_experts + 2)
-        assert cache.decode_copy_stream is stream and (stream is not None) == overlap
-        layers = [_bf16_offload_layer(l, num_experts, top_k, hidden_size, inter) for l in range(num_layers)]
-        for layer in layers:
-            layer.offload_cache = cache
-        outs[overlap] = []
-        for x, logits in steps:
-            for layer in layers:
-                h = x.clone()
-                routing = layer.decode_begin(h, logits)
-                assert (routing is not None) == overlap
-                out = layer.forward(h, logits) if routing is None else layer.decode_finish(h, routing)
-                outs[overlap].append(out.clone())
-        torch.cuda.synchronize()
-    assert all(torch.equal(a, b) for a, b in zip(outs[True], outs[False]))
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"), decode_copy_overlap=True
+    )
+    cache.set_bank_sources({
+        "gate_up": [torch.zeros(4, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+        "down": [torch.zeros(4, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+    })
+    stream = cache.decode_copy_stream
+    cache.rebuild(6)
+    assert cache.decode_copy_stream is stream is not None
+    x = torch.arange(1024, dtype=torch.float32, device="cuda")
+    for layer_id in range(2):
+        with cache.decode_side(layer_id):
+            assert torch.cuda.current_stream() == stream
+            y = x * 2
+        cache.join_decode_side(layer_id)
+        assert torch.equal(y + 0, x * 2)
 
 
 def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
