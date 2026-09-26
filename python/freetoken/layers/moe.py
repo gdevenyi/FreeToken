@@ -243,6 +243,43 @@ class OffloadMoELayer(MoELayer):
         )
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
+    def decode_begin(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> TopK | None:
+        """First half of ``forward`` for a GPU decode whose miss copy overlaps the caller's work.
+
+        Routes, ensures, then forks ``copy_missing`` onto the cache's copy stream and returns the
+        routing (slot ids) for ``decode_finish``. Returns None, having launched nothing, when the
+        overlap is off or does not apply (prefill, CPU/hybrid decode, TP > 1); call ``forward``.
+        Work the caller enqueues in between must not touch the slot cache."""
+        cache = self.offload_cache
+        if (
+            cache is None
+            or cache.decode_copy_stream is None
+            or self.tp_size > 1
+            or get_global_ctx().batch.is_prefill
+            or cache.is_cpu_layer(self.layer_id)
+        ):
+            return None
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        cache.ensure_experts(self.layer_id, topk_ids)
+        cache.fork_copy_missing(self.layer_id)
+        return topk_weights, topk_ids
+
+    def decode_finish(self, hidden_states: torch.Tensor, routing: TopK) -> torch.Tensor:
+        """Second half: wait for this layer's copy, then the routed GEMM (``forward``'s output)."""
+        cache = self.offload_cache
+        cache.join_copy_missing(self.layer_id)
+        topk_weights, topk_ids = routing
+        return self._maybe_all_reduce(self._decode_gemm(cache, hidden_states, topk_weights, topk_ids))
+
     def prefill_forward(
         self,
         hidden_states: torch.Tensor,
@@ -290,6 +327,15 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        return self._decode_gemm(cache, hidden_states, topk_weights, topk_ids)
+
+    def _decode_gemm(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
         return self._expert_gemm(
             cache,
             hidden_states,
