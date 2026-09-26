@@ -45,6 +45,16 @@ start after the ensure and how much of the side-stream shared expert runs inside
 python benchmarks/bench_moe_copy_overlap.py --bs 1 --slots 160
 ```
 
+**`bench_moe_prefetch.py`** — synthetic (no checkpoint): `FREETOKEN_MOE_PREFETCH=measure`
+cost. The router-lookahead predictor alone per layer (GEMV `[bs, 2560] x [2560, 512]`, top-K
+select, and the count kernel), then prefetch off vs measure on a real-geometry Qwen4ExpMoE decode
+stack (512 experts, rule eviction, copy overlap on) with forced routing that misses exactly m
+experts per layer, as CUDA graphs.
+
+```bash
+python benchmarks/bench_moe_prefetch.py --bs 1,2 --misses 0,4
+```
+
 **`bench_expert_copy_corun.py`** — synthetic (no checkpoint): the fused expert copy kernel
 alone and beside compute, on registered host banks with the qwen4_exp NVFP4 row sizes. Sweeps
 `fast_index_copy_multi` (threads x blocks/bank) and `fast_index_copy_multi_slim`
