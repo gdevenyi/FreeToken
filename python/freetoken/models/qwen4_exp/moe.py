@@ -36,8 +36,14 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
-        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         se, ex = self.shared_expert, self.experts
+        # FREETOKEN_MOE_COPY_OVERLAP: the routed experts' miss copy runs under the shared expert
+        routing = ex.decode_begin(hidden_states, router_logits) if isinstance(ex, OffloadMoELayer) else None
+        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+        if routing is not None:
+            shared = se.forward(hidden_states)
+            routed = ex.decode_finish(hidden_states, routing)
+            return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
         if (
             self._tp_size > 1
             and isinstance(se.down_proj, LinearRowParallel)
