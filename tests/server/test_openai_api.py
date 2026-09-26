@@ -791,7 +791,6 @@ import pytest  # noqa: E402
     [
         ("temperature", -0.5),
         ("top_p", 0.0),
-        ("top_k", 0),
     ],
 )
 def test_chat_completion_rejects_invalid_sampling(field, value):
@@ -906,3 +905,29 @@ def test_stream_chat_without_include_usage_has_no_metrics_chunk():
 
     events = parse_sse(run(collect()))
     assert not any(isinstance(e, dict) and "metrics" in e for e in events)
+
+
+@pytest.mark.parametrize("top_k", [0, -5])
+def test_chat_completion_treats_non_positive_top_k_as_disabled(top_k):
+    """Ollama-style clients (Open WebUI) and some SDKs send top_k=0 to mean "off"; vLLM and
+    the other OpenAI-compatible servers accept any top_k <= 0 as disabled, so it must not 400."""
+    app = FastAPI()
+    state = FakeState([])
+
+    @app.post("/v1/chat/completions")
+    async def chat_completion(req: ChatCompletionRequest):
+        return await handle_chat_completion(req, request=None, state=state, model_sampling={})
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "unit-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "top_k": top_k,
+        },
+    )
+
+    assert response.status_code == 200
+    assert state.sent is not None
+    assert state.sent.sampling_params.top_k == -1
