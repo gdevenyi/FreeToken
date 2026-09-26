@@ -27,6 +27,15 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_scored_ensure.py`** — synthetic (no checkpoint): us per decode `ensure` call at a
+fixed miss count, flashlib `lru_ensure` vs the `--moe-cache-policy` kernels (lru, kd, kdfb,
+rule), from a CUDA graph of two decode steps on a full cache. `--stats` times it with
+`--moe-collect-stats` accumulation on.
+
+```bash
+python benchmarks/bench_scored_ensure.py --slots 1650 --k 10,20
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
 
