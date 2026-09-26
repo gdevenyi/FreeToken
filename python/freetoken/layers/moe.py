@@ -419,9 +419,11 @@ class OffloadMoELayer(MoELayer):
         if n > cache.cache_size // 2:  # leave room so a chunk never evicts the one before it
             return None
         uniq = uniq.to(torch.int32)
+        # scored eviction ranks an earlier chunk's fresh installs coldest, so pin them explicitly
+        pin_since = cache.step.clone() if cache.cache_policy_id else None
         for start in range(0, n, _ENSURE_CHUNK_IDS):
             part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
-            cache.ensure_experts(self.layer_id, part, update_state=False)  # not a decode step
+            cache.ensure_experts(self.layer_id, part, update_state=False, pin_since=pin_since)  # not a decode step
             cache.copy_missing()
         return uniq[inverse].view_as(topk_ids)
 

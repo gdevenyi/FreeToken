@@ -917,10 +917,13 @@ class OffloadMoeCache:
         *,
         update_state: bool = True,
         router_logits: torch.Tensor | None = None,
+        pin_since: torch.Tensor | None = None,
     ) -> None:
         """``update_state=False`` (small-prefill ensures) keeps a scored policy's state and
         decode-step clock still; ``router_logits`` (``[rows, num_experts]``) feed the ``rule``
-        policy's near misses. Both are ignored under LRU."""
+        policy's near misses; ``pin_since`` (a ``step`` value) keeps every slot touched after it
+        (a small prefill's earlier chunks). All are ignored under LRU, whose recency order
+        already keeps those slots."""
         from freetoken.moe.offload_kernels import ensure_experts, ensure_experts_scored
 
         if self.collect_decode_freq:
@@ -940,6 +943,7 @@ class OffloadMoeCache:
             bump_tok=update_state and layer_id == self.evict_clock_layer(),
             update_state=update_state,
             router_logits=router_logits,
+            pin_since=pin_since,
         )
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:

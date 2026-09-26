@@ -8,7 +8,7 @@ import freetoken.layers.moe as moe_mod
 from freetoken.distributed import set_tp_info, try_get_tp_info
 
 
-def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32, cache_size=None):
+def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32, cache_size=None, policy="lru", num_layers=1):
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.layers.quantization import NoQuantConfig
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -17,11 +17,14 @@ def _layer_and_cache(device, num_experts=8, top_k=2, hidden=16, inter=32, cache_
         set_tp_info(rank=0, size=1)
     layer = OffloadMoELayer(0, num_experts, top_k, hidden, inter, quant_config=NoQuantConfig(),
                             prefix="model.layers.0.mlp.experts")
-    cache = OffloadMoeCache(num_layers=1, num_experts=num_experts, cache_size=cache_size or num_experts, device=device)
+    cache = OffloadMoeCache(num_layers=num_layers, num_experts=num_experts, cache_size=cache_size or num_experts,
+                            device=device, cache_policy=policy)
     g = torch.Generator().manual_seed(0)
     cache.set_bank_sources({
-        "gate_up": [torch.randn(num_experts, 2 * inter, hidden, generator=g, dtype=torch.bfloat16) * 0.1],
-        "down": [torch.randn(num_experts, hidden, inter, generator=g, dtype=torch.bfloat16) * 0.1],
+        "gate_up": [torch.randn(num_experts, 2 * inter, hidden, generator=g, dtype=torch.bfloat16) * 0.1
+                    for _ in range(num_layers)],
+        "down": [torch.randn(num_experts, hidden, inter, generator=g, dtype=torch.bfloat16) * 0.1
+                 for _ in range(num_layers)],
     })
     layer.offload_cache = cache
     return layer, cache
@@ -100,3 +103,31 @@ def test_a_real_sized_small_prefill_fits_the_lru_kernel(monkeypatch):
         outs[threshold] = _run_and_check_path(layer, hs, w, ids, on_demand=threshold > 0)
     assert widths and max(widths) <= 32, f"LRU ensure widths {sorted(set(widths))}: wider than decode's"
     torch.testing.assert_close(outs[1024], outs[0], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("policy", ["lru", "kd", "kdfb", "rule"])
+def test_a_later_chunk_keeps_the_experts_an_earlier_chunk_loaded(monkeypatch, policy):
+    # Decode fills every slot, then 40 never-decoded experts take two ensure chunks. A scored
+    # policy ranks the first chunk's fresh installs as its coldest slots, so they need a pin.
+    dev = torch.device("cuda")
+    experts, top_k, slots, tokens = 64, 4, 80, 10
+    g = torch.Generator(device=dev).manual_seed(2)
+    hs = torch.randn(tokens, 16, dtype=torch.bfloat16, device=dev, generator=g) * 4  # a wrong expert is ~1.0 off
+    ids = torch.arange(16, 16 + tokens * top_k, dtype=torch.int32, device=dev).view(tokens, top_k)
+    w = torch.softmax(torch.randn(tokens, top_k, device=dev, generator=g), dim=-1)
+    outs = {}
+    for threshold in (0, 64):
+        monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", threshold)
+        layer, cache = _layer_and_cache(dev, num_experts=experts, top_k=top_k, cache_size=slots, policy=policy,
+                                        num_layers=2)
+        for layer_id, first, last in ((1, 0, experts), (0, 0, 16)):
+            for start in range(first, last, 8):
+                cache.ensure_experts(layer_id, torch.arange(start, start + 8, dtype=torch.int32, device=dev))
+                cache.copy_missing()
+        assert bool((cache.id_of_slot >= 0).all())
+        outs[threshold] = _run_and_check_path(layer, hs, w, ids, on_demand=threshold > 0)
+        if threshold:
+            slot_of = cache.slot_for_id[0, ids.long()]
+            assert bool((slot_of >= 0).all()), f"{int((slot_of < 0).sum())} routed experts were evicted"
+    torch.testing.assert_close(outs[64], outs[0], rtol=2e-2, atol=0.1)

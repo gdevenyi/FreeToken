@@ -47,7 +47,7 @@ class RefScoredCache:
         g = np.where(i < se.G_LAST, g0 + (((g1 - g0) * frac) >> shift), 0)
         return np.maximum(x, 0) + g
 
-    def _keys(self, layer, tok, now):
+    def _keys(self, layer, tok, now, pin_since=None):
         c = np.arange(self.S, dtype=np.int64)
         oid = self.id_of_slot
         held = oid >= 0
@@ -68,10 +68,16 @@ class RefScoredCache:
                 score = score + ((self.w_q4 * lcv) >> 4)
             assert np.abs(score).max() < 2**31  # the kernel computes it in int32
             key = np.where(held, ((score + se.SCORE_BIAS) << self.slot_bits) | c, c)
-        return np.where(self.usage != self.step, key, _KEY_MAX)
+        evictable = self.usage != self.step
+        if pin_since is not None:
+            evictable &= self.usage <= pin_since
+        return np.where(evictable, key, _KEY_MAX)
 
-    def ensure(self, layer, ids, *, bump_tok=False, update_state=True, logits=None, thr=0.0, near_miss=None):
+    def ensure(self, layer, ids, *, bump_tok=False, update_state=True, logits=None, thr=0.0, near_miss=None,
+               pin_since=None):
         """One ensure call; returns ``(out_slots, src_ids, dst_slots)`` like the kernel's plan.
+
+        ``pin_since`` (a ``step`` value) also pins every slot touched after it.
 
         Policy 3 refreshes the ids whose ``logits`` (``[rows, E]``) are within ``thr`` of their
         row's lowest routed logit, in fp32 as the kernel does, or the ids of a given ``near_miss`` mask.
@@ -100,7 +106,7 @@ class RefScoredCache:
         src = missing - base
         dst = np.empty(missing.size, np.int64)
         if missing.size:
-            keys = self._keys(layer, tok, now)
+            keys = self._keys(layer, tok, now, pin_since)
             part = np.argpartition(keys, missing.size - 1)[: missing.size]
             victims = part[np.argsort(keys[part])]
             for i, (e, v) in enumerate(zip(missing, victims)):

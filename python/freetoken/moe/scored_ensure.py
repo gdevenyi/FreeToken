@@ -149,12 +149,12 @@ def _scored_ensure_kernel(
     query_ptr, slot_of_id_ptr, id_of_slot_ptr, lru_usage_ptr, lru_step_ptr,
     out_ptr, src_ptr, dst_ptr, num_copy_ptr, stats_ptr,
     tok_ptr, last_tok_ptr, lc_ptr, ct_ptr, g_ptr, logits_ptr,
-    owner_ptr, slot_last_ptr, slot_lc_ptr, slot_ct_ptr,
+    owner_ptr, slot_last_ptr, slot_lc_ptr, slot_ct_ptr, pin_ptr,
     K, num_cached, id_base, nm_topk, nm_stride, nm_thr,
     BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_TOPK: tl.constexpr,
     NM_ROWS: tl.constexpr,
     USAGE_MAX: tl.constexpr, COLLECT_STATS: tl.constexpr,
-    POLICY: tl.constexpr, BUMP_TOK: tl.constexpr, UPDATE_STATE: tl.constexpr,
+    POLICY: tl.constexpr, BUMP_TOK: tl.constexpr, UPDATE_STATE: tl.constexpr, PIN_SINCE: tl.constexpr,
     NUM_LAYERS: tl.constexpr, NUM_EXPERTS: tl.constexpr,
     BETA_STEP: tl.constexpr, W_Q4: tl.constexpr, DECAY_MUL: tl.constexpr, DT_MAX: tl.constexpr,
     SLOT_BITS: tl.constexpr,
@@ -221,7 +221,11 @@ def _scored_ensure_kernel(
                 score += (W_Q4 * lcv) >> 4
             # Every key is distinct and ties go to the lowest slot; an empty slot keys below any held one.
             key = tl.where(held, ((score.to(tl.int64) + _SCORE_BIAS) << SLOT_BITS) | c, c.to(tl.int64))
-            key = tl.where(cmask & (u != step), key, 0x7FFFFFFFFFFFFFFF)
+            evictable = cmask & (u != step)
+            if PIN_SINCE:
+                # the score ignores recency, so slots an earlier call touched since *pin_ptr stay pinned too
+                evictable = evictable & (u <= tl.load(pin_ptr))
+            key = tl.where(evictable, key, 0x7FFFFFFFFFFFFFFF)
         for i in tl.range(num_missing):
             if POLICY == 0:
                 victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -301,6 +305,7 @@ def scored_ensure(
     id_base: int = 0,
     bump_tok: bool = False,
     update_state: bool = True,
+    pin_since: torch.Tensor | None = None,
     beta: float = BETA,
     w: float = W,
     halflife: int = HALFLIFE,
@@ -313,6 +318,8 @@ def scored_ensure(
     ``slot_lc``/``slot_ct`` valid where ``slot_owner`` equals ``id_of_slot`` (-1 marks a stale
     mirror). ``bump_tok`` advances the counter first (once per decode step);
     ``update_state=False`` leaves the state untouched (small-prefill ensures).
+    ``pin_since`` (a ``lru_step`` value) also pins every slot touched after it, so a small
+    prefill's chunked calls cannot evict each other's experts; policy > 0 only.
     Policy 3 refreshes the experts whose ``router_logits`` (``[rows, num_experts]``, rows of
     ``query``) are within ``near_miss_thr`` of their row's lowest routed logit.
     """
@@ -334,6 +341,8 @@ def scored_ensure(
         assert slot_owner is not None and slot_last_tok is not None
         assert slot_owner.dtype == torch.int32 and slot_owner.numel() == num_cached
         assert slot_last_tok.dtype == torch.int64 and slot_last_tok.numel() == num_cached
+    if pin_since is not None:
+        assert policy != 0 and pin_since.dtype == lru_step.dtype and pin_since.numel() == 1
     if policy >= 2:
         assert lc is not None and ct is not None and g_table is not None
         assert lc.dtype == torch.int32 and ct.dtype == torch.int64
@@ -360,6 +369,7 @@ def scored_ensure(
         dummy if slot_last_tok is None else slot_last_tok,
         dummy if slot_lc is None else slot_lc,
         dummy if slot_ct is None else slot_ct,
+        dummy if pin_since is None else pin_since,
         k, num_cached, id_base, nm_topk, nm_stride, float(near_miss_thr),
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_C=block_c,
@@ -371,6 +381,7 @@ def scored_ensure(
         POLICY=policy,
         BUMP_TOK=bool(bump_tok) and policy != 0,
         UPDATE_STATE=bool(update_state) and policy != 0,
+        PIN_SINCE=pin_since is not None,
         NUM_LAYERS=num_layers,
         NUM_EXPERTS=num_experts,
         BETA_STEP=beta_step,

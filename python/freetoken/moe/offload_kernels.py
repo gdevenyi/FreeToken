@@ -48,6 +48,7 @@ def ensure_experts_scored(
     bump_tok: bool,
     update_state: bool,
     router_logits: torch.Tensor | None = None,
+    pin_since: torch.Tensor | None = None,
 ) -> None:
     """``ensure_experts`` for the scored ``--moe-cache-policy`` kinds (kd, kdfb, rule)."""
     from freetoken.moe.scored_ensure import scored_ensure
@@ -80,6 +81,7 @@ def ensure_experts_scored(
         id_base=layer_id * cache.num_experts,
         bump_tok=bump_tok,
         update_state=update_state,
+        pin_since=pin_since,
     )
 
 

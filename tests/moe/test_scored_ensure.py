@@ -479,7 +479,8 @@ def test_materialize_untags_the_slots_it_fills(policy):
 
 @_cuda
 @pytest.mark.parametrize("policy", ["kd", "kdfb", "rule"])
-def test_state_free_ensures_between_decodes_match_cpu_reference(policy):
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_state_free_ensures_between_decodes_match_cpu_reference(policy, chunks):
     cache, ref = _cache(policy), _ref(policy)
     rows = _zipf_rows(12, seed=23)
     extra = _zipf_rows(4, 3, seed=24, skew=0.3)
@@ -490,11 +491,16 @@ def test_state_free_ensures_between_decodes_match_cpu_reference(policy):
         if r % 3 == 2:
             for layer in range(0, L, 7):  # a small prefill's chunked ensures
                 ids = np.unique(extra[r // 3, layer])
-                q = torch.from_numpy(ids.astype(np.int32)).cuda()
-                cache.ensure_experts(layer, q, update_state=False)
-                out, _, dst = ref.ensure(layer, ids, update_state=False)
-                assert q.tolist() == out.tolist()
-                assert bool((cache.evict_slot_owner[torch.from_numpy(dst).cuda()] == -1).all())
+                # two chunks pin each other's slots as _ensure_unique does; one chunk keeps the plain pin
+                pin = cache.step.clone() if chunks > 1 else None
+                ref_pin = ref.step if chunks > 1 else None
+                for part in np.array_split(ids, chunks):
+                    q = torch.from_numpy(part.astype(np.int32)).cuda()
+                    cache.ensure_experts(layer, q, update_state=False, pin_since=pin)
+                    out, _, dst = ref.ensure(layer, part, update_state=False, pin_since=ref_pin)
+                    assert q.tolist() == out.tolist()
+                    assert bool((cache.evict_slot_owner[torch.from_numpy(dst).cuda()] == -1).all())
+                assert bool((cache.slot_for_id[layer, torch.from_numpy(ids).cuda()] >= 0).all())
         _assert_same_tables(cache, ref)
     assert not _assert_mirrors_hold(cache).all()  # some slots still read the per-id state
 
