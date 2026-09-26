@@ -5,6 +5,8 @@ tests/models/qwen4_exp/test_skeleton.py."""
 
 from __future__ import annotations
 
+import weakref
+
 import pytest
 import torch
 
@@ -49,7 +51,11 @@ def test_cache_builds_the_prefetcher_only_when_asked():
     assert cache(prefetch_mode="off").prefetch is None
     assert cache(prefetch_mode="measure").prefetch.copy_stream is None
     on = cache(prefetch_mode="on")
-    assert on.prefetch.mode == "on" and on.prefetch.cache is on and on.prefetch_on
+    assert on.prefetch.mode == "on" and on.prefetch.cache.prefetch is on.prefetch and on.prefetch_on
+    # no reference cycle: dropping the cache frees its tensors at once
+    ref = weakref.ref(on)
+    del on
+    assert ref() is None
     for mode in ("measure", "on"):
         with pytest.raises(ValueError):
             cache(prefetch_mode=mode, decode_target="hybrid")

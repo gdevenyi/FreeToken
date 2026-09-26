@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
@@ -330,7 +331,8 @@ class OffloadMoeCache:
         if self.device.type != "cuda":
             return None
         prefetch = ExpertPrefetcher(self.num_layers, self.num_experts, self.device, mode=self.prefetch_mode)
-        prefetch.cache = self
+        # a proxy, not a cycle: dropping the cache must free its slot banks without waiting for gc
+        prefetch.cache = weakref.proxy(self)
         return prefetch
 
     @property
