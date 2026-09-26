@@ -13,6 +13,9 @@ from flashlib.kernels.slot_cache import N_STATS, Stat
 # (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
 # base address are not 16-byte aligned.
 _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
+# Opt-in: run the fused copy_missing on the slim kernel (a few small CTAs, leaves most SMs to
+# concurrent compute) instead of the 8-CTAs-per-bank one. Off by default.
+_SLIM_COPY = os.getenv("FREETOKEN_MOE_SLIM_COPY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
@@ -1148,13 +1151,14 @@ class OffloadMoeCache:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
         if self._copy_fused_ok:
-            from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+            from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit, fast_index_copy_multi_slim_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
-            fast_index_copy_multi_jit(
+            copy = fast_index_copy_multi_slim_jit if _SLIM_COPY else fast_index_copy_multi_jit
+            copy(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
                 self._copy_feat_bytes,

@@ -45,6 +45,18 @@ start after the ensure and how much shared-expert work runs inside it.
 python benchmarks/bench_moe_copy_overlap.py --bs 1 --slots 160
 ```
 
+**`bench_expert_copy_corun.py`** — synthetic (no checkpoint): the fused expert copy kernel
+alone and beside compute, on registered host banks with the qwen4_exp NVFP4 row sizes. Sweeps
+`fast_index_copy_multi` (threads x blocks/bank) and `fast_index_copy_multi_slim`
+(blocks x threads x unroll) over 1..10-expert plans (GB/s, "hot" back-to-back and "cold"
+spacer-separated copies), then reports the stretch sigma of bf16/fp8 GEMVs, a small matmul and
+the NVFP4 routed decode GEMV while a copy loop runs on another stream. `--json` keeps the raw
+per-trial times.
+
+```bash
+python benchmarks/bench_expert_copy_corun.py --trials 5 --json copy_corun.json
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
 
