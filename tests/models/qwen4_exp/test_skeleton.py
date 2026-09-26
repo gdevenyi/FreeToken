@@ -427,6 +427,128 @@ def test_shared_gate_kernels_match_torch(num_tokens, hidden, dtype):
     assert (fused.float() - ref).abs().max() <= (eager.float() - ref).abs().max() + 1e-6
 
 
+def _offload_experts(kind: str, layer_id: int, num_experts: int, top_k: int, hidden: int, inter: int):
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization import NoQuantConfig, QuantBackend, QuantConfig, set_quant_backend
+
+    if kind == "bf16":
+        quant = NoQuantConfig()
+    else:
+        set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))  # the sm_120 decode kernel
+        quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    return OffloadMoELayer(
+        layer_id, num_experts, top_k, hidden, inter, quant_config=quant,
+        prefix=f"model.layers.{layer_id}.mlp.experts",
+    )
+
+
+def _copy_overlap_run(kind, banks, overlap, bs, graph, inputs, monkeypatch):
+    """Two Qwen4ExpMoE layers sharing one offload cache as small as a layer, so every step evicts
+    and copies: warm up eagerly (and capture), reset the cache, then decode ``inputs``."""
+    import freetoken.kernel.fast_index_copy as fic
+    from flashlib.kernels.slot_cache import Stat
+    from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.utils.torch_utils import torch_dtype
+
+    num_experts, top_k, hidden, inter = 8, 2, 256, 128
+    config = parse_config(toy_hf_config(
+        hidden_size=hidden, num_experts=num_experts, num_experts_per_tok=top_k,
+        moe_intermediate_size=inter, shared_expert_intermediate_size=inter,
+    ))
+    device = torch.device("cuda")
+    with torch.device(device), torch_dtype(torch.bfloat16):
+        moes = [Qwen4ExpMoE(config, layer_id) for layer_id in range(2)]
+    gen = torch.Generator(device=device).manual_seed(41)
+    for moe in moes:
+        _fill(moe, gen, scale=0.2)
+    experts = [_offload_experts(kind, i, num_experts, top_k, hidden, inter) for i in range(2)]
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=num_experts, cache_size=num_experts, device=device,
+        quant_format=banks.quant_format, layout=banks.layout,
+        max_slots=experts[0].quant_method.slot_limit(), decode_copy_overlap=overlap,
+    )
+    cache.set_bank_sources(banks.sources)
+    cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+    cache.collect_stats = True
+    for moe, ex in zip(moes, experts):
+        ex.offload_cache = cache
+        moe.experts = ex
+    cache.reset()
+
+    import freetoken.models.qwen4_exp.moe as qmoe
+
+    copy_streams, gate_streams = [], []
+    real_copy, real_gate = fic.fast_index_copy_multi_jit, qmoe.shared_gate_sigmoid
+    monkeypatch.setattr(
+        fic, "fast_index_copy_multi_jit",
+        lambda *a, **k: (copy_streams.append(torch.cuda.current_stream().cuda_stream), real_copy(*a, **k))[1],
+    )
+    monkeypatch.setattr(
+        qmoe, "shared_gate_sigmoid",
+        lambda *a, **k: (gate_streams.append(torch.cuda.current_stream().cuda_stream), real_gate(*a, **k))[1],
+    )
+
+    def step(x0, x1):
+        return moes[0].forward(x0.clone()), moes[1].forward(x1.clone())
+
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=False))
+    static = [torch.randn(bs, hidden, device=device, dtype=torch.bfloat16) for _ in range(2)]
+    step(*static)  # the eager warm-up the graph runner also does
+    if graph:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            outs = step(*static)
+    cache.reset()
+    cache.reset_stats()
+    results = []
+    for x0, x1 in inputs:
+        if graph:
+            static[0].copy_(x0)
+            static[1].copy_(x1)
+            g.replay()
+        else:
+            outs = step(x0, x1)
+        results.append(tuple(o.clone() for o in outs))
+    torch.cuda.synchronize()
+    state = [t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage, *cache.bank_views())]
+    misses = int(cache.lru_stats[:, Stat.MISS].sum())
+    side = getattr(cache.decode_copy_stream, "cuda_stream", None)
+    return results, state, misses, [s == side for s in copy_streams], [s == side for s in gate_streams]
+
+
+@requires_cuda
+@pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+def test_moe_copy_overlap_is_bitwise_identical(kind, graph, bs, monkeypatch):
+    """FREETOKEN_MOE_COPY_OVERLAP moves the shared expert onto a side stream beside the decode miss
+    copy; the MoE outputs, the slot map and the slot contents must not change by a single bit."""
+    from freetoken.moe.expert_banks import build_expert_banks
+
+    torch.manual_seed(7)
+    method = _offload_experts(kind, 0, 8, 2, 256, 128).quant_method
+    banks = build_expert_banks(method, 2, None, device=torch.device("cuda"), dummy=True)
+    gen = torch.Generator(device="cuda").manual_seed(bs)
+    inputs = [
+        tuple(torch.randn(bs, 256, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.5 for _ in range(2))
+        for _ in range(6)
+    ]
+    off = _copy_overlap_run(kind, banks, False, bs, graph, inputs, monkeypatch)
+    on = _copy_overlap_run(kind, banks, True, bs, graph, inputs, monkeypatch)
+
+    assert off[2] > 0 and on[2] == off[2], "the sequence must miss, and copy, in both runs"
+    assert off[3] and not any(off[3]) and not any(off[4]), "flag off: everything stays on the compute stream"
+    assert on[3] and not any(on[3]), "flag on: the miss copy stays right behind its ensure"
+    assert on[4] and all(on[4]), "flag on: the shared expert runs on the cache's side stream"
+    for got, want in zip(on[0], off[0]):
+        for a, b in zip(got, want):
+            assert torch.isfinite(b.float()).all()
+            assert torch.equal(a, b)
+    for a, b in zip(on[1], off[1]):
+        assert torch.equal(a, b)
+
+
 @requires_cuda
 def test_decoder_stack_prefill_and_decode(monkeypatch):
     """Ragged bs=3 prefill then a bs=3 decode step through the whole model with dummy weights."""

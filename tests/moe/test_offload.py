@@ -427,6 +427,121 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
     assert calls["topk_ids"].tolist() == [[5, 0]]
 
 
+def test_decode_copy_overlap_follows_the_flag_and_the_decode_target(monkeypatch):
+    from freetoken.env import ENV
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    def cache(device, **kw):
+        return OffloadMoeCache(num_layers=3, num_experts=4, cache_size=8, device=torch.device(device), **kw)
+
+    monkeypatch.setattr(ENV.MOE_COPY_OVERLAP, "value", True)
+    assert cache("cpu").decode_copy_overlap is True  # unset -> FREETOKEN_MOE_COPY_OVERLAP
+    assert cache("cpu").decode_copy_stream is None
+    monkeypatch.setattr(ENV.MOE_COPY_OVERLAP, "value", False)
+    assert cache("cpu").decode_copy_overlap is False
+    if not torch.cuda.is_available():
+        return
+    assert cache("cuda").decode_copy_stream is None
+    for target in ("cpu", "hybrid"):
+        assert cache("cuda", decode_copy_overlap=True, decode_target=target).decode_copy_stream is None
+    on = cache("cuda", decode_copy_overlap=True)
+    assert on.decode_copy_stream is not None and len(on._decode_copy_events) == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_copy_missing_takes_an_explicit_layer_id():
+    # a second copy path (the overlap fork, later prefetch) names its source layer instead of trusting whichever call staged last
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_layers, num_experts = 2, 4
+    fingerprint = torch.arange(num_layers * num_experts, dtype=torch.float32).view(num_layers, num_experts, 1, 1)
+    sources = {
+        "gate_up": [fingerprint[l].expand(num_experts, 32, 8).contiguous().pin_memory() for l in range(num_layers)],
+        "down": [fingerprint[l].expand(num_experts, 8, 16).contiguous().pin_memory() for l in range(num_layers)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=num_layers, num_experts=num_experts, cache_size=num_experts, device=torch.device("cuda")
+    )
+    cache.set_bank_sources(sources)
+    cache.reset()
+    ids = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    cache.ensure_experts(1, ids)
+    cache._pending_src_layer = 0
+    cache.copy_missing(1)
+    torch.cuda.synchronize()
+    for bank in cache.bank_views():
+        assert [int(bank[s].flatten()[0]) for s in ids.tolist()] == [num_experts + 2, num_experts + 3]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_decode_side_applies_only_to_gpu_decode(monkeypatch):
+    # prefill, CPU-routed layers, TP > 1 and the flag off keep the shared expert on the compute stream
+    from types import SimpleNamespace
+
+    import freetoken.core as core
+    from freetoken.core import Context
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
+    ctx = Context(page_size=1)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
+
+    def applies(is_prefill=False, cpu_layers=(), **cache_kw):
+        layer.offload_cache = OffloadMoeCache(
+            num_layers=1, num_experts=4, cache_size=4, device=torch.device("cuda"), **cache_kw
+        )
+        layer.offload_cache.cpu_layer_ids = frozenset(cpu_layers)
+        ctx._batch = SimpleNamespace(is_prefill=is_prefill)
+        return layer.decode_side_applies()
+
+    assert not applies(decode_copy_overlap=False)
+    assert not applies(decode_copy_overlap=True, decode_target="hybrid")
+    assert not applies(is_prefill=True, decode_copy_overlap=True)
+    assert not applies(cpu_layers=(0,), decode_copy_overlap=True)
+    monkeypatch.setattr(layer, "tp_size", 2)
+    assert not applies(decode_copy_overlap=True)
+    monkeypatch.setattr(layer, "tp_size", 1)
+    assert applies(decode_copy_overlap=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_decode_side_stream_never_aliases_a_pooled_stream():
+    # torch.cuda.Stream() hands out 32 pooled streams per priority round robin; a pooled side stream
+    # can come back as the engine or capture stream, and then the side work silently runs serially
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=4, device=torch.device("cuda"), decode_copy_overlap=True
+    )
+    side = cache.decode_copy_stream.cuda_stream
+    pooled = {torch.cuda.Stream().cuda_stream for _ in range(64)}
+    assert side not in pooled and side != torch.cuda.current_stream().cuda_stream
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_decode_side_survives_a_rebuild():
+    # the side stream and events are not cache_size-shaped, so a runtime rebuild keeps them working
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"), decode_copy_overlap=True
+    )
+    cache.set_bank_sources({
+        "gate_up": [torch.zeros(4, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+        "down": [torch.zeros(4, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+    })
+    stream = cache.decode_copy_stream
+    cache.rebuild(6)
+    assert cache.decode_copy_stream is stream is not None
+    x = torch.arange(1024, dtype=torch.float32, device="cuda")
+    for layer_id in range(2):
+        with cache.decode_side(layer_id):
+            assert torch.cuda.current_stream() == stream
+            y = x * 2
+        cache.join_decode_side(layer_id)
+        assert torch.equal(y + 0, x * 2)
+
 
 def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     import pytest

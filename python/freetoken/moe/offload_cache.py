@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -25,6 +26,7 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+from freetoken.env import ENV
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -144,6 +146,9 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # GPU decode only: the caller's work that is independent of the routed experts (qwen4_exp: the
+    # shared expert) runs on decode_copy_stream beside the miss copy. None = FREETOKEN_MOE_COPY_OVERLAP.
+    decode_copy_overlap: bool | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -288,6 +293,33 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Decode copy overlap: one side stream plus a (forked, done) event pair per layer.
+        # Neither is cache_size-shaped, so rebuild() keeps them.
+        if self.decode_copy_overlap is None:
+            self.decode_copy_overlap = bool(ENV.MOE_COPY_OVERLAP)
+        self.decode_copy_stream: torch.cuda.Stream | None = None
+        self._decode_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        if self.decode_copy_overlap and self.device.type == "cuda" and self.decode_target == "gpu":
+            self._init_decode_copy_overlap()
+
+    def _init_decode_copy_overlap(self) -> None:
+        # a dedicated stream, not one of torch's 32 pooled ones: a pooled stream can alias the engine
+        # or capture stream, and the side work would then run serially (correct, but no overlap)
+        from cuda.bindings import runtime as cudart
+
+        with torch.cuda.device(self.device):
+            err, handle = cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaStreamCreateWithFlags failed: {err}")
+        self.decode_copy_stream = torch.cuda.ExternalStream(int(handle), device=self.device)
+        self._decode_copy_events = [
+            (torch.cuda.Event(), torch.cuda.Event()) for _ in range(self.num_layers)
+        ]
+        # torch creates the CUDA event on its first record: do that now, never inside a capture
+        for pair in self._decode_copy_events:
+            for event in pair:
+                event.record(self.decode_copy_stream)
+        logger.info("MoE decode copy overlap on: expert misses copy on a side stream")
 
     def set_bank_sources(
         self,
@@ -1011,9 +1043,12 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def copy_missing(self) -> None:
+    def copy_missing(self, layer_id: int | None = None) -> None:
+        """Copy the misses the last ensure_experts/materialize_layer staged, from ``layer_id``'s
+        host banks (default: the layer that staged them)."""
         assert self.banks, "set_bank_sources must register the banks first"
-        layer_id = self._pending_src_layer
+        if layer_id is None:
+            layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
@@ -1055,6 +1090,23 @@ class OffloadMoeCache:
                 self.num_indices,
             )
 
+    @contextmanager
+    def decode_side(self, layer_id: int) -> Iterator[None]:
+        """Run the body on ``decode_copy_stream``, ordered after the work already on the current
+        stream; ``join_decode_side`` must follow before its results are read.
+
+        The copy stays on the current stream right after its ensure, so it never waits on a
+        cross-stream edge; the side work (slack-rich) takes that latency and any SM contention.
+        Under capture the event pair becomes a fork and a join edge of the graph."""
+        forked, done = self._decode_copy_events[layer_id]
+        forked.record(torch.cuda.current_stream(self.device))
+        self.decode_copy_stream.wait_event(forked)
+        with torch.cuda.stream(self.decode_copy_stream):
+            yield
+            done.record(self.decode_copy_stream)
+
+    def join_decode_side(self, layer_id: int) -> None:
+        torch.cuda.current_stream(self.device).wait_event(self._decode_copy_events[layer_id][1])
 
 def iter_offload_moe_layers(model) -> Iterator:
     from freetoken.layers import BaseOP, OffloadMoELayer

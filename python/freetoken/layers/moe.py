@@ -243,6 +243,18 @@ class OffloadMoELayer(MoELayer):
         )
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
+    def decode_side_applies(self) -> bool:
+        """Whether FREETOKEN_MOE_COPY_OVERLAP applies to this layer's next forward: a GPU decode on a
+        cache with a side stream (not prefill, CPU/hybrid decode or TP > 1); see decode_side."""
+        cache = self.offload_cache
+        return not (
+            cache is None
+            or cache.decode_copy_stream is None
+            or self.tp_size > 1
+            or get_global_ctx().batch.is_prefill
+            or cache.is_cpu_layer(self.layer_id)
+        )
+
     def prefill_forward(
         self,
         hidden_states: torch.Tensor,

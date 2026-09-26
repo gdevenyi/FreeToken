@@ -35,9 +35,19 @@ class Qwen4ExpMoE(Qwen3_5MoE):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        se, ex = self.shared_expert, self.experts
+        if isinstance(ex, OffloadMoELayer) and ex.decode_side_applies():
+            # FREETOKEN_MOE_COPY_OVERLAP: the shared expert runs on a side stream while the router,
+            # ensure and miss copy stay back to back on this one; joined before the combine
+            cache = ex.offload_cache
+            with cache.decode_side(ex.layer_id):
+                gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+                shared = se.forward(hidden_states)
+            routed = ex.forward(hidden_states=hidden_states, router_logits=self.gate.forward(hidden_states))
+            cache.join_decode_side(ex.layer_id)
+            return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
-        se, ex = self.shared_expert, self.experts
         if (
             self._tp_size > 1
             and isinstance(se.down_proj, LinearRowParallel)
