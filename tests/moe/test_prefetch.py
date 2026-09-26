@@ -33,9 +33,7 @@ def _select(logits, resident, k, budget, width=16):
 def test_mode_switch():
     from freetoken.moe.prefetch import default_budget, resolve_mode
 
-    assert resolve_mode("off") == "off" and resolve_mode(" Measure ") == "measure"
-    with pytest.raises(NotImplementedError):
-        resolve_mode("on")
+    assert resolve_mode("off") == "off" and resolve_mode(" Measure ") == "measure" and resolve_mode("ON") == "on"
     with pytest.raises(ValueError):
         resolve_mode("lookahead")
     assert (default_budget(True), default_budget(False)) == (3, 4)
@@ -49,11 +47,12 @@ def test_cache_builds_the_prefetcher_only_when_asked():
         return OffloadMoeCache(num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"), **kw)
 
     assert cache(prefetch_mode="off").prefetch is None
-    assert cache(prefetch_mode="measure").prefetch is not None
-    with pytest.raises(NotImplementedError):
-        cache(prefetch_mode="on")
-    with pytest.raises(ValueError):
-        cache(prefetch_mode="measure", decode_target="hybrid")
+    assert cache(prefetch_mode="measure").prefetch.copy_stream is None
+    on = cache(prefetch_mode="on")
+    assert on.prefetch.mode == "on" and on.prefetch.cache is on and on.prefetch_on
+    for mode in ("measure", "on"):
+        with pytest.raises(ValueError):
+            cache(prefetch_mode=mode, decode_target="hybrid")
 
 
 @requires_cuda
@@ -128,6 +127,21 @@ def test_prefetch_stream_never_aliases_a_pooled_stream():
 
 
 @requires_cuda
+def test_prefetch_copy_stream_is_a_third_dedicated_stream():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"),
+        decode_copy_overlap=True, prefetch_mode="on",
+    )
+    pf = cache.prefetch
+    copy = pf.copy_stream.cuda_stream
+    pooled = {torch.cuda.Stream().cuda_stream for _ in range(64)}
+    assert copy not in pooled and pf.stream.cuda_stream not in pooled
+    assert len({copy, pf.stream.cuda_stream, cache.decode_copy_stream.cuda_stream, torch.cuda.current_stream().cuda_stream}) == 4
+
+
+@requires_cuda
 def test_rebuild_and_reset_clear_the_counters():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -154,14 +168,14 @@ def test_rebuild_and_reset_clear_the_counters():
     assert pf._inflight == [None, None]
 
 
-def _emit_prefetch(window, monkeypatch, *, debug=False):
+def _emit_prefetch(window, monkeypatch, *, debug=False, mode="measure"):
     from types import SimpleNamespace
 
     from freetoken.engine import engine as engine_mod
     from freetoken.env import ENV
 
     taken, lines = [], []
-    prefetch = SimpleNamespace(mode="measure", take_window=lambda: taken.append(1) or window)
+    prefetch = SimpleNamespace(mode=mode, take_window=lambda: taken.append(1) or window)
     engine = SimpleNamespace(moe_offload_cache=SimpleNamespace(prefetch=prefetch))
     monkeypatch.setattr(ENV.MOE_PREFETCH_DEBUG, "value", debug)
     # the freetoken loggers do not propagate, so caplog only sees them in some import orders
@@ -181,6 +195,16 @@ def test_engine_reports_one_prefetch_window(monkeypatch):
     out, _ = _emit_prefetch(window, monkeypatch, debug=True)
     assert "L1=1.20/3.00/4.00, L2=2.00/4.00/3.00" in out and "L0" not in out
     assert _emit_prefetch(torch.zeros((3, 6), dtype=torch.int64), monkeypatch)[0] == ""
+
+
+def test_engine_reports_the_on_mode_window(monkeypatch):
+    from freetoken.engine.engine import MOE_STATS_INTERVAL
+
+    # issued, useful, resident_hits, calls, rows, misses, late, copied
+    window = torch.tensor([[0] * 8, [30, 12, 0, 10, 10, 18, 2, 10], [40, 20, 0, 10, 10, 20, 0, 6]])
+    out, _ = _emit_prefetch(window, monkeypatch, mode="on")
+    assert f"MoE prefetch on ({MOE_STATS_INTERVAL} decode steps): issued/layer=3.50, useful/layer=1.60" in out
+    assert "misses/layer=1.90, coverage=0.457, late=0.125 of 16 copies" in out and "resident_hits" not in out
 
 
 def test_summary_rates():

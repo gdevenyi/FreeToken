@@ -1253,7 +1253,7 @@ class Engine:
 
         prefetch = self.moe_offload_cache.prefetch
         window = prefetch.take_window()
-        stats = summarize(window)
+        stats = summarize(window, prefetch.mode)
         if not stats["layer_calls"]:
             return
         logger.info_rank0(f"MoE prefetch {prefetch.mode} ({MOE_STATS_INTERVAL} decode steps): {format_summary(stats)}")
@@ -1266,8 +1266,8 @@ class Engine:
         prefetch = self.moe_offload_cache.prefetch if self.moe_offload_cache is not None else None
         if prefetch is None:
             return
-        totals = prefetch.totals + prefetch.counters.cpu()
-        stats = summarize(totals)
+        totals = prefetch.totals + prefetch.stats.cpu()
+        stats = summarize(totals, prefetch.mode)
         if stats["layer_calls"]:
             logger.info_rank0(f"MoE prefetch {prefetch.mode} (session, {stats['tokens']} tokens): {format_summary(stats)}")
             logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(totals)}")

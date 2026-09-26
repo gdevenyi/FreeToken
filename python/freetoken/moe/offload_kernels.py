@@ -49,10 +49,15 @@ def ensure_experts_scored(
     update_state: bool,
     router_logits: torch.Tensor | None = None,
     pin_since: torch.Tensor | None = None,
+    lowpri: bool = False,
+    pf_count: tuple | None = None,
 ) -> None:
-    """``ensure_experts`` for the scored ``--moe-cache-policy`` kinds (kd, kdfb, rule)."""
+    """``ensure_experts`` for the scored ``--moe-cache-policy`` kinds (kd, kdfb, rule), and for
+    every policy under FREETOKEN_MOE_PREFETCH=on (``lowpri``; ``pf_count`` is the prefetcher's
+    ``(stats_row, ready, num, rows)`` when this layer was prefetched this step)."""
     from freetoken.moe.scored_ensure import scored_ensure
 
+    stats_row, ready, num, rows = pf_count if pf_count is not None else (None, None, None, 0)
     scored_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
@@ -63,6 +68,23 @@ def ensure_experts_scored(
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
+        router_logits=router_logits if cache.near_miss_thr is not None else None,
+        near_miss_thr=cache.near_miss_thr or 0.0,
+        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        bump_tok=bump_tok,
+        update_state=update_state,
+        pin_since=pin_since,
+        lowpri=lowpri,
+        pf_stats=stats_row,
+        pf_ready=ready,
+        pf_num=num,
+        pf_rows=rows,
+        **_evict_state(cache, layer_id),
+    )
+
+
+def _evict_state(cache, layer_id: int) -> dict:
+    return dict(
         policy=cache.cache_policy_id,
         num_layers=cache.num_layers,
         num_experts=cache.num_experts,
@@ -75,13 +97,21 @@ def ensure_experts_scored(
         slot_last_tok=cache.evict_slot_last_tok,
         slot_lc=cache.evict_slot_lc,
         slot_ct=cache.evict_slot_ct,
-        router_logits=router_logits if cache.near_miss_thr is not None else None,
-        near_miss_thr=cache.near_miss_thr or 0.0,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
         id_base=layer_id * cache.num_experts,
-        bump_tok=bump_tok,
-        update_state=update_state,
-        pin_since=pin_since,
+    )
+
+
+def prefetch_ensure_experts(
+    cache, layer_id: int, query: torch.Tensor, dst_slots: torch.Tensor, src_rows: torch.Tensor,
+    num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor,
+) -> None:
+    """FREETOKEN_MOE_PREFETCH=on: install ``query``'s non-resident experts of ``layer_id`` as
+    low-priority slots and plan their copy (scored_ensure.prefetch_ensure)."""
+    from freetoken.moe.scored_ensure import prefetch_ensure
+
+    prefetch_ensure(
+        query, cache.slot_for_id.view(-1), cache.id_of_slot, cache.usage, cache.step,
+        dst_slots, src_rows, num, stats_row, ready, **_evict_state(cache, layer_id),
     )
 
 

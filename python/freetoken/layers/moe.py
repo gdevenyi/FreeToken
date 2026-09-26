@@ -308,13 +308,20 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids, router_logits=router_logits)
         prefetch = cache.prefetch
         if prefetch is not None:
-            self._fork_lookahead(cache, prefetch, hidden_states)
+            prefetch.join_ensure(self.layer_id)
+        cache.ensure_experts(self.layer_id, topk_ids, router_logits=router_logits)
+        target = None
+        if prefetch is not None:
+            # fork before joining this layer's prefetch copy, so a late copy never delays the next prediction
+            target = self._fork_lookahead(cache, prefetch, hidden_states)
+            prefetch.join_copy(self.layer_id)
         cache.copy_missing()
         if prefetch is not None:
             prefetch.join_and_count(self.layer_id, topk_ids, cache.id_of_slot, cache.num_indices)
+            if target is not None:
+                prefetch.issue_copy(target)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -326,15 +333,15 @@ class OffloadMoELayer(MoELayer):
             is_prefill=False,
         )
 
-    def _fork_lookahead(self, cache: OffloadMoeCache, prefetch, hidden_states: torch.Tensor) -> None:
+    def _fork_lookahead(self, cache: OffloadMoeCache, prefetch, hidden_states: torch.Tensor) -> int | None:
         """Predict the next layer's experts beside this layer's miss copy (not under TP, and never
-        toward a CPU-decoded layer, whose ensure would not join it)."""
+        toward a CPU-decoded layer, whose ensure would not join it); the target layer if forked."""
         if self._lookahead is None or self.tp_size > 1:
-            return
+            return None
         gate, target, budget = self._lookahead
         if cache.is_cpu_layer(target):
-            return
-        prefetch.fork(target, hidden_states, gate, cache.slot_for_id[target], budget)
+            return None
+        return target if prefetch.fork(target, hidden_states, gate, cache.slot_for_id[target], budget) else None
 
     def _decode_hybrid(
         self,

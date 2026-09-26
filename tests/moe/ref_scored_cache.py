@@ -47,12 +47,13 @@ class RefScoredCache:
         g = np.where(i < se.G_LAST, g0 + (((g1 - g0) * frac) >> shift), 0)
         return np.maximum(x, 0) + g
 
-    def _keys(self, layer, tok, now, pin_since=None):
+    def _keys(self, layer, tok, now, pin_since=None, lowpri=False):
         c = np.arange(self.S, dtype=np.int64)
         oid = self.id_of_slot
         held = oid >= 0
         if self.policy == 0:
-            key = (self.usage << self.slot_bits) | c
+            # lowpri: empty (0) < unconsumed prefetch (held, usage 0 -> 1) < resident (usage + 1)
+            key = (np.where(held, self.usage + 1, 0) << self.slot_bits) | c if lowpri else (self.usage << self.slot_bits) | c
         else:
             ids = np.where(held, oid, 0)
             lk = ids // self.E
@@ -68,16 +69,20 @@ class RefScoredCache:
                 score = score + ((self.w_q4 * lcv) >> 4)
             assert np.abs(score).max() < 2**31  # the kernel computes it in int32
             key = np.where(held, ((score + se.SCORE_BIAS) << self.slot_bits) | c, c)
+            if lowpri:
+                key = np.where(held & (self.usage == 0), (1 << self.slot_bits) | c, key)
         evictable = self.usage != self.step
         if pin_since is not None:
             evictable &= self.usage <= pin_since
         return np.where(evictable, key, _KEY_MAX)
 
     def ensure(self, layer, ids, *, bump_tok=False, update_state=True, logits=None, thr=0.0, near_miss=None,
-               pin_since=None):
+               pin_since=None, lowpri=False):
         """One ensure call; returns ``(out_slots, src_ids, dst_slots)`` like the kernel's plan.
 
-        ``pin_since`` (a ``step`` value) also pins every slot touched after it.
+        ``pin_since`` (a ``step`` value) also pins every slot touched after it. ``lowpri``
+        (FREETOKEN_MOE_PREFETCH=on) keys unconsumed prefetches between the empty slots and the
+        residents; ``self.useful`` is then the call's distinct hits on such slots.
 
         Policy 3 refreshes the ids whose ``logits`` (``[rows, E]``) are within ``thr`` of their
         row's lowest routed logit, in fp32 as the kernel does, or the ids of a given ``near_miss`` mask.
@@ -100,13 +105,15 @@ class RefScoredCache:
                 self.last_tok[near] = np.maximum(self.last_tok[near], tok - 1)
         q = np.asarray(ids, dtype=np.int64).reshape(-1) + base
         slots = self.slot_of_id[q]
-        self.usage[slots[slots >= 0]] = self.step
         uniq = np.unique(q)
+        held_at = self.slot_of_id[uniq]
+        self.useful = int(((held_at >= 0) & (self.usage[np.maximum(held_at, 0)] == 0)).sum())
+        self.usage[slots[slots >= 0]] = self.step
         missing = uniq[self.slot_of_id[uniq] < 0]  # ascending, as the kernel ranks them
         src = missing - base
         dst = np.empty(missing.size, np.int64)
         if missing.size:
-            keys = self._keys(layer, tok, now, pin_since)
+            keys = self._keys(layer, tok, now, pin_since, lowpri)
             part = np.argpartition(keys, missing.size - 1)[: missing.size]
             victims = part[np.argsort(keys[part])]
             for i, (e, v) in enumerate(zip(missing, victims)):
@@ -127,6 +134,29 @@ class RefScoredCache:
                 self.ct[uniq] = now
         return out, src, dst
 
+    def prefetch(self, layer, sel):
+        """``prefetch_ensure``: install ``sel``'s non-resident ids (-1 = padding, query order) as
+        held slots with usage 0, without bumping a clock or touching a hit; the last demand call's
+        slots (usage == step) stay pinned. Returns ``(src_ids, dst_slots)``, the copy plan."""
+        base = layer * self.E
+        tok = self.tok if self.policy else 0
+        now = tok * self.L + layer
+        order = []
+        for e in sel:
+            if e >= 0 and e + base not in order:
+                order.append(int(e) + base)
+        missing = [i for i in order if self.slot_of_id[i] < 0]
+        keys = self._keys(layer, tok, now, lowpri=True)
+        n = min(len(missing), int((keys != _KEY_MAX).sum()))
+        victims = np.argsort(keys, kind="stable")[:n]
+        for e, v in zip(missing[:n], victims):
+            old = self.id_of_slot[v]
+            if old >= 0:
+                self.slot_of_id[old] = -1
+            self.id_of_slot[v] = e
+            self.slot_of_id[e] = v
+            self.usage[v] = 0
+        return np.asarray(missing[:n], np.int64) - base, victims.astype(np.int64)
 
     def materialize(self, layer):
         """The prefill materialize kernel: the whole layer into slots [0, E), position == expert id."""

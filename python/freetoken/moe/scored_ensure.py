@@ -107,6 +107,22 @@ def _phase1(query_ptr, slot_of_id_ptr, lru_usage_ptr, num_copy_ptr, step, K,
 
 
 @triton.jit
+def _prefetch_phase1(query_ptr, slot_of_id_ptr, K, BLOCK_K: tl.constexpr, id_base):
+    """_phase1 for a prefetch: -1 entries are padding, hits are left alone (a prefetch is not an
+    access), and the misses rank in query order so the select's best candidates install first."""
+    k = tl.arange(0, BLOCK_K)
+    raw = tl.load(query_ptr + k, mask=k < K, other=-1)
+    kmask = raw >= 0
+    q = tl.where(kmask, raw + id_base, 0)
+    s = tl.load(slot_of_id_ptr + q, mask=kmask, other=0)
+    miss = kmask & (s == -1)
+    same = (q[:, None] == q[None, :]) & (k[:, None] > k[None, :]) & kmask[:, None] & kmask[None, :]
+    first_miss = miss & (tl.sum(same.to(tl.int32), axis=1) == 0)
+    rank = tl.cumsum(first_miss.to(tl.int32), axis=0) - 1
+    return q, first_miss, rank, tl.sum(first_miss.to(tl.int32))
+
+
+@triton.jit
 def _stats(stats_ptr, first, num_missing):
     # One vectorized atomic over 3 lanes, not three scalar ones: a scalar atomic serializes the CTA.
     si = tl.arange(0, 4)
@@ -144,13 +160,14 @@ def _owner_state(mirror_ptr, state_ptr, c, oid, mirrored, stale, other):
     )
 
 
-@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_topk", "nm_stride"])
+@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_topk", "nm_stride", "pf_rows"])
 def _scored_ensure_kernel(
     query_ptr, slot_of_id_ptr, id_of_slot_ptr, lru_usage_ptr, lru_step_ptr,
     out_ptr, src_ptr, dst_ptr, num_copy_ptr, stats_ptr,
     tok_ptr, last_tok_ptr, lc_ptr, ct_ptr, g_ptr, logits_ptr,
     owner_ptr, slot_last_ptr, slot_lc_ptr, slot_ct_ptr, pin_ptr,
-    K, num_cached, id_base, nm_topk, nm_stride, nm_thr,
+    pf_stats_ptr, pf_ready_ptr, pf_num_ptr,
+    K, num_cached, id_base, nm_topk, nm_stride, nm_thr, pf_rows,
     BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_TOPK: tl.constexpr,
     NM_ROWS: tl.constexpr,
     USAGE_MAX: tl.constexpr, COLLECT_STATS: tl.constexpr,
@@ -158,9 +175,16 @@ def _scored_ensure_kernel(
     NUM_LAYERS: tl.constexpr, NUM_EXPERTS: tl.constexpr,
     BETA_STEP: tl.constexpr, W_Q4: tl.constexpr, DECAY_MUL: tl.constexpr, DT_MAX: tl.constexpr,
     SLOT_BITS: tl.constexpr,
+    LOWPRI: tl.constexpr, PF_COUNT: tl.constexpr, PREFETCH: tl.constexpr,
 ):
-    step = tl.load(lru_step_ptr) + 1
-    tl.store(lru_step_ptr, step)
+    if PREFETCH:
+        # not an access: the clock stays, so usage == step still pins the last demand call's slots
+        step = tl.load(lru_step_ptr)
+        tl.store(num_copy_ptr, tl.zeros([], tl.int64))
+        tl.store(pf_ready_ptr, 0)
+    else:
+        step = tl.load(lru_step_ptr) + 1
+        tl.store(lru_step_ptr, step)
     if POLICY != 0:
         tok = tl.load(tok_ptr)
         if BUMP_TOK:
@@ -187,9 +211,18 @@ def _scored_ensure_kernel(
                 tl.store(slot_last_ptr + held_at, refreshed, mask=near & (held_at >= 0))
                 # the victim scan and the routed update below read and rewrite what this wrote
                 tl.debug_barrier()
-    q, kmask, miss, first, first_miss, rank, num_missing, out = _phase1(
-        query_ptr, slot_of_id_ptr, lru_usage_ptr, num_copy_ptr, step, K, BLOCK_K,
-        id_base)
+    if PREFETCH:
+        q, first_miss, rank, num_missing = _prefetch_phase1(query_ptr, slot_of_id_ptr, K, BLOCK_K, id_base)
+    else:
+        if PF_COUNT:
+            kk = tl.arange(0, BLOCK_K)
+            sk = tl.load(slot_of_id_ptr + tl.load(query_ptr + kk, mask=kk < K, other=0) + id_base, mask=kk < K, other=-1)
+            # a hit on a held slot with usage 0 consumes a prefetch; read it before _phase1 bumps it
+            was_pf = (sk >= 0) & (tl.load(lru_usage_ptr + sk, mask=sk >= 0, other=1) == 0)
+            tl.debug_barrier()
+        q, kmask, miss, first, first_miss, rank, num_missing, out = _phase1(
+            query_ptr, slot_of_id_ptr, lru_usage_ptr, num_copy_ptr, step, K, BLOCK_K,
+            id_base)
 
     if num_missing > 0:
         # REQUIRED (flashlib): the reload below must see _phase1's hit bump, or a hit is evicted.
@@ -199,7 +232,13 @@ def _scored_ensure_kernel(
         u = tl.load(lru_usage_ptr + c, mask=cmask, other=USAGE_MAX)
         if POLICY == 0:
             umax = tl.full([BLOCK_C], USAGE_MAX, u.dtype)
-            u = tl.where((u == step) | (~cmask), umax, u)
+            if LOWPRI:
+                held0 = cmask & (tl.load(id_of_slot_ptr + c, mask=cmask, other=-1) >= 0)
+                # empty slots, then unconsumed prefetches (held, usage 0), then residents by recency
+                u = tl.where((u == step) | (~cmask), umax, tl.where(held0, u + 1, 0))
+            else:
+                u = tl.where((u == step) | (~cmask), umax, u)
+            n_free = tl.sum((u != umax).to(tl.int32))
         else:
             oid = tl.load(id_of_slot_ptr + c, mask=cmask, other=-1)
             held = cmask & (oid >= 0)
@@ -221,6 +260,10 @@ def _scored_ensure_kernel(
                 score += (W_Q4 * lcv) >> 4
             # Every key is distinct and ties go to the lowest slot; an empty slot keys below any held one.
             key = tl.where(held, ((score.to(tl.int64) + _SCORE_BIAS) << SLOT_BITS) | c, c.to(tl.int64))
+            if LOWPRI:
+                # an unconsumed prefetch (held, usage 0) keys above every empty slot and below every
+                # resident: the caps keep score + 2^31 > 2^30 - 2^25 - 2^22, far above this band's 1
+                key = tl.where(held & (u == 0), (1 << SLOT_BITS) | c.to(tl.int64), key)
             evictable = cmask & (u != step)
             if PIN_SINCE:
                 # the score ignores recency, so slots an earlier call touched since *pin_ptr stay pinned too
@@ -228,7 +271,15 @@ def _scored_ensure_kernel(
             # the pinned key's slot bits are 0, so an all-pinned scan falls back to slot 0 like flashlib's argmin
             pinned_key = 0x7FFFFFFFFFFFFFFF ^ ((1 << SLOT_BITS) - 1)
             key = tl.where(evictable, key, pinned_key)
-        for i in tl.range(num_missing):
+            n_free = tl.sum(evictable.to(tl.int32))
+        if PREFETCH:
+            # never the all-pinned fallback: that slot may be under the running GEMM
+            n_iter = tl.minimum(num_missing, n_free)
+            tl.store(num_copy_ptr, n_iter.to(tl.int64))
+            tl.store(pf_stats_ptr, tl.load(pf_stats_ptr) + n_iter)
+        else:
+            n_iter = num_missing
+        for i in tl.range(n_iter):
             if POLICY == 0:
                 victim = tl.argmin(u, axis=0).to(tl.int32)
             else:
@@ -240,17 +291,38 @@ def _scored_ensure_kernel(
             e = tl.sum(tl.where((rank == i) & first_miss, q, 0))
             tl.store(id_of_slot_ptr + victim, e)
             tl.store(slot_of_id_ptr + e, victim)
-            tl.store(lru_usage_ptr + victim, step)
+            if PREFETCH:
+                # usage 0 on a held slot marks it low priority until a demand call touches it
+                tl.store(lru_usage_ptr + victim, 0)
+                if POLICY != 0:
+                    tl.store(owner_ptr + victim, -1)
+            else:
+                tl.store(lru_usage_ptr + victim, step)
             tl.store(dst_ptr + i, victim)
             tl.store(src_ptr + i, e - id_base)  # back to the caller's id space
-            out = tl.where((rank == i) & miss, victim, out)
+            if not PREFETCH:
+                out = tl.where((rank == i) & miss, victim, out)
             if POLICY == 0:
                 u = tl.where(c == victim, umax, u)  # claim in-register
             else:
                 key = tl.where(c == victim, pinned_key, key)
 
-    # Written from registers, never re-read from slot_of_id, so out_ptr may alias query_ptr.
-    tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
+    if not PREFETCH:
+        # Written from registers, never re-read from slot_of_id, so out_ptr may alias query_ptr.
+        tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
+    if PF_COUNT:
+        # one writer per column: pf_ensure adds ISSUED (column 0) on its own stream, ordered before this
+        pn = tl.load(pf_num_ptr)
+        late = (pn > 0) & (tl.load(pf_ready_ptr, volatile=True) == 0)
+        col = tl.arange(0, 8)
+        add = tl.where(col == 1, tl.sum((first & was_pf).to(tl.int32)).to(tl.int64), 0)
+        add = tl.where(col == 3, 1, add)
+        add = tl.where(col == 4, pf_rows, add)
+        add = tl.where(col == 5, num_missing.to(tl.int64), add)
+        add = tl.where(col == 6, late.to(tl.int64), add)
+        add = tl.where(col == 7, (pn > 0).to(tl.int64), add)
+        cols = (col == 1) | (col >= 3)
+        tl.store(pf_stats_ptr + col, tl.load(pf_stats_ptr + col, mask=cols, other=0) + add, mask=cols)
     if POLICY != 0:
         if UPDATE_STATE:
             # distinct ids only, so a duplicate at bs > 1 counts once per call; out is each id's final slot
@@ -265,7 +337,7 @@ def _scored_ensure_kernel(
                 tl.store(ct_ptr + q, now, mask=first)
                 tl.store(slot_lc_ptr + out, lc_new, mask=first)
                 tl.store(slot_ct_ptr + out, now, mask=first)
-        else:
+        elif not PREFETCH:
             # a slot filled without a state update reads the per-id state until a decode hit re-mirrors it
             tl.store(owner_ptr + out, -1, mask=first_miss)
     if COLLECT_STATS:
@@ -311,6 +383,12 @@ def scored_ensure(
     beta: float = BETA,
     w: float = W,
     halflife: int = HALFLIFE,
+    lowpri: bool = False,
+    pf_stats: torch.Tensor | None = None,
+    pf_ready: torch.Tensor | None = None,
+    pf_num: torch.Tensor | None = None,
+    pf_rows: int = 0,
+    prefetch: bool = False,
 ) -> None:
     """``flashlib.lru_ensure`` (sequential strategy) with the victim picked by ``policy``.
 
@@ -324,7 +402,20 @@ def scored_ensure(
     prefill's chunked calls cannot evict each other's experts; policy > 0 only.
     Policy 3 refreshes the experts whose ``router_logits`` (``[rows, num_experts]``, rows of
     ``query``) are within ``near_miss_thr`` of their row's lowest routed logit.
+
+    FREETOKEN_MOE_PREFETCH=on: ``lowpri`` keys held slots with usage 0 (unconsumed prefetches)
+    between the empty slots and every resident. ``pf_stats`` (a ``[8]`` int64 prefetch stats row)
+    also counts this demand call: hits on such slots, the call, ``pf_rows``, the misses, and whether
+    the prefetch plan ``pf_num`` had rows whose copy had not set ``pf_ready`` yet.
+    ``prefetch=True`` is :func:`prefetch_ensure`'s install mode instead.
     """
+    if prefetch:
+        assert lowpri and pf_stats is not None and pf_ready is not None and stats is None
+        assert not update_state and not bump_tok and pin_since is None and router_logits is None
+    if pf_stats is not None:
+        assert lowpri and pf_stats.dtype == torch.int64 and pf_stats.numel() == 8 and pf_stats.is_contiguous()
+        assert pf_ready is not None and pf_ready.dtype == torch.int32 and pf_ready.numel() == 1
+        assert prefetch or (pf_num is not None and pf_num.dtype == torch.int64 and pf_num.numel() == 1)
     k = query.numel()
     num_cached = id_of_slot.numel()
     assert query.dtype == torch.int32 and query.is_contiguous()
@@ -372,7 +463,10 @@ def scored_ensure(
         dummy if slot_lc is None else slot_lc,
         dummy if slot_ct is None else slot_ct,
         dummy if pin_since is None else pin_since,
-        k, num_cached, id_base, nm_topk, nm_stride, float(near_miss_thr),
+        dummy if pf_stats is None else pf_stats,
+        dummy if pf_ready is None else pf_ready,
+        dummy if pf_num is None else pf_num,
+        k, num_cached, id_base, nm_topk, nm_stride, float(near_miss_thr), int(pf_rows),
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_C=block_c,
         BLOCK_E=triton.next_power_of_2(num_experts),
@@ -391,5 +485,36 @@ def scored_ensure(
         DECAY_MUL=decay_mul,
         DT_MAX=dt_max,
         SLOT_BITS=slot_bits,
+        LOWPRI=bool(lowpri),
+        PF_COUNT=pf_stats is not None and not prefetch,
+        PREFETCH=bool(prefetch),
         num_warps=_num_warps_for(block_c),
+    )
+
+
+def prefetch_ensure(
+    query: torch.Tensor,
+    slot_of_id: torch.Tensor,
+    id_of_slot: torch.Tensor,
+    lru_usage: torch.Tensor,
+    lru_step: torch.Tensor,
+    dst_slots: torch.Tensor,
+    src_rows: torch.Tensor,
+    num_copy: torch.Tensor,
+    pf_stats: torch.Tensor,
+    pf_ready: torch.Tensor,
+    **state,
+) -> None:
+    """Install the ids of ``query`` (-1 = padding) that are not resident as low-priority slots
+    (held, usage 0) and write their copy plan to ``dst_slots``/``src_rows``/``num_copy``.
+
+    Unlike a demand call it bumps no clock, touches no hit and no per-id state, and so keeps
+    every slot of the last demand call (usage == step) pinned; victims follow the demand key
+    (empty, then earlier unconsumed prefetches, then the coldest residents). With fewer
+    evictable slots than misses it installs only the first ones, in query order. Adds the
+    installs to ``pf_stats[0]`` and clears ``pf_ready``.
+    """
+    scored_ensure(
+        query, slot_of_id, id_of_slot, lru_usage, lru_step, query, src_rows, dst_slots, num_copy,
+        update_state=False, lowpri=True, pf_stats=pf_stats, pf_ready=pf_ready, prefetch=True, **state,
     )

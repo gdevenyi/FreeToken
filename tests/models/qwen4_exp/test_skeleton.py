@@ -602,9 +602,9 @@ def _prefetch_stack(kind, banks, mode, monkeypatch, *, k=6, budget=0, wire=True,
     return moes, cache
 
 
-def _prefetch_run(moes, cache, bs, graph, inputs, before_decode=None):
+def _prefetch_run(moes, cache, bs, graph, inputs, before_decode=None, sleep=_PF_SLEEP_CYCLES, before_step=None):
     """Warm up eagerly (and capture), reset the cache, then decode ``inputs`` (per step, one
-    ``[bs, hidden]`` input per layer)."""
+    ``[bs, hidden]`` input per layer); ``sleep`` cycles between layers, ``before_step(i)`` before step i."""
     from flashlib.kernels.slot_cache import Stat
 
     _fresh_ctx(_batch=SimpleNamespace(is_prefill=False))
@@ -612,8 +612,8 @@ def _prefetch_run(moes, cache, bs, graph, inputs, before_decode=None):
     def step(xs):
         outs = []
         for layer, (moe, x) in enumerate(zip(moes, xs)):
-            if layer:
-                torch.cuda._sleep(_PF_SLEEP_CYCLES)
+            if layer and sleep:
+                torch.cuda._sleep(sleep)
             outs.append(moe.forward(x.clone()))
         return outs
 
@@ -628,7 +628,9 @@ def _prefetch_run(moes, cache, bs, graph, inputs, before_decode=None):
     if before_decode is not None:
         before_decode()
     results = []
-    for xs in inputs:
+    for i, xs in enumerate(inputs):
+        if before_step is not None:
+            before_step(i)
         if graph:
             for s, x in zip(static, xs):
                 s.copy_(x)
@@ -850,6 +852,328 @@ def test_moe_prefetch_predicts_layer_l_from_layer_l_minus_1_input(kind, bs, monk
         assert torch.equal(x, inputs[call // (_PF_LAYERS - 1)][target - 1])
         assert gate is moes[target].gate and resident == cache.slot_for_id[target].data_ptr()
         assert torch.equal(logits, F.linear(x, moes[target].gate.weight))
+
+
+# FREETOKEN_MOE_PREFETCH=on: the same stack, with copies. No sleep between layers, so the prefetch
+# streams race the compute stream at toy size and only the joins keep the GEMMs on landed bytes.
+_PF_ON_STEPS = 200
+
+
+def _assert_slots_hold_their_experts(cache):
+    """Lossless: every held slot's bytes equal the host rows of the expert its id names."""
+    held = (cache.id_of_slot >= 0).nonzero().view(-1).cpu()
+    ids = cache.id_of_slot[held.cuda()].long().cpu()
+    assert held.numel() > 0
+    for (per_layer, slots), view in zip(cache.banks, cache.bank_views()):
+        host = torch.stack(per_layer).flatten(0, 1)
+        want = host[ids].contiguous().view(torch.uint8)
+        got = view[held.cuda()].cpu().contiguous().view(torch.uint8)
+        assert torch.equal(got, want)
+
+
+def _routed_ids(moes, inputs):
+    """[step][layer] -> the experts each layer routes (the router alone decides; no cache input)."""
+    from freetoken.moe.fused import fused_topk
+
+    out = []
+    for xs in inputs:
+        row = []
+        for moe, x in zip(moes, xs):
+            _, ids = fused_topk(hidden_states=x, gating_output=moe.gate.forward(x), topk=_PF_TOPK, renormalize=True)
+            row.append(ids.view(-1).tolist())
+        out.append(row)
+    return out
+
+
+def _garbage(routed, width, kind, seed):
+    """Per step a [layers, width] candidate override: 'random' ids (and -1), or 'adversarial' ones
+    that mix layer L's routed ids with ids it does not route, duplicates and padding."""
+    gen = torch.Generator().manual_seed(seed)
+    steps = []
+    for row in routed:
+        sel = torch.full((_PF_LAYERS, width), -1, dtype=torch.int32)
+        for layer in range(1, _PF_LAYERS):
+            if kind == "random":
+                ids = torch.randint(-1, _PF_EXPERTS, (width,), generator=gen)
+            else:
+                hit = list(dict.fromkeys(row[layer]))
+                miss = [e for e in torch.randperm(_PF_EXPERTS, generator=gen).tolist() if e not in hit][:3]
+                ids = torch.tensor((hit[:3] + miss + hit[:1] + [-1] + miss[:1]) * 2)[:width]
+                ids = ids[torch.randperm(ids.numel(), generator=gen)]
+            sel[layer, : ids.numel()] = ids.to(torch.int32)
+        steps.append(sel)
+    return steps
+
+
+def _on_stack(kind, banks, monkeypatch, *, policy, overlap, k=6, budget=0):
+    return _prefetch_stack(kind, banks, "on", monkeypatch, k=k, budget=budget, overlap=overlap, policy=policy)
+
+
+def _with_override(cache, steps, **delays):
+    """before_step hook that loads step i's candidate override into the prefetcher's static buffer."""
+    pf = cache.prefetch
+    pf.sel_override = torch.full_like(pf.sel, -1)
+    for name, cycles in delays.items():
+        setattr(pf, name, cycles)
+
+    def before_step(i):
+        pf.sel_override.copy_(steps[i][:, : pf.sel.shape[1]])
+
+    return before_step
+
+
+def _assert_same_outputs(got, want):
+    for a_step, b_step in zip(got, want):
+        for a, b in zip(a_step, b_step):
+            assert torch.isfinite(b.float()).all()
+            assert torch.equal(a, b)
+
+
+@requires_cuda
+@pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
+def test_moe_prefetch_on_is_bitwise_identical(kind, graph, bs, policy, overlap, monkeypatch):
+    """FREETOKEN_MOE_PREFETCH=on copies predicted experts into low-priority slots beside the decode:
+    over 200 steps of a cache that evicts every step the MoE outputs are those of prefetch off to
+    the bit, every held slot holds its expert's bytes, and the prefetches were used."""
+    from freetoken.moe.prefetch import CALLS, COPIED, ISSUED, USEFUL
+
+    banks = _prefetch_banks(kind)
+    inputs = _prefetch_inputs(bs, steps=_PF_ON_STEPS, seed=5)
+    moes, cache = _prefetch_stack(kind, banks, "off", monkeypatch, overlap=overlap, policy=policy)
+    off = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
+    _assert_slots_hold_their_experts(cache)
+    moes, cache = _on_stack(kind, banks, monkeypatch, policy=policy, overlap=overlap)
+    on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
+    _assert_same_outputs(on[0], off[0])
+    _assert_slots_hold_their_experts(cache)
+    stats = cache.prefetch.stats.cpu()
+    assert stats[0].tolist() == [0] * stats.shape[1], "layer 0 is never prefetched"
+    assert stats[1:, CALLS].tolist() == [_PF_ON_STEPS] * (_PF_LAYERS - 1)
+    assert int(stats[:, ISSUED].sum()) > 0 and int(stats[:, USEFUL].sum()) > 0 and int(stats[:, COPIED].sum()) > 0
+    assert int(on[3].sum()) < int(off[3].sum()), "useful prefetches remove demand misses"
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+@pytest.mark.parametrize("garbage", ["random", "adversarial"])
+def test_moe_prefetch_on_survives_a_garbage_predictor(graph, bs, policy, garbage, monkeypatch):
+    """Whatever the candidates (random ids and padding, or the next layer's routed ids mixed with ids
+    it will not route, duplicates and -1), prefetch on changes no output bit and no slot's bytes."""
+    from freetoken.moe.prefetch import ISSUED, USEFUL
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(bs, steps=_PF_ON_STEPS, seed=6)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True, policy=policy)
+    off = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True, budget=8)
+    steps = _garbage(_routed_ids(moes, inputs), 12, garbage, seed=bs)
+    on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0, before_step=_with_override(cache, steps))
+    _assert_same_outputs(on[0], off[0])
+    _assert_slots_hold_their_experts(cache)
+    stats = cache.prefetch.stats.cpu()
+    assert int(stats[:, ISSUED].sum()) > 0 and int(stats[:, USEFUL].sum()) > 0
+    assert int(stats[:, USEFUL].sum()) < int(stats[:, ISSUED].sum()), "some prefetches must be wrong"
+
+
+# ~0.5 ms at the RTX 5080's clock: far longer than a toy layer, so every delayed stage is late
+_PF_DELAY_CYCLES = 1_000_000
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+@pytest.mark.parametrize("delay", ["copy", "predict", "both"])
+def test_moe_prefetch_on_joins_hold_when_the_prefetch_streams_run_late(graph, bs, policy, delay, monkeypatch):
+    """Race test: a sleep on the prefetch copy stream (every copy lands after its layer's ensure) or on
+    the predictor stream (prefetch_ensure runs long after the fork) must not change a bit. The
+    candidates include each layer's routed ids, so GEMMs do read prefetched slots."""
+    from freetoken.moe.prefetch import COPIED, LATE, USEFUL
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(bs, steps=_PF_ON_STEPS, seed=7)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True, policy=policy)
+    off = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True, budget=8)
+    steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=bs + 10)
+    delays = {"delay_copy_cycles": _PF_DELAY_CYCLES * (delay in ("copy", "both")),
+              "delay_predict_cycles": _PF_DELAY_CYCLES * (delay in ("predict", "both"))}
+    on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0, before_step=_with_override(cache, steps, **delays))
+    _assert_same_outputs(on[0], off[0])
+    _assert_slots_hold_their_experts(cache)
+    stats = cache.prefetch.stats.cpu()
+    assert int(stats[:, USEFUL].sum()) > 0
+    if delay == "copy":
+        # the late counter sees what the join waited for: the copies were still sleeping at ensure(L)
+        # (all of them under replay; an eager host gap longer than the sleep can let one land first)
+        late, copied = int(stats[:, LATE].sum()), int(stats[:, COPIED].sum())
+        assert copied > 0 and (late == copied if graph else late >= 0.9 * copied)
+
+
+@requires_cuda
+def test_moe_prefetch_race_test_catches_a_missing_copy_join(monkeypatch):
+    """Negative control for the race test: without the compute stream's wait on the prefetch copy,
+    GEMMs read prefetched slots before their bytes land and the outputs change."""
+    from freetoken.moe.prefetch import ExpertPrefetcher
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(1, steps=40, seed=7)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True)
+    off = _prefetch_run(moes, cache, 1, False, inputs, sleep=0)
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy="rule", overlap=True, budget=8)
+
+    def no_wait(self, layer_id):
+        self._inflight[layer_id] = None
+
+    monkeypatch.setattr(ExpertPrefetcher, "join_copy", no_wait)
+    steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=11)
+    on = _prefetch_run(moes, cache, 1, False, inputs, sleep=0,
+                       before_step=_with_override(cache, steps, delay_copy_cycles=_PF_DELAY_CYCLES))
+    assert any(not torch.equal(a, b) for got, want in zip(on[0], off[0]) for a, b in zip(got, want))
+
+
+def _replay_on_reference(policy, calls, rows):
+    """Replay the spied prefetch_ensure / ensure sequence on the CPU reference; per-layer stats."""
+    from freetoken.moe.prefetch import CALLS, COPIED, ISSUED, MISSES, ROWS, USEFUL
+    from freetoken.moe.scored_ensure import POLICY_IDS
+    from tests.moe.ref_scored_cache import RefScoredCache
+
+    ref = RefScoredCache(_PF_LAYERS, _PF_EXPERTS, _PF_EXPERTS, POLICY_IDS[policy])
+    stats = torch.zeros((_PF_LAYERS, 8), dtype=torch.int64)
+    planned = {}
+    for call in calls:
+        if call[0] == "prefetch":
+            _, layer, sel = call
+            src, _ = ref.prefetch(layer, sel.tolist())
+            stats[layer, ISSUED] += src.size
+            planned[layer] = src.size
+        else:
+            _, layer, ids, logits = call
+            _, src, _ = ref.ensure(layer, ids.view(-1).numpy(), bump_tok=layer == 0, lowpri=True,
+                                   logits=None if logits is None else logits.float().numpy(), thr=0.25)
+            if layer in planned:
+                stats[layer, [USEFUL, CALLS, ROWS, MISSES, COPIED]] += torch.tensor(
+                    [ref.useful, 1, rows, src.size, int(planned.pop(layer) > 0)])
+    return ref, stats
+
+
+@requires_cuda
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+def test_moe_prefetch_on_counters_match_reference(bs, policy, monkeypatch):
+    """issued / useful / calls / rows / misses / copied equal a CPU replay of the spied candidates
+    and routings, the slot maps end identical, late is 0 when each ensure waits for the copies
+    (known answer), and a captured graph counts the same as eager. prefetch_ensure runs on the
+    predictor stream, the slim prefetch copy on the copy stream, the demand copy on the compute one."""
+    import freetoken.kernel.fast_index_copy as fic
+    from freetoken.moe.prefetch import LATE, NUM_STAT_COLS, RESIDENT_HITS
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(bs, steps=60, seed=8)
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True)
+    calls, streams = [], {"pf_ensure": set(), "slim": set(), "demand": set()}
+    real_pf, real_ensure = cache.prefetch_ensure, cache.ensure_experts
+    real_slim, real_multi = fic.fast_index_copy_multi_slim_jit, fic.fast_index_copy_multi_jit
+
+    def spy_pf(layer, query, *args):
+        streams["pf_ensure"].add(torch.cuda.current_stream().cuda_stream)
+        calls.append(("prefetch", layer, query.clone()))  # enqueued on the predictor stream after the select
+        return real_pf(layer, query, *args)
+
+    def spy_ensure(layer, ids, **kw):
+        torch.cuda.synchronize()  # the copies forked before this ensure have landed: late must be 0
+        logits = kw.get("router_logits")
+        calls.append(("ensure", layer, ids.clone(), None if logits is None or policy != "rule" else logits.clone()))
+        return real_ensure(layer, ids, **kw)
+
+    def spy_slim(*args):
+        streams["slim"].add(torch.cuda.current_stream().cuda_stream)
+        return real_slim(*args)
+
+    def spy_multi(*args):
+        streams["demand"].add(torch.cuda.current_stream().cuda_stream)
+        return real_multi(*args)
+
+    def install():
+        monkeypatch.setattr(cache, "prefetch_ensure", spy_pf)
+        monkeypatch.setattr(cache, "ensure_experts", spy_ensure)
+        monkeypatch.setattr(fic, "fast_index_copy_multi_slim_jit", spy_slim)
+        monkeypatch.setattr(fic, "fast_index_copy_multi_jit", spy_multi)
+
+    eager = _prefetch_run(moes, cache, bs, False, inputs, before_decode=install, sleep=0)
+    torch.cuda.synchronize()
+    calls = [c if c[0] == "prefetch" else (c[0], c[1], c[2].cpu(), None if c[3] is None else c[3].cpu()) for c in calls]
+    calls = [(c[0], c[1], c[2].cpu()) if c[0] == "prefetch" else c for c in calls]
+    ref, want = _replay_on_reference(policy, calls, bs)
+    got = cache.prefetch.stats.cpu()
+    assert got.shape == (_PF_LAYERS, NUM_STAT_COLS)
+    assert int(got[:, LATE].sum()) == 0 and int(got[:, RESIDENT_HITS].sum()) == 0
+    assert torch.equal(got, want), (got, want)
+    assert int(want[:, 1].sum()) > 0, "the sequence must have useful prefetches"
+    assert torch.equal(cache.slot_for_id.view(-1).cpu().long(), torch.from_numpy(ref.slot_of_id))
+    assert torch.equal(cache.id_of_slot.cpu().long(), torch.from_numpy(ref.id_of_slot))
+    assert torch.equal(cache.usage.cpu(), torch.from_numpy(ref.usage))
+    assert streams["pf_ensure"] == {cache.prefetch.stream.cuda_stream}
+    assert streams["slim"] == {cache.prefetch.copy_stream.cuda_stream}
+    assert streams["demand"] == {torch.cuda.current_stream().cuda_stream}
+
+    monkeypatch.undo()
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True)
+    graph = _prefetch_run(moes, cache, bs, True, inputs, sleep=_PF_SLEEP_CYCLES)
+    _assert_same_outputs(graph[0], eager[0])
+    cols = [c for c in range(NUM_STAT_COLS) if c != LATE]
+    assert torch.equal(cache.prefetch.stats.cpu()[:, cols], got[:, cols])
+
+
+@requires_cuda
+def test_moe_prefetch_on_rebuild_and_reset_clear_the_prefetch_state(monkeypatch):
+    """A rebuild keeps both prefetch streams, the events and plan buffers, and drops the counters,
+    the in-flight state and every low-priority slot; a recaptured graph then matches eager and off.
+    A reset (as after a capture) also drops the counters and low-priority slots."""
+    banks = _prefetch_banks("bf16")
+    inputs = _prefetch_inputs(1, steps=40, seed=9)
+    moes, cache = _on_stack("bf16", banks, monkeypatch, policy="rule", overlap=True)
+    _prefetch_run(moes, cache, 1, True, inputs, sleep=0)
+    pf = cache.prefetch
+    streams, plan = (pf.stream, pf.copy_stream), (pf.pf_slots, pf.pf_src, pf.pf_num, pf.pf_ready)
+    assert int(pf.stats.sum()) > 0 and bool(((cache.id_of_slot >= 0) & (cache.usage == 0)).any())
+    pf._inflight[2] = torch.zeros(1)
+    cache.rebuild(_PF_EXPERTS + 4)
+    assert (pf.stream, pf.copy_stream) == streams and (pf.pf_slots, pf.pf_src, pf.pf_num, pf.pf_ready) == plan
+    assert int(pf.stats.abs().sum()) == 0 and int(pf.totals.abs().sum()) == 0 and pf._inflight == [None] * _PF_LAYERS
+    assert not bool(((cache.id_of_slot >= 0) & (cache.usage == 0)).any())
+    graph = _prefetch_run(moes, cache, 1, True, inputs, sleep=0)
+    eager = _prefetch_run(moes, cache, 1, False, inputs, sleep=0)
+    _assert_same_outputs(graph[0], eager[0])
+    _assert_slots_hold_their_experts(cache)
+    assert int(pf.stats.sum()) > 0
+    cache.reset()
+    assert int(pf.stats.abs().sum()) == 0 and not bool(((cache.id_of_slot >= 0) & (cache.usage == 0)).any())
+    moes_off, cache_off = _prefetch_stack("bf16", banks, "off", monkeypatch, overlap=True)
+    cache_off.rebuild(_PF_EXPERTS + 4)
+    off = _prefetch_run(moes_off, cache_off, 1, False, inputs, sleep=0)
+    _assert_same_outputs(eager[0], off[0])
+
+
+@requires_cuda
+def test_moe_prefetch_on_skips_batches_past_the_select_tile(monkeypatch):
+    """An eager decode wider than MAX_ROWS forks nothing: no join, no count, the same outputs."""
+    from freetoken.moe.prefetch import MAX_ROWS
+
+    banks = _prefetch_banks("bf16")
+    bs = MAX_ROWS + 1
+    inputs = _prefetch_inputs(bs, steps=6, seed=10)
+    off = _prefetch_run(*_prefetch_stack("bf16", banks, "off", monkeypatch), bs, False, inputs, sleep=0)
+    moes, cache = _on_stack("bf16", banks, monkeypatch, policy="rule", overlap=True)
+    on = _prefetch_run(moes, cache, bs, False, inputs, sleep=0)
+    _assert_same_outputs(on[0], off[0])
+    assert int(cache.prefetch.stats.abs().sum()) == 0 and cache.prefetch._inflight == [None] * _PF_LAYERS
 
 
 @requires_cuda

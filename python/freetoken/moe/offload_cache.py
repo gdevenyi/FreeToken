@@ -329,7 +329,14 @@ class OffloadMoeCache:
             raise ValueError(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} needs GPU decode, not {self.decode_target!r}")
         if self.device.type != "cuda":
             return None
-        return ExpertPrefetcher(self.num_layers, self.num_experts, self.device, mode=self.prefetch_mode)
+        prefetch = ExpertPrefetcher(self.num_layers, self.num_experts, self.device, mode=self.prefetch_mode)
+        prefetch.cache = self
+        return prefetch
+
+    @property
+    def prefetch_on(self) -> bool:
+        """FREETOKEN_MOE_PREFETCH=on: every ensure keys prefetched slots low priority."""
+        return self.prefetch is not None and self.prefetch.mode == "on"
 
     def _init_decode_copy_overlap(self) -> None:
         # a dedicated stream, not one of torch's 32 pooled ones: a pooled stream can alias the engine
@@ -985,9 +992,11 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        if self.cache_policy_id == 0:
+        lowpri = self.prefetch_on
+        if self.cache_policy_id == 0 and not lowpri:
             ensure_experts(self, layer_id, expert_ids)
             return
+        # prefetch on: LRU runs the vendored kernel (flashlib's cannot key low-priority slots)
         ensure_experts_scored(
             self,
             layer_id,
@@ -996,7 +1005,20 @@ class OffloadMoeCache:
             update_state=update_state,
             router_logits=router_logits,
             pin_since=pin_since,
+            lowpri=lowpri,
+            pf_count=self.prefetch.count_args(layer_id) if lowpri and update_state else None,
         )
+
+    def prefetch_ensure(
+        self, layer_id: int, query: torch.Tensor, dst_slots: torch.Tensor, src_rows: torch.Tensor,
+        num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor,
+    ) -> None:
+        """Install ``query``'s non-resident experts of ``layer_id`` as low-priority slots and plan
+        their copy into ``dst_slots``/``src_rows``/``num`` (never the demand plan, which copy(L-1)
+        may still be reading)."""
+        from freetoken.moe.offload_kernels import prefetch_ensure_experts
+
+        prefetch_ensure_experts(self, layer_id, query, dst_slots, src_rows, num, stats_row, ready)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -1179,34 +1201,35 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
+        self.copy_rows(layer_id, self.evict_slots, self.src_indices, self.num_indices, slim=_SLIM_COPY)
+
+    def copy_rows(
+        self, layer_id: int, dst_slots: torch.Tensor, src_rows: torch.Tensor, num: torch.Tensor, *, slim: bool
+    ) -> None:
+        """Copy host rows ``src_rows[:num]`` of ``layer_id``'s banks into slots ``dst_slots[:num]``
+        on the current stream (the demand plan, or a prefetch plan on the prefetch copy stream)."""
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit, fast_index_copy_multi_slim_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
-            # bank). evict_slots/src_indices/num_indices are shared across banks;
-            # src_indices holds layer-local expert rows, resolved against this layer's
-            # source pointers (layer_id is a static int per captured graph node).
-            copy = fast_index_copy_multi_slim_jit if _SLIM_COPY else fast_index_copy_multi_jit
+            # bank). The slot/row plan is shared across banks; src_rows holds layer-local
+            # expert rows, resolved against this layer's source pointers (layer_id is a
+            # static int per captured graph node).
+            copy = fast_index_copy_multi_slim_jit if slim else fast_index_copy_multi_jit
             copy(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
                 self._copy_feat_bytes,
-                self.evict_slots,
-                self.src_indices,
-                self.num_indices,
+                dst_slots,
+                src_rows,
+                num,
             )
             return
 
         from freetoken.kernel import fast_index_copy_jit
 
         for per_layer, cache in self.banks:
-            fast_index_copy_jit(
-                cache,
-                self.evict_slots,
-                per_layer[layer_id],
-                self.src_indices,
-                self.num_indices,
-            )
+            fast_index_copy_jit(cache, dst_slots, per_layer[layer_id], src_rows, num)
 
     @contextmanager
     def decode_side(self, layer_id: int) -> Iterator[None]:
