@@ -152,6 +152,8 @@ class OffloadMoeCache:
     # GPU decode only: the caller's work that is independent of the routed experts (qwen4_exp: the
     # shared expert) runs on decode_copy_stream beside the miss copy. None = FREETOKEN_MOE_COPY_OVERLAP.
     decode_copy_overlap: bool | None = None
+    # GPU decode only: cross-layer expert prefetch (moe/prefetch.py). None = FREETOKEN_MOE_PREFETCH.
+    prefetch_mode: str | None = None
 
     def __post_init__(self) -> None:
         from freetoken.moe.scored_ensure import POLICY_IDS
@@ -315,6 +317,19 @@ class OffloadMoeCache:
         self._decode_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         if self.decode_copy_overlap and self.device.type == "cuda" and self.decode_target == "gpu":
             self._init_decode_copy_overlap()
+        self.prefetch = self._init_prefetch()
+
+    def _init_prefetch(self):
+        from freetoken.moe.prefetch import ExpertPrefetcher, resolve_mode
+
+        self.prefetch_mode = resolve_mode(self.prefetch_mode)
+        if self.prefetch_mode == "off":
+            return None
+        if self.decode_target != "gpu":
+            raise ValueError(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} needs GPU decode, not {self.decode_target!r}")
+        if self.device.type != "cuda":
+            return None
+        return ExpertPrefetcher(self.num_layers, self.num_experts, self.device, mode=self.prefetch_mode)
 
     def _init_decode_copy_overlap(self) -> None:
         # a dedicated stream, not one of torch's 32 pooled ones: a pooled stream can alias the engine
@@ -622,6 +637,8 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.decode_freq.zero_()
+        if self.prefetch is not None:
+            self.prefetch.reset()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -1019,6 +1036,9 @@ class OffloadMoeCache:
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
         self.reset_evict_state()
+        if self.prefetch is not None:
+            # the graph runner resets after each capture: drop the capture-time counts too
+            self.prefetch.reset_counters()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0

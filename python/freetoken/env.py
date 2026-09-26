@@ -79,6 +79,14 @@ class EnvClassSingleton:
     WARMUP_MAX_LEN = EnvInt(0)
     # GPU-decode MoE: run a layer's expert miss copy on a side stream under the shared expert
     MOE_COPY_OVERLAP = EnvBool(False)
+    # GPU-decode MoE cross-layer prefetch: off | measure (predict and count, no copies) | on (reserved)
+    MOE_PREFETCH = EnvStr("off")
+    # router-lookahead candidates per layer, and the non-resident ones kept per target layer
+    # (0 = 3 before GDN layers, 4 before full-attention layers)
+    MOE_PREFETCH_K = EnvInt(16)
+    MOE_PREFETCH_BUDGET = EnvInt(0)
+    # measure mode: also log the per-layer breakdown with every summary
+    MOE_PREFETCH_DEBUG = EnvBool(False)
 
     def __new__(cls):
         # single instance

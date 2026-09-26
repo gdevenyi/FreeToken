@@ -65,4 +65,15 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
 
-__all__ = ["Qwen4ExpMoE"]
+def wire_router_lookahead(moes: list[Qwen4ExpMoE], config: ModelConfig) -> None:
+    """Give each offloaded MoE block the next layer's router, for FREETOKEN_MOE_PREFETCH's
+    lookahead (inert when it is off). ``moes[i]`` is decoder layer ``i``'s block."""
+    from freetoken.moe.prefetch import default_budget
+
+    for target in range(1, len(moes)):
+        experts = moes[target - 1].experts
+        if isinstance(experts, OffloadMoELayer):
+            experts.set_lookahead(moes[target].gate, target, default_budget(config.is_linear_layer(target)))
+
+
+__all__ = ["Qwen4ExpMoE", "wire_router_lookahead"]

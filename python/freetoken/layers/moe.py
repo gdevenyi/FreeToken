@@ -194,6 +194,13 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # FREETOKEN_MOE_PREFETCH: (next MoE layer's router op, its layer id, its budget); the
+        # underscore keeps the borrowed router out of this layer's state dict
+        self._lookahead: tuple[BaseOP, int, int] | None = None
+
+    def set_lookahead(self, gate: BaseOP, target_layer: int, budget: int) -> None:
+        """Let this layer's GPU decode predict ``target_layer``'s experts with that layer's router."""
+        self._lookahead = (gate, target_layer, budget)
 
     def forward(
         self,
@@ -302,7 +309,12 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids, router_logits=router_logits)
+        prefetch = cache.prefetch
+        if prefetch is not None:
+            self._fork_lookahead(cache, prefetch, hidden_states)
         cache.copy_missing()
+        if prefetch is not None:
+            prefetch.join_and_count(self.layer_id, topk_ids, cache.id_of_slot, cache.num_indices)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -313,6 +325,16 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _fork_lookahead(self, cache: OffloadMoeCache, prefetch, hidden_states: torch.Tensor) -> None:
+        """Predict the next layer's experts beside this layer's miss copy (not under TP, and never
+        toward a CPU-decoded layer, whose ensure would not join it)."""
+        if self._lookahead is None or self.tp_size > 1:
+            return
+        gate, target, budget = self._lookahead
+        if cache.is_cpu_layer(target):
+            return
+        prefetch.fork(target, hidden_states, gate, cache.slot_for_id[target], budget)
 
     def _decode_hybrid(
         self,

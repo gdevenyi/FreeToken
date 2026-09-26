@@ -1195,11 +1195,15 @@ class Engine:
         logprobs_out = self.sampler.compute_logprobs(batch_logits, next_tokens_gpu, args)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if self.moe_offload_cache is not None and self.moe_offload_cache.collect_stats and batch.is_decode:
+        cache = self.moe_offload_cache
+        if cache is not None and (cache.collect_stats or cache.prefetch is not None) and batch.is_decode:
             self._moe_stats_step += 1
             if self._moe_stats_step >= MOE_STATS_INTERVAL:
                 self._moe_stats_step = 0
-                self._emit_moe_stats()
+                if cache.prefetch is not None:
+                    self._emit_prefetch_stats()
+                if cache.collect_stats:
+                    self._emit_moe_stats()
         if logprobs_out is None:
             return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
         chosen_logprobs, top_ids, top_logprobs = logprobs_out
@@ -1242,6 +1246,31 @@ class Engine:
         if mc.has_linear_attention and cap >= 8193:
             lens.add(8193)  # chunk_delta_h NT bucket 2 (NT > 128)
         return sorted(n for n in lens if 2 <= n <= cap)
+
+    def _emit_prefetch_stats(self) -> None:
+        """Report one window of the FREETOKEN_MOE_PREFETCH counters (one host sync), then restart them."""
+        from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
+
+        prefetch = self.moe_offload_cache.prefetch
+        window = prefetch.take_window()
+        stats = summarize(window)
+        if not stats["layer_calls"]:
+            return
+        logger.info_rank0(f"MoE prefetch {prefetch.mode} ({MOE_STATS_INTERVAL} decode steps): {format_summary(stats)}")
+        if ENV.MOE_PREFETCH_DEBUG:
+            logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(window)}")
+
+    def _log_prefetch_totals(self) -> None:
+        from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
+
+        prefetch = self.moe_offload_cache.prefetch if self.moe_offload_cache is not None else None
+        if prefetch is None:
+            return
+        totals = prefetch.totals + prefetch.counters.cpu()
+        stats = summarize(totals)
+        if stats["layer_calls"]:
+            logger.info_rank0(f"MoE prefetch {prefetch.mode} (session, {stats['tokens']} tokens): {format_summary(stats)}")
+            logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(totals)}")
 
     def _emit_moe_stats(self) -> None:
         """Report one window of expert-cache behaviour, then reset the miss counters.
@@ -1365,6 +1394,10 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        try:
+            self._log_prefetch_totals()
+        except Exception as exc:  # noqa: BLE001 -- a diagnostic must never block shutdown
+            logger.warning(f"MoE prefetch totals unavailable at shutdown: {exc}")
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

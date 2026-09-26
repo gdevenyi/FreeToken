@@ -551,6 +551,273 @@ def test_moe_copy_overlap_is_bitwise_identical(kind, graph, bs, monkeypatch):
         assert torch.equal(a, b)
 
 
+# FREETOKEN_MOE_PREFETCH stack: 4 layers (full attention on layer 3), 16 experts, top-2, and one
+# shared cache as small as a layer so every step evicts
+_PF_LAYERS, _PF_EXPERTS, _PF_TOPK, _PF_HIDDEN, _PF_INTER = 4, 16, 2, 256, 128
+# ~50-100 us between layers: the predictor must finish before the next ensure even at toy size
+_PF_SLEEP_CYCLES = 200_000
+
+
+def _prefetch_banks(kind):
+    from freetoken.moe.expert_banks import build_expert_banks
+
+    torch.manual_seed(7)
+    method = _offload_experts(kind, 0, _PF_EXPERTS, _PF_TOPK, _PF_HIDDEN, _PF_INTER).quant_method
+    return build_expert_banks(method, _PF_LAYERS, None, device=torch.device("cuda"), dummy=True)
+
+
+def _prefetch_stack(kind, banks, mode, monkeypatch, *, k=6, budget=0, wire=True, overlap=False):
+    from freetoken.env import ENV
+    from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE, wire_router_lookahead
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.utils.torch_utils import torch_dtype
+
+    monkeypatch.setattr(ENV.MOE_PREFETCH_K, "value", k)
+    monkeypatch.setattr(ENV.MOE_PREFETCH_BUDGET, "value", budget)
+    config = parse_config(toy_hf_config(
+        _PF_LAYERS, hidden_size=_PF_HIDDEN, num_experts=_PF_EXPERTS, num_experts_per_tok=_PF_TOPK,
+        moe_intermediate_size=_PF_INTER, shared_expert_intermediate_size=_PF_INTER,
+    ))
+    device = torch.device("cuda")
+    with torch.device(device), torch_dtype(torch.bfloat16):
+        moes = [Qwen4ExpMoE(config, layer_id) for layer_id in range(_PF_LAYERS)]
+    gen = torch.Generator(device=device).manual_seed(43)
+    for moe in moes:
+        _fill(moe, gen, scale=0.2)
+    experts = [_offload_experts(kind, i, _PF_EXPERTS, _PF_TOPK, _PF_HIDDEN, _PF_INTER) for i in range(_PF_LAYERS)]
+    cache = OffloadMoeCache(
+        num_layers=_PF_LAYERS, num_experts=_PF_EXPERTS, cache_size=_PF_EXPERTS, device=device,
+        cache_policy="rule", quant_format=banks.quant_format, layout=banks.layout,
+        max_slots=experts[0].quant_method.slot_limit(), prefetch_mode=mode, decode_copy_overlap=overlap,
+    )
+    cache.set_bank_sources(banks.sources)
+    cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+    cache.collect_stats = True
+    for moe, ex in zip(moes, experts):
+        ex.offload_cache = cache
+        moe.experts = ex
+    if wire:
+        wire_router_lookahead(moes, config)
+    cache.reset()
+    return moes, cache
+
+
+def _prefetch_run(moes, cache, bs, graph, inputs, before_decode=None):
+    """Warm up eagerly (and capture), reset the cache, then decode ``inputs`` (per step, one
+    ``[bs, hidden]`` input per layer)."""
+    from flashlib.kernels.slot_cache import Stat
+
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=False))
+
+    def step(xs):
+        outs = []
+        for layer, (moe, x) in enumerate(zip(moes, xs)):
+            if layer:
+                torch.cuda._sleep(_PF_SLEEP_CYCLES)
+            outs.append(moe.forward(x.clone()))
+        return outs
+
+    static = [torch.randn(bs, _PF_HIDDEN, device="cuda", dtype=torch.bfloat16) for _ in moes]
+    step(static)  # the eager warm-up the graph runner also does
+    if graph:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            outs = step(static)
+    cache.reset()
+    cache.reset_stats()
+    if before_decode is not None:
+        before_decode()
+    results = []
+    for xs in inputs:
+        if graph:
+            for s, x in zip(static, xs):
+                s.copy_(x)
+            g.replay()
+        else:
+            outs = step(xs)
+        results.append([o.clone() for o in outs])
+    torch.cuda.synchronize()
+    state = [t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage, *cache.bank_views())]
+    counters = None if cache.prefetch is None else cache.prefetch.counters.cpu()
+    return results, state, counters, cache.lru_stats[:, Stat.MISS].cpu()
+
+
+def _prefetch_inputs(bs, steps=8, chain=False, seed=0):
+    gen = torch.Generator(device="cuda").manual_seed(seed * 10 + bs)
+
+    def x():
+        return torch.randn(bs, _PF_HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.5
+
+    if chain:  # every layer sees the same input, so the lookahead equals the next router
+        return [[x()] * _PF_LAYERS for _ in range(steps)]
+    return [[x() for _ in range(_PF_LAYERS)] for _ in range(steps)]
+
+
+@requires_cuda
+@pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
+def test_moe_prefetch_measure_is_bitwise_identical(kind, graph, bs, overlap, monkeypatch):
+    """FREETOKEN_MOE_PREFETCH=measure predicts and counts beside the decode (with and without
+    FREETOKEN_MOE_COPY_OVERLAP's side stream); the MoE outputs, the slot map, the usage clock and
+    the slot contents must not change by a single bit."""
+    banks = _prefetch_banks(kind)
+    inputs = _prefetch_inputs(bs)
+    off = _prefetch_run(*_prefetch_stack(kind, banks, "off", monkeypatch, overlap=overlap), bs, graph, inputs)
+    on = _prefetch_run(*_prefetch_stack(kind, banks, "measure", monkeypatch, overlap=overlap), bs, graph, inputs)
+
+    assert off[2] is None and int(off[3].sum()) > 0 and torch.equal(on[3], off[3])
+    for got, want in zip(on[0], off[0]):
+        for a, b in zip(got, want):
+            assert torch.isfinite(b.float()).all()
+            assert torch.equal(a, b)
+    for a, b in zip(on[1], off[1]):
+        assert torch.equal(a, b)
+    from freetoken.moe.prefetch import CALLS, ISSUED, ROWS
+
+    counters = on[2]
+    assert counters[0].tolist() == [0] * counters.shape[1], "layer 0 has no predecessor"
+    assert counters[1:, CALLS].tolist() == [len(inputs)] * (_PF_LAYERS - 1)
+    assert counters[1:, ROWS].tolist() == [len(inputs) * bs] * (_PF_LAYERS - 1)
+    assert int(counters[1:, ISSUED].sum()) > 0
+
+
+def _reference_counters(selects, ensures, budget_override, k):
+    """CPU counters from the spied predictor logits and each target layer's routing and residency."""
+    from freetoken.moe.prefetch import NUM_COLS, default_budget
+    from tests.moe.ref_prefetch import ref_count, ref_select
+
+    config = parse_config(toy_hf_config(_PF_LAYERS))
+    counters = torch.zeros((_PF_LAYERS, NUM_COLS), dtype=torch.int64)
+    for layer in range(1, _PF_LAYERS):
+        assert len(selects[layer]) == len(ensures[layer]) > 0
+        want_budget = budget_override or default_budget(config.is_linear_layer(layer))
+        for (logits, budget), (raw, resident) in zip(selects[layer], ensures[layer]):
+            assert budget == want_budget
+            sel, res = ref_select(logits.tolist(), resident.tolist(), k, budget)
+            routed = raw.view(-1).tolist()
+            misses = len({e for e in routed if resident[e] < 0})
+            counters[layer] += torch.tensor(ref_count(sel, res, routed, misses, logits.shape[0]))
+    return counters
+
+
+@requires_cuda
+@pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("budget", [0, 5])
+def test_moe_prefetch_counters_match_reference(kind, bs, budget, monkeypatch):
+    """Eager counters equal a CPU reference built from the predictor's own logits and each layer's
+    routing and pre-ensure residency; the captured graph counts the same. The predictor runs on
+    its dedicated stream, the count on the compute stream."""
+    import freetoken.moe.prefetch as pf_mod
+
+    banks = _prefetch_banks(kind)
+    inputs = _prefetch_inputs(bs, seed=1)
+    k = 6
+    moes, cache = _prefetch_stack(kind, banks, "measure", monkeypatch, k=k, budget=budget)
+    selects = {layer: [] for layer in range(_PF_LAYERS)}
+    ensures = {layer: [] for layer in range(_PF_LAYERS)}
+    streams = {"select": set(), "count": set()}
+    real_select, real_count, real_ensure = pf_mod.lookahead_select, pf_mod.prefetch_count, cache.ensure_experts
+
+    def spy_select(logits, resident, sel, res, *, k, budget):
+        layer = (sel.data_ptr() - cache.prefetch.sel.data_ptr()) // cache.prefetch.sel[0].nbytes
+        selects[layer].append((logits.float().cpu(), budget))
+        streams["select"].add(torch.cuda.current_stream().cuda_stream)
+        return real_select(logits, resident, sel, res, k=k, budget=budget)
+
+    def spy_count(*args, **kwargs):
+        streams["count"].add(torch.cuda.current_stream().cuda_stream)
+        return real_count(*args, **kwargs)
+
+    def spy_ensure(layer_id, expert_ids, **kwargs):
+        torch.cuda.synchronize()  # the prediction forked after the previous ensure has landed
+        ensures[layer_id].append((expert_ids.cpu(), cache.slot_for_id[layer_id].cpu()))
+        return real_ensure(layer_id, expert_ids, **kwargs)
+
+    def install():
+        monkeypatch.setattr(pf_mod, "lookahead_select", spy_select)
+        monkeypatch.setattr(pf_mod, "prefetch_count", spy_count)
+        monkeypatch.setattr(cache, "ensure_experts", spy_ensure)
+
+    eager = _prefetch_run(moes, cache, bs, False, inputs, before_decode=install)
+    want = _reference_counters(selects, ensures, budget, k)
+    assert torch.equal(eager[2], want), (eager[2], want)
+    assert int(want[:, 1].sum()) > 0, "the sequence must have useful predictions"
+    assert streams["select"] == {cache.prefetch.stream.cuda_stream}
+    assert streams["count"] == {torch.cuda.current_stream().cuda_stream}
+
+    monkeypatch.undo()
+    moes, cache = _prefetch_stack(kind, banks, "measure", monkeypatch, k=k, budget=budget)
+    graph = _prefetch_run(moes, cache, bs, True, inputs)
+    assert torch.equal(graph[2], eager[2])
+    for got, want_out in zip(graph[0], eager[0]):
+        for a, b in zip(got, want_out):
+            assert torch.equal(a, b)
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+def test_moe_prefetch_perfect_lookahead_counts_every_miss(graph, bs, monkeypatch):
+    """Known answer: when layer L-1's router input equals layer L's, the lookahead is layer L's own
+    router, so with the budget covering every candidate each demand miss is a useful prediction."""
+    from freetoken.moe.prefetch import ISSUED, MISSES, RESIDENT_HITS, USEFUL
+
+    banks = _prefetch_banks("nvfp4")
+    moes, cache = _prefetch_stack("nvfp4", banks, "measure", monkeypatch, k=4, budget=8)
+    _, _, counters, lru_misses = _prefetch_run(moes, cache, bs, graph, _prefetch_inputs(bs, chain=True, seed=2))
+    assert int(counters[1:, MISSES].sum()) > 0
+    assert counters[1:, USEFUL].tolist() == counters[1:, MISSES].tolist() == lru_misses[1:].tolist()
+    assert (counters[1:, ISSUED] >= counters[1:, USEFUL]).all()
+    assert int(counters[1:, RESIDENT_HITS].sum()) > 0, "routed hits among the top candidates"
+
+
+@requires_cuda
+def test_moe_prefetch_off_launches_nothing_new(monkeypatch):
+    """With the flag off the wired lookahead is inert: no prefetcher, and the decode launches
+    exactly the kernels of an unwired stack (measure adds some, so the check can see them)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    banks = _prefetch_banks("bf16")
+    inputs = _prefetch_inputs(1, steps=2)
+
+    def kernels(mode, wire):
+        moes, cache = _prefetch_stack("bf16", banks, mode, monkeypatch, wire=wire)
+        _prefetch_run(moes, cache, 1, False, inputs[:1])  # warm up and compile outside the trace
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            _prefetch_run(moes, cache, 1, False, inputs)
+        events = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+        return cache, [e.name for e in sorted(events, key=lambda e: e.time_range.start)]
+
+    cache, wired_off = kernels("off", True)
+    assert cache.prefetch is None
+    _, unwired_off = kernels("off", False)
+    _, measured = kernels("measure", True)
+    assert wired_off == unwired_off
+    assert len(measured) > len(wired_off)
+
+
+@requires_cuda
+def test_moe_prefetch_survives_a_rebuild(monkeypatch):
+    """A runtime rebuild resets the counters and keeps the predictor stream; a recaptured graph
+    counts like an eager run on the rebuilt cache."""
+    banks = _prefetch_banks("bf16")
+    inputs = _prefetch_inputs(1, seed=3)
+    moes, cache = _prefetch_stack("bf16", banks, "measure", monkeypatch)
+    before = _prefetch_run(moes, cache, 1, True, inputs)[2]
+    stream = cache.prefetch.stream
+    assert int(before.sum()) > 0
+    cache.rebuild(_PF_EXPERTS + 4)
+    assert int(cache.prefetch.counters.abs().sum()) == 0 and cache.prefetch.stream is stream
+    graph = _prefetch_run(moes, cache, 1, True, inputs)
+    eager = _prefetch_run(moes, cache, 1, False, inputs)
+    assert int(graph[2].sum()) > 0 and torch.equal(graph[2], eager[2])
+    for a, b in zip(graph[1], eager[1]):
+        assert torch.equal(a, b)
+
+
 @requires_cuda
 def test_decoder_stack_prefill_and_decode(monkeypatch):
     """Ragged bs=3 prefill then a bs=3 decode step through the whole model with dummy weights."""
