@@ -595,3 +595,112 @@ struct MultiIndexCopyKernel {
                      device.unwrap())(kernel, params);
     }
 };
+
+
+// ---------------------------------------------------------------------------
+// Slim multi-bank copy: the fused copy from a small grid, so it can share the GPU with compute. The
+// grid strides each (row, bank) segment in turn, carrying the phase across, so no bank runs alone at the tail.
+template <std::size_t kUnroll>
+__always_inline __device__ void slim_copy_segment(
+    uint4* __restrict__ dst, const uint4* __restrict__ src, int32_t count, int32_t i, int32_t stride
+) {
+    constexpr int32_t kU = static_cast<int32_t>(kUnroll);
+    // kUnroll independent loads in flight per thread: host-link latency, not issue rate, bounds a small grid
+    for (; i + (kU - 1) * stride < count; i += kU * stride) {
+        uint4 v[kUnroll];
+#pragma unroll
+        for (int32_t k = 0; k < kU; ++k) {
+            v[k] = details::load_nc(src + i + k * stride);
+        }
+#pragma unroll
+        for (int32_t k = 0; k < kU; ++k) {
+            dst[i + k * stride] = v[k];
+        }
+    }
+    uint4 v[kUnroll];
+#pragma unroll
+    for (int32_t k = 0; k < kU; ++k) {
+        if (i + k * stride < count) {
+            v[k] = details::load_nc(src + i + k * stride);
+        }
+    }
+#pragma unroll
+    for (int32_t k = 0; k < kU; ++k) {
+        if (i + k * stride < count) {
+            dst[i + k * stride] = v[k];
+        }
+    }
+}
+
+template <typename IdType, std::size_t kNumThreads, std::size_t kUnroll>
+__global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi_slim(
+    const __grid_constant__ MultiIndexCopyParams p
+) {
+    const int64_t n = p.valid_length ? p.valid_length[0] : p.length;
+    const auto stride = static_cast<int32_t>(gridDim.x * kNumThreads);
+    const auto tid = static_cast<int32_t>(blockIdx.x * kNumThreads + threadIdx.x);
+    const auto* di = static_cast<const IdType*>(p.dst_indices);
+    const auto* si = static_cast<const IdType*>(p.src_indices);
+    int32_t phase = 0;  // grid thread that takes the next segment's first chunk
+    for (int64_t row = 0; row < n; ++row) {
+        const auto ps = static_cast<int64_t>(si[row]);
+        const auto pd = static_cast<int64_t>(di[row]);
+        for (int b = 0; b < p.num_banks; ++b) {
+            const int64_t feat = p.feat_bytes[b];
+            const auto units = static_cast<int32_t>(feat >> 4);  // feat % 16 == 0; int32 chunk index: rows < 32 GiB
+            const auto* src = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(p.src_ptrs[b]) + ps * feat);
+            auto* dst = reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(p.dst_ptrs[b]) + pd * feat);
+            const int32_t first = tid >= phase ? tid - phase : tid - phase + stride;
+            slim_copy_segment<kUnroll>(dst, src, units, first, stride);
+            phase = static_cast<int32_t>((static_cast<int64_t>(phase) + units) % stride);
+        }
+    }
+}
+
+template <std::size_t kNumBlocks, std::size_t kNumThreads, std::size_t kUnroll>
+struct MultiIndexCopySlimKernel {
+    static void run(
+        tvm::ffi::TensorView dst_ptrs,
+        tvm::ffi::TensorView src_ptrs,
+        tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView dst_indices,
+        tvm::ffi::TensorView src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices
+    ) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto B = SymbolicSize{"num_banks"};
+        auto L = SymbolicSize{"indices length"};
+        auto ptr_dtype = SymbolicDType{};
+        auto indices_dtype = SymbolicDType{};
+        auto num_indices_dtype = SymbolicDType{};
+
+        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+            .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
+        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+            .verify(dst_indices).verify(src_indices);
+
+        const int64_t* valid_length = nullptr;
+        if (num_indices.has_value()) {
+            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+                .verify(num_indices.value());
+            valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
+        }
+
+        const auto params = MultiIndexCopyParams{
+            static_cast<const int64_t*>(dst_ptrs.data_ptr()),
+            static_cast<const int64_t*>(src_ptrs.data_ptr()),
+            static_cast<const int64_t*>(feat_bytes.data_ptr()),
+            dst_indices.data_ptr(),
+            src_indices.data_ptr(),
+            valid_length,
+            static_cast<int64_t>(L.unwrap()),
+            static_cast<int>(B.unwrap()),
+        };
+        const auto use_int32 = indices_dtype.unwrap().bits == 32;
+        const auto kernel = use_int32
+            ? fast_index_copy_multi_slim<int32_t, kNumThreads, kUnroll>
+            : fast_index_copy_multi_slim<int64_t, kNumThreads, kUnroll>;
+        LaunchKernel(kNumBlocks, kNumThreads, device.unwrap())(kernel, params);
+    }
+};

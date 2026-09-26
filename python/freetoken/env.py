@@ -77,6 +77,8 @@ class EnvClassSingleton:
     MAMBA_SSM_DTYPE = EnvStr("float32")
     # cap the longest prefill warmup forward; 0 = the engine's own chunk cap
     WARMUP_MAX_LEN = EnvInt(0)
+    # GPU-decode MoE: run a layer's expert miss copy on a side stream under the shared expert
+    MOE_COPY_OVERLAP = EnvBool(False)
 
     def __new__(cls):
         # single instance

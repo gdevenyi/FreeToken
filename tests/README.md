@@ -65,6 +65,7 @@ checkpoint is set:
 | `FREETOKEN_TEST_MODELS_ROOT` | `models/test_quant_config.py` — directory whose checkpoints the stored-tensor scheme scan checks (default `/mnt/nvme/models`) |
 | `FREETOKEN_DSV4_VL_MODEL` | `tokenizer/test_mm_tokenize.py` - local DeepSeek-V4 vision checkpoint |
 | `FREETOKEN_DSV4_VISION_CKPT` | `models/test_dsv4_vision.py` - the same checkpoint, for the parity tests against its `inference/` reference code |
+| `FREETOKEN_MOE_ROUTING_TRACE` | `moe/test_scored_ensure.py` — a compact decode routing trace directory (`experts.npy`, `logit_idx.npy`, `logit_val.npy`); its rows are replayed through the scored eviction kernel and the CPU reference |
 
 `test_aime.py` takes its sampling protocol from the checkpoint's own
 `generation_config.json` (pass@N at the recommended temperature, or a single greedy
