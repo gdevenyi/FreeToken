@@ -14,10 +14,11 @@ the qwen4_exp triton-NVFP4 row sizes. Source rows are not reused within a loop, 
 weights are cycled over copies that together exceed L2, and every loop is a CUDA graph.
 Alone and co-run trials are interleaved; each cell reports min and median over trials.
 
-Copy loops run in two link modes. "hot": copies back to back, so the host link never idles.
-"cold": a one-element spacer kernel after every copy (as the ensure kernel precedes every
-decode copy); on the RTX 5080 a copy that starts after even ~1 us of link idle costs ~8 us
-more, for every kernel variant. Cold GB/s subtracts the spacer's own alone time.
+Copy loops run in two modes. "hot": copy nodes back to back. "cold": a one-element spacer
+kernel after every copy, as the ensure kernel precedes every decode copy. On the RTX 5080, in
+graph replay, a copy node that follows another kernel's node runs ~8 us longer than one that
+follows a copy node, for every variant (CUPTI puts it in the copy's own duration; eager
+launches do not show it; cause not identified). Cold GB/s subtracts the spacer's alone time.
 
 Run: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python python benchmarks/bench_expert_copy_corun.py
 """
@@ -417,7 +418,8 @@ def run_corun(rig: CopyRig, variants, ops, corun_experts, args, s_fg, s_bg, spac
         print(f"   kernels: {_fmt_info(results['kernels'][op.name])}", flush=True)
         print("   " + "copy variant".ljust(18) + "E".rjust(3)
               + "  op_alone_us(min/med)  op_corun_us(min/med)  sigma(min/med)"
-              + "  copy_GBps alone(med) -> under op(med)  valid", flush=True)
+              + "  copy_GBps alone(med) -> under op(med)  valid  (! = alone median >10% over the probe:"
+              + " other GPU load, trust the min column)", flush=True)
         for v in variants:
             for e in corun_experts:
                 copy_launch_us = e * 55.0
@@ -444,8 +446,9 @@ def run_corun(rig: CopyRig, variants, ops, corun_experts, args, s_fg, s_bg, spac
                 nbytes = e * rig.expert_bytes
                 gb_alone = nbytes / (statistics.median(cp_alone) * 1e3)
                 gb_co = nbytes / (statistics.median(cp_co) * 1e3)
+                suspect = a_med > 1.1 * t_probe
                 results["corun"].append({
-                    "link": args.corun_link, "op": op.name, "variant": v.name, "experts": e,
+                    "link": args.corun_link, "op": op.name, "variant": v.name, "experts": e, "suspect": suspect,
                     "op_alone_us": op_alone, "op_corun_us": op_co,
                     "sigma_min": sig_min, "sigma_median": sig_med,
                     "copy_alone_us": cp_alone, "copy_corun_us": cp_co,
@@ -454,7 +457,7 @@ def run_corun(rig: CopyRig, variants, ops, corun_experts, args, s_fg, s_bg, spac
                 })
                 print(f"   {v.name.ljust(18)}{e:>3d}  {a_min:8.2f}/{a_med:8.2f}    {c_min:8.2f}/{c_med:8.2f}"
                       f"    {sig_min:+6.3f}/{sig_med:+6.3f}   {gb_alone:6.1f} -> {gb_co:6.1f}"
-                      f"          {valid_op}/{valid_cp}", flush=True)
+                      f"          {valid_op}/{valid_cp}{'  !' if suspect else ''}", flush=True)
                 del g_copy_long, g_copy, g_op_long
         del g_op
 
