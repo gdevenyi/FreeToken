@@ -1,5 +1,5 @@
-"""FREETOKEN_MOE_PREFETCH=measure cost: the router-lookahead predictor alone, and its effect on the
-decode compute stream when it runs beside it.
+"""FREETOKEN_MOE_PREFETCH cost and gain: the router-lookahead predictor alone, its effect on the
+decode compute stream in measure mode, and (--on) whole decode steps with prefetch off vs on.
 
 1. Predictor alone, per layer: the lookahead GEMV ([bs, 2560] x [2560, 512] bf16, a distinct router
    weight per layer as in the model), the top-K + select kernel, and both; one stream, CUDA graph.
@@ -11,13 +11,22 @@ decode compute stream when it runs beside it.
    experts + m cold ones per row) and the cache restored before every replay, so both arms copy
    the same bytes. One CUDA graph per step, prefetch off vs measure. No attention runs, so the
    percentages overstate the model's.
+4. --on: the same stack at the model's depth (48 layers), with a bf16 GEMV "filler" before every
+   block standing in for attention and the rest of the layer (--filler-us, ~225 us between one
+   demand copy and the next in production). Prefetch on installs a fixed candidate list per layer:
+   3 before GDN / 4 before attention layers, of which --useful are the layer's cold experts and the
+   rest never-routed ids (production: ~3.24 issued, ~1.75 useful, ~4.2 misses per layer at bs 1).
+   Reports ms/step, demand misses/step and the late fraction; --delay-us adds a sleep ahead of every
+   prefetch copy to price the compute stream's wait on a late copy.
 
 Run: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python python benchmarks/bench_moe_prefetch.py
+     ... benchmarks/bench_moe_prefetch.py --on --bs 1,2 --misses 4
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import statistics
 
 import torch
@@ -106,7 +115,7 @@ class DecodeStack:
     """N Qwen4ExpMoE blocks (router, shared expert, nvfp4 offload experts) over one shared cache,
     wired like qwen4_exp for the lookahead."""
 
-    def __init__(self, layers: int, slots: int, bs: int, misses: int, mode: str, overlap: bool):
+    def __init__(self, layers: int, slots: int, bs: int, misses: int, mode: str, overlap: bool, filler=None):
         import freetoken.core as core
         from types import SimpleNamespace
 
@@ -168,6 +177,8 @@ class DecodeStack:
         set_global_ctx(ctx)
         ctx._batch = SimpleNamespace(is_prefill=False)
         self.x = [torch.randn(bs, H, device=dev, dtype=torch.bfloat16, generator=gen) * 0.5 for _ in range(layers)]
+        self.filler = filler
+        self.bs, self.hot, self.misses = bs, hot, misses
         # warm the hot experts in, then drop the fresh ones: every replay then misses exactly those
         cache.reset()
         self.step()
@@ -189,7 +200,15 @@ class DecodeStack:
 
     def step(self):
         for moe, x in zip(self.moes, self.x):
+            if self.filler is not None:
+                F.linear(x, self.filler)
             moe.forward(x.clone())
+
+    def cold(self, layer: int) -> list[int]:
+        """The experts ``layer`` misses every replay, merged rank by rank across rows like the select."""
+        per_row = [list(range(self.bs * self.hot + r * self.misses, self.bs * self.hot + (r + 1) * self.misses))
+                   for r in range(self.bs)]
+        return [row[i] for i in range(self.misses) for row in per_row]
 
 
 def bench_stack(layers, slots, bs, misses, reps, overlap) -> dict:
@@ -217,6 +236,78 @@ def bench_stack(layers, slots, bs, misses, reps, overlap) -> dict:
     return out
 
 
+def budget_of(layer: int) -> int:
+    return 3 if (layer + 1) % 4 else 4
+
+
+def bench_on(layers, slots, bs, misses, useful, reps, filler_us, delays_us) -> list[dict]:
+    """ms per decode step, prefetch off vs on (and on with every prefetch copy delayed)."""
+    from flashlib.kernels.slot_cache import Stat
+
+    from freetoken.moe.prefetch import COPIED, ISSUED, LATE, USEFUL
+
+    dev = torch.device("cuda")
+    x = torch.randn(1, H, device=dev, dtype=torch.bfloat16)
+    probe = torch.randn(32768, H, device=dev, dtype=torch.bfloat16)
+    per_row_us = time_graph(lambda: F.linear(x, probe), reps) * 1000.0 / 32768
+    del probe
+    filler = torch.randn(max(int(filler_us / per_row_us), 1), H, device=dev, dtype=torch.bfloat16) * 0.01
+    cycles_per_us = 1_000_000 / (time_graph(lambda: torch.cuda._sleep(1_000_000), 5) * 1000.0)
+    out = []
+    for arm in ["off", "on", *[f"on+{d}us" for d in delays_us if d]]:
+        stack = DecodeStack(layers, slots, bs, misses, "off" if arm == "off" else "on", True, filler=filler)
+        cache = stack.cache
+        want = [bs * misses] * layers
+        if arm != "off":
+            pf = cache.prefetch
+            pf.sel_override = torch.full_like(pf.sel, -1)
+            for layer in range(1, layers):
+                u = min(useful[layer % len(useful)], bs * misses)
+                wrong = list(range(E - 1, E - 1 - (budget_of(layer) - u), -1))
+                ids = stack.cold(layer)[:u] + wrong
+                pf.sel_override[layer, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
+                want[layer] -= u
+            if arm.startswith("on+"):
+                pf.delay_copy_cycles = int(float(arm[3:-2]) * cycles_per_us)
+        cache.collect_stats = True
+        stack.restore()
+        cache.lru_stats.zero_()
+        stack.step()
+        got = cache.lru_stats[:, Stat.MISS].tolist()
+        assert got == want, f"{arm}: expected demand misses {want}, got {got}"
+        cache.collect_stats = False
+        stack.restore()
+        stack.step()
+        torch.cuda.synchronize()
+        stack.restore()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            stack.step()
+        if cache.prefetch is not None:
+            cache.prefetch.stats.zero_()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        times = []
+        for rep in range(reps + 3):
+            stack.restore()
+            torch.cuda.synchronize()
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            if rep >= 3:
+                times.append(start.elapsed_time(end))
+        row = {"arm": arm, "ms": statistics.median(times), "misses": sum(want)}
+        if cache.prefetch is not None:
+            st = cache.prefetch.stats.sum(0).tolist()
+            calls = max(reps + 3, 1) * (layers - 1)
+            row.update(issued=st[ISSUED] / calls, useful=st[USEFUL] / calls, late=st[LATE] / max(st[COPIED], 1))
+        out.append(row)
+        del graph, stack, cache
+        gc.collect()  # the module graph holds cycles: free this arm's slot banks before the next one
+        torch.cuda.empty_cache()
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bs", default="1,2")
@@ -227,11 +318,37 @@ def main() -> None:
     ap.add_argument("--misses", default="0,4", help="demand misses per layer per row")
     ap.add_argument("--reps", type=int, default=30)
     ap.add_argument("--overlap", type=int, default=1, help="FREETOKEN_MOE_COPY_OVERLAP in the stack (production: 1)")
+    ap.add_argument("--on", action="store_true", help="time whole decode steps with prefetch off vs on instead")
+    ap.add_argument("--on-layers", type=int, default=48)
+    ap.add_argument("--on-slots", type=int, default=0, help="0 = every layer's routed experts + 64 (the warm-up must not evict)")
+    ap.add_argument("--filler-us", type=float, default=160.0, help="per-layer compute standing in for attention")
+    ap.add_argument("--useful", default="2,1,2,2", help="useful prefetches per layer, cycled over layers")
+    ap.add_argument("--delay-us", default="0,150,300", help="sleep ahead of every prefetch copy (0 = none)")
     args = ap.parse_args()
     from freetoken.env import ENV
 
     ENV.MOE_PREFETCH_K.value, ENV.MOE_PREFETCH_BUDGET.value = args.k, args.budget
     dev = torch.device("cuda")
+    if args.on:
+        useful = [int(u) for u in args.useful.split(",")]
+        delays = [float(d) for d in args.delay_us.split(",")]
+        print(f"# {torch.cuda.get_device_name(dev)}, {args.on_layers} Qwen4ExpMoE nvfp4 layers, "
+              f"{args.on_slots or 'layers * bs * top-k + 64'} slots, "
+              f"rule, copy overlap on, filler {args.filler_us:.0f} us/layer, useful {useful}, median of {args.reps} replays")
+        print(f"{'bs':>3} {'m':>3} {'arm':>10} {'ms/step':>9} {'vs off':>8} {'misses/step':>12} "
+              f"{'issued/layer':>13} {'useful/layer':>13} {'late':>6}")
+        for bs in (int(b) for b in args.bs.split(",")):
+            for m in (int(x) for x in args.misses.split(",")):
+                slots = args.on_slots or args.on_layers * bs * TOP_K + 64
+                rows = bench_on(args.on_layers, slots, bs, m, useful, args.reps, args.filler_us, delays)
+                base = rows[0]["ms"]
+                for r in rows:
+                    extra = (f"{r['issued']:>13.2f} {r['useful']:>13.2f} {r['late']:>6.3f}" if "late" in r
+                             else f"{'':>13} {'':>13} {'':>6}")
+                    print(f"{bs:>3} {m:>3} {r['arm']:>10} {r['ms']:>9.3f} {r['ms'] / base - 1:>+8.1%} "
+                          f"{r['misses']:>12d} {extra}", flush=True)
+        print(f"# peak allocated {torch.cuda.max_memory_allocated(dev) / 2**30:.2f} GiB")
+        return
     print(f"# {torch.cuda.get_device_name(dev)}, K={args.k}, budget={args.budget}, median of {args.reps} graph replays")
     print("# predictor alone, us per layer (47 layers, one stream)")
     print(f"{'bs':>3} {'gemv':>8} {'select':>8} {'predictor':>10} {'count':>8}")
