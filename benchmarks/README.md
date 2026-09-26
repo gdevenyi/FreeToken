@@ -27,6 +27,15 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_moe_copy_overlap.py`** — synthetic (no checkpoint): `FREETOKEN_MOE_COPY_OVERLAP`
+off vs on for Qwen4ExpMoE decode layers at the Qwen3.8-Flash-Next expert geometry, as CUDA
+graphs. Checks the outputs are bitwise identical, times replays ABAB, and profiles the copy's
+start after the ensure and how much shared-expert work runs inside it.
+
+```bash
+python benchmarks/bench_moe_copy_overlap.py --bs 1 --slots 160
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
 
