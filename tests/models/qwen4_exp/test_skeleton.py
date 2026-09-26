@@ -476,11 +476,17 @@ def _copy_overlap_run(kind, banks, overlap, bs, graph, inputs, monkeypatch):
         moe.experts = ex
     cache.reset()
 
-    copy_streams = []
-    real_copy = fic.fast_index_copy_multi_jit
+    import freetoken.models.qwen4_exp.moe as qmoe
+
+    copy_streams, gate_streams = [], []
+    real_copy, real_gate = fic.fast_index_copy_multi_jit, qmoe.shared_gate_sigmoid
     monkeypatch.setattr(
         fic, "fast_index_copy_multi_jit",
         lambda *a, **k: (copy_streams.append(torch.cuda.current_stream().cuda_stream), real_copy(*a, **k))[1],
+    )
+    monkeypatch.setattr(
+        qmoe, "shared_gate_sigmoid",
+        lambda *a, **k: (gate_streams.append(torch.cuda.current_stream().cuda_stream), real_gate(*a, **k))[1],
     )
 
     def step(x0, x1):
@@ -507,8 +513,8 @@ def _copy_overlap_run(kind, banks, overlap, bs, graph, inputs, monkeypatch):
     torch.cuda.synchronize()
     state = [t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage, *cache.bank_views())]
     misses = int(cache.lru_stats[:, Stat.MISS].sum())
-    copy_stream = getattr(cache.decode_copy_stream, "cuda_stream", None)
-    return results, state, misses, [s == copy_stream for s in copy_streams]
+    side = getattr(cache.decode_copy_stream, "cuda_stream", None)
+    return results, state, misses, [s == side for s in copy_streams], [s == side for s in gate_streams]
 
 
 @requires_cuda
@@ -516,8 +522,8 @@ def _copy_overlap_run(kind, banks, overlap, bs, graph, inputs, monkeypatch):
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("bs", [1, 2])
 def test_moe_copy_overlap_is_bitwise_identical(kind, graph, bs, monkeypatch):
-    """FREETOKEN_MOE_COPY_OVERLAP moves the decode miss copy onto a side stream under the shared
-    expert; the MoE outputs, the slot map and the slot contents must not change by a single bit."""
+    """FREETOKEN_MOE_COPY_OVERLAP moves the shared expert onto a side stream beside the decode miss
+    copy; the MoE outputs, the slot map and the slot contents must not change by a single bit."""
     from freetoken.moe.expert_banks import build_expert_banks
 
     torch.manual_seed(7)
@@ -532,8 +538,9 @@ def test_moe_copy_overlap_is_bitwise_identical(kind, graph, bs, monkeypatch):
     on = _copy_overlap_run(kind, banks, True, bs, graph, inputs, monkeypatch)
 
     assert off[2] > 0 and on[2] == off[2], "the sequence must miss, and copy, in both runs"
-    assert off[3] and not any(off[3]), "flag off: the copy stays on the compute stream"
-    assert on[3] and all(on[3]), "flag on: every miss copy runs on the cache's copy stream"
+    assert off[3] and not any(off[3]) and not any(off[4]), "flag off: everything stays on the compute stream"
+    assert on[3] and not any(on[3]), "flag on: the miss copy stays right behind its ensure"
+    assert on[4] and all(on[4]), "flag on: the shared expert runs on the cache's side stream"
     for got, want in zip(on[0], off[0]):
         for a, b in zip(got, want):
             assert torch.isfinite(b.float()).all()
