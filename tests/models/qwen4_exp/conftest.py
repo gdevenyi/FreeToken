@@ -22,5 +22,7 @@ def _runtime():
         # streams would otherwise pin ~16 MiB for the rest of the session
         gc.collect()
         torch.cuda.synchronize()
-        torch._C._cuda_clearCublasWorkspaces()
+        clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)  # private torch API
+        if clear is not None:
+            clear()
         torch.cuda.empty_cache()
