@@ -6,6 +6,7 @@ scored policies. Set FREETOKEN_MOE_ROUTING_TRACE to a compact routing trace dire
 (experts.npy, logit_idx.npy, logit_val.npy) to also replay real decode rows.
 """
 import os
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -620,3 +621,321 @@ def test_an_all_pinned_call_never_stores_past_the_slot_arrays(policy):
     for name, buf in guarded.items():
         assert torch.all(buf[s:] == 7), f"{name} written past slot {s - 1}"
     assert int(cache.num_indices) == 1 and 0 <= int(cache.evict_slots[0]) < s
+
+
+# (h) FREETOKEN_MOE_PREFETCH=on: prefetch installs and low-priority keys ----------------------
+
+_PF_L, _PF_E, _PF_S, _PF_K, _PF_W = 4, 64, 100, 6, 16
+
+
+def _pf_cache(policy, cache_size=_PF_S, num_layers=_PF_L, num_experts=_PF_E):
+    return _cache(policy, cache_size, num_layers, num_experts, prefetch_mode="on")
+
+
+def _gpu_prefetch(cache, layer, sel, stats_row, width=_PF_W, budget=None):
+    """prefetch_ensure on the current stream; returns (src_ids, dst_slots), the plan it wrote."""
+    from freetoken.moe.offload_kernels import prefetch_ensure_experts
+
+    dev = cache.id_of_slot.device
+    query = torch.tensor(list(sel) + [-1] * (width - len(sel)), dtype=torch.int32, device=dev)
+    dst = torch.full((width,), -7, dtype=torch.int32, device=dev)
+    src = torch.full((width,), -7, dtype=torch.int32, device=dev)
+    num = torch.full((1,), 99, dtype=torch.int64, device=dev)
+    ready = torch.ones(1, dtype=torch.int32, device=dev)
+    prefetch_ensure_experts(cache, layer, query, dst, src, num, stats_row, ready, budget=budget)
+    n = int(num)
+    assert int(ready) == 0, "prefetch_ensure clears the copy's ready flag"
+    assert dst[n:].tolist() == [-7] * (width - n)
+    return src[:n].cpu().numpy().astype(np.int64), dst[:n].cpu().numpy().astype(np.int64), num
+
+
+def _lowpri_slots(cache):
+    return set(((cache.id_of_slot >= 0) & (cache.usage == 0)).nonzero().view(-1).tolist())
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "kd", "kdfb", "rule"])
+@pytest.mark.parametrize("rows_per_step", [1, 2])
+def test_prefetch_mode_matches_cpu_reference(policy, rows_per_step):
+    """prefetch_ensure and the low-priority demand ensure against the CPU reference victim for victim,
+    with adversarial candidates (next routed ids, resident ids, duplicates, padding, junk) and a
+    materialized prefill in between; the per-layer prefetch stats match the reference's counts."""
+    from freetoken.moe.offload_kernels import ensure_experts_scored
+    from freetoken.moe.prefetch import CALLS, COPIED, ISSUED, LATE, MISSES, RESIDENT_HITS, ROWS, USEFUL
+
+    rng = np.random.default_rng(31 + rows_per_step)
+    rows = _zipf_rows(40, rows_per_step, seed=33, num_layers=_PF_L, num_experts=_PF_E, top_k=_PF_K)
+    logits = _random_logits(rows, seed=34, num_experts=_PF_E) if policy == "rule" else None
+    cache, ref = _pf_cache(policy), _ref(policy, _PF_S, _PF_L, _PF_E)
+    dev = cache.id_of_slot.device
+    stats = torch.zeros((_PF_L, 8), dtype=torch.int64, device=dev)
+    want = np.zeros((_PF_L, 8), np.int64)
+    ready = torch.zeros(1, dtype=torch.int32, device=dev)
+    for r in range(rows.shape[0]):
+        if r == 20:
+            cache.materialize_layer(2)
+            ref.materialize(2)
+            assert not {s for s in _lowpri_slots(cache) if s < _PF_E}, "materialize installs at usage step"
+        for layer in range(_PF_L):
+            ids = rows[r, layer]
+            plan = None
+            if layer and rng.random() < 0.9:
+                routed = list(dict.fromkeys(ids.ravel().tolist()))
+                held = [e for e in range(_PF_E) if ref.slot_of_id[layer * _PF_E + e] >= 0]
+                sel = rng.choice(routed, size=min(3, len(routed)), replace=False).tolist()
+                sel += rng.choice(_PF_E, size=4).tolist() + held[:2] + sel[:1] + [-1]
+                rng.shuffle(sel)
+                pinned = set(np.flatnonzero((ref.usage == ref.step) & (ref.id_of_slot >= 0)).tolist())
+                budget = [None, 0, 1, 2, 4][int(rng.integers(5))]
+                src, dst, num = _gpu_prefetch(cache, layer, sel, stats[layer], budget=budget)
+                want_src, want_dst = ref.prefetch(layer, sel, budget)
+                np.testing.assert_array_equal(src, want_src)
+                np.testing.assert_array_equal(dst, want_dst)
+                assert not pinned & set(dst.tolist()), "a prefetch evicted a slot of the last demand call"
+                assert set(dst.tolist()) <= _lowpri_slots(cache)
+                want[layer, ISSUED] += len(want_src)
+                _assert_same_tables(cache, ref)
+                plan = num
+                ready.fill_(int(rng.random() < 0.5))  # a copy that has (1) or has not (0) landed
+            q = torch.from_numpy(np.ascontiguousarray(ids, dtype=np.int32)).to(dev).view(-1)
+            lg = None if logits is None else torch.from_numpy(np.ascontiguousarray(logits[r, layer])).to(dev, torch.bfloat16)
+            lowpri_before = _lowpri_slots(cache)
+            ensure_experts_scored(
+                cache, layer, q, bump_tok=layer == 0, update_state=True, router_logits=lg, lowpri=True,
+                pf_count=None if plan is None else (stats[layer], ready, plan, rows_per_step),
+            )
+            out, src, _ = ref.ensure(layer, ids, bump_tok=layer == 0, logits=None if lg is None else lg.float().cpu().numpy(),
+                                     thr=NEAR_MISS_THR, lowpri=True)
+            np.testing.assert_array_equal(q.cpu().numpy(), out)
+            _assert_same_tables(cache, ref)
+            # a demand hit makes a prefetched slot an ordinary resident, tagged with its owner's state
+            converted = lowpri_before & set(out.tolist())
+            assert all(int(cache.usage[s]) == int(cache.step) for s in converted)
+            if policy != "lru":
+                assert all(int(cache.evict_slot_owner[s]) == int(cache.id_of_slot[s]) for s in converted)
+            if plan is not None:
+                n = int(plan)
+                want[layer, [USEFUL, CALLS, ROWS, MISSES]] += [ref.useful, 1, rows_per_step, src.size]
+                want[layer, LATE] += int(n > 0 and int(ready) == 0)
+                want[layer, COPIED] += int(n > 0)
+    got = stats.cpu().numpy()
+    np.testing.assert_array_equal(got, want)
+    assert got[:, USEFUL].sum() > 0 and got[:, LATE].sum() > 0 and got[:, RESIDENT_HITS].sum() == 0
+    assert got[:, COPIED].sum() > got[:, LATE].sum()
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "rule"])
+@pytest.mark.parametrize("rows_per_step", [1, 2, 8])
+def test_prefetch_mode_matches_cpu_reference_at_production_geometry(policy, rows_per_step):
+    """The same victim-for-victim check at the deployment's shape: 48 layers x 512 experts, 1480
+    slots (a 2048-wide, 8-warp victim scan), top-10, up to 8 rows (every graph size that forks)
+    and 32-wide prefetch queries, with small-prefill ensures (pinned since their first chunk) and a
+    materialized layer in between. No prefetch ever evicts a slot of the last demand call."""
+    from freetoken.moe.offload_kernels import ensure_experts_scored
+
+    num_layers, num_experts, size, width = L, E, 1480, 32
+    rng = np.random.default_rng(71 + rows_per_step)
+    rows = _zipf_rows(4, rows_per_step, seed=72, num_layers=num_layers, num_experts=num_experts, top_k=TOP_K)
+    logits = _random_logits(rows, seed=73, num_experts=num_experts) if policy == "rule" else None
+    cache, ref = _pf_cache(policy, size, num_layers, num_experts), _ref(policy, size, num_layers, num_experts)
+    dev = cache.id_of_slot.device
+    stats = torch.zeros((num_layers, 8), dtype=torch.int64, device=dev)
+    ready = torch.zeros(1, dtype=torch.int32, device=dev)
+    installs = 0
+    for r in range(rows.shape[0]):
+        if r == 2:
+            cache.materialize_layer(5)
+            ref.materialize(5)
+        for layer in range(num_layers):
+            ids = rows[r, layer]
+            plan = None
+            if layer:
+                routed = list(dict.fromkeys(ids.ravel().tolist()))
+                held = [e for e in range(num_experts) if ref.slot_of_id[layer * num_experts + e] >= 0]
+                sel = rng.choice(routed, size=min(6, len(routed)), replace=False).tolist()
+                sel += rng.choice(num_experts, size=16).tolist() + held[:4] + sel[:2] + [-1, -1]
+                sel = sel[:width]
+                rng.shuffle(sel)
+                pinned = set(np.flatnonzero((ref.usage == ref.step) & (ref.id_of_slot >= 0)).tolist())
+                src, dst, plan = _gpu_prefetch(cache, layer, sel, stats[layer], width=width)
+                want_src, want_dst = ref.prefetch(layer, sel)
+                np.testing.assert_array_equal(src, want_src)
+                np.testing.assert_array_equal(dst, want_dst)
+                assert not pinned & set(dst.tolist()), "a prefetch evicted a slot of the last demand call"
+                installs += len(dst)
+                _assert_same_tables(cache, ref)
+            q = torch.from_numpy(np.ascontiguousarray(ids, dtype=np.int32)).to(dev).view(-1)
+            lg = None if logits is None else torch.from_numpy(np.ascontiguousarray(logits[r, layer])).to(dev, torch.bfloat16)
+            ensure_experts_scored(
+                cache, layer, q, bump_tok=layer == 0, update_state=True, router_logits=lg, lowpri=True,
+                pf_count=None if plan is None else (stats[layer], ready, plan, rows_per_step),
+            )
+            out, _, _ = ref.ensure(layer, ids, bump_tok=layer == 0, logits=None if lg is None else lg.float().cpu().numpy(),
+                                   thr=NEAR_MISS_THR, lowpri=True)
+            np.testing.assert_array_equal(q.cpu().numpy(), out)
+            _assert_same_tables(cache, ref)
+        # a short prefill of one layer between decode steps: chunked, pinned since its first chunk
+        layer = int(rng.integers(num_layers))
+        uniq = np.unique(rng.choice(num_experts, size=60, replace=False))
+        pin = cache.step.clone() if policy != "lru" else None
+        ref_pin = ref.step if policy != "lru" else None
+        for start in range(0, uniq.size, 32):
+            part = torch.from_numpy(uniq[start : start + 32].astype(np.int32)).to(dev)
+            cache.ensure_experts(layer, part, update_state=False, pin_since=pin)
+            out, _, _ = ref.ensure(layer, uniq[start : start + 32], update_state=False, pin_since=ref_pin, lowpri=True)
+            np.testing.assert_array_equal(part.cpu().numpy(), out)
+            _assert_same_tables(cache, ref)
+    assert installs > 0 and int((ref.id_of_slot >= 0).sum()) == size, "the cache must be full and evicting"
+
+
+def _plant(cache, ref, slot, flat_id, usage):
+    for t_id, t_slot in ((cache.id_of_slot, cache.slot_for_id.view(-1)), (ref.id_of_slot, ref.slot_of_id)):
+        t_id[slot] = flat_id
+        t_slot[flat_id] = slot
+    cache.usage[slot] = usage
+    ref.usage[slot] = usage
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "kd", "kdfb", "rule"])
+def test_lowpri_band_sits_between_empty_slots_and_every_resident(policy):
+    """An unconsumed prefetch is evicted after every empty slot and before any resident, even the
+    coldest resident the score caps allow, whatever the slot order."""
+    from freetoken.moe import scored_ensure as se
+    from freetoken.moe.offload_kernels import ensure_experts_scored
+
+    num_layers, num_experts, size = 2, 16, 16
+    cache, ref = _pf_cache(policy, size, num_layers, num_experts), _ref(policy, size, num_layers, num_experts)
+    dev = cache.id_of_slot.device
+    cache.step.fill_(5)
+    ref.step = 5
+    # slots 0-12: layer-0 residents at the oldest usage 1 with never-seen state (the lowest possible
+    # score); slot 13 empty; slots 14, 15 unconsumed prefetches
+    for slot in range(13):
+        _plant(cache, ref, slot, slot, 1)
+    _plant(cache, ref, 14, 13, 0)
+    _plant(cache, ref, 15, 14, 0)
+    if policy != "lru":
+        cache.evict_slot_owner.fill_(-1)
+    victims = []
+    for e in (15, 16 + 0, 16 + 1, 16 + 2):  # four misses, one per call
+        layer, expert = divmod(e, num_experts)
+        q = torch.tensor([expert], dtype=torch.int32, device=dev)
+        ensure_experts_scored(cache, layer, q, bump_tok=False, update_state=True, lowpri=True)
+        ref.ensure(layer, [expert], lowpri=True)
+        victims.append(int(cache.evict_slots[0]))
+        _assert_same_tables(cache, ref)
+    assert victims[:3] == [13, 14, 15] and victims[3] < 13
+    # the band's keys are below 2 << SLOT_BITS; the caps' worst resident score keeps score + 2^31 >= 2
+    beta_step, w_q4, _, _ = se.score_params(se.MAX_BETA, se.MAX_W, 1, 1)
+    worst = -((se.K_MAX << se.Q) + 1 * beta_step) + ((w_q4 * se.LC_FLOOR) >> 4)
+    assert worst + se.SCORE_BIAS >= 2
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "rule"])
+def test_prefetch_budget_keeps_the_first_non_resident_candidates(policy):
+    """The install budget counts only non-resident candidates, in query order: resident ids, padding
+    and duplicates ahead of them take none of it, and ISSUED counts the installs."""
+    num_experts = 16
+    cache, ref = _pf_cache(policy, num_experts, 2, num_experts), _ref(policy, num_experts, 2, num_experts)
+    stats = torch.zeros(8, dtype=torch.int64, device="cuda")
+    cache.ensure_experts(0, torch.tensor([0, 1], dtype=torch.int32, device="cuda"))  # step 0 pins every slot
+    ref.ensure(0, np.arange(2), bump_tok=True, lowpri=True)
+    src, _, _ = _gpu_prefetch(cache, 1, [4, 6], stats)
+    ref.prefetch(1, [4, 6])
+    assert src.tolist() == [4, 6]
+    sel = [4, -1, 6, 9, 9, 3, 7, 1]
+    src, dst, _ = _gpu_prefetch(cache, 1, sel, stats, budget=2)
+    assert src.tolist() == [9, 3] and int(stats[0]) == 4
+    np.testing.assert_array_equal(np.stack(ref.prefetch(1, sel, 2)), np.stack([src, dst]))
+    _assert_same_tables(cache, ref)
+    src, _, _ = _gpu_prefetch(cache, 1, [5, 8], stats, budget=0)
+    assert src.size == 0 and int(stats[0]) == 4
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "rule"])
+def test_prefetch_installs_only_into_evictable_slots(policy):
+    """With fewer evictable slots than candidates a prefetch installs the first candidates only, and
+    with every slot pinned by the last demand call it installs nothing (no all-pinned fallback)."""
+    num_experts = 16
+    cache, ref = _pf_cache(policy, num_experts, 2, num_experts), _ref(policy, num_experts, 2, num_experts)
+    stats = torch.zeros(8, dtype=torch.int64, device="cuda")
+    ids = np.arange(12)
+    cache.ensure_experts(0, torch.from_numpy(ids.astype(np.int32)).cuda())
+    ref.ensure(0, ids, bump_tok=True, lowpri=True)
+    pinned = cache.id_of_slot.clone()
+    src, dst, _ = _gpu_prefetch(cache, 1, [9, 3, 7, 1, 5, 11, 2], stats)
+    assert src.tolist() == [9, 3, 7, 1] and sorted(dst.tolist()) == [12, 13, 14, 15]
+    np.testing.assert_array_equal(np.stack(ref.prefetch(1, [9, 3, 7, 1, 5, 11, 2])), np.stack([src, dst]))
+    assert torch.equal(cache.id_of_slot[:12], pinned[:12]) and int(stats[0]) == 4
+    all16 = np.arange(16)
+    cache.ensure_experts(0, torch.from_numpy(all16.astype(np.int32)).cuda())
+    before = [t.clone() for t in (cache.id_of_slot, cache.slot_for_id, cache.usage)]
+    src, dst, num = _gpu_prefetch(cache, 1, [0, 1, 2], stats)
+    assert int(num) == 0 and src.size == 0 and int(stats[0]) == 4
+    for a, b in zip(before, (cache.id_of_slot, cache.slot_for_id, cache.usage)):
+        assert torch.equal(a, b)
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["kd", "kdfb", "rule"])
+def test_prefetch_scores_victims_from_the_previous_layers_position(policy):
+    """prefetch_ensure(L) runs right after layer L-1's demand call and scores victims from there:
+    layer L's residents are next up (d = 1), so one used last token outlives an older resident of
+    a later layer instead of looking a whole pass away."""
+    num_layers, num_experts, size = 8, 16, 16
+    cache, ref = _pf_cache(policy, size, num_layers, num_experts), _ref(policy, size, num_layers, num_experts)
+    cache.step.fill_(7)
+    ref.step = 7
+    cache.evict_tok.fill_(10)
+    ref.tok = 10
+    cache.evict_slot_owner.fill_(-1)
+    # slots 0-13: layer 1's routed experts (pinned), slot 14: a layer-2 expert used last token,
+    # slot 15: a layer-5 expert last used three tokens ago; all with the same (never-counted) use count
+    planted = [(slot, 16 + slot, 7, 10) for slot in range(14)] + [(14, 2 * 16 + 3, 6, 9), (15, 5 * 16 + 4, 5, 7)]
+    for slot, flat, usage, last in planted:
+        _plant(cache, ref, slot, flat, usage)
+        cache.evict_last_tok[flat] = last
+        ref.last_tok[flat] = last
+    stats = torch.zeros(8, dtype=torch.int64, device="cuda")
+    src, dst, _ = _gpu_prefetch(cache, 2, [9], stats)
+    assert src.tolist() == [9] and dst.tolist() == [15], "the prefetch evicted the target layer's fresh resident"
+    np.testing.assert_array_equal(np.stack(ref.prefetch(2, [9])), np.stack([src, dst]))
+    _assert_same_tables(cache, ref)
+
+
+@_cuda
+@pytest.mark.parametrize("rows_per_step", [1, 2])
+def test_lowpri_lru_without_prefetches_is_flashlib(rows_per_step):
+    """Prefetch on routes LRU through the vendored kernel with the low-priority key; while no slot is
+    a prefetch it evicts exactly what flashlib's lru_ensure does."""
+    num_layers, num_experts, size = 8, 64, 200
+    on = _pf_cache("lru", size, num_layers, num_experts)
+    off = _cache("lru", size, num_layers, num_experts)
+    rows = _zipf_rows(30, rows_per_step, seed=41, num_layers=num_layers, num_experts=num_experts)
+    ids = torch.from_numpy(rows.astype(np.int32)).cuda()
+    for r in range(rows.shape[0]):
+        for layer in range(num_layers):
+            a, b = ids[r, layer].clone(), ids[r, layer].clone()
+            on.ensure_experts(layer, a)
+            off.ensure_experts(layer, b)
+            assert torch.equal(a, b)
+            assert torch.equal(on.evict_slots[: int(on.num_indices)], off.evict_slots[: int(off.num_indices)])
+    for name in ("slot_for_id", "id_of_slot", "usage", "step"):
+        assert torch.equal(getattr(on, name), getattr(off, name)), name
+
+
+def test_lru_policy_leaves_flashlib_only_when_prefetch_is_on(monkeypatch):
+    import freetoken.moe.offload_kernels as ok
+
+    calls = []
+    monkeypatch.setattr(ok, "lru_ensure", lambda *a, **kw: calls.append("flashlib"))
+    monkeypatch.setattr(ok, "ensure_experts_scored", lambda *a, **kw: calls.append(("scored", kw["lowpri"])))
+    for mode in ("off", "measure", "on"):
+        cache = _cache("lru", 12, 2, 8, device="cpu", prefetch_mode=mode)
+        cache.prefetch = SimpleNamespace(mode=mode, count_args=lambda layer: None) if mode != "off" else None
+        cache.ensure_experts(1, torch.zeros(2, dtype=torch.int32))
+    assert calls == ["flashlib", "flashlib", ("scored", True)]

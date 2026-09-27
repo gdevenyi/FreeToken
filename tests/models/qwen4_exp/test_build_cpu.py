@@ -47,3 +47,32 @@ def test_every_layer_gets_its_own_prefixed_weights():
     mlp_keys = {k for k in sd if ".mlp." in k}
     layers = {k.split(".layers.")[1].split(".")[0] for k in mlp_keys if ".layers." in k}
     assert len(layers) > 1, f"MoE weights landed on a single layer: {sorted(layers)}"
+
+
+def test_offloaded_layers_borrow_the_next_router_for_the_lookahead():
+    # FREETOKEN_MOE_PREFETCH: layer L-1's experts hold layer L's router, outside the state dict
+    # and without the engine's offload-layer walk finding extra layers through it
+    import dataclasses
+
+    from freetoken.moe.offload_cache import iter_offload_moe_layers
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    previous = rotary._ROPE_DEVICE
+    set_rope_device(torch.device("cpu"))
+    try:
+        config = dataclasses.replace(parse_config(toy_hf_config()), moe_strategy="offload")
+        with torch.device("meta"):
+            model = Qwen4ExpForCausalLM(config)
+    finally:
+        rotary.get_rope.cache_clear()
+        set_rope_device(previous)
+    mlps = [layer.mlp for layer in model.model.layers.op_list]
+    assert len(list(iter_offload_moe_layers(model))) == len(mlps) == 4
+    wired = [mlp.experts._lookahead for mlp in mlps]
+    assert wired[-1] is None
+    assert [(gate is mlps[t].gate, t, budget) for gate, t, budget in wired[:-1]] == [
+        (True, 1, 3), (True, 2, 3), (True, 3, 4),  # layer 3 is the full-attention one
+    ]
+    assert not any("lookahead" in k for k in model.state_dict())
+    assert sum(k.endswith(".mlp.gate.weight") for k in model.state_dict()) == 4
