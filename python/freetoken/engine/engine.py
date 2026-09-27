@@ -1181,6 +1181,9 @@ class Engine:
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        audit = self.moe_offload_cache.audit if self.moe_offload_cache is not None else None
+        if audit is not None and batch.is_decode:
+            audit.end_decode_step(self.moe_offload_cache)  # every side stream has joined the compute stream
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1195,11 +1198,21 @@ class Engine:
         logprobs_out = self.sampler.compute_logprobs(batch_logits, next_tokens_gpu, args)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if self.moe_offload_cache is not None and self.moe_offload_cache.collect_stats and batch.is_decode:
+        cache = self.moe_offload_cache
+        if cache is not None and batch.is_decode and (
+            cache.collect_stats or cache.prefetch is not None or cache.verify is not None or cache.audit is not None
+        ):
             self._moe_stats_step += 1
             if self._moe_stats_step >= MOE_STATS_INTERVAL:
                 self._moe_stats_step = 0
-                self._emit_moe_stats()
+                if cache.prefetch is not None:
+                    self._emit_prefetch_stats()
+                if cache.verify is not None:
+                    self._emit_verify_stats()
+                if cache.audit is not None:
+                    self._emit_audit_stats()
+                if cache.collect_stats:
+                    self._emit_moe_stats()
         if logprobs_out is None:
             return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
         chosen_logprobs, top_ids, top_logprobs = logprobs_out
@@ -1242,6 +1255,39 @@ class Engine:
         if mc.has_linear_attention and cap >= 8193:
             lens.add(8193)  # chunk_delta_h NT bucket 2 (NT > 128)
         return sorted(n for n in lens if 2 <= n <= cap)
+
+    def _emit_prefetch_stats(self) -> None:
+        """Report one window of the FREETOKEN_MOE_PREFETCH counters (one host sync), then restart them."""
+        from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
+
+        prefetch = self.moe_offload_cache.prefetch
+        window = prefetch.take_window()
+        stats = summarize(window, prefetch.mode)
+        if not stats["layer_calls"]:
+            return
+        logger.info_rank0(f"MoE prefetch {prefetch.mode} ({MOE_STATS_INTERVAL} decode steps): {format_summary(stats)}")
+        if ENV.MOE_PREFETCH_DEBUG:
+            logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(window)}")
+
+    def _emit_verify_stats(self) -> None:
+        """Report one window of the FREETOKEN_MOE_PREFETCH_VERIFY counts and the new bad records (host syncs)."""
+        _log_lines(self.moe_offload_cache.verify.report_window(MOE_STATS_INTERVAL))
+
+    def _emit_audit_stats(self) -> None:
+        """Report one window of FREETOKEN_MOE_SLOT_AUDIT totals and the new bad slots (host syncs)."""
+        _log_lines(self.moe_offload_cache.audit.report_window(MOE_STATS_INTERVAL))
+
+    def _log_prefetch_totals(self) -> None:
+        from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
+
+        prefetch = self.moe_offload_cache.prefetch if self.moe_offload_cache is not None else None
+        if prefetch is None:
+            return
+        totals = prefetch.totals + prefetch.stats.cpu()
+        stats = summarize(totals, prefetch.mode)
+        if stats["layer_calls"]:
+            logger.info_rank0(f"MoE prefetch {prefetch.mode} (session, {stats['tokens']} tokens): {format_summary(stats)}")
+            logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(totals)}")
 
     def _emit_moe_stats(self) -> None:
         """Report one window of expert-cache behaviour, then reset the miss counters.
@@ -1365,9 +1411,30 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        try:
+            self._log_prefetch_totals()
+        except Exception as exc:  # noqa: BLE001 -- a diagnostic must never block shutdown
+            logger.warning(f"MoE prefetch totals unavailable at shutdown: {exc}")
+        try:
+            verify = self.moe_offload_cache.verify if self.moe_offload_cache is not None else None
+            if verify is not None:
+                _log_lines(verify.report_session())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MoE verify totals unavailable at shutdown: {exc}")
+        try:
+            audit = self.moe_offload_cache.audit if self.moe_offload_cache is not None else None
+            if audit is not None:
+                _log_lines(audit.report_session())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MoE slot audit totals unavailable at shutdown: {exc}")
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _log_lines(lines: list[tuple[str, str]]) -> None:
+    for level, line in lines:
+        (logger.warning_rank0 if level == "warning" else logger.info_rank0)(line)
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
