@@ -1524,6 +1524,41 @@ def test_moe_prefetch_verify_is_quiet_on_a_correct_decode(graph, bs, prefetch, v
 
 @requires_cuda
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+@pytest.mark.parametrize("path", list(_PREFILL_PATHS))
+def test_moe_prefetch_verify_is_quiet_across_prefills(graph, prefetch, path, monkeypatch):
+    """Every request prefills before it decodes: the whole-layer materialize, the overlap double
+    buffers (with the hit-D2D gather) and small prefills rewrite slots between decode steps, and the
+    decode checks after each of them still find nothing."""
+    import freetoken.layers.moe as layers_moe
+    from freetoken.moe.verify import CHECKS
+
+    cache_size, tokens, cache_kw, small = _PREFILL_PATHS[path]
+    monkeypatch.setattr(layers_moe, "_SMALL_PREFILL_TOKENS", small)
+    banks = _prefetch_banks("nvfp4")
+    decode = _prefetch_inputs(2, steps=18, seed=75)
+    gen = torch.Generator(device="cuda").manual_seed(76)
+    prefills = [[torch.randn(tokens, _PF_HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.5
+                 for _ in range(_PF_LAYERS)] for _ in range(2)]
+    schedule = ([("decode", xs) for xs in decode[:6]] + [("prefill", prefills[0])]
+                + [("decode", xs) for xs in decode[6:12]] + [("prefill", prefills[1])]
+                + [("decode", xs) for xs in decode[12:]])
+    moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, budget=8, overlap=True, cache_size=cache_size,
+                                  verify_mode="full", **cache_kw)
+    before_step = None
+    if prefetch == "on":
+        steps = _garbage(_routed_ids(moes, [xs for _, xs in schedule]), 12, "adversarial", seed=77)
+        before_step = _with_override(cache, steps)
+    _mixed_run(moes, cache, 2, graph, schedule, before_step=before_step)
+    counts, records = _verify_state(cache)
+    if path == "overlap_d2d":
+        assert cache.prefill_hit_rows > 0, "the hit-D2D gather must have read resident slots"
+    assert counts[CHECKS] == (len(decode) + 1) * _PF_LAYERS
+    assert counts[CHECKS + 1 :] == [0] * (len(counts) - 1) and records == [], records
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 def test_moe_prefetch_verify_catches_a_missing_copy_join(graph, monkeypatch):
     """Negative control: without the compute stream's wait on the prefetch copy (and with that copy
     late), GEMMs read prefetched slots before their bytes land. The byte check before the GEMM flags
