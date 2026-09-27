@@ -155,6 +155,8 @@ class OffloadMoeCache:
     decode_copy_overlap: bool | None = None
     # GPU decode only: cross-layer expert prefetch (moe/prefetch.py). None = FREETOKEN_MOE_PREFETCH.
     prefetch_mode: str | None = None
+    # GPU decode only: debug slot checks (moe/verify.py). None = FREETOKEN_MOE_PREFETCH_VERIFY.
+    verify_mode: str | None = None
 
     def __post_init__(self) -> None:
         from freetoken.moe.scored_ensure import POLICY_IDS
@@ -319,6 +321,22 @@ class OffloadMoeCache:
         if self.decode_copy_overlap and self.device.type == "cuda" and self.decode_target == "gpu":
             self._init_decode_copy_overlap()
         self.prefetch = self._init_prefetch()
+        self.verify = self._init_verify()
+
+    def _init_verify(self):
+        from freetoken.moe.verify import ExpertVerifier, resolve_mode
+
+        from_env = self.verify_mode is None
+        self.verify_mode = resolve_mode(self.verify_mode)
+        if self.verify_mode == "off" or self.device.type != "cuda":
+            return None
+        if self.decode_target != "gpu":
+            if not from_env:
+                raise ValueError(f"FREETOKEN_MOE_PREFETCH_VERIFY={self.verify_mode} needs GPU decode, not {self.decode_target!r}")
+            logger.warning(f"FREETOKEN_MOE_PREFETCH_VERIFY={self.verify_mode} ignored: decode target is {self.decode_target!r}")
+            self.verify_mode = "off"
+            return None
+        return ExpertVerifier(self.num_layers, self.num_experts, self.device, mode=self.verify_mode)
 
     def _init_prefetch(self):
         from freetoken.moe.prefetch import ExpertPrefetcher, resolve_mode
@@ -491,6 +509,8 @@ class OffloadMoeCache:
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
+        if self.verify is not None:
+            self.verify.bind(self)
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
@@ -627,6 +647,8 @@ class OffloadMoeCache:
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
+        if self.verify is not None:
+            self.verify.bind(self)
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)

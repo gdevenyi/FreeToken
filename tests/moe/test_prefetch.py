@@ -244,3 +244,89 @@ def test_summary_rates():
     assert stats["useful_per_token"] == 3.2 and stats["resident_hits_per_layer"] == 0.5
     assert "useful/token=3.2" in format_summary(stats)
     assert format_per_layer(counters) == "L1=1.20/3.00/4.00, L2=2.00/4.00/3.00"
+
+
+# FREETOKEN_MOE_PREFETCH_VERIFY (moe/verify.py): the mode switch, where the verifier is built, and
+# the engine's report; the checks themselves run on the qwen4_exp stacks in test_skeleton.py
+
+
+def test_verify_mode_switch():
+    from freetoken.moe.verify import resolve_mode
+
+    assert [resolve_mode(m) for m in ("0", "", "off", "1", " True ", "full", "META")] == [
+        "off", "off", "off", "full", "full", "full", "meta"]
+    with pytest.raises(ValueError):
+        resolve_mode("bytes")
+
+
+@requires_cuda
+def test_cache_builds_the_verifier_only_for_gpu_decode(monkeypatch):
+    from freetoken.env import ENV
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    def cache(**kw):
+        return OffloadMoeCache(num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"), **kw)
+
+    monkeypatch.setattr(ENV.MOE_PREFETCH_VERIFY, "value", "0")
+    assert cache().verify is None and cache(verify_mode="off").verify is None
+    full = cache(verify_mode="full", prefetch_mode="on")
+    assert full.verify.mode == "full" and cache(verify_mode="meta").verify.mode == "meta"
+    # the verifier holds no reference to its cache
+    ref = weakref.ref(full)
+    del full
+    assert ref() is None
+    with pytest.raises(ValueError):
+        cache(verify_mode="full", decode_target="hybrid")
+    monkeypatch.setattr(ENV.MOE_PREFETCH_VERIFY, "value", "1")
+    for target in ("hybrid", "cpu"):
+        assert cache(decode_target=target).verify is None
+    assert cache().verify.mode == "full"
+
+
+@requires_cuda
+def test_engine_reports_the_verify_window_and_session(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.engine import engine as engine_mod
+    from freetoken.engine.engine import MOE_STATS_INTERVAL
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.verify import BYTES_PRE, CHECKS, NUM_FIELDS, PRE_BAD
+
+    cache = OffloadMoeCache(num_layers=3, num_experts=4, cache_size=4, device=torch.device("cuda"), verify_mode="full")
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(4, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(3)],
+        "down": [torch.randn(4, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(3)],
+    })
+    v = cache.verify
+    lines = []
+    for level in ("info_rank0", "warning_rank0"):
+        monkeypatch.setattr(engine_mod.logger, level, lambda msg, *a, level=level, **k: lines.append((level, msg)))
+    engine = SimpleNamespace(moe_offload_cache=cache)
+
+    v.counters[:, CHECKS] = 256
+    engine_mod.Engine._emit_verify_stats(engine)
+    assert lines == [("info_rank0", f"MoE verify full ({MOE_STATS_INTERVAL} decode steps): 768 layer calls checked, "
+                                    "meta_bad=0, pre_bad=0, post_bad=0, post_meta_bad=0; session bad=0")]
+    lines.clear()
+    v.counters[:, CHECKS] = 256
+    v.counters[1, PRE_BAD] = 1
+    # call 7, layer 1, row 3 of a top-2 call, expert 2, slot 1, bank down, before the GEMM; slot 1 holds
+    # layer 1's expert 2, usage 9 at lru step 9, demand-copied; bytes 64.. differ in 4 words
+    record = [7, 1, 3, 2, 1, 1, BYTES_PRE, 6, 1, 9, 9, 1, 64, 4]
+    assert len(record) == NUM_FIELDS
+    v.ring[0] = torch.tensor(record)
+    v.cursor.fill_(1)
+    v._top_k = 2
+    engine_mod.Engine._emit_verify_stats(engine)
+    assert [level for level, _ in lines] == ["warning_rank0", "warning_rank0"]
+    assert "pre_bad=1" in lines[0][1] and "(meta/pre/post/post_meta by layer: L1=0/1/0/0); session bad=1" in lines[0][1]
+    assert lines[1][1] == (
+        "MoE verify record: bytes_pre call=7 layer=1 row=3 (token 1, rank 1) expert=2 slot=1 bank=down "
+        "first_bad_byte=64 bad_words=4 | slot now holds L1/e2, slot_for_id=1, usage=9, lru_step=9, slot in: demand copy")
+    lines.clear()
+    engine_mod.Engine._emit_verify_stats(engine)  # nothing checked and no new record: silent
+    assert lines == []
+    session = v.report_session()
+    assert session[0] == ("warning", "MoE verify full (session): 1536 layer calls checked, meta_bad=0, pre_bad=1, "
+                                     "post_bad=0, post_meta_bad=0 (meta/pre/post/post_meta by layer: L1=0/1/0/0)")
+    assert session[1:] == [("warning", "MoE verify record: " + v.format_record(record))]

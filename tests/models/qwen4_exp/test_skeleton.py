@@ -1476,6 +1476,267 @@ def test_moe_prefetch_on_fuzzes_per_layer_stream_delays(seed, rows, policy, monk
     assert torch.equal(stats[:, cols], delayed_stats[:, cols])
 
 
+# FREETOKEN_MOE_PREFETCH_VERIFY: the debug slot checks on the same stacks, quiet on a correct decode
+# and loud on each kind of fault they exist for
+_VERIFY_STEPS = 60
+
+
+def _verify_state(cache):
+    """(counters summed over layers, kept records) of the stack's verifier."""
+    from freetoken.moe.verify import RING
+
+    v = cache.verify
+    torch.cuda.synchronize()
+    return v.counters.cpu().sum(0).tolist(), v.ring[: min(int(v.cursor), RING)].cpu().tolist()
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+@pytest.mark.parametrize("verify", ["full", "meta"])
+def test_moe_prefetch_verify_is_quiet_on_a_correct_decode(graph, bs, prefetch, verify, monkeypatch):
+    """FREETOKEN_MOE_PREFETCH_VERIFY checks every decode layer call and finds nothing on a correct
+    decode: prefetch off, and prefetch on with candidates the GEMMs read, late copies and a late
+    predictor. The checks only read, so the outputs equal those of verify off to the bit."""
+    from freetoken.moe.prefetch import USEFUL
+    from freetoken.moe.verify import CHECKS
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(bs, steps=_VERIFY_STEPS, seed=70)
+    runs = []
+    for mode in ("off", verify):
+        moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, overlap=True, budget=8, verify_mode=mode)
+        before_step = None
+        if prefetch == "on":
+            steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=bs + 70)
+            before_step = _with_override(cache, steps, delay_copy_cycles=_PF_DELAY_CYCLES // 2,
+                                         delay_predict_cycles=_PF_DELAY_CYCLES // 4)
+        runs.append(_prefetch_run(moes, cache, bs, graph, inputs, sleep=0, before_step=before_step))
+    _assert_same_outputs(runs[1][0], runs[0][0])
+    counts, records = _verify_state(cache)
+    assert counts[CHECKS] == (_VERIFY_STEPS + 1) * _PF_LAYERS  # the eager warm-up is checked too
+    assert counts[CHECKS + 1 :] == [0] * (len(counts) - 1) and records == [], records
+    assert (cache.verify.scratch is None) == (verify == "meta")
+    if prefetch == "on":
+        assert int(cache.prefetch.stats[:, USEFUL].sum()) > 0, "the GEMMs must have read prefetched slots"
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+def test_moe_prefetch_verify_catches_a_missing_copy_join(graph, monkeypatch):
+    """Negative control: without the compute stream's wait on the prefetch copy (and with that copy
+    late), GEMMs read prefetched slots before their bytes land. The byte check before the GEMM flags
+    them, and the records place the slot in the layer's prefetch copy plan."""
+    from freetoken.moe.prefetch import ExpertPrefetcher
+    from freetoken.moe.verify import BYTES_PRE, META_BAD, PRE_BAD, R_KIND, R_SOURCE, SRC_PREFETCH
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(1, steps=40, seed=7)
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, overlap=True, budget=8, verify_mode="full")
+
+    def no_wait(self, layer_id):
+        self._inflight[layer_id] = None
+
+    monkeypatch.setattr(ExpertPrefetcher, "join_copy", no_wait)
+    if graph:
+        # a capture needs the copy stream joined back: after the last layer, past every GEMM it races
+        last, copy_stream = moes[-1].forward, cache.prefetch.copy_stream
+
+        def forward(x):
+            out = last(x)
+            torch.cuda.current_stream().wait_stream(copy_stream)
+            return out
+
+        monkeypatch.setattr(moes[-1], "forward", forward)
+    steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=11)
+    # ~2.5 ms a copy: the copy stream falls ever further behind even an eager host's slow enqueue
+    _prefetch_run(moes, cache, 1, graph, inputs, sleep=0,
+                  before_step=_with_override(cache, steps, delay_copy_cycles=5 * _PF_DELAY_CYCLES))
+    counts, records = _verify_state(cache)
+    assert counts[PRE_BAD] > 0 and counts[META_BAD] == 0
+    assert any(r[R_KIND] == BYTES_PRE and r[R_SOURCE] & SRC_PREFETCH for r in records)
+
+
+def _on_call(layer, call, action):
+    """Wrap ExpertVerifier.before_gemm so ``action(verifier, cache, slots, real)`` replaces it on the
+    ``call``-th decode call of ``layer`` (call 0 is the eager warm-up)."""
+    from freetoken.moe.verify import ExpertVerifier
+
+    real, seen = ExpertVerifier.before_gemm, {}
+
+    def before_gemm(self, cache, slots, next_plan):
+        at = self._call[0]
+        seen[at] = seen.get(at, -1) + 1
+        if (at, seen[at]) == (layer, call):
+            return action(self, cache, slots, lambda: real(self, cache, slots, next_plan))
+        return real(self, cache, slots, next_plan)
+
+    return before_gemm
+
+
+@requires_cuda
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+def test_moe_prefetch_verify_catches_a_corrupt_slot(prefetch, monkeypatch):
+    """Negative control: bytes flipped in one bank of one routed slot right before the checks are
+    flagged before the GEMM, with the call, layer, slot, expert, bank and byte offset of the flip."""
+    from freetoken.moe.verify import (BYTES_PRE, META_BAD, PRE_BAD, R_BANK, R_CALL, R_EXPERT, R_FIRST_BYTE,
+                                      R_KIND, R_LAYER, R_SLOT, ExpertVerifier)
+
+    banks = _prefetch_banks("nvfp4")
+    moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, overlap=True, verify_mode="full")
+    hit = {}
+
+    def corrupt(verifier, cache, slots, real):
+        torch.cuda.synchronize()
+        hit.update(slot=int(slots.view(-1)[0]), expert=int(verifier.ids[0]))
+        cache.bank_views()[3][hit["slot"]].view(torch.uint8).view(-1)[100:108].bitwise_not_()
+        real()
+
+    monkeypatch.setattr(ExpertVerifier, "before_gemm", _on_call(2, 10, corrupt))
+    _prefetch_run(moes, cache, 1, False, _prefetch_inputs(1, steps=20, seed=71), sleep=0)
+    counts, records = _verify_state(cache)
+    assert counts[PRE_BAD] >= 1 and counts[META_BAD] == 0
+    first = records[0]
+    assert [first[f] for f in (R_KIND, R_CALL, R_LAYER, R_SLOT, R_EXPERT, R_BANK, R_FIRST_BYTE)] == [
+        BYTES_PRE, 10, 2, hit["slot"], hit["expert"], 3, 100]
+
+
+@requires_cuda
+@pytest.mark.parametrize("verify", ["full", "meta"])
+def test_moe_prefetch_verify_catches_a_wrong_slot_owner(verify, monkeypatch):
+    """Negative control: a routed slot's id_of_slot names another layer's expert while the checks
+    before the GEMM run (restored right after them): exactly that entry is flagged, with the owner it
+    saw, and the checks after the GEMM find the maps whole again."""
+    from freetoken.moe.verify import (CHECKS, META_BAD, META_PRE, R_CALL, R_EXPERT, R_KIND, R_LAYER, R_MAPPED,
+                                      R_OWNER, R_ROW, R_SLOT, ExpertVerifier)
+
+    banks = _prefetch_banks("nvfp4")
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True, verify_mode=verify)
+    hit = {}
+
+    def corrupt(verifier, cache, slots, real):
+        torch.cuda.synchronize()
+        s, e = int(slots.view(-1)[1]), int(verifier.ids[1])
+        hit.update(slot=s, expert=e, saved=int(cache.id_of_slot[s]))
+        cache.id_of_slot[s] = 3 * _PF_EXPERTS + e  # in range: an ensure reading it stays in bounds
+        real()
+        cache.id_of_slot[s] = hit["saved"]
+
+    monkeypatch.setattr(ExpertVerifier, "before_gemm", _on_call(1, 7, corrupt))
+    _prefetch_run(moes, cache, 1, False, _prefetch_inputs(1, steps=12, seed=72), sleep=0)
+    counts, records = _verify_state(cache)
+    assert hit["saved"] == _PF_EXPERTS + hit["expert"]
+    assert counts[META_BAD] == 1 and sum(counts[CHECKS + 1 :]) == 1 and len(records) == 1
+    rec = records[0]
+    assert [rec[f] for f in (R_KIND, R_CALL, R_LAYER, R_ROW, R_SLOT, R_EXPERT, R_OWNER, R_MAPPED)] == [
+        META_PRE, 7, 1, 1, hit["slot"], hit["expert"], 3 * _PF_EXPERTS + hit["expert"], hit["slot"]]
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+def test_moe_prefetch_verify_catches_a_write_during_the_gemm(graph, prefetch, monkeypatch):
+    """Negative control: another stream rewrites a routed slot while the GEMM runs, after the checks
+    before it (a sleep on the compute stream holds the GEMM until the write lands). The byte check
+    after the GEMM flags it; the check before it saw nothing."""
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.verify import (BYTES_POST, BYTES_PRE, POST_BAD, R_BANK, R_CALL, R_FIRST_BYTE, R_KIND, R_LAYER,
+                                      R_SLOT, ExpertVerifier)
+
+    banks = _prefetch_banks("nvfp4")
+    moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, overlap=True, verify_mode="full")
+    side, real, armed = torch.cuda.Stream(), OffloadMoELayer._expert_gemm, {"on": False}
+    slot = torch.zeros((1,), dtype=torch.int64, device="cuda")
+    offset = torch.arange(16, device="cuda")
+
+    def gemm(self, cache, hidden, weights, topk_ids, *, is_prefill, **kw):
+        if armed["on"] and self.layer_id == 3 and not is_prefill:
+            slot.copy_(topk_ids.view(-1)[:1])  # device side, so a captured graph rewrites this step's slot
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                torch.cuda._sleep(_PF_DELAY_CYCLES // 20)
+                row = cache.bank_views()[0].view(cache.cache_size, -1)
+                row.index_put_((slot, offset), row[slot, offset].bitwise_not())
+            torch.cuda._sleep(_PF_DELAY_CYCLES)
+            out = real(self, cache, hidden, weights, topk_ids, is_prefill=is_prefill, **kw)
+            torch.cuda.current_stream().wait_stream(side)  # a capture must join the side stream back
+            return out
+        return real(self, cache, hidden, weights, topk_ids, is_prefill=is_prefill, **kw)
+
+    monkeypatch.setattr(OffloadMoELayer, "_expert_gemm", gemm)
+    real_run = ExpertVerifier.before_gemm
+
+    def arm_at_call_5(self, cache, slots, next_plan):
+        # graph: the arm must be set while capturing, so the rewrite replays every step; eager: once at call 5
+        armed["on"] = self._call[0] == 3 and (graph or int(self.calls[3]) == 5)
+        return real_run(self, cache, slots, next_plan)
+
+    monkeypatch.setattr(ExpertVerifier, "before_gemm", arm_at_call_5)
+    _prefetch_run(moes, cache, 1, graph, _prefetch_inputs(1, steps=8, seed=73), sleep=0)
+    torch.cuda.synchronize()
+    counts, records = _verify_state(cache)
+    assert counts[POST_BAD] >= 1
+    first = records[0]
+    assert [first[f] for f in (R_KIND, R_LAYER, R_BANK, R_FIRST_BYTE)] == [BYTES_POST, 3, 0, 0]
+    assert not any(r[R_KIND] == BYTES_PRE and (r[R_CALL], r[R_SLOT]) == (first[R_CALL], first[R_SLOT]) for r in records)
+
+
+@requires_cuda
+def test_moe_prefetch_verify_off_builds_and_launches_nothing(monkeypatch):
+    """With the flag off there is no verifier and a decode launches only what it launches without
+    one; meta and full only add launches (their kernels, the id copy and the host-row gather)."""
+    from collections import Counter
+
+    from torch.profiler import ProfilerActivity, profile
+
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.MOE_PREFETCH_VERIFY, "value", "0")
+    banks = _prefetch_banks("bf16")
+    inputs = _prefetch_inputs(1, steps=2)
+
+    def kernels(verify):
+        moes, cache = _prefetch_stack("bf16", banks, "off", monkeypatch, verify_mode=verify)
+        _prefetch_run(moes, cache, 1, False, inputs[:1])  # warm up and compile outside the trace
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            _prefetch_run(moes, cache, 1, False, inputs)
+        return cache, Counter(e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA)
+
+    cache, off = kernels(None)
+    assert cache.verify is None and cache.verify_mode == "off"
+    ours = ("_plan_kernel", "_compare_kernel", "_tally_kernel")
+    assert not any(k in name for name in off for k in ours)
+    for mode in ("meta", "full"):
+        _, on = kernels(mode)
+        assert not off - on, f"{mode} dropped a launch"
+        added = on - off
+        assert all(any(k in name for k in (*ours, "Memcpy", "fast_index_copy_multi")) for name in added), added
+        assert any("_compare_kernel" in name for name in added) == (mode == "full")
+
+
+@requires_cuda
+def test_moe_prefetch_verify_follows_a_rebuild(monkeypatch):
+    """A rebuild reallocates the slot banks (production rebuilds to its final slot count after start):
+    the verifier keeps its scratch and counts, points its byte checks at the new banks, and a
+    recaptured graph checks clean."""
+    from freetoken.moe.verify import CHECKS
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(2, steps=30, seed=74)
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, overlap=True, verify_mode="full")
+    v = cache.verify
+    scratch = v.scratch
+    _prefetch_run(moes, cache, 2, True, inputs, sleep=0)
+    cache.rebuild(_PF_EXPERTS + 4)
+    assert cache.verify is v and v.scratch is scratch
+    assert v.cache_ptrs.tolist() == [bank.data_ptr() for bank in cache.bank_views()]
+    _prefetch_run(moes, cache, 2, True, inputs, sleep=0)
+    counts, records = _verify_state(cache)
+    assert counts[CHECKS] == 2 * (30 + 1) * _PF_LAYERS
+    assert counts[CHECKS + 1 :] == [0] * (len(counts) - 1) and records == []
+
+
 @requires_cuda
 def test_decoder_stack_prefill_and_decode(monkeypatch):
     """Ragged bs=3 prefill then a bs=3 decode step through the whole model with dummy weights."""

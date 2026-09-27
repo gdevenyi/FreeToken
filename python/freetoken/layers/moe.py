@@ -308,7 +308,9 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        prefetch = cache.prefetch
+        prefetch, verify = cache.prefetch, cache.verify
+        if verify is not None:
+            verify.begin(cache, self.layer_id, topk_ids, prefetch and prefetch.plan_of(self.layer_id))
         if prefetch is not None:
             prefetch.join_ensure(self.layer_id)
         cache.ensure_experts(self.layer_id, topk_ids, router_logits=router_logits)
@@ -322,7 +324,10 @@ class OffloadMoELayer(MoELayer):
             prefetch.join_and_count(self.layer_id, topk_ids, cache.id_of_slot, cache.num_indices)
             if target is not None:
                 prefetch.issue_copy(target)
-        return self._expert_gemm(
+        if verify is not None:
+            # after issue_copy: the next layer's prefetch copy starts when it would without the checks
+            verify.before_gemm(cache, topk_ids, None if target is None else prefetch.plan_of(target))
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -332,6 +337,9 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if verify is not None:
+            verify.after_gemm(cache)
+        return out
 
     def _fork_lookahead(self, cache: OffloadMoeCache, prefetch, hidden_states: torch.Tensor) -> int | None:
         """Predict the next layer's experts beside this layer's miss copy (not under TP, and never

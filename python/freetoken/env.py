@@ -87,6 +87,10 @@ class EnvClassSingleton:
     MOE_PREFETCH_BUDGET = EnvInt(0)
     # measure mode: also log the per-layer breakdown with every summary
     MOE_PREFETCH_DEBUG = EnvBool(False)
+    # debug: check every GPU decode layer call's slot maps (meta) and slot bytes before/after the GEMM (1)
+    MOE_PREFETCH_VERIFY = EnvStr("0")
+    # routed experts a call byte-checks (scratch rows, ~2.8 MB each on Qwen3.8-Flash)
+    MOE_PREFETCH_VERIFY_ROWS = EnvInt(20)
 
     def __new__(cls):
         # single instance

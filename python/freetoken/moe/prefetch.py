@@ -293,6 +293,12 @@ class ExpertPrefetcher:
             return None
         return self.stats[layer_id], self.pf_ready[layer_id], self.pf_num[layer_id], x.shape[0]
 
+    def plan_of(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """On mode: ``layer_id``'s prefetch copy plan (slots, count) while its prefetch is in flight."""
+        if self.mode != "on" or self._inflight[layer_id] is None:
+            return None
+        return self.pf_slots[layer_id], self.pf_num[layer_id]
+
     def join_copy(self, layer_id: int) -> None:
         """On mode: the compute stream waits for ``layer_id``'s prefetch copy before its own copy, so
         a prefetched slot ensure(L) picked as a demand victim is never written by two copies."""

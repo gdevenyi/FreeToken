@@ -1196,12 +1196,14 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         cache = self.moe_offload_cache
-        if cache is not None and (cache.collect_stats or cache.prefetch is not None) and batch.is_decode:
+        if cache is not None and (cache.collect_stats or cache.prefetch is not None or cache.verify is not None) and batch.is_decode:
             self._moe_stats_step += 1
             if self._moe_stats_step >= MOE_STATS_INTERVAL:
                 self._moe_stats_step = 0
                 if cache.prefetch is not None:
                     self._emit_prefetch_stats()
+                if cache.verify is not None:
+                    self._emit_verify_stats()
                 if cache.collect_stats:
                     self._emit_moe_stats()
         if logprobs_out is None:
@@ -1259,6 +1261,10 @@ class Engine:
         logger.info_rank0(f"MoE prefetch {prefetch.mode} ({MOE_STATS_INTERVAL} decode steps): {format_summary(stats)}")
         if ENV.MOE_PREFETCH_DEBUG:
             logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(window)}")
+
+    def _emit_verify_stats(self) -> None:
+        """Report one window of the FREETOKEN_MOE_PREFETCH_VERIFY counts and the new bad records (host syncs)."""
+        _log_lines(self.moe_offload_cache.verify.report_window(MOE_STATS_INTERVAL))
 
     def _log_prefetch_totals(self) -> None:
         from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
@@ -1398,9 +1404,20 @@ class Engine:
             self._log_prefetch_totals()
         except Exception as exc:  # noqa: BLE001 -- a diagnostic must never block shutdown
             logger.warning(f"MoE prefetch totals unavailable at shutdown: {exc}")
+        try:
+            verify = self.moe_offload_cache.verify if self.moe_offload_cache is not None else None
+            if verify is not None:
+                _log_lines(verify.report_session())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MoE verify totals unavailable at shutdown: {exc}")
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _log_lines(lines: list[tuple[str, str]]) -> None:
+    for level, line in lines:
+        (logger.warning_rank0 if level == "warning" else logger.info_rank0)(line)
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
