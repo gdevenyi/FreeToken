@@ -13,3 +13,14 @@ def _runtime():
     core._GLOBAL_CTX = None
     yield
     core._GLOBAL_CTX = None
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        import gc
+
+        # torch keeps a cuBLAS workspace per stream for good: each offload cache's dedicated
+        # streams would otherwise pin ~16 MiB for the rest of the session
+        gc.collect()
+        torch.cuda.synchronize()
+        torch._C._cuda_clearCublasWorkspaces()
+        torch.cuda.empty_cache()
