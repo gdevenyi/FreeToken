@@ -409,7 +409,7 @@ class SlotAuditor:
                 num=None, start: int = 0, row: int = ROW_PLAN, row_base: int = 0, pred: int = PRED_ALL) -> None:
         if width <= 0 or not self.num_slots:
             return
-        block = min(triton.next_power_of_2(width), 1024)
+        block = min(triton.next_power_of_2(width), 128)
         d = self._dummy
         _record_kernel[(triton.cdiv(width, block),)](
             self.meta_hist if meta else self.bytes_hist, self.meta_cur if meta else self.bytes_cur,

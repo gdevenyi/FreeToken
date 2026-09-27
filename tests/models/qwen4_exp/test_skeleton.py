@@ -1912,10 +1912,10 @@ def test_moe_slot_audit_explains_a_skipped_prefetch_copy(graph, policy, monkeypa
     moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, policy=policy, overlap=True, budget=8, slot_audit=1)
     real = cache.copy_rows
 
-    def copy_rows(layer_id, dst, src, num, *, slim, kind=0):
-        if kind == sa.PREFETCH_COPY and layer_id == 2:
+    def copy_rows(layer_id, dst, src, num, *, slim, **kw):
+        if kw.get("kind") == sa.PREFETCH_COPY and layer_id == 2:
             return None  # the fault: no bytes move (and so nothing is recorded)
-        return real(layer_id, dst, src, num, slim=slim, kind=kind)
+        return real(layer_id, dst, src, num, slim=slim, **kw)
 
     monkeypatch.setattr(cache, "copy_rows", copy_rows)
     steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=85)

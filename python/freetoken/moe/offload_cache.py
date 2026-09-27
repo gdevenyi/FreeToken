@@ -293,8 +293,9 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
-        # the slot audit's label for the staged copy
+        # the slot audit's label for the staged copy, and the most entries its plan can have
         self._pending_kind = 0
+        self._pending_width: int | None = None
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -1095,6 +1096,7 @@ class OffloadMoeCache:
 
             kind = sa.DEMAND_INSTALL if update_state else sa.PREFILL_INSTALL
             self._pending_kind = sa.DEMAND_COPY if update_state else sa.PREFILL_COPY
+            self._pending_width = width
             audit.record_plan(self, kind, layer_id, self.evict_slots, self.src_indices, self.num_indices, meta=True, width=width)
 
     def prefetch_ensure(
@@ -1149,6 +1151,7 @@ class OffloadMoeCache:
             self.evict_slot_owner[: self.num_experts].fill_(-1)  # it installs the layer into these slots
         if audit is not None:
             self._pending_kind = sa.MATERIALIZE_COPY
+            self._pending_width = self.num_experts
             audit.record_plan(self, sa.MATERIALIZE_INSTALL, layer_id, self.evict_slots, self.src_indices, self.num_indices,
                               meta=True, width=self.num_experts)
 
@@ -1311,20 +1314,21 @@ class OffloadMoeCache:
 
                 self.audit.record_range(self, PAGEABLE_COPY, layer_id, 0, self.num_experts, meta=False)
             return
-        self.copy_rows(layer_id, self.evict_slots, self.src_indices, self.num_indices, slim=_SLIM_COPY, kind=self._pending_kind)
+        self.copy_rows(layer_id, self.evict_slots, self.src_indices, self.num_indices, slim=_SLIM_COPY,
+                       kind=self._pending_kind, width=self._pending_width)
 
     def copy_rows(
         self, layer_id: int, dst_slots: torch.Tensor, src_rows: torch.Tensor, num: torch.Tensor, *, slim: bool,
-        kind: int = 0,
+        kind: int = 0, width: int | None = None,
     ) -> None:
         """Copy host rows ``src_rows[:num]`` of ``layer_id``'s banks into slots ``dst_slots[:num]``
         on the current stream (the demand plan, or a prefetch plan on the prefetch copy stream);
-        ``kind`` labels the copy for the slot audit."""
+        ``kind`` labels the copy for the slot audit and ``width`` bounds ``num`` for it."""
         self._copy_rows(layer_id, dst_slots, src_rows, num, slim=slim)
         if self.audit is not None:
             from freetoken.moe.slot_audit import OTHER_COPY
 
-            self.audit.record_plan(self, kind or OTHER_COPY, layer_id, dst_slots, src_rows, num, meta=False)
+            self.audit.record_plan(self, kind or OTHER_COPY, layer_id, dst_slots, src_rows, num, meta=False, width=width)
 
     def _copy_rows(
         self, layer_id: int, dst_slots: torch.Tensor, src_rows: torch.Tensor, num: torch.Tensor, *, slim: bool
