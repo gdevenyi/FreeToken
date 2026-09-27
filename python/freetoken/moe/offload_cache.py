@@ -323,11 +323,17 @@ class OffloadMoeCache:
     def _init_prefetch(self):
         from freetoken.moe.prefetch import ExpertPrefetcher, resolve_mode
 
+        from_env = self.prefetch_mode is None
         self.prefetch_mode = resolve_mode(self.prefetch_mode)
         if self.prefetch_mode == "off":
             return None
         if self.decode_target != "gpu":
-            raise ValueError(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} needs GPU decode, not {self.decode_target!r}")
+            if not from_env:
+                raise ValueError(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} needs GPU decode, not {self.decode_target!r}")
+            # the process-wide flag skips hybrid/CPU-decoded caches, like FREETOKEN_MOE_COPY_OVERLAP
+            logger.warning(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} ignored: decode target is {self.decode_target!r}")
+            self.prefetch_mode = "off"
+            return None
         if self.device.type != "cuda":
             return None
         prefetch = ExpertPrefetcher(self.num_layers, self.num_experts, self.device, mode=self.prefetch_mode)

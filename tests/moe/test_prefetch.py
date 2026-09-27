@@ -62,6 +62,19 @@ def test_cache_builds_the_prefetcher_only_when_asked():
 
 
 @requires_cuda
+def test_the_prefetch_env_flag_skips_caches_that_do_not_decode_on_the_gpu(monkeypatch):
+    # a process-wide flag must not break hybrid or CPU-decoded caches, as FREETOKEN_MOE_COPY_OVERLAP does not
+    from freetoken.env import ENV
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(ENV.MOE_PREFETCH, "value", "on")
+    for target in ("hybrid", "cpu"):
+        c = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"), decode_target=target)
+        assert c.prefetch is None and not c.prefetch_on
+    assert OffloadMoeCache(num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda")).prefetch_on
+
+
+@requires_cuda
 def test_select_known_answers():
     # order by logit: 1, 4, 6, 2, 3, 7, 0, 5; experts 4 and 2 are resident
     logits = [[0.1, 0.9, 0.5, 0.3, 0.8, 0.0, 0.7, 0.2]]
