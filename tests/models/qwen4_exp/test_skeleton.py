@@ -1437,7 +1437,6 @@ def test_moe_prefetch_on_writes_the_slot_maps_only_on_the_compute_stream(graph, 
     monkeypatch.setattr(pf_mod, "lookahead_select", spy_select)
     _mixed_run(moes, cache, bs, graph, schedule, before_step=_with_override(cache, steps))
     pf = cache.prefetch
-    assert selects and set(selects) == {(pf._none_resident.data_ptr(), pf.stream.cuda_stream)}
     assert not compute & {pf.stream.cuda_stream, pf.copy_stream.cuda_stream, cache.decode_copy_stream.cuda_stream}
     assert len(compute) == 1 + graph
     writers = {name for name, _ in seen}
@@ -1449,6 +1448,8 @@ def test_moe_prefetch_on_writes_the_slot_maps_only_on_the_compute_stream(graph, 
     assert all(name == "invalidate" and stream in fence for name, stream in off_compute), off_compute
     assert {stream for name, stream in seen if name == "prefetch_ensure"} == compute  # eager, and the capture
     assert int(pf.stats[:, ISSUED].sum()) > 0
+    # after the writer checks, which are what a predictor-side install fails
+    assert selects and set(selects) == {(pf._none_resident.data_ptr(), pf.stream.cuda_stream)}
 
 
 # ~4 ms at the RTX 5080's clock: a select far later than its whole layer
