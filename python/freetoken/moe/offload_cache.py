@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator
@@ -175,6 +176,13 @@ class OffloadMoeCache:
     # GPU decode only: the caller's work that is independent of the routed experts (qwen4_exp: the
     # shared expert) runs on decode_copy_stream beside the miss copy. None = FREETOKEN_MOE_COPY_OVERLAP.
     decode_copy_overlap: bool | None = None
+    # GPU decode only: cross-layer expert prefetch (moe/prefetch.py). None = FREETOKEN_MOE_PREFETCH.
+    prefetch_mode: str | None = None
+    # GPU decode only: debug slot checks (moe/verify.py). None = FREETOKEN_MOE_PREFETCH_VERIFY.
+    verify_mode: str | None = None
+    # GPU decode only: debug slot writer history + audit every N decode steps (moe/slot_audit.py).
+    # None = FREETOKEN_MOE_SLOT_AUDIT, 0 = off.
+    slot_audit: int | None = None
 
     def __post_init__(self) -> None:
         from freetoken.moe.scored_ensure import POLICY_IDS
@@ -340,6 +348,9 @@ class OffloadMoeCache:
         # _stage_tails[g][b]: the pad after buffer b's rows in layout g
         self._stage_tails: list[list[list[torch.Tensor]]] = []
         self._inval: list[slice | torch.Tensor] = []
+        # the slot audit's label for the staged copy, and the most entries its plan can have
+        self._pending_kind = 0
+        self._pending_width: int | None = None
         self.prefill_copy_stream: torch.cuda.Stream | None = None
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
@@ -368,6 +379,70 @@ class OffloadMoeCache:
         self._decode_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         if self.decode_copy_overlap and self.device.type == "cuda" and self.decode_target == "gpu":
             self._init_decode_copy_overlap()
+        self.prefetch = self._init_prefetch()
+        self.verify = self._init_verify()
+        self.audit = self._init_audit()
+
+    def _init_audit(self):
+        from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
+        from freetoken.moe.slot_audit import SlotAuditor, resolve_interval
+
+        from_env = self.slot_audit is None
+        self.slot_audit = resolve_interval(self.slot_audit)
+        if not self.slot_audit or self.device.type != "cuda":
+            return None
+        if self.decode_target != "gpu":
+            if not from_env:
+                raise ValueError(f"FREETOKEN_MOE_SLOT_AUDIT={self.slot_audit} needs GPU decode, not {self.decode_target!r}")
+            logger.warning(f"FREETOKEN_MOE_SLOT_AUDIT={self.slot_audit} ignored: decode target is {self.decode_target!r}")
+            self.slot_audit = 0
+            return None
+        if _skip_fast_index_copy_enabled():
+            logger.warning("FREETOKEN_MOE_SLOT_AUDIT ignored: FREETOKEN_SKIP_FAST_INDEX_COPY makes every copy a no-op")
+            self.slot_audit = 0
+            return None
+        return SlotAuditor(self.num_layers, self.num_experts, self.device, interval=self.slot_audit)
+
+    def _init_verify(self):
+        from freetoken.moe.verify import ExpertVerifier, resolve_mode
+
+        from_env = self.verify_mode is None
+        self.verify_mode = resolve_mode(self.verify_mode)
+        if self.verify_mode == "off" or self.device.type != "cuda":
+            return None
+        if self.decode_target != "gpu":
+            if not from_env:
+                raise ValueError(f"FREETOKEN_MOE_PREFETCH_VERIFY={self.verify_mode} needs GPU decode, not {self.decode_target!r}")
+            logger.warning(f"FREETOKEN_MOE_PREFETCH_VERIFY={self.verify_mode} ignored: decode target is {self.decode_target!r}")
+            self.verify_mode = "off"
+            return None
+        return ExpertVerifier(self.num_layers, self.num_experts, self.device, mode=self.verify_mode)
+
+    def _init_prefetch(self):
+        from freetoken.moe.prefetch import ExpertPrefetcher, resolve_mode
+
+        from_env = self.prefetch_mode is None
+        self.prefetch_mode = resolve_mode(self.prefetch_mode)
+        if self.prefetch_mode == "off":
+            return None
+        if self.decode_target != "gpu":
+            if not from_env:
+                raise ValueError(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} needs GPU decode, not {self.decode_target!r}")
+            # the process-wide flag skips hybrid/CPU-decoded caches, like FREETOKEN_MOE_COPY_OVERLAP
+            logger.warning(f"FREETOKEN_MOE_PREFETCH={self.prefetch_mode} ignored: decode target is {self.decode_target!r}")
+            self.prefetch_mode = "off"
+            return None
+        if self.device.type != "cuda":
+            return None
+        prefetch = ExpertPrefetcher(self.num_layers, self.num_experts, self.device, mode=self.prefetch_mode)
+        # a proxy, not a cycle: dropping the cache must free its slot banks without waiting for gc
+        prefetch.cache = weakref.proxy(self)
+        return prefetch
+
+    @property
+    def prefetch_on(self) -> bool:
+        """FREETOKEN_MOE_PREFETCH=on: every ensure keys prefetched slots low priority."""
+        return self.prefetch is not None and self.prefetch.mode == "on"
 
     def _pool_layout(self, pool: int) -> int:
         return self.layer_layout[self.pool_of_layer.index(pool)]
@@ -651,6 +726,10 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         self._slice_pools()
         self._build_copy_plan()
+        if self.verify is not None:
+            self.verify.bind(self)
+        if self.audit is not None:
+            self.audit.bind(self)
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
@@ -818,6 +897,8 @@ class OffloadMoeCache:
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
         self._slice_pools()
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
+        if self.verify is not None:
+            self.verify.bind(self)
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -839,6 +920,10 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.decode_freq.zero_()
+        if self.prefetch is not None:
+            self.prefetch.reset()
+        if self.audit is not None:
+            self.audit.bind(self)  # new slot arrays: a new history
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -943,6 +1028,10 @@ class OffloadMoeCache:
         """Take buffer ``buffer_id``'s slots for staging ``layer_id``."""
         slots = self._inval[buffer_id]
         if isinstance(slots, slice):
+            if self.audit is not None:
+                from freetoken.moe.slot_audit import INVALIDATE
+
+                self.audit.record_clear(self, INVALIDATE, layer_id, slots.start, slots.stop - slots.start)
             # One fixed-shape launch. The boolean-mask index
             # (slot_for_id[old_ids[old_ids >= 0]] = -1) has a data-dependent shape, so every
             # call hid a device-to-host sync -- and with two buffer reuses per chunk x 48
@@ -1009,6 +1098,10 @@ class OffloadMoeCache:
             self._invalidate_prefill_buffer(buffer_id, layer_id)
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, buffer_id)):
                 view.copy_(per_layer[layer_id], non_blocking=True)
+            if self.audit is not None:
+                from freetoken.moe.slot_audit import PREFILL_BUFFER
+
+                self.audit.record_range(self, PREFILL_BUFFER, layer_id, buffer_id * self.num_experts, self.num_experts, meta=False)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -1110,6 +1203,11 @@ class OffloadMoeCache:
                 self._prefill_hit_num,
                 blocks_per_bank=64,
             )
+            if self.audit is not None:
+                from freetoken.moe.slot_audit import PREFILL_HIT_D2D
+
+                self.audit.record_plan(self, PREFILL_HIT_D2D, layer_id, self._prefill_hit_dst, None, self._prefill_hit_num,
+                                       meta=False, aux=self._prefill_hit_src, row_base=buffer_id * E)
         miss = np.nonzero(~hit_mask)[0]
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
@@ -1142,6 +1240,11 @@ class OffloadMoeCache:
                     torch.tensor(nbytes, dtype=torch.int64),
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
+                if self.audit is not None:
+                    from freetoken.moe.slot_audit import PREFILL_SPLIT_H2D
+
+                    # every row gets at least its small banks from the host, the misses all of them
+                    self.audit.record_range(self, PREFILL_SPLIT_H2D, layer_id, buffer_id * E, E, meta=False)
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
@@ -1200,18 +1303,49 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        if self.cache_policy_id == 0:
+        audit = self.audit
+        if audit is not None and update_state and layer_id == self.evict_clock_layer():
+            audit.begin_step()
+        lowpri = self.prefetch_on
+        width = expert_ids.numel()
+        if self.cache_policy_id == 0 and not lowpri:
             ensure_experts(self, layer_id, expert_ids)
-            return
-        ensure_experts_scored(
-            self,
-            layer_id,
-            expert_ids,
-            bump_tok=update_state and layer_id == self.evict_clock_layer(),
-            update_state=update_state,
-            router_logits=router_logits,
-            pin_since=pin_since,
-        )
+        else:
+            # prefetch on: LRU runs the vendored kernel (flashlib's cannot key low-priority slots)
+            ensure_experts_scored(
+                self,
+                layer_id,
+                expert_ids,
+                bump_tok=update_state and layer_id == self.evict_clock_layer(),
+                update_state=update_state,
+                router_logits=router_logits,
+                pin_since=pin_since,
+                lowpri=lowpri,
+                pf_count=self.prefetch.count_args(layer_id) if lowpri and update_state else None,
+            )
+        if audit is not None:
+            from freetoken.moe import slot_audit as sa
+
+            kind = sa.DEMAND_INSTALL if update_state else sa.PREFILL_INSTALL
+            self._pending_kind = sa.DEMAND_COPY if update_state else sa.PREFILL_COPY
+            self._pending_width = width
+            audit.record_plan(self, kind, layer_id, self.evict_slots, self.src_indices, self.num_indices, meta=True, width=width)
+
+    def prefetch_ensure(
+        self, layer_id: int, query: torch.Tensor, dst_slots: torch.Tensor, src_rows: torch.Tensor,
+        num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor, budget: int | None = None,
+    ) -> None:
+        """Install the first ``budget`` of ``query``'s non-resident experts of ``layer_id`` as
+        low-priority slots and plan their copy into ``dst_slots``/``src_rows``/``num`` (never the
+        demand plan, which copy(L-1) still reads). Runs on the compute stream like every other slot
+        map writer."""
+        from freetoken.moe.offload_kernels import prefetch_ensure_experts
+
+        prefetch_ensure_experts(self, layer_id, query, dst_slots, src_rows, num, stats_row, ready, budget=budget)
+        if self.audit is not None:
+            from freetoken.moe.slot_audit import PREFETCH_INSTALL
+
+            self.audit.record_plan(self, PREFETCH_INSTALL, layer_id, dst_slots, src_rows, num, meta=True)
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False
@@ -1241,18 +1375,36 @@ class OffloadMoeCache:
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        audit = self.audit
+        if audit is not None:
+            from freetoken.moe import slot_audit as sa
+
+            # the kernel also frees this layer's slots above E; record them while they still name it
+            audit.record_clear(self, sa.MATERIALIZE_CLEAR, layer_id, 0, self.cache_size, layer_above_e=True)
         materialize_layer(self, layer_id)
         if self.evict_slot_owner is not None:
             self.evict_slot_owner[: self.num_experts].fill_(-1)  # it installs the layer into these slots
+        if audit is not None:
+            self._pending_kind = sa.MATERIALIZE_COPY
+            self._pending_width = self.num_experts
+            audit.record_plan(self, sa.MATERIALIZE_INSTALL, layer_id, self.evict_slots, self.src_indices, self.num_indices,
+                              meta=True, width=self.num_experts)
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
+        if self.audit is not None:
+            from freetoken.moe.slot_audit import RESET
+
+            self.audit.record_clear(self, RESET, -1, 0, self.cache_size)
         reset_cache(self)
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
         self.reset_evict_state()
+        if self.prefetch is not None:
+            # the graph runner resets after each capture: drop the capture-time counts too
+            self.prefetch.reset_counters()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
@@ -1377,26 +1529,49 @@ class OffloadMoeCache:
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, 0)):
                 view.copy_(per_layer[layer_id])
+            if self.audit is not None:
+                from freetoken.moe.slot_audit import PAGEABLE_COPY
+
+                self.audit.record_range(self, PAGEABLE_COPY, layer_id, 0, self.num_experts, meta=False)
             return
         # materialize stages rows of staging buffer 0; ensure stages slots local to the layer's pool
-        whole = self._pending_whole_layer
+        self.copy_rows(layer_id, self.evict_slots, self.src_indices, self.num_indices, slim=_SLIM_COPY,
+                       kind=self._pending_kind, width=self._pending_width, whole=self._pending_whole_layer)
+
+    def copy_rows(
+        self, layer_id: int, dst_slots: torch.Tensor, src_rows: torch.Tensor, num: torch.Tensor, *, slim: bool,
+        kind: int = 0, width: int | None = None, whole: bool = False,
+    ) -> None:
+        """Copy host rows ``src_rows[:num]`` of ``layer_id``'s banks into slots ``dst_slots[:num]``
+        on the current stream (the demand plan, or a prefetch plan on the prefetch copy stream);
+        ``kind`` labels the copy for the slot audit and ``width`` bounds ``num`` for it. ``dst_slots``
+        are local to the layer's pool, or rows of staging buffer 0 when ``whole`` (materialize)."""
+        self._copy_rows(layer_id, dst_slots, src_rows, num, slim=slim, whole=whole)
+        if self.audit is not None:
+            from freetoken.moe.slot_audit import OTHER_COPY
+
+            self.audit.record_plan(self, kind or OTHER_COPY, layer_id, dst_slots, src_rows, num, meta=False, width=width)
+
+    def _copy_rows(
+        self, layer_id: int, dst_slots: torch.Tensor, src_rows: torch.Tensor, num: torch.Tensor, *, slim: bool,
+        whole: bool = False,
+    ) -> None:
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit, fast_index_copy_multi_slim_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
-            # bank). evict_slots/src_indices/num_indices are shared across banks;
-            # src_indices holds layer-local expert rows, resolved against this layer's
-            # source pointers (layer_id is a static int per captured graph node).
-            copy = fast_index_copy_multi_slim_jit if _SLIM_COPY else fast_index_copy_multi_jit
-            copy(
-                self._copy_dst_ptrs if whole else self._copy_dst_ptrs_pool[self.pool_of_layer[layer_id]],
-                self._copy_src_ptrs[layer_id],
-                self._copy_feat_bytes[self.layer_layout[layer_id]],
-                self.evict_slots,
-                self.src_indices,
-                self.num_indices,
-                blocks_per_bank=self._copy_blocks_per_bank,
-            )
+            # bank). The slot/row plan is shared across banks; src_rows holds layer-local
+            # expert rows, resolved against this layer's source pointers (layer_id is a
+            # static int per captured graph node).
+            dst_ptrs = self._copy_dst_ptrs if whole else self._copy_dst_ptrs_pool[self.pool_of_layer[layer_id]]
+            feat_bytes = self._copy_feat_bytes[self.layer_layout[layer_id]]
+            if slim:
+                fast_index_copy_multi_slim_jit(dst_ptrs, self._copy_src_ptrs[layer_id], feat_bytes, dst_slots, src_rows, num)
+            else:
+                fast_index_copy_multi_jit(
+                    dst_ptrs, self._copy_src_ptrs[layer_id], feat_bytes, dst_slots, src_rows, num,
+                    blocks_per_bank=self._copy_blocks_per_bank,
+                )
             return
 
         from freetoken.kernel import fast_index_copy_jit
@@ -1405,13 +1580,7 @@ class OffloadMoeCache:
         for (per_layer, _), cache in zip(self.banks, views):
             if cache.numel() == 0:
                 continue
-            fast_index_copy_jit(
-                cache,
-                self.evict_slots,
-                per_layer[layer_id],
-                self.src_indices,
-                self.num_indices,
-            )
+            fast_index_copy_jit(cache, dst_slots, per_layer[layer_id], src_rows, num)
 
     @contextmanager
     def decode_side(self, layer_id: int) -> Iterator[None]:
