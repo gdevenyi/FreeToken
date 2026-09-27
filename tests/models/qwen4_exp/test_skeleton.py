@@ -1593,6 +1593,97 @@ def test_moe_prefetch_on_late_select_right_after_a_prefill(graph, bs, path, monk
 
 
 @requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+def test_moe_prefetch_on_install_may_evict_a_slot_whose_prefetch_copy_is_in_flight(graph, bs, policy, monkeypatch):
+    """prefetch_ensure(L) runs on the compute stream before it joins copy(L-1), so it may evict a slot
+    that plan L-1 installed and whose slim copy is still writing it. The next writer of that slot's
+    bytes (copy(L) on the same copy stream, or a demand copy after join_copy) is ordered after copy(L-1):
+    with every copy late and flood candidates the eviction happens (counted on the device, so it holds
+    under replay too), and still no output bit and no slot's bytes change."""
+    from freetoken.moe.prefetch import ExpertPrefetcher
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(bs, steps=40, seed=110)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True, policy=policy)
+    off = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True, budget=8)
+    pf = cache.prefetch
+    evicted_in_flight = torch.zeros((), dtype=torch.int64, device="cuda")
+    col = torch.arange(pf.pf_slots.shape[1], device="cuda")
+    real_install = ExpertPrefetcher.install
+
+    def install(self, target):
+        got = real_install(self, target)
+        if got is not None and got >= 2:
+            # on the compute stream right after prefetch_ensure(got), before join_copy(got - 1)
+            new = torch.where(col < self.pf_num[got], self.pf_slots[got], -2)
+            old = torch.where(col < self.pf_num[got - 1], self.pf_slots[got - 1], -3)
+            shared = (new[:, None] == old[None, :]).any()
+            evicted_in_flight.add_((shared & (self.pf_ready[got - 1][0] == 0)).long())
+        return got
+
+    monkeypatch.setattr(ExpertPrefetcher, "install", install)
+    steps = _garbage(_routed_ids(moes, inputs), 12, "flood", seed=bs + 111)
+    on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0,
+                       before_step=_with_override(cache, steps, delay_copy_cycles=_PF_DELAY_CYCLES))
+    _assert_same_outputs(on[0], off[0])
+    _assert_slots_hold_their_experts(cache)
+    assert int(evicted_in_flight) > 0, "no install evicted a slot of the previous layer's in-flight copy"
+
+
+@requires_cuda
+def test_moe_prefetch_in_flight_eviction_test_catches_an_unordered_next_copy(monkeypatch):
+    """Negative control for the test above: order each prefetch copy only after its own install (not
+    after copy(L-1)'s join) and put odd and even layers' copies on two streams, only the even ones
+    late. A late copy then lands on a slot the next install took over, and the outputs or the held
+    slots' bytes go wrong."""
+    from freetoken.moe.prefetch import ExpertPrefetcher, _mark_ready_kernel, dedicated_stream
+    from freetoken.moe.slot_audit import PREFETCH_COPY
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(1, steps=40, seed=110)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True)
+    off = _prefetch_run(moes, cache, 1, False, inputs, sleep=0)
+    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy="rule", overlap=True, budget=8)
+    pf = cache.prefetch
+    streams = [pf.copy_stream, dedicated_stream(torch.device("cuda"), highest_priority=True)]
+    installed = [torch.cuda.Event() for _ in range(_PF_LAYERS)]
+    real_install = ExpertPrefetcher.install
+
+    def install(self, target):
+        got = real_install(self, target)
+        if got is not None:
+            installed[got].record(torch.cuda.current_stream())
+        return got
+
+    def issue_copy(self, target):
+        if not self._pending(target):
+            return
+        stream = streams[target % 2]
+        stream.wait_event(installed[target])
+        with torch.cuda.stream(stream):
+            if target % 2 == 0:
+                torch.cuda._sleep(_PF_DELAY_CYCLES)
+            self.cache.copy_rows(target, self.pf_slots[target], self.pf_src[target], self.pf_num[target], slim=True,
+                                 kind=PREFETCH_COPY)
+            _mark_ready_kernel[(1,)](self.pf_ready[target])
+            self._copy_events[target][1].record(stream)
+
+    monkeypatch.setattr(ExpertPrefetcher, "install", install)
+    monkeypatch.setattr(ExpertPrefetcher, "issue_copy", issue_copy)
+    steps = _garbage(_routed_ids(moes, inputs), 12, "flood", seed=112)
+    on = _prefetch_run(moes, cache, 1, False, inputs, sleep=0, before_step=_with_override(cache, steps))
+    try:
+        _assert_same_outputs(on[0], off[0])
+        _assert_slots_hold_their_experts(cache)
+    except AssertionError:
+        return
+    pytest.fail("a prefetch copy landing on a slot the next install took over went unnoticed")
+
+
+@requires_cuda
 @pytest.mark.parametrize("kind", ["bf16", "nvfp4"])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("bs", [1, 2])
