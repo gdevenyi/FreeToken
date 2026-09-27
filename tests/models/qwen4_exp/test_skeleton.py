@@ -1879,9 +1879,11 @@ def test_moe_slot_audit_is_quiet_and_changes_no_bit(graph, bs, prefetch, path, m
 @pytest.mark.parametrize("policy", ["rule", "lru"])
 def test_moe_slot_audit_is_quiet_across_graph_sizes_and_eager_steps(policy, monkeypatch):
     """The graph runner's shape: bs 1 and bs 2 graphs in one pool, replayed in any order with eager
-    steps between them (a bs 9 one forks no prefetch); audited after every step, nothing is bad."""
+    steps between them (a bs 9 one forks no prefetch); audited after every step, with the decode
+    verifier on beside it, neither finds anything."""
     from freetoken.moe import slot_audit as sa
     from freetoken.moe.prefetch import MAX_ROWS
+    from freetoken.moe.verify import CHECKS
 
     banks = _prefetch_banks("nvfp4")
     gen = torch.Generator().manual_seed(90)
@@ -1889,12 +1891,15 @@ def test_moe_slot_audit_is_quiet_across_graph_sizes_and_eager_steps(policy, monk
     sizes = {0: 1, 1: 2, 2: 3, 3: MAX_ROWS + 1}
     xs_by_bs = {bs: iter(_prefetch_inputs(bs, steps=40, seed=91 + bs)) for bs in sizes.values()}
     schedule = [(sizes[b], next(xs_by_bs[sizes[b]]), r and sizes[b] <= 2) for b, r in order]
-    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, policy=policy, overlap=True, budget=8, slot_audit=1)
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, policy=policy, overlap=True, budget=8, slot_audit=1,
+                                  verify_mode="meta")
     steps = _garbage(_routed_ids(moes, [xs for _, xs, _ in schedule]), 12, "adversarial", seed=92)
     _multi_graph_run(moes, cache, schedule, before_step=_with_override(cache, steps))
     totals, records = _audit_records(cache)
     assert records == [] and totals[sa.T_BAD] == 0 and totals[sa.T_AUDITS] == len(schedule)
     assert totals[sa.T_BYTES_CHECKED] == totals[sa.T_HELD] > 0
+    counts, verify_records = _verify_state(cache)
+    assert counts[CHECKS] > 0 and counts[CHECKS + 1 :] == [0] * (len(counts) - 1) and verify_records == []
 
 
 @requires_cuda
