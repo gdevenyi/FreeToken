@@ -26,7 +26,7 @@ from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
-from .moe import Qwen4ExpMoE
+from .moe import Qwen4ExpMoE, wire_router_lookahead
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
@@ -101,6 +101,7 @@ class Qwen4ExpModel(BaseOP):
                 for layer_id in range(config.num_layers)
             ]
         )
+        wire_router_lookahead([layer.mlp for layer in self.layers.op_list], config)
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)

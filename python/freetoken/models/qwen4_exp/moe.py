@@ -36,6 +36,10 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         se, ex = self.shared_expert, self.experts
+        if isinstance(ex, OffloadMoELayer):
+            # FREETOKEN_MOE_PREFETCH: the next layer's prediction needs only this block's input, so it
+            # starts here and runs beside this layer's router and ensure
+            ex.fork_lookahead(hidden_states)
         if isinstance(ex, OffloadMoELayer) and ex.decode_side_applies():
             # FREETOKEN_MOE_COPY_OVERLAP: the shared expert runs on a side stream while the router,
             # ensure and miss copy stay back to back on this one; joined before the combine
@@ -65,4 +69,15 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
 
-__all__ = ["Qwen4ExpMoE"]
+def wire_router_lookahead(moes: list[Qwen4ExpMoE], config: ModelConfig) -> None:
+    """Give each offloaded MoE block the next layer's router, for FREETOKEN_MOE_PREFETCH's
+    lookahead (inert when it is off). ``moes[i]`` is decoder layer ``i``'s block."""
+    from freetoken.moe.prefetch import default_budget
+
+    for target in range(1, len(moes)):
+        experts = moes[target - 1].experts
+        if isinstance(experts, OffloadMoELayer):
+            experts.set_lookahead(moes[target].gate, target, default_budget(config.is_linear_layer(target)))
+
+
+__all__ = ["Qwen4ExpMoE", "wire_router_lookahead"]
