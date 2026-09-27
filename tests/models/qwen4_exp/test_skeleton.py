@@ -639,6 +639,8 @@ def _prefetch_run(moes, cache, bs, graph, inputs, before_decode=None, sleep=_PF_
             g.replay()
         else:
             outs = step(xs)
+        if cache.audit is not None:
+            cache.audit.end_decode_step(cache)  # where the engine calls it: after the forward
         results.append([o.clone() for o in outs])
     torch.cuda.synchronize()
     state = [t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage, *cache.bank_views())]
@@ -1278,6 +1280,8 @@ def _mixed_run(moes, cache, bs, graph, schedule, before_step=None):
             outs = graph_outs
         else:
             outs = step(xs)
+        if phase == "decode" and cache.audit is not None:
+            cache.audit.end_decode_step(cache)
         results.append([o.clone() for o in outs])
         if phase == "prefill":
             torch.cuda.synchronize()
@@ -1385,6 +1389,8 @@ def _multi_graph_run(moes, cache, schedule, before_step=None):
             g.replay()
         else:
             outs = step(xs)
+        if cache.audit is not None:
+            cache.audit.end_decode_step(cache)
         results.append([o.clone() for o in outs])
     torch.cuda.synchronize()
     return results
@@ -1770,6 +1776,327 @@ def test_moe_prefetch_verify_follows_a_rebuild(monkeypatch):
     counts, records = _verify_state(cache)
     assert counts[CHECKS] == 2 * (30 + 1) * _PF_LAYERS
     assert counts[CHECKS + 1 :] == [0] * (len(counts) - 1) and records == []
+
+
+# FREETOKEN_MOE_SLOT_AUDIT (moe/slot_audit.py): quiet and output-neutral on a correct decode with
+# prefills between the steps, and each injected persistent fault found with the history that explains it
+
+
+def _audit_records(cache):
+    """(totals, kept records) of the stack's slot audit."""
+    a = cache.audit
+    torch.cuda.synchronize()
+    return a.totals.cpu().tolist(), a.ring[: min(int(a.cursor), a.ring_n)].cpu().tolist()
+
+
+def _bad_slots(cache):
+    """Ground truth: the (slot, owner) pairs whose bytes differ from the owner's host rows."""
+    torch.cuda.synchronize()
+    held = (cache.id_of_slot >= 0).nonzero().view(-1).cpu()
+    ids = cache.id_of_slot[held.cuda()].long().cpu()
+    bad = torch.zeros(held.numel(), dtype=torch.bool)
+    for (per_layer, _), view in zip(cache.banks, cache.bank_views()):
+        want = torch.stack(per_layer).flatten(0, 1)[ids].contiguous().view(torch.uint8).view(held.numel(), -1)
+        got = view[held.cuda()].cpu().contiguous().view(torch.uint8).view(held.numel(), -1)
+        bad |= (got != want).any(dim=1)
+    return {(int(s), int(o)) for s, o, b in zip(held, ids, bad) if b}
+
+
+def _spy_audit_kinds(monkeypatch):
+    """The event kinds the recorders were asked for, at enqueue time."""
+    from freetoken.moe.slot_audit import SlotAuditor
+
+    kinds, real = set(), SlotAuditor._launch
+
+    def launch(self, cache, kind, *args, **kwargs):
+        kinds.add(kind)
+        return real(self, cache, kind, *args, **kwargs)
+
+    monkeypatch.setattr(SlotAuditor, "_launch", launch)
+    return kinds
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+@pytest.mark.parametrize("path", list(_PREFILL_PATHS))
+def test_moe_slot_audit_is_quiet_and_changes_no_bit(graph, bs, prefetch, path, monkeypatch):
+    """FREETOKEN_MOE_SLOT_AUDIT=1 records every slot writer (the decode and prefetch ensures and copies,
+    and between the decode steps the whole-layer materialize, the overlap double buffers with the
+    hit-D2D gather, or small prefills) and audits every held slot after each decode step: it finds
+    nothing, and the outputs, slot maps and slot bytes equal those of the audit off to the bit."""
+    import freetoken.layers.moe as layers_moe
+    import freetoken.moe.offload_cache as offload_cache
+    from freetoken.moe import slot_audit as sa
+
+    cache_size, tokens, cache_kw, small = _PREFILL_PATHS[path]
+    monkeypatch.setattr(layers_moe, "_SMALL_PREFILL_TOKENS", small)
+    if path == "overlap_d2d":
+        # every toy bank is under the 256 KiB small-bank floor, which would leave the hit gather idle
+        monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 8192)
+    banks = _prefetch_banks("nvfp4")
+    decode = _prefetch_inputs(bs, steps=18, seed=81)
+    gen = torch.Generator(device="cuda").manual_seed(82)
+    prefills = [[torch.randn(tokens, _PF_HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.5
+                 for _ in range(_PF_LAYERS)] for _ in range(2)]
+    schedule = ([("decode", xs) for xs in decode[:6]] + [("prefill", prefills[0])]
+                + [("decode", xs) for xs in decode[6:12]] + [("prefill", prefills[1])]
+                + [("decode", xs) for xs in decode[12:]])
+    kinds = _spy_audit_kinds(monkeypatch)
+    runs = []
+    for interval in (0, 1):
+        moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, budget=8, overlap=True,
+                                      cache_size=cache_size, slot_audit=interval, **cache_kw)
+        assert (cache.audit is None) == (interval == 0)
+        before_step = None
+        if prefetch == "on":
+            steps = _garbage(_routed_ids(moes, [xs for _, xs in schedule]), 12, "adversarial", seed=bs + 83)
+            before_step = _with_override(cache, steps)
+        out = _mixed_run(moes, cache, bs, graph, schedule, before_step=before_step)
+        runs.append((out, [t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage, *cache.bank_views())]))
+    _assert_same_outputs(runs[1][0], runs[0][0])
+    for a, b in zip(runs[1][1], runs[0][1]):
+        assert torch.equal(a, b)
+    totals, records = _audit_records(cache)
+    assert records == [] and totals[sa.T_BAD] == 0, [cache.audit.format_record(r) for r in records]
+    assert totals[sa.T_MAP_RANGE] == totals[sa.T_BAD_PLAN] == totals[sa.T_UNCHECKED] == 0
+    assert totals[sa.T_AUDITS] == len(decode)
+    assert totals[sa.T_HELD] > 0 and totals[sa.T_BYTES_CHECKED] == totals[sa.T_HELD] and totals[sa.T_EVENTS] > 0
+    expected = {sa.DEMAND_INSTALL, sa.DEMAND_COPY, sa.RESET}
+    if prefetch == "on":
+        expected |= {sa.PREFETCH_INSTALL, sa.PREFETCH_COPY}
+    expected |= {
+        "materialize": {sa.MATERIALIZE_CLEAR, sa.MATERIALIZE_INSTALL, sa.MATERIALIZE_COPY},
+        "overlap": {sa.INVALIDATE, sa.PREFILL_BUFFER},
+        "overlap_d2d": {sa.INVALIDATE, sa.PREFILL_SPLIT_H2D, sa.PREFILL_HIT_D2D},
+        "small": {sa.PREFILL_INSTALL, sa.PREFILL_COPY},
+    }[path]
+    assert kinds == expected, (kinds - expected, expected - kinds)
+
+
+@requires_cuda
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+def test_moe_slot_audit_is_quiet_across_graph_sizes_and_eager_steps(policy, monkeypatch):
+    """The graph runner's shape: bs 1 and bs 2 graphs in one pool, replayed in any order with eager
+    steps between them (a bs 9 one forks no prefetch); audited after every step, nothing is bad."""
+    from freetoken.moe import slot_audit as sa
+    from freetoken.moe.prefetch import MAX_ROWS
+
+    banks = _prefetch_banks("nvfp4")
+    gen = torch.Generator().manual_seed(90)
+    order = [(int(b), bool(r)) for b, r in zip(torch.randint(0, 4, (40,), generator=gen), torch.randint(0, 2, (40,), generator=gen))]
+    sizes = {0: 1, 1: 2, 2: 3, 3: MAX_ROWS + 1}
+    xs_by_bs = {bs: iter(_prefetch_inputs(bs, steps=40, seed=91 + bs)) for bs in sizes.values()}
+    schedule = [(sizes[b], next(xs_by_bs[sizes[b]]), r and sizes[b] <= 2) for b, r in order]
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, policy=policy, overlap=True, budget=8, slot_audit=1)
+    steps = _garbage(_routed_ids(moes, [xs for _, xs, _ in schedule]), 12, "adversarial", seed=92)
+    _multi_graph_run(moes, cache, schedule, before_step=_with_override(cache, steps))
+    totals, records = _audit_records(cache)
+    assert records == [] and totals[sa.T_BAD] == 0 and totals[sa.T_AUDITS] == len(schedule)
+    assert totals[sa.T_BYTES_CHECKED] == totals[sa.T_HELD] > 0
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+def test_moe_slot_audit_explains_a_skipped_prefetch_copy(graph, policy, monkeypatch):
+    """Fault injection: layer 2's prefetch copies copy nothing. Every slot the audit finds bad holds a
+    layer-2 expert whose history reads 'prefetch install, no prefetch copy', and every bad slot still
+    held at the end was found."""
+    from freetoken.moe import slot_audit as sa
+
+    monkeypatch.setattr(sa, "RING", 1024)
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(1, steps=40, seed=84)
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, policy=policy, overlap=True, budget=8, slot_audit=1)
+    real = cache.copy_rows
+
+    def copy_rows(layer_id, dst, src, num, *, slim, kind=0):
+        if kind == sa.PREFETCH_COPY and layer_id == 2:
+            return None  # the fault: no bytes move (and so nothing is recorded)
+        return real(layer_id, dst, src, num, slim=slim, kind=kind)
+
+    monkeypatch.setattr(cache, "copy_rows", copy_rows)
+    steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=85)
+    _prefetch_run(moes, cache, 1, graph, inputs, sleep=0, before_step=_with_override(cache, steps))
+    truth = _bad_slots(cache)
+    totals, records = _audit_records(cache)
+    assert records and totals[sa.T_BAD] > 0 and totals[sa.T_NEW] == len(records)
+    a = cache.audit
+    for rec in records:
+        assert rec[sa.H_FLAGS] == sa.F_BYTES and rec[sa.H_OWNER] // _PF_EXPERTS == 2, a.format_record(rec)
+        # a layer-1 prefetch copy still in flight may land after the install and is named as such
+        assert a.diagnose(rec).startswith("prefetch install, no prefetch copy"), a.format_record(rec)
+    assert truth <= {(r[sa.H_SLOT], r[sa.H_OWNER]) for r in records}
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+def test_moe_slot_audit_explains_a_demand_copy_from_the_wrong_layer(graph, prefetch, monkeypatch):
+    """Fault injection: layer 2's demand copies read layer 1's host banks (the right rows). The bad
+    slots are layer-2 demand installs whose last copy came from layer 1's source."""
+    from freetoken.moe import slot_audit as sa
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(sa, "RING", 1024)
+    real = OffloadMoeCache.copy_missing
+
+    def copy_missing(self, layer_id=None):
+        if self._pending_src_layer == 2 and not self._pending_whole_layer:
+            return self.copy_rows(1, self.evict_slots, self.src_indices, self.num_indices, slim=False, kind=self._pending_kind)
+        return real(self, layer_id)
+
+    monkeypatch.setattr(OffloadMoeCache, "copy_missing", copy_missing)
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(1, steps=30, seed=86)
+    moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, overlap=True, budget=8, slot_audit=1)
+    _prefetch_run(moes, cache, 1, graph, inputs, sleep=0)
+    truth = _bad_slots(cache)
+    totals, records = _audit_records(cache)
+    assert records and truth <= {(r[sa.H_SLOT], r[sa.H_OWNER]) for r in records}
+    for rec in records:
+        owner = rec[sa.H_OWNER]
+        assert owner // _PF_EXPERTS == 2 and rec[sa.H_FLAGS] == sa.F_BYTES
+        e = owner % _PF_EXPERTS
+        assert cache.audit.diagnose(rec).startswith(
+            f"demand install of L2/e{e}, then demand copy from layer 1's source (L1/e{e}, #"), cache.audit.format_record(rec)
+
+
+@requires_cuda
+@pytest.mark.parametrize("prefetch", ["off", "on"])
+def test_moe_slot_audit_explains_bytes_overwritten_after_install(prefetch, monkeypatch):
+    """Fault injection: bytes of a held slot flipped behind every recorder's back. The next audit keeps
+    one record (bank, byte offset, bad words) whose history ends in the owner's install and copy, a
+    later audit counts it again without a second record, and a clean slot is forgotten."""
+    from freetoken.moe import slot_audit as sa
+
+    banks = _prefetch_banks("nvfp4")
+    moes, cache = _prefetch_stack("nvfp4", banks, prefetch, monkeypatch, overlap=True, budget=8, slot_audit=1000)
+    _prefetch_run(moes, cache, 1, False, _prefetch_inputs(1, steps=12, seed=87), sleep=0)
+    a = cache.audit
+    a.scan(cache)
+    assert _audit_records(cache)[1] == []
+    slot = int((cache.id_of_slot >= 0).nonzero()[0])
+    owner = int(cache.id_of_slot[slot])
+    row = cache.bank_views()[3][slot].view(torch.uint8).view(-1)
+    row[100:108].bitwise_not_()
+    a.scan(cache)
+    a.scan(cache)
+    totals, records = _audit_records(cache)
+    assert len(records) == 1 and [totals[t] for t in (sa.T_AUDITS, sa.T_BAD, sa.T_NEW, sa.T_STILL)] == [3, 2, 1, 1]
+    rec = records[0]
+    assert [rec[f] for f in (sa.H_AUDIT, sa.H_SLOT, sa.H_OWNER, sa.H_FLAGS, sa.H_BANKS, sa.H_FIRST_BANK,
+                             sa.H_FIRST_BYTE, sa.H_BAD_WORDS)] == [1, slot, owner, sa.F_BYTES, 1 << 3, 3, 100, 2]
+    events = a.events(rec)
+    install = [ev for ev in events if ev["kind"] in sa.INSTALLS][-1]
+    copy = [ev for ev in events if ev["ring"] == "bytes"][-1]
+    assert a._flat(install) == owner == a._flat(copy) and copy["seq"] > install["seq"]
+    assert "then the bytes changed with no recorded write" in a.diagnose(rec)
+    row[100:108].bitwise_not_()
+    a.scan(cache)
+    row[100:108].bitwise_not_()
+    a.scan(cache)
+    totals, records = _audit_records(cache)
+    assert len(records) == 2 and records[1][sa.H_AUDIT] == 4 and totals[sa.T_BAD] == 3
+
+
+@requires_cuda
+def test_moe_slot_audit_explains_stale_and_missing_map_entries(monkeypatch):
+    """Fault injection on the maps: slot_for_id still names a slot for its previous owner (an eviction
+    that forgot to clear it: routing that expert would read another's bytes), and a held slot's owner
+    has lost its entry. Both are found and the stale one is traced to the install it outlived."""
+    from freetoken.moe import slot_audit as sa
+
+    banks = _prefetch_banks("nvfp4")
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, overlap=True, budget=8, slot_audit=1000)
+    _prefetch_run(moes, cache, 1, False, _prefetch_inputs(1, steps=12, seed=88), sleep=0)
+    a = cache.audit
+    flat = cache.slot_for_id.view(-1)
+    held = (cache.id_of_slot >= 0).nonzero().view(-1).tolist()
+    found = None
+    for s in held:
+        for ev in sorted(a.meta_hist[s].tolist()):
+            fid = ev[sa.E_LAYER] * _PF_EXPERTS + ev[sa.E_ROW]
+            if ev[sa.E_KIND] in sa.INSTALLS and int(flat[fid]) == -1:
+                found = (s, fid)
+        if found:
+            break
+    assert found, "some slot must have outlived an earlier owner"
+    stale_slot, stale_id = found
+    fwd_slot = next(t for t in held if t != stale_slot)
+    fwd_owner = int(cache.id_of_slot[fwd_slot])
+    flat[stale_id] = stale_slot
+    flat[fwd_owner] = -1
+    a.scan(cache)
+    totals, records = _audit_records(cache)
+    assert [totals[t] for t in (sa.T_BAD, sa.T_STALE, sa.T_FWD, sa.T_BYTES)] == [2, 1, 1, 0] and len(records) == 2
+    by_slot = {r[sa.H_SLOT]: r for r in records}
+    rec = by_slot[stale_slot]
+    assert rec[sa.H_FLAGS] == sa.F_STALE and rec[sa.H_STALE_ID] == stale_id
+    holder = a._name(int(cache.id_of_slot[stale_slot]))
+    text = a.diagnose(rec)
+    assert text.startswith(f"stale slot_for_id: {a._name(stale_id)} -> this slot, which holds {holder}; "
+                           f"{a._name(stale_id)} was installed here by "), text
+    assert text.endswith("without clearing its map entry"), text
+    rec = by_slot[fwd_slot]
+    assert rec[sa.H_FLAGS] == sa.F_FWD and rec[sa.H_MAPPED] == -1
+    assert a.diagnose(rec) == f"slot_for_id[{a._name(fwd_owner)}]=-1, not this slot"
+
+
+@requires_cuda
+def test_moe_slot_audit_off_builds_and_launches_nothing(monkeypatch):
+    """With the flag off there is no auditor and a decode launches only what it launches without one;
+    on, a decode only adds the recorders (and the audit its own kernels and host-row gathers)."""
+    from collections import Counter
+
+    from torch.profiler import ProfilerActivity, profile
+
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.MOE_SLOT_AUDIT, "value", 0)
+    banks = _prefetch_banks("bf16")
+    inputs = _prefetch_inputs(1, steps=2)
+
+    def kernels(interval):
+        moes, cache = _prefetch_stack("bf16", banks, "on", monkeypatch, slot_audit=interval)
+        _prefetch_run(moes, cache, 1, False, inputs[:1])  # warm up and compile outside the trace
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            _prefetch_run(moes, cache, 1, False, inputs)
+        return cache, Counter(e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA)
+
+    cache, off = kernels(None)
+    assert cache.audit is None and cache.slot_audit == 0
+    ours = ("_record_kernel", "_bump_step_kernel", "_audit_")
+    assert not any(k in name for name in off for k in ours)
+    _, on = kernels(1)
+    assert not off - on, "the audit dropped a launch"
+    added = on - off
+    assert all(any(k in name for k in (*ours, "fast_index_copy_multi")) for name in added), added
+    assert any("_audit_report_kernel" in name for name in added)
+
+
+@requires_cuda
+def test_moe_slot_audit_follows_a_rebuild(monkeypatch):
+    """A rebuild reallocates the slot banks and maps: the auditor keeps its scratch and totals, starts a
+    new history sized for the new slot count, points its byte checks at the new banks, and a recaptured
+    graph audits clean."""
+    from freetoken.moe import slot_audit as sa
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(2, steps=20, seed=89)
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, overlap=True, slot_audit=1)
+    a = cache.audit
+    scratch = a.scratch
+    _prefetch_run(moes, cache, 2, True, inputs, sleep=0)
+    cache.rebuild(_PF_EXPERTS + 4)
+    assert cache.audit is a and a.scratch is scratch and a.num_slots == _PF_EXPERTS + 4
+    assert a.meta_hist.shape[0] == a.bytes_cur.shape[0] == _PF_EXPERTS + 4 and int(a.meta_cur.sum()) == 0
+    assert a.cache_ptrs.tolist() == [bank.data_ptr() for bank in cache.bank_views()]
+    _prefetch_run(moes, cache, 2, True, inputs, sleep=0)
+    totals, records = _audit_records(cache)
+    assert records == [] and totals[sa.T_BAD] == 0 and totals[sa.T_AUDITS] == 2 * len(inputs)
 
 
 @requires_cuda

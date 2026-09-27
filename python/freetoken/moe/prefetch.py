@@ -34,6 +34,7 @@ import triton
 import triton.language as tl
 
 from freetoken.env import ENV
+from freetoken.moe.slot_audit import PREFETCH_COPY
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -318,7 +319,8 @@ class ExpertPrefetcher:
         with torch.cuda.stream(self.copy_stream):
             if self.delay_copy_cycles:
                 torch.cuda._sleep(self.delay_copy_cycles)
-            self.cache.copy_rows(target, self.pf_slots[target], self.pf_src[target], self.pf_num[target], slim=True)
+            self.cache.copy_rows(target, self.pf_slots[target], self.pf_src[target], self.pf_num[target], slim=True,
+                                 kind=PREFETCH_COPY)
             _mark_ready_kernel[(1,)](self.pf_ready[target])
             pfcopy.record(self.copy_stream)
 

@@ -330,3 +330,95 @@ def test_engine_reports_the_verify_window_and_session(monkeypatch):
     assert session[0] == ("warning", "MoE verify full (session): 1536 layer calls checked, meta_bad=0, pre_bad=1, "
                                      "post_bad=0, post_meta_bad=0 (meta/pre/post/post_meta by layer: L1=0/1/0/0)")
     assert session[1:] == [("warning", "MoE verify record: " + v.format_record(record))]
+
+
+# FREETOKEN_MOE_SLOT_AUDIT (moe/slot_audit.py): the switch, where the auditor is built, and the
+# engine's report; the recorders and the audit run on the qwen4_exp stacks in test_skeleton.py
+
+
+def test_slot_audit_interval_switch(monkeypatch):
+    from freetoken.env import ENV
+    from freetoken.moe.slot_audit import resolve_interval
+
+    monkeypatch.setattr(ENV.MOE_SLOT_AUDIT, "value", 64)
+    assert [resolve_interval(v) for v in (None, 0, 1, 8)] == [64, 0, 1, 8]
+    with pytest.raises(ValueError):
+        resolve_interval(-1)
+
+
+@requires_cuda
+def test_cache_builds_the_auditor_only_for_gpu_decode(monkeypatch):
+    from freetoken.env import ENV
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    def cache(**kw):
+        return OffloadMoeCache(num_layers=2, num_experts=4, cache_size=4, device=torch.device("cuda"), **kw)
+
+    monkeypatch.setattr(ENV.MOE_SLOT_AUDIT, "value", 0)
+    assert cache().audit is None and cache(slot_audit=0).audit is None
+    on = cache(slot_audit=8, prefetch_mode="on")
+    assert on.audit.interval == 8 and on.slot_audit == 8
+    ref = weakref.ref(on)  # the auditor holds no reference to its cache
+    del on
+    assert ref() is None
+    with pytest.raises(ValueError):
+        cache(slot_audit=8, decode_target="hybrid")
+    monkeypatch.setattr(ENV.MOE_SLOT_AUDIT, "value", 16)
+    for target in ("hybrid", "cpu"):
+        assert cache(decode_target=target).audit is None
+    assert cache().audit.interval == 16
+    monkeypatch.setenv("FREETOKEN_SKIP_FAST_INDEX_COPY", "1")
+    assert cache().audit is None, "copies that move nothing cannot be audited"
+
+
+@requires_cuda
+def test_engine_reports_the_audit_window_and_session(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.engine import engine as engine_mod
+    from freetoken.engine.engine import MOE_STATS_INTERVAL
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(num_layers=3, num_experts=4, cache_size=6, device=torch.device("cuda"), slot_audit=2)
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(4, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(3)],
+        "down": [torch.randn(4, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(3)],
+    })
+    cache.reset()
+    lines = []
+    for level in ("info_rank0", "warning_rank0"):
+        monkeypatch.setattr(engine_mod.logger, level, lambda msg, *a, level=level, **k: lines.append((level, msg)))
+    engine = SimpleNamespace(moe_offload_cache=cache)
+    engine_mod.Engine._emit_audit_stats(engine)
+    assert lines == [], "no audit ran: nothing to say"
+
+    # one decode step of layer 1 routing experts 2 and 0: two demand installs and their copy
+    ids = torch.tensor([[2, 0]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts(1, ids)
+    cache.copy_missing()
+    audit = cache.audit
+    assert not audit.end_decode_step(cache) and audit.end_decode_step(cache), "every 2 decode steps"
+    engine_mod.Engine._emit_audit_stats(engine)
+    assert lines == [("info_rank0", f"MoE slot audit ({MOE_STATS_INTERVAL} decode steps, every 2): 1 audits, 2 held slots "
+                                    "an audit (2 byte-checked), bad slots=0 (bytes=0, map=0, stale slot_for_id=0, owner out "
+                                    "of range=0), new=0, repeat=0, events=4; session: 1 audits, 0 bad (slot, owner) pairs")]
+    lines.clear()
+    slot = int(ids[0, 0])
+    cache.bank_views()[1][slot].view(torch.uint8).view(-1)[8:12].bitwise_not_()
+    audit.scan(cache)
+    engine_mod.Engine._emit_audit_stats(engine)
+    assert [level for level, _ in lines] == ["warning_rank0", "warning_rank0"]
+    assert "1 audits, 2 held slots an audit (2 byte-checked), bad slots=1 (bytes=1," in lines[0][1]
+    assert lines[1][1].startswith(
+        f"MoE slot audit record: audit=1 step=0 lru=1 slot={slot} holds L1/e2 (slot_for_id={slot}, usage=1) | bytes differ in "
+        "down (first at down+8, 1 bad words) | diagnosis: demand install and demand copy of L1/e2 (#"), lines[1][1]
+    assert "then the bytes changed with no recorded write" in lines[1][1]
+    # the kernel ranks misses by id: e0 installs first (#0), e2 second (#1); the copy records after both
+    assert lines[1][1].endswith("history (1 map / 1 byte events in all): #1 demand install L1/e2 @step 0/lru 1 (then held "
+                                "L1/e2, usage 1); #3 demand copy L1/e2 @step 0/lru 1 (slot held L1/e2, usage 1)"), lines[1][1]
+    lines.clear()
+    engine_mod.Engine._emit_audit_stats(engine)
+    assert lines == []
+    session = audit.report_session()
+    assert session[0][0] == "warning" and session[0][1].startswith("MoE slot audit (session, every 2 decode steps): 2 audits")
+    assert session[1:] == [("warning", "MoE slot audit record: " + audit.format_record(audit.ring[0].tolist()))]

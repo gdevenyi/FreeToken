@@ -91,6 +91,8 @@ class EnvClassSingleton:
     MOE_PREFETCH_VERIFY = EnvStr("0")
     # routed experts a call byte-checks (scratch rows, ~2.8 MB each on Qwen3.8-Flash)
     MOE_PREFETCH_VERIFY_ROWS = EnvInt(20)
+    # debug: record every expert slot writer and audit every held slot each N decode steps (0 = off)
+    MOE_SLOT_AUDIT = EnvInt(0)
 
     def __new__(cls):
         # single instance
