@@ -1267,9 +1267,12 @@ def _assert_held_slots_hold_their_experts(cache):
         _assert_slots_hold_their_experts(cache)
 
 
-def _mixed_run(moes, cache, bs, graph, schedule, before_step=None):
+def _mixed_run(moes, cache, bs, graph, schedule, before_step=None, late=None, settle=True):
     """Warm up (and capture) the decode like _prefetch_run, reset, then run ``schedule``: ("decode", xs)
-    is one decode step (a replay under ``graph``), ("prefill", xs) an eager prefill of xs's tokens."""
+    is one decode step (a replay under ``graph``), ("prefill", xs) an eager prefill of xs's tokens.
+    ``late=(cycles, steps)`` sleeps that long on the predictor stream in those decode steps (a second
+    graph captured with the sleep, in the same pool, replays them); ``settle`` syncs and checks the
+    slots after each prefill, else the next decode is enqueued right behind it."""
     ctx = _fresh_ctx(_batch=SimpleNamespace(is_prefill=False))
 
     def step(xs):
@@ -1280,24 +1283,33 @@ def _mixed_run(moes, cache, bs, graph, schedule, before_step=None):
     if graph:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            graph_outs = step(static)
+            graphs = {False: (g, step(static))}
+        if late is not None:
+            cache.prefetch.delay_predict_cycles = late[0]
+            g_late = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_late, pool=g.pool()):
+                graphs[True] = (g_late, step(static))
+            cache.prefetch.delay_predict_cycles = 0
     cache.reset()
     results = []
     for i, (phase, xs) in enumerate(schedule):
         if before_step is not None:
             before_step(i)
         ctx._batch.is_prefill = phase == "prefill"
+        slow = late is not None and i in late[1]
         if phase == "decode" and graph:
             for s, x in zip(static, xs):
                 s.copy_(x)
+            g, outs = graphs[slow]
             g.replay()
-            outs = graph_outs
         else:
+            if late is not None:
+                cache.prefetch.delay_predict_cycles = late[0] if slow else 0
             outs = step(xs)
         if phase == "decode" and cache.audit is not None:
             cache.audit.end_decode_step(cache)
         results.append([o.clone() for o in outs])
-        if phase == "prefill":
+        if phase == "prefill" and settle:
             torch.cuda.synchronize()
             _assert_held_slots_hold_their_experts(cache)
     torch.cuda.synchronize()
@@ -1437,6 +1449,146 @@ def test_moe_prefetch_on_writes_the_slot_maps_only_on_the_compute_stream(graph, 
     assert all(name == "invalidate" and stream in fence for name, stream in off_compute), off_compute
     assert {stream for name, stream in seen if name == "prefetch_ensure"} == compute  # eager, and the capture
     assert int(pf.stats[:, ISSUED].sum()) > 0
+
+
+# ~4 ms at the RTX 5080's clock: a select far later than its whole layer
+_PF_LATE_CYCLES = 8 * _PF_DELAY_CYCLES
+
+
+def _step_starts(times):
+    """before_step hook recording a timed event on the compute stream at the start of each step."""
+    def before_step(i):
+        times.append(torch.cuda.Event(enable_timing=True))
+        times[-1].record()
+
+    return before_step
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("policy", ["rule", "lru"])
+def test_moe_prefetch_on_waits_for_a_late_select(graph, bs, policy, monkeypatch):
+    """The compute stream waits for the select before it installs, however late the predictor runs:
+    with every select ~4 ms late (far past its whole layer) a step lasts at least its three late
+    selects, and the outputs equal off's and the maps and counts (all but LATE) those of the run
+    without the delay."""
+    from freetoken.moe.prefetch import LATE, NUM_STAT_COLS, USEFUL
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(bs, steps=24, seed=100)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True, policy=policy)
+    off = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    torch.cuda._sleep(_PF_LATE_CYCLES)
+    end.record()
+    end.synchronize()
+    late_ms = start.elapsed_time(end)
+    runs = []
+    for cycles in (0, _PF_LATE_CYCLES):
+        moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True, budget=8)
+        steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=bs + 101)
+        load, times = _with_override(cache, steps, delay_predict_cycles=cycles), []
+        mark = _step_starts(times)
+
+        def before_step(i, load=load, mark=mark):
+            mark(i)
+            load(i)
+
+        on = _prefetch_run(moes, cache, bs, graph, inputs, sleep=0, before_step=before_step)
+        _assert_same_outputs(on[0], off[0])
+        _assert_slots_hold_their_experts(cache)
+        step_ms = sorted(a.elapsed_time(b) for a, b in zip(times, times[1:]))
+        runs.append((on[1][:3], cache.prefetch.stats.cpu(), step_ms[len(step_ms) // 2]))
+    (maps, stats, fast_ms), (late_maps, late_stats, slow_ms) = runs
+    assert int(stats[:, USEFUL].sum()) > 0
+    for a, b in zip(maps, late_maps):
+        assert torch.equal(a, b)
+    cols = [c for c in range(NUM_STAT_COLS) if c != LATE]
+    assert torch.equal(stats[:, cols], late_stats[:, cols])
+    # layers 1-3 are predicted; each prediction forks after the previous one was waited for
+    assert slow_ms >= 0.9 * (_PF_LAYERS - 1) * late_ms > 4 * fast_ms, (slow_ms, late_ms, fast_ms)
+
+
+@requires_cuda
+def test_moe_prefetch_on_late_select_without_the_wait_changes_the_maps_but_no_output(monkeypatch):
+    """Negative control for the test above (eager: a capture needs the predictor joined): without the
+    compute stream's wait, prefetch_ensure installs stale candidates, so the maps differ from the
+    undelayed run's, yet every output still equals off's: the slot maps have one writer, so a wrong
+    prediction only costs a copy."""
+    from freetoken.moe.prefetch import ExpertPrefetcher
+
+    banks = _prefetch_banks("nvfp4")
+    inputs = _prefetch_inputs(1, steps=24, seed=100)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, overlap=True)
+    off = _prefetch_run(moes, cache, 1, False, inputs, sleep=0)
+
+    def no_wait(self, target):
+        """install without the compute stream's wait on the select."""
+        if target is None or self._inflight[target] is None:
+            return None
+        self.cache.prefetch_ensure(
+            target, self.sel[target], self.pf_slots[target], self.pf_src[target],
+            self.pf_num[target], self.stats[target], self.pf_ready[target], budget=self._budget[target],
+        )
+        self._installed[target] = True
+        return target
+
+    runs = []
+    for skip in (False, True):
+        moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy="rule", overlap=True, budget=8)
+        if skip:
+            monkeypatch.setattr(ExpertPrefetcher, "install", no_wait)
+        steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=102)
+        on = _prefetch_run(moes, cache, 1, False, inputs, sleep=0,
+                           before_step=_with_override(cache, steps, delay_predict_cycles=_PF_LATE_CYCLES * skip))
+        _assert_same_outputs(on[0], off[0])
+        _assert_slots_hold_their_experts(cache)
+        runs.append(on[1][:3])
+    assert any(not torch.equal(a, b) for a, b in zip(*runs))
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("path", list(_PREFILL_PATHS))
+def test_moe_prefetch_on_late_select_right_after_a_prefill(graph, bs, path, monkeypatch):
+    """The suspected production trigger: a decode step enqueued right behind a prefill (which
+    rewrote slots behind the prefetch's back, the overlap buffers' [0, 2E) included) with the
+    predictor ~4 ms late. Every output equals off's to the bit, the maps equal those of the same run
+    with no late step, every held slot holds its expert and the decode verifier finds nothing."""
+    import freetoken.layers.moe as layers_moe
+    from freetoken.moe.verify import CHECKS
+
+    cache_size, tokens, cache_kw, small = _PREFILL_PATHS[path]
+    monkeypatch.setattr(layers_moe, "_SMALL_PREFILL_TOKENS", small)
+    banks = _prefetch_banks("nvfp4")
+    decode = _prefetch_inputs(bs, steps=15, seed=105)
+    gen = torch.Generator(device="cuda").manual_seed(106)
+    prefills = [[torch.randn(tokens, _PF_HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.5
+                 for _ in range(_PF_LAYERS)] for _ in range(2)]
+    schedule = ([("decode", xs) for xs in decode[:5]] + [("prefill", prefills[0])]
+                + [("decode", xs) for xs in decode[5:10]] + [("prefill", prefills[1])]
+                + [("decode", xs) for xs in decode[10:]])
+    after_prefill = {i + 1 for i, (phase, _) in enumerate(schedule) if phase == "prefill"}
+    kw = dict(overlap=True, cache_size=cache_size, **cache_kw)
+    moes, cache = _prefetch_stack("nvfp4", banks, "off", monkeypatch, **kw)
+    off = _mixed_run(moes, cache, bs, graph, schedule)
+    runs = []
+    for late in (None, (_PF_LATE_CYCLES, after_prefill)):
+        moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, budget=8, verify_mode="meta", **kw)
+        steps = _garbage(_routed_ids(moes, [xs for _, xs in schedule]), 12, "adversarial", seed=bs + 107)
+        on = _mixed_run(moes, cache, bs, graph, schedule, before_step=_with_override(cache, steps), late=late,
+                        settle=False)
+        _assert_same_outputs(on, off)
+        counts, records = _verify_state(cache)
+        assert counts[CHECKS] > 0 and counts[CHECKS + 1 :] == [0] * (len(counts) - 1) and records == [], records
+        runs.append([t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage)])
+    for a, b in zip(*runs):
+        assert torch.equal(a, b)
+    if path == "overlap_d2d":
+        assert cache.prefill_hit_rows > 0, "the hit-D2D gather must have read resident slots"
 
 
 @requires_cuda
