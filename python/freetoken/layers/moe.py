@@ -194,6 +194,13 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # FREETOKEN_MOE_PREFETCH: (next MoE layer's router op, its layer id, its budget); the
+        # underscore keeps the borrowed router out of this layer's state dict
+        self._lookahead: tuple[BaseOP, int, int] | None = None
+
+    def set_lookahead(self, gate: BaseOP, target_layer: int, budget: int) -> None:
+        """Let this layer's GPU decode predict ``target_layer``'s experts with that layer's router."""
+        self._lookahead = (gate, target_layer, budget)
 
     def forward(
         self,
@@ -301,9 +308,25 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        prefetch, verify = cache.prefetch, cache.verify
+        if verify is not None:
+            verify.begin(cache, self.layer_id, topk_ids, prefetch and prefetch.plan_of(self.layer_id))
         cache.ensure_experts(self.layer_id, topk_ids, router_logits=router_logits)
+        target = None
+        if prefetch is not None:
+            # on: install the next layer's prediction (forked at this block's start) on this stream, the slot
+            # maps' only writer; before this layer's copy join, so a late prefetch copy never delays it
+            target = prefetch.install(self._lookahead and self._lookahead[1])
+            prefetch.join_copy(self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        if prefetch is not None:
+            prefetch.join_and_count(self.layer_id, topk_ids, cache.id_of_slot, cache.num_indices)
+            if target is not None:
+                prefetch.issue_copy(target)
+        if verify is not None:
+            # after issue_copy: the next layer's prefetch copy starts when it would without the checks
+            verify.before_gemm(cache, topk_ids, None if target is None else prefetch.plan_of(target))
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -313,6 +336,29 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if verify is not None:
+            verify.after_gemm(cache)
+        return out
+
+    def fork_lookahead(self, hidden_states: torch.Tensor) -> None:
+        """FREETOKEN_MOE_PREFETCH: at the start of this layer's MoE block, predict the next layer's
+        experts from this block's router input on the predictor stream, beside this layer's router
+        and ensure. Only on the GPU decode path that ``_decode_routed`` takes and not under TP, and
+        never toward a CPU-decoded layer, whose ensure would not use it."""
+        cache = self.offload_cache
+        if (
+            self._lookahead is None
+            or cache is None
+            or cache.prefetch is None
+            or self.tp_size > 1
+            or get_global_ctx().batch.is_prefill
+            or cache.is_cpu_layer(self.layer_id)
+            or cache.decode_target == "hybrid"
+        ):
+            return
+        gate, target, budget = self._lookahead
+        if not cache.is_cpu_layer(target):
+            cache.prefetch.fork(target, hidden_states, gate, cache.slot_for_id[target], budget)
 
     def _decode_hybrid(
         self,
