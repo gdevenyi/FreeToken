@@ -4,11 +4,14 @@ Two parts, both on the device and off by default:
 
 - writer history: every writer of the slot maps (demand and prefetch ensures, prefill ensures, the
   whole-layer materialize, prefill buffer invalidation, reset) and every writer of the slot banks
-  (demand, prefetch and prefill copies, the prefill double buffers) is followed on its own stream by
-  a tiny kernel keyed on the same plan (or slot range) that appends ``(seq, kind, decode step, lru
-  step, layer, expert row, ...)`` to a per-slot ring of the last ``DEPTH`` metadata events and one of
-  the last ``DEPTH`` byte events. ``seq`` is one global atomic counter, so the two rings merge into
-  one cross-stream order. Clears are recorded just before their writer, so they carry the old owner.
+  (demand, prefetch and prefill copies, the prefill double buffers) is followed on its writer's
+  stream by a tiny kernel keyed on the same plan (or slot range) that appends ``(seq, kind, decode
+  step, lru step, layer, expert row, ...)`` to a per-slot ring of the last ``DEPTH`` metadata events
+  and one of the last ``DEPTH`` byte events. The map writers all run on the compute stream except the
+  prefill buffer invalidation (on the prefill copy stream, fenced behind it); the byte writers also
+  run on the prefetch and prefill copy streams. ``seq`` is one global atomic counter, so the two rings
+  merge into one cross-stream order. Clears are recorded just before their writer, so they carry the
+  old owner.
   Fixed shapes and no host sync: the recorders capture into the decode graph.
 - audit: every N decode steps, after the forward on the compute stream, every held slot is checked:
   its bytes in every bank against the host row of the (layer, expert) its ``id_of_slot`` names

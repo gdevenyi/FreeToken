@@ -43,7 +43,7 @@ KINDS = ("meta_pre", "bytes_pre", "meta_post", "bytes_post")
  R_SOURCE, R_FIRST_BYTE, R_BAD_WORDS) = range(14)
 NUM_FIELDS = 14
 # R_SOURCE bits: the slot is in this call's demand copy plan, this layer's prefetch copy plan, or
-# the next layer's prefetch plan (read racily: that plan is being written on the predictor stream)
+# the next layer's prefetch plan (installed earlier on the compute stream)
 SRC_DEMAND, SRC_PREFETCH, SRC_NEXT_PREFETCH = 1, 2, 4
 RING = 64
 # routed entries a call may have (bs * top_k); wider eager batches are counted unchecked

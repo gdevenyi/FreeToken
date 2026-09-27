@@ -7,25 +7,32 @@ first, ...), duplicates dropped, under one budget.
 
 ``measure``: after layer L's ensure, count how many of them layer L actually routed. Nothing is
 copied and the cache is never touched. The predictor reads ``slot_for_id[L]`` without ordering
-against ensure(L); a late read only skews the counters, never the model.
+against the ensures; a late read only skews the counters, never the model.
 
-    compute: ... ensure(L-1) -fork-> copy(L-1) GEMM(L-1) ... ensure(L) copy(L) -join-> count(L) GEMM(L)
-    predict:                  \\-> router_L(x_{L-1}) -> top-K -> select(L) -/
+The prediction forks at the start of layer L-1's MoE block, where x_{L-1} first exists, so it runs
+beside layer L-1's own router and ensure:
 
-``on``: the predictor stream also installs the kept candidates as low-priority slots
-(prefetch_ensure: held, usage 0, keyed between the empty slots and every resident) and a third
-stream copies them from layer L's host banks with the slim copy kernel:
+    compute: -fork(L)-> router_{L-1} ensure(L-1) copy(L-1) GEMM(L-1) ... ensure(L) copy(L) -join-> count(L) GEMM(L)
+    predict:       \\-> router_L(x_{L-1}) -> top-K -> select(L) -rec sel(L) -/
 
-    compute: ensure(L-1) -fork-> [wait pfcopy(L-1)] copy(L-1) -rec dcopy(L)-> GEMM(L-1) ... [wait pf(L)] ensure(L) [wait pfcopy(L)] copy(L) GEMM(L)
-    predict:              \\-> router_L -> select(L) -> prefetch_ensure(L) -rec pf(L)
-    copy:                                              [wait pf(L), dcopy(L)] slim copy(L) -> ready(L) -rec pfcopy(L)
+``on``: the predictor only merges the candidates (it reads no cache state); the compute stream
+installs the first BUDGET of them that are not resident as low-priority slots (prefetch_ensure:
+held, usage 0, keyed between the empty slots and every resident) and a third stream copies them
+from layer L's host banks with the slim copy kernel:
 
-Every writer of the slot maps is on one fork/join chain (ensure(L-1) < prefetch_ensure(L) <
-ensure(L)), so they never race. prefetch_ensure(L) keeps usage == step, i.e. layer L-1's routed
-slots, pinned while GEMM(L-1) may read them; the compute stream joins the prefetch copy before
-its own copy(L), so ensure(L) may reuse a prefetched slot as a demand victim and GEMM(L) only
-ever reads landed bytes. A demand hit on a prefetched slot sets its usage (a normal resident)
-and counts as useful. Layer 0 is never predicted.
+    compute: -fork(L)-> ... ensure(L-1) [wait sel(L)] prefetch_ensure(L) [wait pfcopy(L-1)] copy(L-1) -rec dcopy(L)-> GEMM(L-1) ... ensure(L) [wait pfcopy(L)] copy(L) GEMM(L)
+    predict:       \\-> router_L -> top-K -> merge(L) -rec sel(L)
+    copy:                                                                                   [wait dcopy(L)] slim copy(L) -> ready(L) -rec pfcopy(L)
+
+Every writer of the slot maps and their mirrors runs on the compute stream, so the maps have one
+writer in stream order and no cross-stream edge guards them, and the installs follow layer L's
+residency right after ensure(L-1) however late the predictor runs. dcopy(L) follows
+prefetch_ensure(L) and the demand copy(L-1) on the compute stream, so the copy stream reads a
+finished plan and owns the host link second. prefetch_ensure(L) keeps usage == step, i.e. layer
+L-1's routed slots, pinned while GEMM(L-1) may read them; the compute stream joins the prefetch copy
+before its own copy(L), so ensure(L) may reuse a prefetched slot as a demand victim and GEMM(L) only
+ever reads landed bytes. A demand hit on a prefetched slot sets its usage (a normal resident) and
+counts as useful. Layer 0 is never predicted.
 """
 from __future__ import annotations
 
@@ -183,14 +190,14 @@ def _mark_ready_kernel(ready_ptr):
 class ExpertPrefetcher:
     """Predictor stream, per-layer buffers and device counters for the router lookahead.
 
-    ``fork`` runs layer L's prediction on the dedicated stream right after layer L-1's ensure.
-    ``measure``: ``join_and_count`` waits for it after layer L's copy is enqueued and counts on
-    the compute stream. ``on``: the fork also runs prefetch_ensure(L); ``issue_copy`` puts its
-    copy on a second dedicated stream after layer L-1's demand copy; the compute stream joins the
-    ensure before ensure(L) (``join_ensure``) and the copy before copy(L) (``join_copy``), and
-    ensure(L) counts the call (``count_args``). The events are created up front, the shapes are
-    fixed and nothing syncs the host, so every side captures into the decode graph. Nothing here
-    is cache_size-shaped: a rebuild keeps it and only resets the counters.
+    ``fork`` runs layer L's prediction on the dedicated stream at the start of layer L-1's MoE
+    block. ``measure``: ``join_and_count`` waits for it after layer L's copy is enqueued and counts
+    on the compute stream. ``on``: ``install`` (right after layer L-1's ensure) waits for it and
+    runs prefetch_ensure(L) on the compute stream; ``issue_copy`` puts its copy on a second
+    dedicated stream after layer L-1's demand copy; the compute stream joins the copy before its
+    copy(L) (``join_copy``) and ensure(L) counts the call (``count_args``). The events are created
+    up front, the shapes are fixed and nothing syncs the host, so every side captures into the
+    decode graph. Nothing here is cache_size-shaped: a rebuild keeps it and only resets the counters.
     """
 
     def __init__(
@@ -210,12 +217,15 @@ class ExpertPrefetcher:
         if self.budget_override < 0:
             raise ValueError(f"FREETOKEN_MOE_PREFETCH_BUDGET={self.budget_override} must be >= 0")
         self.stream = dedicated_stream(device)
-        # (forked, done): done follows the select in measure mode, prefetch_ensure in on mode
+        # (forked, selected): the predictor starts after forked and records selected after the select
         self._events = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(num_layers)]
         # torch creates the CUDA event on its first record: do that now, never inside a capture
         for pair in self._events:
             for event in pair:
                 event.record(self.stream)
+        # on mode's select sees nothing resident: prefetch_ensure applies residency and the budget
+        self._none_resident = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
+        self._budget = [0] * num_layers
         width = 2 * self.k  # room for the whole bs-2 union
         self.sel = torch.full((num_layers, width), -1, dtype=torch.int32, device=device)
         self.res = torch.full((num_layers, width), -1, dtype=torch.int32, device=device)
@@ -223,9 +233,11 @@ class ExpertPrefetcher:
         # measure mode's six columns, a view: its count kernel and readers keep the stage-A layout
         self.counters = self.stats[:, :NUM_COLS]
         self.totals = torch.zeros((num_layers, NUM_STAT_COLS), dtype=torch.int64)
-        # the router input of each in-flight prediction, alive until its join is enqueued so the
-        # allocator cannot hand its block to later compute-stream work the predictor still reads
+        # the router input of each forked prediction, alive until the compute stream has waited for
+        # the select so the allocator cannot hand its block to later work the predictor still reads
         self._inflight: list[torch.Tensor | None] = [None] * num_layers
+        # on mode: whether install ran prefetch_ensure for the forked prediction (its copy is then due)
+        self._installed = [False] * num_layers
         # on mode: the cache whose slot maps prefetch_ensure writes and whose banks the copy reads
         self.cache = None
         self.copy_stream = None
@@ -233,7 +245,8 @@ class ExpertPrefetcher:
             # the slim copy is an SM kernel: at default priority a late copy queues for SMs behind the next
             # compute grid while the compute stream waits on it (bench --on: a 50 us slip cost 14% per step)
             self.copy_stream = dedicated_stream(device, highest_priority=True)
-            # (dcopy: after layer L-1's demand copy on the compute stream, pfcopy: after layer L's prefetch copy)
+            # (dcopy: after prefetch_ensure(L) and layer L-1's demand copy on the compute stream,
+            # pfcopy: after layer L's prefetch copy)
             self._copy_events = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(num_layers)]
             for pair in self._copy_events:
                 for event in pair:
@@ -244,7 +257,8 @@ class ExpertPrefetcher:
             self.pf_num = torch.zeros((num_layers, 1), dtype=torch.int64, device=device)
             self.pf_ready = torch.zeros((num_layers, 1), dtype=torch.int32, device=device)
         # test hooks, read at enqueue (capture) time: a [num_layers, width] device buffer replacing
-        # sel, and sleeps put on the predictor / copy stream ahead of their work
+        # sel (on mode still installs at most the budget), and sleeps put on the predictor / copy
+        # stream ahead of their work
         self.sel_override: torch.Tensor | None = None
         self.delay_predict_cycles = 0
         self.delay_copy_cycles = 0
@@ -259,62 +273,78 @@ class ExpertPrefetcher:
 
     def fork(self, target: int, x: torch.Tensor, gate, resident: torch.Tensor, budget: int) -> bool:
         """Predict ``target``'s experts from ``x`` (the previous layer's router input) on the
-        predictor stream, ordered after the work already on the current stream; in on mode also
-        install them. Returns whether it forked."""
+        predictor stream, ordered after the work already on the current stream. Measure mode skips
+        the ids ``resident`` holds (a racy read of the cache); on mode reads no cache state and
+        leaves residency and the budget to ``install``. Returns whether it forked."""
         if x.shape[0] > MAX_ROWS:
             return False
-        forked, done = self._events[target]
+        budget = self.budget_for(budget)
+        if self.mode == "on":
+            self._budget[target] = budget
+            resident, budget = self._none_resident, self.sel.shape[1]
+        forked, selected = self._events[target]
         forked.record(torch.cuda.current_stream(self.device))
         self.stream.wait_event(forked)
         with torch.cuda.stream(self.stream):
             if self.delay_predict_cycles:
                 torch.cuda._sleep(self.delay_predict_cycles)
             logits = gate.forward(x)
-            lookahead_select(logits, resident, self.sel[target], self.res[target], k=self.k, budget=self.budget_for(budget))
+            lookahead_select(logits, resident, self.sel[target], self.res[target], k=self.k, budget=budget)
             if self.sel_override is not None:
                 self.sel[target].copy_(self.sel_override[target])
-            if self.mode == "on":
-                self.cache.prefetch_ensure(
-                    target, self.sel[target], self.pf_slots[target], self.pf_src[target],
-                    self.pf_num[target], self.stats[target], self.pf_ready[target],
-                )
-            done.record(self.stream)
+            selected.record(self.stream)
         self._inflight[target] = x
+        self._installed[target] = False
         return True
 
-    def join_ensure(self, layer_id: int) -> None:
-        """On mode: the compute stream waits for ``layer_id``'s prefetch_ensure before its own ensure."""
-        if self.mode == "on" and self._inflight[layer_id] is not None:
-            torch.cuda.current_stream(self.device).wait_event(self._events[layer_id][1])
+    def install(self, target: int | None) -> int | None:
+        """On mode, right after the previous layer's ensure: wait for ``target``'s prediction and
+        install its first budget non-resident candidates with prefetch_ensure on the current
+        (compute) stream. Returns ``target`` when its copy is due (``issue_copy``), else None."""
+        if target is None or self.mode != "on" or self._inflight[target] is None:
+            return None
+        torch.cuda.current_stream(self.device).wait_event(self._events[target][1])
+        self.cache.prefetch_ensure(
+            target, self.sel[target], self.pf_slots[target], self.pf_src[target],
+            self.pf_num[target], self.stats[target], self.pf_ready[target], budget=self._budget[target],
+        )
+        self._installed[target] = True
+        return target
+
+    def _pending(self, layer_id: int) -> bool:
+        """On mode: ``layer_id``'s prediction was installed and its copy is not joined yet."""
+        return self.mode == "on" and self._installed[layer_id] and self._inflight[layer_id] is not None
 
     def count_args(self, layer_id: int) -> tuple | None:
         """On mode: what ``layer_id``'s demand ensure counts into, or None when it was not prefetched."""
-        x = self._inflight[layer_id] if self.mode == "on" else None
-        if x is None:
+        if not self._pending(layer_id):
             return None
-        return self.stats[layer_id], self.pf_ready[layer_id], self.pf_num[layer_id], x.shape[0]
+        return self.stats[layer_id], self.pf_ready[layer_id], self.pf_num[layer_id], self._inflight[layer_id].shape[0]
 
     def plan_of(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """On mode: ``layer_id``'s prefetch copy plan (slots, count) while its prefetch is in flight."""
-        if self.mode != "on" or self._inflight[layer_id] is None:
+        if not self._pending(layer_id):
             return None
         return self.pf_slots[layer_id], self.pf_num[layer_id]
 
     def join_copy(self, layer_id: int) -> None:
         """On mode: the compute stream waits for ``layer_id``'s prefetch copy before its own copy, so
         a prefetched slot ensure(L) picked as a demand victim is never written by two copies."""
-        if self.mode == "on" and self._inflight[layer_id] is not None:
-            torch.cuda.current_stream(self.device).wait_event(self._copy_events[layer_id][1])
-            self._inflight[layer_id] = None
+        if self.mode != "on" or self._inflight[layer_id] is None:
+            return
+        # a prediction that was never installed still has to rejoin (a capture needs every fork joined)
+        done = self._copy_events[layer_id][1] if self._pending(layer_id) else self._events[layer_id][1]
+        torch.cuda.current_stream(self.device).wait_event(done)
+        self._inflight[layer_id] = None
+        self._installed[layer_id] = False
 
     def issue_copy(self, target: int) -> None:
-        """On mode: copy ``target``'s prefetch plan on the copy stream, after its prefetch_ensure and
-        after the demand copy already on the current stream (which owns the host link first)."""
-        if self.mode != "on" or self._inflight[target] is None:
+        """On mode: copy ``target``'s prefetch plan on the copy stream after the work already on the
+        current stream: its prefetch_ensure and the demand copy (which owns the host link first)."""
+        if not self._pending(target):
             return
         dcopy, pfcopy = self._copy_events[target]
         dcopy.record(torch.cuda.current_stream(self.device))
-        self.copy_stream.wait_event(self._events[target][1])
         self.copy_stream.wait_event(dcopy)
         with torch.cuda.stream(self.copy_stream):
             if self.delay_copy_cycles:
@@ -345,6 +375,7 @@ class ExpertPrefetcher:
         self.stats.zero_()
         self.totals.zero_()
         self._inflight = [None] * self.num_layers
+        self._installed = [False] * self.num_layers
 
     def take_window(self) -> torch.Tensor:
         """This window's ``[num_layers, NUM_STAT_COLS]`` stats on the host (one sync), added to

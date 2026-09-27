@@ -160,14 +160,14 @@ def _owner_state(mirror_ptr, state_ptr, c, oid, mirrored, stale, other):
     )
 
 
-@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_topk", "nm_stride", "pf_rows"])
+@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "nm_topk", "nm_stride", "pf_rows", "pf_budget"])
 def _scored_ensure_kernel(
     query_ptr, slot_of_id_ptr, id_of_slot_ptr, lru_usage_ptr, lru_step_ptr,
     out_ptr, src_ptr, dst_ptr, num_copy_ptr, stats_ptr,
     tok_ptr, last_tok_ptr, lc_ptr, ct_ptr, g_ptr, logits_ptr,
     owner_ptr, slot_last_ptr, slot_lc_ptr, slot_ct_ptr, pin_ptr,
     pf_stats_ptr, pf_ready_ptr, pf_num_ptr,
-    K, num_cached, id_base, nm_topk, nm_stride, nm_thr, pf_rows,
+    K, num_cached, id_base, nm_topk, nm_stride, nm_thr, pf_rows, pf_budget,
     BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_TOPK: tl.constexpr,
     NM_ROWS: tl.constexpr,
     USAGE_MAX: tl.constexpr, COLLECT_STATS: tl.constexpr,
@@ -278,8 +278,9 @@ def _scored_ensure_kernel(
             key = tl.where(evictable, key, pinned_key)
             n_free = tl.sum(evictable.to(tl.int32))
         if PREFETCH:
-            # never the all-pinned fallback: that slot may be under the running GEMM
-            n_iter = tl.minimum(num_missing, n_free)
+            # never the all-pinned fallback: that slot may be under the running GEMM; misses rank in
+            # query order, so the budget keeps the first non-resident candidates
+            n_iter = tl.minimum(tl.minimum(num_missing, n_free), pf_budget)
             tl.store(num_copy_ptr, n_iter.to(tl.int64))
             tl.store(pf_stats_ptr, tl.load(pf_stats_ptr) + n_iter)
         else:
@@ -316,7 +317,7 @@ def _scored_ensure_kernel(
         # Written from registers, never re-read from slot_of_id, so out_ptr may alias query_ptr.
         tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
     if PF_COUNT:
-        # one writer per column: pf_ensure adds ISSUED (column 0) on its own stream, ordered before this
+        # one writer per column: pf_ensure adds ISSUED (column 0), earlier on this stream
         pn = tl.load(pf_num_ptr)
         late = (pn > 0) & (tl.load(pf_ready_ptr, volatile=True) == 0)
         col = tl.arange(0, 8)
@@ -393,6 +394,7 @@ def scored_ensure(
     pf_ready: torch.Tensor | None = None,
     pf_num: torch.Tensor | None = None,
     pf_rows: int = 0,
+    pf_budget: int | None = None,
     prefetch: bool = False,
 ) -> None:
     """``flashlib.lru_ensure`` (sequential strategy) with the victim picked by ``policy``.
@@ -412,7 +414,8 @@ def scored_ensure(
     between the empty slots and every resident. ``pf_stats`` (a ``[8]`` int64 prefetch stats row)
     also counts this demand call: hits on such slots, the call, ``pf_rows``, the misses, and whether
     the prefetch plan ``pf_num`` had rows whose copy had not set ``pf_ready`` yet.
-    ``prefetch=True`` is :func:`prefetch_ensure`'s install mode instead.
+    ``prefetch=True`` is :func:`prefetch_ensure`'s install mode instead, installing at most
+    ``pf_budget`` ids (default: all).
     """
     if prefetch:
         assert lowpri and pf_stats is not None and pf_ready is not None and stats is None
@@ -472,6 +475,7 @@ def scored_ensure(
         dummy if pf_ready is None else pf_ready,
         dummy if pf_num is None else pf_num,
         k, num_cached, id_base, nm_topk, nm_stride, float(near_miss_thr), int(pf_rows),
+        k if pf_budget is None else int(pf_budget),
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_C=block_c,
         BLOCK_E=triton.next_power_of_2(num_experts),
@@ -508,10 +512,12 @@ def prefetch_ensure(
     num_copy: torch.Tensor,
     pf_stats: torch.Tensor,
     pf_ready: torch.Tensor,
+    budget: int | None = None,
     **state,
 ) -> None:
     """Install the ids of ``query`` (-1 = padding) that are not resident as low-priority slots
-    (held, usage 0) and write their copy plan to ``dst_slots``/``src_rows``/``num_copy``.
+    (held, usage 0), at most the first ``budget`` of them in query order (default: all), and
+    write their copy plan to ``dst_slots``/``src_rows``/``num_copy``.
 
     Unlike a demand call it bumps no clock, touches no hit and no per-id state, and so keeps
     every slot of the last demand call (usage == step) pinned; victims follow the demand key
@@ -522,5 +528,6 @@ def prefetch_ensure(
     """
     scored_ensure(
         query, slot_of_id, id_of_slot, lru_usage, lru_step, query, src_rows, dst_slots, num_copy,
-        update_state=False, lowpri=True, pf_stats=pf_stats, pf_ready=pf_ready, prefetch=True, **state,
+        update_state=False, lowpri=True, pf_stats=pf_stats, pf_ready=pf_ready, pf_budget=budget, prefetch=True,
+        **state,
     )

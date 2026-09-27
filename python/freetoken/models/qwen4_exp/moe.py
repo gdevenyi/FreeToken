@@ -36,6 +36,10 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         se, ex = self.shared_expert, self.experts
+        if isinstance(ex, OffloadMoELayer):
+            # FREETOKEN_MOE_PREFETCH: the next layer's prediction needs only this block's input, so it
+            # starts here and runs beside this layer's router and ensure
+            ex.fork_lookahead(hidden_states)
         if isinstance(ex, OffloadMoELayer) and ex.decode_side_applies():
             # FREETOKEN_MOE_COPY_OVERLAP: the shared expert runs on a side stream while the router,
             # ensure and miss copy stay back to back on this one; joined before the combine

@@ -134,10 +134,11 @@ class RefScoredCache:
                 self.ct[uniq] = now
         return out, src, dst
 
-    def prefetch(self, layer, sel):
-        """``prefetch_ensure``: install ``sel``'s non-resident ids (-1 = padding, query order) as
-        held slots with usage 0, without bumping a clock or touching a hit; the last demand call's
-        slots (usage == step) stay pinned. Returns ``(src_ids, dst_slots)``, the copy plan."""
+    def prefetch(self, layer, sel, budget=None):
+        """``prefetch_ensure``: install ``sel``'s non-resident ids (-1 = padding, query order), at most
+        the first ``budget``, as held slots with usage 0, without bumping a clock or touching a hit;
+        the last demand call's slots (usage == step) stay pinned. Returns ``(src_ids, dst_slots)``,
+        the copy plan."""
         base = layer * self.E
         tok = self.tok if self.policy else 0
         pos = layer - 1  # the kernel scores from the previous layer's call, where the prefetch runs
@@ -148,7 +149,7 @@ class RefScoredCache:
                 order.append(int(e) + base)
         missing = [i for i in order if self.slot_of_id[i] < 0]
         keys = self._keys(pos, tok, now, lowpri=True)
-        n = min(len(missing), int((keys != _KEY_MAX).sum()))
+        n = min(len(missing), int((keys != _KEY_MAX).sum()), len(missing) if budget is None else budget)
         victims = np.argsort(keys, kind="stable")[:n]
         for e, v in zip(missing[:n], victims):
             old = self.id_of_slot[v]

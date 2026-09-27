@@ -1101,14 +1101,15 @@ class OffloadMoeCache:
 
     def prefetch_ensure(
         self, layer_id: int, query: torch.Tensor, dst_slots: torch.Tensor, src_rows: torch.Tensor,
-        num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor,
+        num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor, budget: int | None = None,
     ) -> None:
-        """Install ``query``'s non-resident experts of ``layer_id`` as low-priority slots and plan
-        their copy into ``dst_slots``/``src_rows``/``num`` (never the demand plan, which copy(L-1)
-        may still be reading)."""
+        """Install the first ``budget`` of ``query``'s non-resident experts of ``layer_id`` as
+        low-priority slots and plan their copy into ``dst_slots``/``src_rows``/``num`` (never the
+        demand plan, which copy(L-1) still reads). Runs on the compute stream like every other slot
+        map writer."""
         from freetoken.moe.offload_kernels import prefetch_ensure_experts
 
-        prefetch_ensure_experts(self, layer_id, query, dst_slots, src_rows, num, stats_row, ready)
+        prefetch_ensure_experts(self, layer_id, query, dst_slots, src_rows, num, stats_row, ready, budget=budget)
         if self.audit is not None:
             from freetoken.moe.slot_audit import PREFETCH_INSTALL
 

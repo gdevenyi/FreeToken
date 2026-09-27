@@ -103,15 +103,15 @@ def _evict_state(cache, layer_id: int) -> dict:
 
 def prefetch_ensure_experts(
     cache, layer_id: int, query: torch.Tensor, dst_slots: torch.Tensor, src_rows: torch.Tensor,
-    num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor,
+    num: torch.Tensor, stats_row: torch.Tensor, ready: torch.Tensor, budget: int | None = None,
 ) -> None:
-    """FREETOKEN_MOE_PREFETCH=on: install ``query``'s non-resident experts of ``layer_id`` as
-    low-priority slots and plan their copy (scored_ensure.prefetch_ensure)."""
+    """FREETOKEN_MOE_PREFETCH=on: install the first ``budget`` of ``query``'s non-resident experts
+    of ``layer_id`` as low-priority slots and plan their copy (scored_ensure.prefetch_ensure)."""
     from freetoken.moe.scored_ensure import prefetch_ensure
 
     prefetch_ensure(
         query, cache.slot_for_id.view(-1), cache.id_of_slot, cache.usage, cache.step,
-        dst_slots, src_rows, num, stats_row, ready, **_evict_state(cache, layer_id),
+        dst_slots, src_rows, num, stats_row, ready, budget=budget, **_evict_state(cache, layer_id),
     )
 
 

@@ -632,7 +632,7 @@ def _pf_cache(policy, cache_size=_PF_S, num_layers=_PF_L, num_experts=_PF_E):
     return _cache(policy, cache_size, num_layers, num_experts, prefetch_mode="on")
 
 
-def _gpu_prefetch(cache, layer, sel, stats_row, width=_PF_W):
+def _gpu_prefetch(cache, layer, sel, stats_row, width=_PF_W, budget=None):
     """prefetch_ensure on the current stream; returns (src_ids, dst_slots), the plan it wrote."""
     from freetoken.moe.offload_kernels import prefetch_ensure_experts
 
@@ -642,7 +642,7 @@ def _gpu_prefetch(cache, layer, sel, stats_row, width=_PF_W):
     src = torch.full((width,), -7, dtype=torch.int32, device=dev)
     num = torch.full((1,), 99, dtype=torch.int64, device=dev)
     ready = torch.ones(1, dtype=torch.int32, device=dev)
-    prefetch_ensure_experts(cache, layer, query, dst, src, num, stats_row, ready)
+    prefetch_ensure_experts(cache, layer, query, dst, src, num, stats_row, ready, budget=budget)
     n = int(num)
     assert int(ready) == 0, "prefetch_ensure clears the copy's ready flag"
     assert dst[n:].tolist() == [-7] * (width - n)
@@ -686,8 +686,9 @@ def test_prefetch_mode_matches_cpu_reference(policy, rows_per_step):
                 sel += rng.choice(_PF_E, size=4).tolist() + held[:2] + sel[:1] + [-1]
                 rng.shuffle(sel)
                 pinned = set(np.flatnonzero((ref.usage == ref.step) & (ref.id_of_slot >= 0)).tolist())
-                src, dst, num = _gpu_prefetch(cache, layer, sel, stats[layer])
-                want_src, want_dst = ref.prefetch(layer, sel)
+                budget = [None, 0, 1, 2, 4][int(rng.integers(5))]
+                src, dst, num = _gpu_prefetch(cache, layer, sel, stats[layer], budget=budget)
+                want_src, want_dst = ref.prefetch(layer, sel, budget)
                 np.testing.assert_array_equal(src, want_src)
                 np.testing.assert_array_equal(dst, want_dst)
                 assert not pinned & set(dst.tolist()), "a prefetch evicted a slot of the last demand call"
@@ -830,6 +831,28 @@ def test_lowpri_band_sits_between_empty_slots_and_every_resident(policy):
     beta_step, w_q4, _, _ = se.score_params(se.MAX_BETA, se.MAX_W, 1, 1)
     worst = -((se.K_MAX << se.Q) + 1 * beta_step) + ((w_q4 * se.LC_FLOOR) >> 4)
     assert worst + se.SCORE_BIAS >= 2
+
+
+@_cuda
+@pytest.mark.parametrize("policy", ["lru", "rule"])
+def test_prefetch_budget_keeps_the_first_non_resident_candidates(policy):
+    """The install budget counts only non-resident candidates, in query order: resident ids, padding
+    and duplicates ahead of them take none of it, and ISSUED counts the installs."""
+    num_experts = 16
+    cache, ref = _pf_cache(policy, num_experts, 2, num_experts), _ref(policy, num_experts, 2, num_experts)
+    stats = torch.zeros(8, dtype=torch.int64, device="cuda")
+    cache.ensure_experts(0, torch.tensor([0, 1], dtype=torch.int32, device="cuda"))  # step 0 pins every slot
+    ref.ensure(0, np.arange(2), bump_tok=True, lowpri=True)
+    src, _, _ = _gpu_prefetch(cache, 1, [4, 6], stats)
+    ref.prefetch(1, [4, 6])
+    assert src.tolist() == [4, 6]
+    sel = [4, -1, 6, 9, 9, 3, 7, 1]
+    src, dst, _ = _gpu_prefetch(cache, 1, sel, stats, budget=2)
+    assert src.tolist() == [9, 3] and int(stats[0]) == 4
+    np.testing.assert_array_equal(np.stack(ref.prefetch(1, sel, 2)), np.stack([src, dst]))
+    _assert_same_tables(cache, ref)
+    src, _, _ = _gpu_prefetch(cache, 1, [5, 8], stats, budget=0)
+    assert src.size == 0 and int(stats[0]) == 4
 
 
 @_cuda

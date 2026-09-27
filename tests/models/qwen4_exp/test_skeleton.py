@@ -690,7 +690,8 @@ def test_moe_prefetch_measure_is_bitwise_identical(kind, graph, bs, overlap, pol
 
 
 def _reference_counters(selects, ensures, budget_override, k):
-    """CPU counters from the spied predictor logits and each target layer's routing and residency."""
+    """CPU counters from the spied predictor logits and the residency its select read, and each
+    target layer's routing and residency at its ensure."""
     from freetoken.moe.prefetch import NUM_COLS, default_budget
     from tests.moe.ref_prefetch import ref_count, ref_select
 
@@ -699,9 +700,9 @@ def _reference_counters(selects, ensures, budget_override, k):
     for layer in range(1, _PF_LAYERS):
         assert len(selects[layer]) == len(ensures[layer]) > 0
         want_budget = budget_override or default_budget(config.is_linear_layer(layer))
-        for (logits, budget), (raw, resident) in zip(selects[layer], ensures[layer]):
+        for (logits, budget, seen), (raw, resident) in zip(selects[layer], ensures[layer]):
             assert budget == want_budget
-            sel, res = ref_select(logits.tolist(), resident.tolist(), k, budget)
+            sel, res = ref_select(logits.tolist(), seen.tolist(), k, budget)
             routed = raw.view(-1).tolist()
             misses = len({e for e in routed if resident[e] < 0})
             counters[layer] += torch.tensor(ref_count(sel, res, routed, misses, logits.shape[0]))
@@ -713,9 +714,9 @@ def _reference_counters(selects, ensures, budget_override, k):
 @pytest.mark.parametrize("bs", [1, 2])
 @pytest.mark.parametrize("budget", [0, 5])
 def test_moe_prefetch_counters_match_reference(kind, bs, budget, monkeypatch):
-    """Eager counters equal a CPU reference built from the predictor's own logits and each layer's
-    routing and pre-ensure residency; the captured graph counts the same. The predictor runs on
-    its dedicated stream, the count on the compute stream."""
+    """Eager counters equal a CPU reference built from the predictor's own logits and the residency
+    its select read, and each layer's routing and pre-ensure residency; the captured graph counts
+    the same. The predictor runs on its dedicated stream, the count on the compute stream."""
     import freetoken.moe.prefetch as pf_mod
 
     banks = _prefetch_banks(kind)
@@ -728,10 +729,13 @@ def test_moe_prefetch_counters_match_reference(kind, bs, budget, monkeypatch):
     real_select, real_count, real_ensure = pf_mod.lookahead_select, pf_mod.prefetch_count, cache.ensure_experts
 
     def spy_select(logits, resident, sel, res, *, k, budget):
+        # the select reads residency beside layer L-1's ensure: syncing on both sides pins what it saw
+        torch.cuda.synchronize()
         layer = (sel.data_ptr() - cache.prefetch.sel.data_ptr()) // cache.prefetch.sel[0].nbytes
-        selects[layer].append((logits.float().cpu(), budget))
+        selects[layer].append((logits.float().cpu(), budget, resident.cpu()))
         streams["select"].add(torch.cuda.current_stream().cuda_stream)
-        return real_select(logits, resident, sel, res, k=k, budget=budget)
+        real_select(logits, resident, sel, res, k=k, budget=budget)
+        torch.cuda.synchronize()
 
     def spy_count(*args, **kwargs):
         streams["count"].add(torch.cuda.current_stream().cuda_stream)
@@ -1064,8 +1068,8 @@ def _replay_on_reference(policy, calls, rows):
     planned = {}
     for call in calls:
         if call[0] == "prefetch":
-            _, layer, sel = call
-            src, _ = ref.prefetch(layer, sel.tolist())
+            _, layer, sel, budget = call
+            src, _ = ref.prefetch(layer, sel.tolist(), budget)
             stats[layer, ISSUED] += src.size
             planned[layer] = src.size
         else:
@@ -1084,8 +1088,9 @@ def _replay_on_reference(policy, calls, rows):
 def test_moe_prefetch_on_counters_match_reference(bs, policy, monkeypatch):
     """issued / useful / calls / rows / misses / copied equal a CPU replay of the spied candidates
     and routings, the slot maps end identical, late is 0 when each ensure waits for the copies
-    (known answer), and a captured graph counts the same as eager. prefetch_ensure runs on the
-    predictor stream, the slim prefetch copy on the copy stream, the demand copy on the compute one."""
+    (known answer), and with the candidates fixed a captured graph counts the same as eager.
+    prefetch_ensure and the demand copy run on the compute stream, the slim prefetch copy on the
+    copy stream."""
     import freetoken.kernel.fast_index_copy as fic
     from freetoken.moe.prefetch import LATE, NUM_STAT_COLS, RESIDENT_HITS
 
@@ -1096,10 +1101,10 @@ def test_moe_prefetch_on_counters_match_reference(bs, policy, monkeypatch):
     real_pf, real_ensure = cache.prefetch_ensure, cache.ensure_experts
     real_slim, real_multi = fic.fast_index_copy_multi_slim_jit, fic.fast_index_copy_multi_jit
 
-    def spy_pf(layer, query, *args):
+    def spy_pf(layer, query, *args, **kw):
         streams["pf_ensure"].add(torch.cuda.current_stream().cuda_stream)
-        calls.append(("prefetch", layer, query.clone()))  # enqueued on the predictor stream after the select
-        return real_pf(layer, query, *args)
+        calls.append(("prefetch", layer, query.clone(), kw.get("budget")))  # on the compute stream after its wait on the select
+        return real_pf(layer, query, *args, **kw)
 
     def spy_ensure(layer, ids, **kw):
         torch.cuda.synchronize()  # the copies forked before this ensure have landed: late must be 0
@@ -1124,7 +1129,7 @@ def test_moe_prefetch_on_counters_match_reference(bs, policy, monkeypatch):
     eager = _prefetch_run(moes, cache, bs, False, inputs, before_decode=install, sleep=0)
     torch.cuda.synchronize()
     calls = [c if c[0] == "prefetch" else (c[0], c[1], c[2].cpu(), None if c[3] is None else c[3].cpu()) for c in calls]
-    calls = [(c[0], c[1], c[2].cpu()) if c[0] == "prefetch" else c for c in calls]
+    calls = [(c[0], c[1], c[2].cpu(), c[3]) if c[0] == "prefetch" else c for c in calls]
     ref, want = _replay_on_reference(policy, calls, bs)
     got = cache.prefetch.stats.cpu()
     assert got.shape == (_PF_LAYERS, NUM_STAT_COLS)
@@ -1134,16 +1139,25 @@ def test_moe_prefetch_on_counters_match_reference(bs, policy, monkeypatch):
     assert torch.equal(cache.slot_for_id.view(-1).cpu().long(), torch.from_numpy(ref.slot_of_id))
     assert torch.equal(cache.id_of_slot.cpu().long(), torch.from_numpy(ref.id_of_slot))
     assert torch.equal(cache.usage.cpu(), torch.from_numpy(ref.usage))
-    assert streams["pf_ensure"] == {cache.prefetch.stream.cuda_stream}
+    assert streams["pf_ensure"] == {torch.cuda.current_stream().cuda_stream}
     assert streams["slim"] == {cache.prefetch.copy_stream.cuda_stream}
     assert streams["demand"] == {torch.cuda.current_stream().cuda_stream}
 
+    # the select reads residency beside layer L-1's ensure, so two runs may pick different candidates:
+    # with the candidates fixed, a captured graph must install, count and end like eager
     monkeypatch.undo()
-    moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True)
-    graph = _prefetch_run(moes, cache, bs, True, inputs, sleep=_PF_SLEEP_CYCLES)
-    _assert_same_outputs(graph[0], eager[0])
+    runs = []
+    for graph in (False, True):
+        moes, cache = _on_stack("nvfp4", banks, monkeypatch, policy=policy, overlap=True)
+        steps = _garbage(_routed_ids(moes, inputs), 12, "adversarial", seed=bs + 8)
+        run = _prefetch_run(moes, cache, bs, graph, inputs, sleep=_PF_SLEEP_CYCLES, before_step=_with_override(cache, steps))
+        _assert_same_outputs(run[0], eager[0])
+        runs.append((run[1][:3], cache.prefetch.stats.cpu()))
     cols = [c for c in range(NUM_STAT_COLS) if c != LATE]
-    assert torch.equal(cache.prefetch.stats.cpu()[:, cols], got[:, cols])
+    (maps, stats), (graph_maps, graph_stats) = runs
+    for a, b in zip(maps, graph_maps):
+        assert torch.equal(a, b)
+    assert torch.equal(graph_stats[:, cols], stats[:, cols]) and int(stats[:, 1].sum()) > 0
 
 
 @requires_cuda
@@ -1333,6 +1347,96 @@ def test_moe_prefetch_on_survives_prefills_between_decodes(graph, bs, policy, pa
     if path == "overlap_d2d":
         assert cache.prefill_hit_rows > 0, "the hit-D2D gather must have read resident slots"
     assert int(cache.prefetch.stats[:, 0].sum()) > 0
+
+
+def _record_compute_streams(monkeypatch, moes):
+    """The streams the MoE blocks are entered on (the default stream, and the capture stream under a
+    graph): the compute streams of the decode."""
+    compute = set()
+    for moe in moes:
+        real = moe.forward
+
+        def forward(x, real=real):
+            compute.add(torch.cuda.current_stream().cuda_stream)
+            return real(x)
+
+        monkeypatch.setattr(moe, "forward", forward)
+    return compute
+
+
+def _spy_map_writers(monkeypatch):
+    """(writer, stream) of every launch that writes the slot maps or their mirrors, at enqueue time."""
+    import freetoken.kernel.triton.moe as triton_moe
+    import freetoken.moe.offload_kernels as ok
+    import freetoken.moe.scored_ensure as se
+
+    seen = []
+
+    def spy(name, real):
+        def launch(*args, **kwargs):
+            seen.append((name(kwargs) if callable(name) else name, torch.cuda.current_stream().cuda_stream))
+            return real(*args, **kwargs)
+
+        return launch
+
+    # scored_ensure is the kernel of both the demand ensures and prefetch_ensure (prefetch=True)
+    monkeypatch.setattr(se, "scored_ensure", spy(lambda kw: "prefetch_ensure" if kw.get("prefetch") else "ensure",
+                                                 se.scored_ensure))
+    monkeypatch.setattr(ok, "lru_ensure", spy("ensure", ok.lru_ensure))
+    monkeypatch.setattr(ok, "materialize_layer", spy("materialize", ok.materialize_layer))
+    monkeypatch.setattr(ok, "reset_cache", spy("reset", ok.reset_cache))
+    monkeypatch.setattr(triton_moe, "invalidate_prefill_slots", spy("invalidate", triton_moe.invalidate_prefill_slots))
+    return seen
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("path", list(_PREFILL_PATHS))
+def test_moe_prefetch_on_writes_the_slot_maps_only_on_the_compute_stream(graph, bs, path, monkeypatch):
+    """Single writer: every launch that writes the slot maps (the demand and prefetch ensures, prefill
+    ensures, the whole-layer materialize, reset) runs on the stream the MoE blocks run on (the capture
+    stream under a graph), never on the predictor, prefetch copy or shared-expert side stream. The only
+    other writer is the overlap prefill's buffer invalidation, on the prefill copy stream it fences.
+    The predictor's select reads no cache state."""
+    import freetoken.layers.moe as layers_moe
+    import freetoken.moe.prefetch as pf_mod
+    from freetoken.moe.prefetch import ISSUED
+
+    cache_size, tokens, cache_kw, small = _PREFILL_PATHS[path]
+    monkeypatch.setattr(layers_moe, "_SMALL_PREFILL_TOKENS", small)
+    banks = _prefetch_banks("nvfp4")
+    decode = _prefetch_inputs(bs, steps=6, seed=95)
+    gen = torch.Generator(device="cuda").manual_seed(96)
+    prefill = [torch.randn(tokens, _PF_HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.5
+               for _ in range(_PF_LAYERS)]
+    schedule = [("decode", xs) for xs in decode[:3]] + [("prefill", prefill)] + [("decode", xs) for xs in decode[3:]]
+    moes, cache = _prefetch_stack("nvfp4", banks, "on", monkeypatch, budget=8, overlap=True, cache_size=cache_size,
+                                  **cache_kw)
+    steps = _garbage(_routed_ids(moes, [xs for _, xs in schedule]), 12, "adversarial", seed=bs + 97)
+    seen = _spy_map_writers(monkeypatch)
+    compute = _record_compute_streams(monkeypatch, moes)
+    selects, real_select = [], pf_mod.lookahead_select
+
+    def spy_select(logits, resident, *args, **kwargs):
+        selects.append((resident.data_ptr(), torch.cuda.current_stream().cuda_stream))
+        return real_select(logits, resident, *args, **kwargs)
+
+    monkeypatch.setattr(pf_mod, "lookahead_select", spy_select)
+    _mixed_run(moes, cache, bs, graph, schedule, before_step=_with_override(cache, steps))
+    pf = cache.prefetch
+    assert selects and set(selects) == {(pf._none_resident.data_ptr(), pf.stream.cuda_stream)}
+    assert not compute & {pf.stream.cuda_stream, pf.copy_stream.cuda_stream, cache.decode_copy_stream.cuda_stream}
+    assert len(compute) == 1 + graph
+    writers = {name for name, _ in seen}
+    want = {"ensure", "prefetch_ensure", "reset"} | {"materialize": {"materialize"}, "overlap": {"invalidate"},
+                                                     "overlap_d2d": {"invalidate"}, "small": set()}[path]
+    assert writers == want, writers
+    off_compute = [(name, stream) for name, stream in seen if stream not in compute]
+    fence = {cache.prefill_copy_stream.cuda_stream} if cache.prefill_copy_stream is not None else set()
+    assert all(name == "invalidate" and stream in fence for name, stream in off_compute), off_compute
+    assert {stream for name, stream in seen if name == "prefetch_ensure"} == compute  # eager, and the capture
+    assert int(pf.stats[:, ISSUED].sum()) > 0
 
 
 @requires_cuda
@@ -1803,13 +1907,14 @@ def _bad_slots(cache):
 
 
 def _spy_audit_kinds(monkeypatch):
-    """The event kinds the recorders were asked for, at enqueue time."""
+    """The event kinds the recorders were asked for, at enqueue time, each with the streams its
+    recorders ran on (a recorder follows its writer on the writer's stream)."""
     from freetoken.moe.slot_audit import SlotAuditor
 
-    kinds, real = set(), SlotAuditor._launch
+    kinds, real = {}, SlotAuditor._launch
 
     def launch(self, cache, kind, *args, **kwargs):
-        kinds.add(kind)
+        kinds.setdefault(kind, set()).add(torch.cuda.current_stream().cuda_stream)
         return real(self, cache, kind, *args, **kwargs)
 
     monkeypatch.setattr(SlotAuditor, "_launch", launch)
@@ -1825,7 +1930,9 @@ def test_moe_slot_audit_is_quiet_and_changes_no_bit(graph, bs, prefetch, path, m
     """FREETOKEN_MOE_SLOT_AUDIT=1 records every slot writer (the decode and prefetch ensures and copies,
     and between the decode steps the whole-layer materialize, the overlap double buffers with the
     hit-D2D gather, or small prefills) and audits every held slot after each decode step: it finds
-    nothing, and the outputs, slot maps and slot bytes equal those of the audit off to the bit."""
+    nothing, and the outputs, slot maps and slot bytes equal those of the audit off to the bit. Every
+    map writer it records ran on the compute stream but the prefill buffer invalidation (on the
+    prefill copy stream), and the prefetch copy on the prefetch copy stream."""
     import freetoken.layers.moe as layers_moe
     import freetoken.moe.offload_cache as offload_cache
     from freetoken.moe import slot_audit as sa
@@ -1853,6 +1960,7 @@ def test_moe_slot_audit_is_quiet_and_changes_no_bit(graph, bs, prefetch, path, m
         if prefetch == "on":
             steps = _garbage(_routed_ids(moes, [xs for _, xs in schedule]), 12, "adversarial", seed=bs + 83)
             before_step = _with_override(cache, steps)
+        compute = _record_compute_streams(monkeypatch, moes)
         out = _mixed_run(moes, cache, bs, graph, schedule, before_step=before_step)
         runs.append((out, [t.clone() for t in (cache.slot_for_id, cache.id_of_slot, cache.usage, *cache.bank_views())]))
     _assert_same_outputs(runs[1][0], runs[0][0])
@@ -1872,7 +1980,13 @@ def test_moe_slot_audit_is_quiet_and_changes_no_bit(graph, bs, prefetch, path, m
         "overlap_d2d": {sa.INVALIDATE, sa.PREFILL_SPLIT_H2D, sa.PREFILL_HIT_D2D},
         "small": {sa.PREFILL_INSTALL, sa.PREFILL_COPY},
     }[path]
-    assert kinds == expected, (kinds - expected, expected - kinds)
+    assert set(kinds) == expected, (set(kinds) - expected, expected - set(kinds))
+    fence = set() if cache.prefill_copy_stream is None else {cache.prefill_copy_stream.cuda_stream}
+    for kind in (sa.DEMAND_INSTALL, sa.PREFETCH_INSTALL, sa.PREFILL_INSTALL, sa.MATERIALIZE_INSTALL,
+                 sa.MATERIALIZE_CLEAR, sa.RESET, sa.INVALIDATE):
+        assert kinds.get(kind, set()) <= (fence if kind == sa.INVALIDATE else compute), kind
+    if prefetch == "on":
+        assert kinds[sa.PREFETCH_COPY] == {cache.prefetch.copy_stream.cuda_stream}
 
 
 @requires_cuda
