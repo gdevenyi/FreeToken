@@ -195,7 +195,9 @@ class Qwen4ExpMTPDraft(BaseOP):
         h = self.pre_fc_norm_hidden.forward(prev_hidden)
         r = self.fc_hidden.forward(h.view(rows * self.hc_count, hidden)).view(rows, self.hc_count, hidden)
         r += e.unsqueeze(1)
-        return self.layers.op_list[0].forward(r.view(rows, -1), get_global_ctx().batch)
+        layer = self.layers.op_list[0]
+        h_out, mlp_out, inject = layer.forward(r.view(rows, -1), get_global_ctx().batch)
+        return layer.mlp_hyper_connection.combine(h_out, mlp_out, inject)
 
     def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.hyper_connection_mixer.mix(hidden)[0]
