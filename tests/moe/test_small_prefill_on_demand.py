@@ -60,7 +60,7 @@ def _record_paths(monkeypatch, layer, cache):
     """Stub the cache movement and the GEMM; log each call and what the GEMM was handed."""
     calls, got = [], {}
 
-    def ensure(layer_id, ids):
+    def ensure(layer_id, ids, **_):
         calls.append(("ensure", ids.tolist()))
         ids.add_(100)  # the LRU kernel rewrites its query to slot ids in place
 
