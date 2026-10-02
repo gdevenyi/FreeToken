@@ -88,11 +88,17 @@ class EngineConfig:
     # DSV4 window/full ratio directly. Used only when swa_num_pages_override is None (a runtime
     # rebuild can pin an absolute window instead).
     swa_full_tokens_ratio: float = 0.2
+    # Force one decode step after this many consecutive prefill steps, so a long chunked
+    # prefill cannot starve in-flight decodes. None/0 keeps the historical prefill-first
+    # order (the scheduler's own TODO names this: "support other policies: e.g. DECODE
+    # first"). At 8 the cost is ~1% of prefill wall time.
+    decode_interleave_every: int | None = None
     # Absolute window-pool size in the pool's own pages (usable, dummy excluded); None -> use the
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
     distributed_timeout: float = 1800.0  # ranks reach the first collective minutes apart on a 100+ GiB offload load
+    distributed_port: int = 2333
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
@@ -166,4 +172,4 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        return f"tcp://127.0.0.1:{self.distributed_port}"

@@ -32,6 +32,7 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .interleave import DecodeInterleavePolicy
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
@@ -92,6 +93,14 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        # Bound how long a run of prefill steps may starve in-flight decodes. A long
+        # prompt chunked at the window budget is hundreds of consecutive prefill steps;
+        # measured on an 8xRTX4090 DSV4 deployment, that left an already-decoding
+        # request unscheduled for 267-317 s. Unset reproduces the historical
+        # prefill-first order exactly.
+        self._interleave = DecodeInterleavePolicy(
+            getattr(config, "decode_interleave_every", None)
+        )
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -462,16 +471,38 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req) -> str | None:
-        """First stop string present in this request's generated tail, else None. Decodes
-        only a short suffix (bounded by the longest stop string's char length, so a stop of
-        N chars spans at most N tokens) to keep the per-step cost small."""
+        """Match stops against the same incrementally decoded text as the frontend."""
+        from freetoken.tokenizer.detokenize import DecodeStatus
+
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        end = len(req.input_ids)
+        # The frontend omits a terminal EOS, including at the output limit with ignore_eos.
+        # The limit is the delivered length, as in hit_length: under overlap device_len (and
+        # so can_decode) runs a step ahead of the host.
+        if (
+            end > prompt_len
+            and end >= req.max_device_len
+            and int(req.input_ids[-1]) in self.eos_token_ids
+        ):
+            end -= 1
+        if end <= prompt_len:
             return None
+        if req.stop_decode_status is None:
+            req.stop_decode_status = DecodeStatus(
+                decoded_ids=[],
+                decoded_str="",
+                read_offset=0,
+                surr_offset=0,
+                sent_offset=0,
+                skip_special=req.sampling_params.skip_special_tokens,
+            )
+        state = req.stop_decode_status
+        state.decoded_ids.extend(req.input_ids[prompt_len + len(state.decoded_ids) : end].tolist())
+        tail = state.decode(self.tokenizer)
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        # Bound the text used for matching, retaining token context for incomplete characters.
+        state.decoded_str = state.decoded_str[-max_chars:]
         for s in stop_strs:
             if s in tail:
                 return s
@@ -916,11 +947,28 @@ class Scheduler(SchedulerIOMixin):
             )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # Prefill keeps priority -- a request that never prefills never starts -- but a
+        # long run of prefill chunks must not starve in-flight decodes. When the policy
+        # says a decode is due, take one if a decode is actually runnable; otherwise stay
+        # with prefill (never spend a slot idle just to keep a promise).
+        # getattr, not attribute access: the accounting tests drive this method on a
+        # partially built Scheduler, and interleaving must be an opt-in that a stripped
+        # object simply does not have rather than something that breaks it. A missing
+        # policy is the historical prefill-first order.
+        policy = getattr(self, "_interleave", None)
+        batch = None
+        if policy is not None and policy.wants_decode():
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                policy.note_decode()
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None and policy is not None:
+                policy.note_prefill()
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None and policy is not None:
+                policy.note_decode()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

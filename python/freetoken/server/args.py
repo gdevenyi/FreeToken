@@ -109,10 +109,6 @@ class ServerArgs(SchedulerConfig):
     def frontend_create_tokenizer_link(self) -> bool:
         return not self.share_tokenizer
 
-    @property
-    def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
-
 
 def _json_object(text: str) -> dict:
     try:
@@ -167,6 +163,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a positive integer") from exc
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
+        return n
+
+    def _valid_port(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer") from exc
+        if not 0 <= n <= 65535:
+            raise argparse.ArgumentTypeError("must be between 0 and 65535")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -376,6 +381,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dist-port",
+        type=_valid_port,
+        dest="distributed_port",
+        default=None,
+        help=(
+            "Port for the internal TP rendezvous store, loopback-only regardless of --host. "
+            "Defaults to --port + 1; override when that collides with another instance or "
+            "service on the same host."
+        ),
+    )
+
+    parser.add_argument(
         "--cuda-graph-max-bs",
         "--graph",
         type=int,
@@ -425,6 +442,20 @@ def parse_args(
             "Total KV-cache capacity in tokens; must be a multiple of the resolved page "
             "size (DSV4: 128 window page, TRTLLM backend: 64). Mutually exclusive with "
             "--num-pages."
+        ),
+    )
+
+    parser.add_argument(
+        "--decode-interleave-every",
+        type=int,
+        default=ServerArgs.decode_interleave_every,
+        help=(
+            "Force one decode step after this many consecutive prefill steps. A long "
+            "prompt is prefilled in chunks, so it occupies that many consecutive "
+            "scheduler steps; measured on an 8xRTX4090 DSV4 deployment, a 300k-token "
+            "context left an already-decoding request unscheduled for 267-317 s. "
+            "Unset keeps the historical prefill-first order (the scheduler's own TODO "
+            "names this policy)."
         ),
     )
 
@@ -918,6 +949,9 @@ def parse_args(
             parser.error("--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead")
         if entry:
             kwargs["quant_backend"] = entry
+
+    if kwargs["distributed_port"] is None:
+        kwargs["distributed_port"] = kwargs["server_port"] + 1
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])

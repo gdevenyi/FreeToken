@@ -5,6 +5,7 @@ import errno
 import gc
 import math
 import os
+import socket
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -127,6 +128,9 @@ def _backend_requirements_met(name: str) -> bool:
     if any(i.requires_flashinfer for i in infos) and not _flashinfer_available():
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
+        return False
+    # requires_sm90 also admits sm_100 (FA4). Hopper-only would reject B200.
+    if any(i.requires_sm90 for i in infos) and not (is_sm90_family() or is_sm100_family()):
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
@@ -283,6 +287,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"Attention backend {config.attention_backend!r} requires sgl_kernel, which is "
                 "not installed. Install it with `pip install 'freetoken[sgl]'` (or "
                 "'freetoken[accel]'), or use --attention-backend triton."
+            )
+        if info.requires_sm90 and not (is_sm90_family() or is_sm100_family()):
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} requires a compute capability "
+                "9.x GPU (FA3, sm_90 cubins) or 10.x GPU (FA4). Ada (sm_89) and consumer "
+                "Blackwell (sm_12x) are not in the published sgl_kernel flash_ops set. "
+                "Use --attention-backend fi (or triton) instead."
             )
         if info.requires_sm100 and not is_sm100_family():
             raise RuntimeError(
@@ -611,15 +622,40 @@ class Engine:
         if config.prefill_warmup:
             self._warmup_prefill()
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
+    def _make_distributed_store(self, config: EngineConfig) -> torch.distributed.Store:
+        """The rendezvous store's C10d server ignores the host it's given and always listens
+        on every interface, so an unauthenticated TCPStore ends up reachable off-box even
+        when distributed_addr says 127.0.0.1. Rank 0 pre-binds the listening socket to
+        loopback itself and hands the fd to TCPStore (master_listen_fd) to force that."""
+        timeout = timedelta(seconds=config.distributed_timeout)
+        if not config.tp_info.is_primary():
+            return torch.distributed.TCPStore(
+                "127.0.0.1", config.distributed_port, config.tp_info.size,
+                is_master=False, timeout=timeout, multi_tenant=True,
             )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", config.distributed_port))
+        sock.listen(1024)
+        self._distributed_listen_addr = sock.getsockname()
+        # TCPStore takes ownership of the fd and closes it with the store; detach so the
+        # Python socket never closes that number again after it has been reused.
+        return torch.distributed.TCPStore(
+            "127.0.0.1", config.distributed_port, config.tp_info.size,
+            is_master=True, timeout=timeout, multi_tenant=True, master_listen_fd=sock.detach(),
+        )
+
+    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        store = self._make_distributed_store(config)
+        use_gloo = config.tp_info.size == 1 or config.use_pynccl
+        torch.distributed.init_process_group(
+            backend="gloo" if use_gloo else "nccl",
+            rank=config.tp_info.rank,
+            world_size=config.tp_info.size,
+            timeout=timedelta(seconds=config.distributed_timeout),
+            store=store,
+        )
+        if use_gloo:
             tp_cpu_group = torch.distributed.group.WORLD
             assert tp_cpu_group is not None
             max_bytes = (
@@ -627,13 +663,6 @@ class Engine:
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
