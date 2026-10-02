@@ -74,6 +74,21 @@ class DecodeStatus:
     skip_special: bool = False  # decode this request with skip_special_tokens
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
 
+    def update(self, read_str: str, surr_str: str) -> str:
+        new_text = read_str[len(surr_str) :]
+        if len(new_text) > 0 and not new_text.endswith("�"):
+            self.decoded_str += new_text
+            self.surr_offset = self.read_offset
+            self.read_offset = len(self.decoded_ids)
+            return self.decoded_str
+        return self.decoded_str + find_printable_text(new_text)
+
+    def decode(self, tokenizer: PreTrainedTokenizerBase) -> str:
+        return self.update(
+            tokenizer.decode(self.decoded_ids[self.surr_offset :]),
+            tokenizer.decode(self.decoded_ids[self.surr_offset : self.read_offset]),
+        )
+
 
 class DetokenizeManager:
     def __init__(
@@ -116,6 +131,10 @@ class DetokenizeManager:
     def detokenize_with_meta(self, msgs: List[DetokenizeMsg]) -> tuple[List[str], List[int]]:
         """Incremental text per message plus, for a finished message, its reasoning token
         count (0 otherwise or when the model emitted no reasoning end tag)."""
+        # Each message must advance its request's decode state before the next one.
+        if len({msg.uid for msg in msgs}) != len(msgs):
+            parts = [self.detokenize_with_meta([msg]) for msg in msgs]
+            return [p[0][0] for p in parts], [p[1][0] for p in parts]
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         skip: List[bool] = []
@@ -130,7 +149,9 @@ class DetokenizeManager:
                     skip_special=bool(getattr(msg, "skip_special_tokens", False)),
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token in self.eos_token_ids):
+            if not (
+                msg.finished and not msg.matched_stop and msg.next_token in self.eos_token_ids
+            ):
                 s.decoded_ids.append(msg.next_token)
             if (
                 self.think_end_id is not None
@@ -149,16 +170,7 @@ class DetokenizeManager:
         reasoning_tokens: List[int] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
-            new_text = read_str[len(surr_str) :]
-            # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
-                output_str = s.decoded_str + new_text
-                s.decoded_str = output_str
-                s.surr_offset = s.read_offset
-                s.read_offset = len(s.decoded_ids)
-            else:
-                new_text = find_printable_text(new_text)
-                output_str = s.decoded_str + new_text
+            output_str = s.update(read_str, surr_str)
 
             prev_sent = s.sent_offset
             if msg.finished:
