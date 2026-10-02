@@ -50,10 +50,10 @@ class ServerArgs(SchedulerConfig):
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
     # Server-wide default thinking mode for reasoning-capable models: "auto" keeps the
-    # current per-request behavior; "chat" forces enable_thinking=False for every request
-    # that does not explicitly set it in chat_template_kwargs (for OpenAI-compatible
-    # clients that never send template kwargs, like Vercel AI SDK or llama-swap);
-    # "thinking" forces thinking on the same way.
+    # current per-request behavior; "chat" turns thinking off for every request that does
+    # not choose itself (template kwargs or a protocol-level effort/thinking field), for
+    # OpenAI-compatible clients that never send template kwargs, like Vercel AI SDK or
+    # llama-swap; "thinking" turns it on the same way.
     default_thinking_mode: str = "auto"
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
@@ -599,7 +599,7 @@ def parse_args(
         default=ServerArgs.enable_metrics_report,
         help=(
             "Serve a per-request `metrics` object next to usage on /v1/chat/completions, "
-            "/v1/completions, /v1/messages and /v1/responses: ttft_ms, prefill_time_ms and "
+            "/v1/messages and /v1/responses: ttft_ms, prefill_time_ms and "
             "prefill_tokens_per_second (the prefill span measured by the scheduler itself), "
             "decode_time_ms and decode_tokens_per_second, cached_prompt_tokens and "
             "total_time_ms. Streaming responses carry it on the same final chunk as usage, so "
@@ -675,10 +675,11 @@ def parse_args(
         choices=["auto", "chat", "thinking"],
         help=(
             "Server-wide default thinking mode for reasoning-capable models. 'auto' keeps "
-            "the current per-request behavior; 'chat' forces enable_thinking=False for "
-            "every request that does not explicitly set it in chat_template_kwargs (for "
-            "OpenAI-compatible clients that never send template kwargs, like Vercel AI SDK "
-            "or llama-swap); 'thinking' forces thinking on the same way."
+            "the current per-request behavior; 'chat' turns thinking off for every request "
+            "that does not choose itself (chat_template_kwargs, reasoning_effort, "
+            "reasoning.effort, thinking) -- for OpenAI-compatible clients that never send "
+            "template kwargs, like Vercel AI SDK or llama-swap; 'thinking' turns it on the "
+            "same way."
         ),
     )
 
@@ -721,6 +722,16 @@ def parse_args(
         help=(
             "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
             "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+        ),
+    )
+
+    parser.add_argument(
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
+        help=(
+            "Where the token embedding table lives. 'host' keeps it in pinned host RAM and gathers "
+            "the rows each step needs over PCIe, freeing its VRAM (single GPU only)."
         ),
     )
 

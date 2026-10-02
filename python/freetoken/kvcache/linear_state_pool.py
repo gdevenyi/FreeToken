@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from freetoken.distributed import get_tp_info
@@ -260,6 +261,34 @@ def linear_state_bytes_per_req(
 __all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
 
 
+_GDN_CHUNK_SIZE = 64  # keep in lockstep with kernel/fla/chunk_delta_h.py CHUNK_SIZE
+
+
+def gdn_prefill_workspace_bytes(config) -> int:
+    """Bytes of the GDN chunked-prefill buffers that scale with the extend length.
+
+    ``chunk_gated_delta_rule_fwd_h`` materializes the per-chunk recurrent states for
+    the WHOLE extend at once -- ``[NT, H, V, K]`` with ``NT = ceil(extend / 64)`` --
+    plus the ``v_new`` value buffer (288 MiB at an 8192-token extend for qwen4_exp).
+    This is a lower bound on the GDN prefill peak, not the peak: w/u/A/o and the
+    in_proj/conv activations still come out of the ``(1 - memory_ratio)`` headroom.
+    0 for non-GDN models."""
+    linear_group = config.model_config.linear_attention_group()
+    if linear_group is None:
+        return 0
+    # EngineConfig has no max_extend_tokens (the served config is a SchedulerConfig subclass)
+    extent = min(getattr(config, "max_extend_tokens", 8192), config.max_seq_len)
+    nt = -(-extent // _GDN_CHUNK_SIZE)
+    states = (
+        nt
+        * linear_group.num_value_heads
+        * linear_group.value_head_dim
+        * linear_group.key_head_dim
+    )
+    v_new = extent * linear_group.num_value_heads * linear_group.value_head_dim
+    return (states + v_new) * config.dtype.itemsize
+
+
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
     """Total GDN state-pool bytes at ``num_slots`` PHYSICAL slots (default: the startup
     slot count). The engine adds this to the KV family's fixed cost when budgeting --
@@ -285,7 +314,10 @@ def _linear_pool_num_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    # With the host snapshot tier (FT_GDN_HOST_TIER=1) evicted snapshots spill to RAM and come
+    # back on a hit, so the GPU cache need not keep four of them resident.
+    floor = 1 if os.environ.get("FT_GDN_HOST_TIER", "0") == "1" else 4
+    n_cache = max(floor, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 

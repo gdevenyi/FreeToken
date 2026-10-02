@@ -34,7 +34,8 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, gdn_prefill_workspace_bytes,
+    state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -81,6 +82,42 @@ def _sgl_flash_attn_available() -> bool:
         )
         return False
     return True
+
+
+def _place_embeddings_on_host(model) -> int:
+    """--embed-weights host: every input embedding table moves to pinned host RAM, except one an lm_head is tied to.
+
+    Returns the pinned bytes."""
+    from freetoken.layers.base import BaseOP
+    from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+
+    found: list[VocabParallelEmbedding] = []
+    tied: set[int] = set()
+    stack, seen = [model], set()
+    while stack:
+        op = stack.pop()
+        if id(op) in seen:
+            continue
+        seen.add(id(op))
+        if isinstance(op, ParallelLMHead):
+            if op.tied_embedding is not None:
+                tied.add(id(op.tied_embedding))
+            continue
+        if isinstance(op, VocabParallelEmbedding):
+            found.append(op)
+            continue
+        for value in vars(op).values():
+            items = value if isinstance(value, (list, tuple)) else (value,)
+            stack.extend(v for v in items if isinstance(v, BaseOP))
+    moved = [e for e in found if id(e) not in tied]
+    if not moved:
+        raise ValueError("--embed-weights host: the model has no untied input embedding to move")
+    for emb in moved:
+        emb.place_on_host()
+    torch.cuda.empty_cache()
+    size = sum(e.weight.numel() * e.weight.element_size() for e in moved)
+    logger.info_rank0(f"Token embedding in pinned host RAM ({mem_GB(size)}), gathered over PCIe")
+    return size
 
 
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
@@ -453,6 +490,7 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        embed_host_bytes = _place_embeddings_on_host(self.model) if config.embed_weights == "host" else 0
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -466,11 +504,11 @@ class Engine:
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
-        # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = 0
+        # planning sees the pin quota the table (and a host embedding) already spent.
+        self._host_tables_bytes = embed_host_bytes
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
-                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+                self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -503,6 +541,9 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        # Reserve part of the GDN prefill transient (chunk states + v_new); the rest of the
+        # prefill activations still live in the (1 - memory_ratio) headroom.
+        available_memory -= gdn_prefill_workspace_bytes(config)
         num_gpu_pages = self._pool_cls.solve_num_pages(config, available_memory)
         if config.kv_host_pages > 0:
             # KV host offload: the scheduler, page table and radix tree run in a LOGICAL page
@@ -739,6 +780,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += gdn_prefill_workspace_bytes(config)  # GDN prefill transient
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -1152,7 +1194,8 @@ class Engine:
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
             extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
+                (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
+                + gdn_prefill_workspace_bytes(config)
             ),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""

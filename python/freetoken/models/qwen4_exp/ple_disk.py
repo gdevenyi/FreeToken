@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+from collections import deque
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -146,11 +147,18 @@ class _PendingFill:
             self._future.result()
         except BaseException:  # noqa: BLE001 -- the launch error is the one to surface
             pass
+        pending = self._table._pending_fills()
+        if self._future in pending:
+            pending.remove(self._future)  # its outcome was consumed here
+        self._table._retire(self._future)
         self._table._flag.zero_()
 
 
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
+
+    # the fill hashes on the host; lookup/prefetch read only the row_ids shape
+    reads_row_ids = False
 
     def __init__(
         self,
@@ -213,11 +221,10 @@ class DiskRowTable:
         from freetoken.kernel.row_store import probe_wait_sync
 
         self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
-        # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
+        # one flag for all graphs: each fill's readback event orders it after the previous graph, so signals never overlap
         self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
-        self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
@@ -237,12 +244,29 @@ class DiskRowTable:
     def _current_stream(self):
         return torch.cuda.current_stream(self._device)
 
+    def _pending_fills(self) -> deque:
+        return self.__dict__.setdefault("_pending_fill_queue", deque())
+
+    def _readback_pool(self) -> list:
+        return self.__dict__.setdefault("_readback_events", [])
+
+    def _retire(self, future: Future) -> None:
+        """Return a finished fill's readback event for reuse (engine thread only)."""
+        event = getattr(future, "readback", None)
+        if event is not None:
+            self._readback_pool().append(event)
+            future.readback = None
+
     def _raise_failed_fill(self) -> None:
-        pending = self.__dict__.pop("_pending_fill", None)
-        if pending is not None and pending.done() and pending.exception() is not None:
-            raise pending.exception()
-        if pending is not None and not pending.done():
-            self._pending_fill = pending
+        """Surface a finished graph fill's error on the engine thread, oldest first; a failed
+        fill signalled its WAIT, so that graph ran on stale rows."""
+        pending = self._pending_fills()
+        while pending and pending[0].done():
+            future = pending.popleft()
+            self._retire(future)
+            exc = future.exception()
+            if exc is not None:
+                raise exc
 
     def _fill_now(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """A fill that completes before its launch, on the store's thread (after any queued graph fill)."""
@@ -285,12 +309,18 @@ class DiskRowTable:
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
-                self._readback_event.record(self._current_stream())
+                # one event per fill: a shared one re-recorded by the next step before this job
+                # reached synchronize() would wait on a graph parked on this job's own WAIT
+                # recycled, never destroyed while serving: cuEventDestroy from the filler blocks on
+                # the driver lock a blocked cuGraphLaunch holds, and the fill it waits for never runs
+                pool = self._readback_pool()
+                readback = pool.pop() if pool else torch.cuda.Event()
+                readback.record(self._current_stream())
                 cancelled = threading.Event()
 
                 def _job() -> None:
                     try:
-                        self._readback_event.synchronize()
+                        readback.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
                         if cancelled.is_set():
                             return
@@ -303,8 +333,10 @@ class DiskRowTable:
                         signal(self._flag)
                         raise
 
-                self._pending_fill = self._filler().submit(_job)
-                return _PendingFill(self, self._pending_fill, cancelled)
+                future = self._filler().submit(_job)
+                future.readback = readback
+                self._pending_fills().append(future)
+                return _PendingFill(self, future, cancelled)
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
             runs = [torch.tensor([*ctx, t], dtype=torch.int64) for ctx, t in zip(contexts, tokens)]

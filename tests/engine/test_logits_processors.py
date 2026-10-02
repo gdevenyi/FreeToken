@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from freetoken.core import SamplingParams
 from freetoken.engine.sample import LogitsPlan, Sampler, apply_logits_processors
@@ -85,6 +86,31 @@ def test_min_tokens_masks_the_stop_ids_of_the_row_only():
     assert torch.isfinite(out[0]).all()
 
 
+@pytest.mark.parametrize("overlap", [True, False])
+def test_min_tokens_releases_the_stop_ids_at_output_index_min_tokens(overlap):
+    """Overlap scheduling prepares batch N before batch N-1's token reaches req.input_ids on
+    the host; the count must not lag by that token and hold EOS one step too long."""
+    from freetoken.core import Req
+
+    sp = SamplingParams(min_tokens=3, max_tokens=10)
+    sp.min_tokens_stop_ids = [0]
+    req = Req(input_ids=torch.tensor([5, 6], dtype=torch.int32), table_idx=0, cached_len=0,
+              output_len=10, uid=1, sampling_params=sp, cache_handle=None)
+    sampler = Sampler(CPU, V)
+    masked, pending = [], None
+    for _ in range(6):
+        plan = sampler.prepare(SimpleNamespace(reqs=[req])).plan
+        masked.append(plan is not None and plan.min_rows is not None)
+        req.complete_one()  # the forward launch advances the device length
+        if overlap:
+            if pending is not None:  # batch N-1 drains after batch N launched
+                req.append_host(pending)
+            pending = torch.tensor([7], dtype=torch.int32)
+        else:
+            req.append_host(torch.tensor([7], dtype=torch.int32))
+    assert [i for i, m in enumerate(masked) if m] == [0, 1, 2]
+
+
 def test_min_p_drops_tokens_below_the_fraction_of_the_top_probability():
     logits = torch.log(torch.tensor([[0.5, 0.3, 0.1, 0.05, 0.03, 0.01, 0.005, 0.005]]))
     plan = _plan(
@@ -104,6 +130,7 @@ def _req(
     ids = torch.tensor(prompt + generated, dtype=torch.int32)
     return SimpleNamespace(
         input_ids=ids,
+        device_len=len(ids),
         output_len=max_tokens,
         max_device_len=len(prompt) + max_tokens,
         sampling_params=SamplingParams(**sp),
@@ -163,3 +190,18 @@ def test_repetition_penalty_ignores_multimodal_placeholder_ids_in_the_prompt():
     args = sampler.prepare(batch)
     out = apply_logits_processors(torch.ones(1, V), args.plan, V)
     assert out[0, 1] == 0.5 and out[0, 2] == 0.5 and out[0, 4] == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_min_p_with_temperature_draws_only_the_kept_tokens():
+    # min_p leaves -inf over nearly the whole row; the sampling softmax must not turn that
+    # into NaN (which the Pascal fallback then samples as a uniform row)
+    V = 32768
+    sampler = Sampler(torch.device("cuda"), V)
+    req = _req([1, 2], [], 4, temperature=0.8, min_p=0.1)
+    args = sampler.prepare(SimpleNamespace(reqs=[req]))
+    logits = torch.full((1, V), -10.0, device="cuda")
+    kept = [100, 20000, 31000]
+    logits[0, kept] = torch.tensor([5.0, 4.5, 4.0], device="cuda")
+    for _ in range(32):
+        assert sampler.sample(logits, args).item() in kept
