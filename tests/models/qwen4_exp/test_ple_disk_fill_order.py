@@ -63,7 +63,9 @@ def _table(monkeypatch) -> DiskRowTable:
     t._token_readback = torch.zeros(8, dtype=torch.int32)
     t._readback_event = _Event()
     t._graph_pinned = torch.zeros(64, dtype=torch.uint8)
-    t._eager_pinned = torch.zeros(64, dtype=torch.uint8)
+    t._eager_pinned = [torch.zeros(64, dtype=torch.uint8), torch.zeros(64, dtype=torch.uint8)]
+    t._eager_read = [_Event(), _Event()]
+    t._eager_slot = 0
     t._token_bytes = 1
     t.eos_token_id = EOS
     t.image_token_id = None
