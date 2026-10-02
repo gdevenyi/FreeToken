@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from freetoken.core import SamplingParams
 from freetoken.engine.sample import LogitsPlan, Sampler, apply_logits_processors
