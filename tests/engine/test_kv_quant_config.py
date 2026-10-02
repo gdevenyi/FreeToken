@@ -39,7 +39,7 @@ def _model_config(kind):
         has_swa_attention=False,
         has_linear_attention=False,
         num_layers=4,
-        rotary_config=SimpleNamespace(max_position=1024),
+        rotary_config=SimpleNamespace(max_position=1024, table_positions=1024),
     )
     specs = {
         "full": (_spec("full", AttnType.FULL),),
