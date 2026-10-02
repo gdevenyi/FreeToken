@@ -77,6 +77,22 @@ class EnvClassSingleton:
     MAMBA_SSM_DTYPE = EnvStr("float32")
     # cap the longest prefill warmup forward; 0 = the engine's own chunk cap
     WARMUP_MAX_LEN = EnvInt(0)
+    # GPU-decode MoE: run a layer's expert miss copy on a side stream under the shared expert
+    MOE_COPY_OVERLAP = EnvBool(False)
+    # GPU-decode MoE cross-layer prefetch: off | measure (predict and count, no copies) | on (predict and copy)
+    MOE_PREFETCH = EnvStr("off")
+    # router-lookahead candidates per layer, and the non-resident ones kept per target layer
+    # (0 = 3 before GDN layers, 4 before full-attention layers)
+    MOE_PREFETCH_K = EnvInt(16)
+    MOE_PREFETCH_BUDGET = EnvInt(0)
+    # measure mode: also log the per-layer breakdown with every summary
+    MOE_PREFETCH_DEBUG = EnvBool(False)
+    # debug: check every GPU decode layer call's slot maps (meta) and slot bytes before/after the GEMM (1)
+    MOE_PREFETCH_VERIFY = EnvStr("0")
+    # routed experts a call byte-checks (scratch rows, ~2.8 MB each on Qwen3.8-Flash)
+    MOE_PREFETCH_VERIFY_ROWS = EnvInt(20)
+    # debug: record every expert slot writer and audit every held slot each N decode steps (0 = off)
+    MOE_SLOT_AUDIT = EnvInt(0)
 
     def __new__(cls):
         # single instance

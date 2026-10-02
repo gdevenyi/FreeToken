@@ -36,6 +36,15 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # The request's stop strings (None when it has none), so the detokenizer can hold back
     # a trailing partial-stop prefix instead of streaming it and then needing to retract.
     stop_strs: list[str] | None = None
+    # Keep the matched stop string in the output (SamplingParams.include_stop_str_in_output).
+    keep_stop_str: bool = False
+    # Decode this request with skip_special_tokens (SamplingParams.skip_special_tokens).
+    skip_special_tokens: bool = False
+    # Sampled-token logprobs (None unless the request asked): the chosen token's raw
+    # logprob and the top alternatives, already cut to this request's top_logprobs.
+    chosen_logprob: float | None = None
+    top_ids: list[int] | None = None
+    top_logprobs: list[float] | None = None
     # KV page-pool usage snapshot at this step (not-evictable used/total), passed
     # through to the frontend for the shell status bar. 0/0 for owned-KV models.
     kv_used_pages: int = 0
@@ -48,6 +57,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Scheduler-measured prefill span for this request: admission (the first prefill batch
+    # was prepared) to the token sampled off its last prefill chunk. Set on that first token
+    # only, 0.0 on every later one -- it is the one span a client cannot derive from HTTP
+    # timestamps, which is why it rides the wire instead of being re-estimated frontend-side.
+    prefill_ms: float = 0.0
 
 
 @dataclass

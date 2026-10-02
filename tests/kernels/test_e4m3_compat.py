@@ -44,6 +44,29 @@ def _native_cc() -> bool:
     return torch.cuda.get_device_capability() >= (8, 9)
 
 
+@pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm")
+def test_rocm_host_and_compile_time_native_gates_match():
+    """The host wrapper and Triton constexpr must choose the same buffer ABI."""
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.e4m3_compat import e4m3_native, e4m3_native_cx
+
+    @triton.jit
+    def gate_kernel(output):
+        if e4m3_native_cx():
+            value = 1
+        else:
+            value = 0
+        tl.store(output, value)
+
+    output = torch.empty(1, dtype=torch.int32, device="cuda")
+    gate_kernel[(1,)](output)
+
+    assert e4m3_native() is False
+    assert output.item() == int(e4m3_native())
+
+
 def test_constexpr_probe_never_references_a_host_function():
     """triton hashes an @constexpr_function by walking its AST (runtime/jit.py:
     cache_key -> record_reference), and a bare reference to a plain python function
@@ -354,6 +377,24 @@ def _emit_all(path: str) -> None:
         (codes_to_f32(kc4) * k_sc.view(pages, page, kvh, 1)).to(torch.bfloat16),
         (codes_to_f32(vc4) * v_sc.view(pages, page, kvh, 1)).to(torch.bfloat16),
         sel, table, t2r))
+
+
+    # a K no tile divides takes the masked loads, whose fill value must suit an fp8 pointer
+    Kr, H5, I5 = 272, 272, 80
+    pkr = torch.randint(0, 256, (N, Kr // 2), dtype=torch.uint8, device=dev)
+    scr = (torch.rand(N, Kr // 16, device=dev) * 2 + 0.1).to(FP8)
+    out["nv_gemm_inkernel_ragged_k"] = f32(nvfp4_dense_linear(
+        torch.randn(8, Kr, dtype=torch.bfloat16, device=dev), pkr, scr, g))
+    gup5 = torch.randint(0, 256, (S, 2 * I5, H5 // 2), dtype=torch.uint8, device=dev)
+    gus5 = (torch.rand(S, 2 * I5, H5 // 16, device=dev) + 0.1).to(FP8)
+    gug5 = (torch.rand(S, 2 * I5, device=dev) * 0.05 + 0.01).to(torch.float16)
+    dnp5 = torch.randint(0, 256, (S, H5, I5 // 2), dtype=torch.uint8, device=dev)
+    dns5 = (torch.rand(S, H5, I5 // 16, device=dev) + 0.1).to(FP8)
+    dng5 = (torch.rand(S, H5, device=dev) * 0.05 + 0.01).to(torch.float16)
+    out["nv_moe_prefill_ragged_k"] = f32(fused_experts_nvfp4(
+        torch.randn(2, H5, dtype=torch.bfloat16, device=dev),
+        gup5, gus5, gug5, dnp5, dns5, dng5, tw, tids, S))
+
     torch.save(out, path)
 
 

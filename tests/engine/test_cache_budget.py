@@ -80,6 +80,43 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
+def test_overlap_floor_that_does_not_fit_falls_back_to_num_experts():
+    # #4: 2*num_experts slots (800 B) + the KV reserve (100 B) exceed the 700 B budget, but
+    # num_experts slots do fit. Plan without overlap instead of refusing to start.
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=700, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert overlap is False
+    assert size == 6  # (700 - 100) // 100, above the num_experts floor
+    assert pages == 10
+    assert size * 100 + pages * 10 <= 700
+
+
+def test_overlap_kept_when_its_floor_fits_the_budget():
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=900, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert (size, pages, overlap) == (8, 10, True)
+
+
+def test_budget_too_small_message_names_what_fits_and_the_flags():
+    # num_experts slots (400 B) + 10 reserved pages (100 B) > 450 B: 5 pages fit beside them.
+    with pytest.raises(AssertionError) as err:
+        plan_cache_budget(
+            budget_bytes=450, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=50, prefill_overlap=True,
+            kv_reserve_pages=10, max_slots=50, page_size=64,
+        )
+    msg = str(err.value)
+    assert "beside 4 slots at most 5 KV pages (320 tokens) fit" in msg
+    for flag in ("--kv-reserve-tokens", "--kv-cache-dtype", "--memory-ratio", "--moe-cache-size"):
+        assert flag in msg
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
@@ -110,6 +147,25 @@ def test_resolve_auto_applies_ratio_once():
     )
     # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
     assert size == 8 and pages == 40 and overlap is True
+
+
+def test_resolve_auto_reserves_usable_tokens_beyond_the_dummy_page():
+    size, pages, overlap = resolve_moe_cache_auto(
+        baseline_free=940,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=2,
+        total_experts=50,
+        prefill_overlap=False,
+        kv_reserve_tokens=256,
+        page_size=64,
+    )
+    assert overlap is False
+    assert (pages - 1) * 64 >= 256
+    assert size == 8 and pages == 14
 
 
 def test_resolve_auto_caps_slots_at_the_kernel_limit():
@@ -266,7 +322,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -293,6 +349,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        num_page_override = 64
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -314,29 +371,70 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     engine._weights_bytes = 1_000_000
     engine._pool_cls = MHAKVCache  # __init__ skipped -> install the generic pool family
 
-    size, pages, overlap = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+    captured = {}
 
-    # cross-check against the same pure functions, proving the kwarg mapping is faithful
-    from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
-    from freetoken.kvcache.mha_pool import MHAKVCache
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 8, 64, True
 
-    cache_per_page, fixed, _, _ = MHAKVCache.kv_cost(StubConfig())
-    expected = resolve_moe_cache_auto(
-        baseline_free=10_000_000, weights_bytes=1_000_000, memory_ratio=0.9,
-        cache_per_page=cache_per_page, fixed_cache_size=fixed,
-        per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=16,
+    monkeypatch.setattr(
+        "freetoken.engine.cache_budget.resolve_moe_cache_auto", fake_resolve
     )
-    assert (size, pages, overlap) == expected
+    got = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+
+    assert got == (8, 64, True)
+    assert captured["kv_reserve_tokens"] == 64 * 16
+    assert captured["page_size"] == 16
+    assert captured["num_experts"] == 4
+    assert captured["total_experts"] == 8
+    assert captured["per_expert_bytes"] == 512 + 256
 
     class StubMethod:
         def slot_limit(self):
             return 5
 
-    size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
-    assert size == 5
+    # the kernel's slot limit rides the same mapping (fork #20)
+    engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
+    assert captured["max_slots"] == 5
 
+
+
+def test_rebuild_fit_check_reserves_the_gdn_prefill_workspace():
+    """The runtime-rebuild fit-check prices the GDN prefill workspace like the startup sizing,
+    so a rebuild cannot grow the pools back into the space reserved for it."""
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.linear_state_pool import gdn_prefill_workspace_bytes, state_pool_bytes
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(linear_attention_group=lambda: group),
+        dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        max_extend_tokens=1024, max_seq_len=4096,
+    )
+    captured = {}
+
+    def validate_rebuild(config, **kwargs):
+        captured.update(kwargs)
+        raise CacheRebuildRejected("stop before teardown")
+
+    engine = SimpleNamespace(
+        config=config, moe_offload_cache=None, kv_offloader=None,
+        linear_state_pool=SimpleNamespace(num_slots=5),
+        kv_cache=SimpleNamespace(validate_rebuild=validate_rebuild),
+        _baseline_free=1 << 30, _weights_bytes=0, num_pages=64,
+    )
+    engine._target_moe_and_expert_bytes = lambda size: (0, 0)
+    with pytest.raises(CacheRebuildRejected):
+        Engine.rebuild_runtime_cache(engine, num_pages=32)
+
+    workspace = gdn_prefill_workspace_bytes(config)
+    assert workspace > 0
+    assert captured["extra_fixed_bytes"] == state_pool_bytes(config, 5) + workspace
 
 # ---------------------------------------------------------------------------
 # offload-cache sizing guard + auto-resolution (_require_offload_cache_size / _adjust_config),
@@ -430,13 +528,17 @@ def test_page_table_width_covers_whole_trailing_pages():
             assert w > last_col and w % 32 == 0
 
 
-def _generic_rotary_cfg(max_position, override):
+def _generic_rotary_cfg(max_position, override, scaling=None):
     from types import SimpleNamespace
+
+    from freetoken.models.config import RotaryConfig
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
         has_swa_attention=False, has_linear_attention=False,
-        rotary_config=SimpleNamespace(max_position=max_position),
+        rotary_config=RotaryConfig(
+            head_dim=128, rotary_dim=128, max_position=max_position, base=1e4, scaling=scaling
+        ),
     )
 
     class Cfg:
@@ -476,6 +578,19 @@ def test_adjust_config_allows_override_at_rope_table_boundary():
     _adjust_config(_generic_rotary_cfg(max_position=1024, override=1024))  # must not raise
 
 
+YARN_4X = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024}
+
+
+def test_adjust_config_allows_override_to_the_yarn_extended_table():
+    # A YaRN override that leaves max_position_embeddings at the trained length (Qwen3.8's 1M
+    # recipe) serves original * factor positions; the gate must follow the table, not the config.
+    from freetoken.engine.engine import _adjust_config
+
+    _adjust_config(_generic_rotary_cfg(max_position=1024, override=4096, scaling=YARN_4X))
+    with pytest.raises(ValueError, match=r"rope table \(4096 positions\)"):
+        _adjust_config(_generic_rotary_cfg(max_position=1024, override=4097, scaling=YARN_4X))
+
+
 def test_adjust_config_rope_gate_exempts_dsv4():
     # DSV4 sizes its own rope table from the resolved max_seq_len (_adjust_dsv4_config),
     # so the generic gate must not fire even when the override dwarfs max_position.
@@ -503,3 +618,19 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_host_embedding_placement_reports_the_bytes_it_pinned(monkeypatch):
+    # the engine charges these bytes to the pin budget before it plans the expert banks
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.engine.engine import _place_embeddings_on_host
+    from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setattr(VocabParallelEmbedding, "place_on_host", lambda self: None)
+    embed, tied = VocabParallelEmbedding(100, 64), VocabParallelEmbedding(50, 64)
+    embed.weight = torch.empty(100, 64, dtype=torch.bfloat16)
+    head = ParallelLMHead(50, 64, tie_word_embeddings=True, tied_embedding=tied)
+    model = SimpleNamespace(embed_tokens=embed, per_layer_embed=tied, lm_head=head)
+    assert _place_embeddings_on_host(model) == 100 * 64 * 2

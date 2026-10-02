@@ -201,6 +201,19 @@ def test_token_index_cache_is_keyed_by_shape():
     assert embedding._token_index(other)[0] is not first[0]
 
 
+def test_token_index_capture_never_reuses_an_evictable_cache_entry(monkeypatch):
+    """The eager warmup forward caches the decode pair right before capture; a capture that
+    reused it would bake an address the FIFO later evicts while the graph still reads it."""
+    embedding = _make_layer(_config()).ple_embedding
+    decode = _meta([[5]], [[EOS, EOS]], decode=True)
+    eager = embedding._token_index(decode)  # the warmup forward
+    monkeypatch.setattr(ple_module, "_capturing", lambda device: True)
+    captured = embedding._token_index(decode)
+    assert captured[0] is not eager[0] and captured[1] is not eager[1]
+    assert all(v[0] is not captured[0] for v in embedding._token_index_cache.values())
+    assert captured[0].tolist() == [0] and captured[1].tolist() == [0]
+
+
 def test_token_index_does_not_confuse_a_decode_with_a_one_request_prefill():
     """Same [T], opposite meaning: B decode rows at offset 0 vs B offsets in one request."""
     layer = _make_layer(_config())
@@ -325,6 +338,46 @@ def test_the_fused_hash_refuses_a_geometry_it_cannot_address(ctx_len, heads_per_
             heads_per_ngram=heads_per_ngram,
         )
 
+
+
+def test_a_host_hashing_table_skips_the_device_hash(monkeypatch):
+    """The disk table hashes on the host and reads only the row_ids shape, so neither the
+    prefetch nor the lookup path runs the device hash for it."""
+    from freetoken.models.qwen4_exp.ple import ZeroTable
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    assert DiskRowTable.reads_row_ids is False
+    config = _config()
+    args = config.qwen4_args
+    seen = []
+
+    class HostHashedTable(ZeroTable):
+        reads_row_ids = False
+
+        def lookup(self, row_ids, out=None):
+            seen.append(("lookup", tuple(row_ids.shape), row_ids.dtype))
+            return super().lookup(row_ids, out)
+
+        def prefetch(self, row_ids):
+            seen.append(("prefetch", tuple(row_ids.shape), row_ids.dtype))
+
+    layer = _make_layer(config, table=HostHashedTable(_padded_vocab(args), args.ngram_head_dim))
+    embedding = layer.ple_embedding
+
+    def no_hash(*a, **k):
+        raise AssertionError("the device hash ran for a table that never reads it")
+
+    monkeypatch.setattr(embedding, "row_ids", no_hash)
+    sequences, contexts = [[3, 4, EOS, 5], [2, 7]], [[EOS, EOS], [21, 22]]
+    meta = _meta(sequences, contexts)
+    total = sum(len(s) for s in sequences)
+    states = torch.zeros(len(sequences), args.ple_state_width, args.ple_conv_state_len)
+
+    layer.start_prefetch(None, meta)
+    _forward(layer, torch.randn(total, layer.hc_count * layer.hidden_size), meta, states)
+    embedding.forward(meta)
+    rows = (total, embedding.num_heads)
+    assert seen == [("prefetch", rows, torch.int64), ("lookup", rows, torch.int64), ("lookup", rows, torch.int64)]
 
 # --------------------------------------------------------------------------------------
 # table backends

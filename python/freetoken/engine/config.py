@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
@@ -23,6 +24,8 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
+    hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
@@ -32,6 +35,8 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # --embed-weights: "host" keeps the token embedding in pinned host RAM, gathered over PCIe.
+    embed_weights: str = "gpu"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -78,18 +83,24 @@ class EngineConfig:
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
-    linear_state_cache_ratio: float = 2.0
+    linear_state_cache_ratio: float = float(os.environ.get("FT_LINEAR_STATE_CACHE_RATIO", "2.0"))
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
     # DSV4 window/full ratio directly. Used only when swa_num_pages_override is None (a runtime
     # rebuild can pin an absolute window instead).
     swa_full_tokens_ratio: float = 0.2
+    # Force one decode step after this many consecutive prefill steps, so a long chunked
+    # prefill cannot starve in-flight decodes. None/0 keeps the historical prefill-first
+    # order (the scheduler's own TODO names this: "support other policies: e.g. DECODE
+    # first"). At 8 the cost is ~1% of prefill wall time.
+    decode_interleave_every: int | None = None
     # Absolute window-pool size in the pool's own pages (usable, dummy excluded); None -> use the
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 60.0
+    distributed_timeout: float = 1800.0  # ranks reach the first collective minutes apart on a 100+ GiB offload load
+    distributed_port: int = 2333
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
@@ -97,6 +108,11 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Extra KV pages mirrored to pinned host RAM (QSA paged pools, e.g. Qwen3.8-Flash-Next):
+    # the GPU pool becomes an LRU cache over the logical page space (scheduler, page table and
+    # radix tree all see num_pages + kv_host_pages pages), extending context past VRAM
+    # capacity. 0 (default) = off.
+    kv_host_pages: int = 0
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
@@ -111,7 +127,7 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+        return cached_load_hf_config(self.model_path, self.hf_overrides)
 
     @cached_property
     def model_spec(self) -> ModelSpec:
@@ -144,13 +160,23 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        self._check_embed_weights(model_config)
         return replace(model_config, quant=quant)
+
+    def _check_embed_weights(self, model_config) -> None:
+        # the parsed flag, not the hf key: gemma4 ties by default and gguf infers it from the tensors
+        if self.embed_weights != "host":
+            return
+        if model_config.tie_word_embeddings:
+            raise ValueError("--embed-weights host needs an untied embedding (a tied lm_head reads the table on the GPU)")
+        if self.tp_info.size > 1:
+            raise ValueError("--embed-weights host serves a single GPU only (--tensor-parallel-size 1)")
 
     @property
     def max_seq_len(self) -> int:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
-        return self.model_config.rotary_config.max_position
+        return self.model_config.rotary_config.table_positions
 
     @property
     def max_forward_len(self) -> int:
@@ -158,4 +184,4 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        return f"tcp://127.0.0.1:{self.distributed_port}"

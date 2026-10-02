@@ -24,6 +24,12 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# Prefills of at most this many tokens load only their routed experts (the decode path's
+# on-demand LRU) instead of streaming every expert of every layer; 0 = off.
+_SMALL_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_SMALL_PREFILL_TOKENS", "0"))
+# ids per LRU ensure in that path: the kernel's block is next_pow2(ids) x next_pow2(slots), and a
+# block much wider than decode's spills to local memory whose launch reservation can OOM
+_ENSURE_CHUNK_IDS = 32
 
 
 class MoELayer(BaseOP):
@@ -188,6 +194,13 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # FREETOKEN_MOE_PREFETCH: (next MoE layer's router op, its layer id, its budget); the
+        # underscore keeps the borrowed router out of this layer's state dict
+        self._lookahead: tuple[BaseOP, int, int] | None = None
+
+    def set_lookahead(self, gate: BaseOP, target_layer: int, budget: int) -> None:
+        """Let this layer's GPU decode predict ``target_layer``'s experts with that layer's router."""
+        self._lookahead = (gate, target_layer, budget)
 
     def forward(
         self,
@@ -235,7 +248,19 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._decode_routed(hidden_states, topk_weights, topk_ids, router_logits=router_logits)
+
+    def decode_side_applies(self) -> bool:
+        """Whether FREETOKEN_MOE_COPY_OVERLAP applies to this layer's next forward: a GPU decode on a
+        cache with a side stream (not prefill, CPU/hybrid decode or TP > 1); see decode_side."""
+        cache = self.offload_cache
+        return not (
+            cache is None
+            or cache.decode_copy_stream is None
+            or self.tp_size > 1
+            or get_global_ctx().batch.is_prefill
+            or cache.is_cpu_layer(self.layer_id)
+        )
 
     def prefill_forward(
         self,
@@ -263,6 +288,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -282,9 +308,25 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
+        prefetch, verify = cache.prefetch, cache.verify
+        if verify is not None:
+            verify.begin(cache, self.layer_id, topk_ids, prefetch and prefetch.plan_of(self.layer_id))
+        cache.ensure_experts(self.layer_id, topk_ids, router_logits=router_logits)
+        target = None
+        if prefetch is not None:
+            # on: install the next layer's prediction (forked at this block's start) on this stream, the slot
+            # maps' only writer; before this layer's copy join, so a late prefetch copy never delays it
+            target = prefetch.install(self._lookahead and self._lookahead[1])
+            prefetch.join_copy(self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        if prefetch is not None:
+            prefetch.join_and_count(self.layer_id, topk_ids, cache.id_of_slot, cache.num_indices)
+            if target is not None:
+                prefetch.issue_copy(target)
+        if verify is not None:
+            # after issue_copy: the next layer's prefetch copy starts when it would without the checks
+            verify.before_gemm(cache, topk_ids, None if target is None else prefetch.plan_of(target))
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -294,6 +336,29 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if verify is not None:
+            verify.after_gemm(cache)
+        return out
+
+    def fork_lookahead(self, hidden_states: torch.Tensor) -> None:
+        """FREETOKEN_MOE_PREFETCH: at the start of this layer's MoE block, predict the next layer's
+        experts from this block's router input on the predictor stream, beside this layer's router
+        and ensure. Only on the GPU decode path that ``_decode_routed`` takes and not under TP, and
+        never toward a CPU-decoded layer, whose ensure would not use it."""
+        cache = self.offload_cache
+        if (
+            self._lookahead is None
+            or cache is None
+            or cache.prefetch is None
+            or self.tp_size > 1
+            or get_global_ctx().batch.is_prefill
+            or cache.is_cpu_layer(self.layer_id)
+            or cache.decode_target == "hybrid"
+        ):
+            return
+        gate, target, budget = self._lookahead
+        if not cache.is_cpu_layer(target):
+            cache.prefetch.fork(target, hidden_states, gate, cache.slot_for_id[target], budget)
 
     def _decode_hybrid(
         self,
@@ -356,6 +421,26 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if (
+            0 < hidden_states.shape[0] <= _SMALL_PREFILL_TOKENS
+            and cache.decode_target in ("gpu", "hybrid")
+            and not cache.is_unpinned_layer(self.layer_id)
+        ):
+            # A short extension (an agent turn over a cached prefix) touches a fraction of each
+            # layer's experts; fetching those beats streaming all of them (~68 GB here). An
+            # unpinned layer's copy_missing presumes position == expert id, so it streams below;
+            # unpinned layers only exist with the prefill overlap off, so no layer can enter
+            # the overlap double buffer after an earlier layer skipped begin_prefill.
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                self._ensure_unique(cache, topk_ids),
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -382,6 +467,27 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _ensure_unique(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make this layer's routed experts resident and return ``topk_ids`` mapped to slots.
+
+        The LRU kernel is sized for decode: its block is next_pow2(ids) x next_pow2(slots), so a
+        prefill's tokens x top_k ids overflow Triton's element limit, and even a block under it
+        can fail to launch on a full GPU. It gets the unique ids (at most num_experts) in
+        decode-width chunks; each chunk's misses are copied before the next ensure reuses the plan."""
+        uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
+        n = uniq.numel()
+        # Each ensure stamps a newer LRU step, so a later chunk evicts the earlier chunks' slots
+        # only once every other slot is gone; the engine's num_experts slot floor rules that out.
+        assert n <= cache.cache_size, f"{n} routed experts exceed the {cache.cache_size}-slot cache"
+        uniq = uniq.to(torch.int32)
+        # scored eviction ranks an earlier chunk's fresh installs coldest, so pin them explicitly
+        pin_since = cache.step.clone() if cache.cache_policy_id else None
+        for start in range(0, n, _ENSURE_CHUNK_IDS):
+            part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
+            cache.ensure_experts(self.layer_id, part, update_state=False, pin_since=pin_since)  # not a decode step
+            cache.copy_missing()
+        return uniq[inverse].view_as(topk_ids)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

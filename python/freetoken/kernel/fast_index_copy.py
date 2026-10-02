@@ -14,6 +14,11 @@ if TYPE_CHECKING:
 
 
 DEFAULT_NUM_BLOCKS = 4
+# fast_index_copy_multi_slim grid (8K loads in flight, the least that holds ~51 GB/s on an
+# RTX 5080 at 4 experts); the AOT spec (kernel/aot.py) builds exactly this config
+SLIM_COPY_BLOCKS = 8
+SLIM_COPY_THREADS = 256
+SLIM_COPY_UNROLL = 4
 SKIP_FAST_INDEX_COPY_ENV = "FREETOKEN_SKIP_FAST_INDEX_COPY"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -181,6 +186,43 @@ def fast_index_copy_multi_jit(
         return
     module = _jit_fast_index_copy_multi_module(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
+    )
+    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
+
+
+@lru_cache(maxsize=None)
+def _jit_fast_index_copy_multi_slim_module(*, num_blocks: int, num_threads: int, unroll: int) -> Module:
+    args = make_cpp_args(num_blocks, num_threads, unroll)
+    return load_jit(
+        "fast_index_copy_multi_slim",
+        *args,
+        cuda_files=["fast_index_copy.cuh"],
+        cuda_wrappers=[("launch", f"&MultiIndexCopySlimKernel<{args}>::run")],
+    )
+
+
+def fast_index_copy_multi_slim_jit(
+    dst_ptrs: torch.Tensor,
+    src_ptrs: torch.Tensor,
+    feat_bytes: torch.Tensor,
+    dst_indices: torch.Tensor,
+    src_indices: torch.Tensor,
+    num_indices: torch.Tensor | None = None,
+    *,
+    num_blocks: int = SLIM_COPY_BLOCKS,
+    num_threads: int = SLIM_COPY_THREADS,
+    unroll: int = SLIM_COPY_UNROLL,
+) -> None:
+    """:func:`fast_index_copy_multi_jit` from a small fixed grid, for copies that run beside compute.
+
+    ``num_blocks`` CTAs split the concatenated (row, bank) 16-byte chunk range evenly and each
+    thread keeps ``unroll`` loads in flight, so a few SMs still saturate the host link while
+    the rest stay free for concurrent kernels. Same arguments and alignment contract.
+    """
+    if _skip_fast_index_copy_enabled():
+        return
+    module = _jit_fast_index_copy_multi_slim_module(
+        num_blocks=num_blocks, num_threads=num_threads, unroll=unroll
     )
     module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
 

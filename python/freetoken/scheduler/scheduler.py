@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -31,6 +32,7 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .interleave import DecodeInterleavePolicy
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
@@ -91,6 +93,14 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        # Bound how long a run of prefill steps may starve in-flight decodes. A long
+        # prompt chunked at the window budget is hundreds of consecutive prefill steps;
+        # measured on an 8xRTX4090 DSV4 deployment, that left an already-decoding
+        # request unscheduled for 267-317 s. Unset reproduces the historical
+        # prefill-first order exactly.
+        self._interleave = DecodeInterleavePolicy(
+            getattr(config, "decode_interleave_every", None)
+        )
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -111,6 +121,11 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
+        # uid -> monotonic clock at admission, for the per-request prefill span shipped on the
+        # first sampled token. An entry existing IS the "this is the first token" test, so it is
+        # popped there; _free_req_resources pops too, so a request aborted mid-prefill (which
+        # never samples) cannot leave one behind.
+        self._prefill_start: dict[int, float] = {}
         self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
@@ -313,8 +328,9 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        batch, outputs = last_data[0].batch, last_data[1]
+        next_tokens_cpu = outputs.next_tokens_cpu
+        outputs.copy_done_event.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -347,12 +363,26 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+
+                row_chosen_logprob: float | None = None
+                row_top_ids: list[int] | None = None
+                row_top_logprobs: list[float] | None = None
+                if req.sampling_params.logprobs and outputs.chosen_logprobs_cpu is not None:
+                    row_chosen_logprob = float(outputs.chosen_logprobs_cpu[i].item())
+                    requested_top = req.sampling_params.top_logprobs
+                    if requested_top > 0 and outputs.top_ids_cpu is not None:
+                        row_top_ids = [int(t) for t in outputs.top_ids_cpu[i, :requested_top].tolist()]
+                        row_top_logprobs = outputs.top_logprobs_cpu[i, :requested_top].tolist()
+                    else:
+                        row_top_ids = []
+                        row_top_logprobs = []
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # Overlap can advance device_len ahead of the token delivered to the host.
+                hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
+                ) or next_token in req.sampling_params.stop_token_ids
                 matched_stop = (
                     self._match_stop_str(req)
                     if not hit_eos and req.sampling_params.stop_strs
@@ -370,6 +400,10 @@ class Scheduler(SchedulerIOMixin):
                     and not finished
                 ):
                     req.toolcall_anchor_len = req.input_ids.numel()
+                # Present only until this request's first token is sampled, i.e. off its last
+                # prefill chunk -- so popping it both ends the prefill span and marks this as
+                # the one reply that carries it.
+                started_at = self._prefill_start.pop(req.uid, None)
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
@@ -378,6 +412,15 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        keep_stop_str=req.sampling_params.include_stop_str_in_output,
+                        skip_special_tokens=req.sampling_params.skip_special_tokens,
+                        prefill_ms=(
+                            0.0 if started_at is None
+                            else (time.monotonic() - started_at) * 1000.0
+                        ),
+                        chosen_logprob=row_chosen_logprob,
+                        top_ids=row_top_ids,
+                        top_logprobs=row_top_logprobs,
                     )
                 )
 
@@ -428,16 +471,38 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req) -> str | None:
-        """First stop string present in this request's generated tail, else None. Decodes
-        only a short suffix (bounded by the longest stop string's char length, so a stop of
-        N chars spans at most N tokens) to keep the per-step cost small."""
+        """Match stops against the same incrementally decoded text as the frontend."""
+        from freetoken.tokenizer.detokenize import DecodeStatus
+
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        end = len(req.input_ids)
+        # The frontend omits a terminal EOS, including at the output limit with ignore_eos.
+        # The limit is the delivered length, as in hit_length: under overlap device_len (and
+        # so can_decode) runs a step ahead of the host.
+        if (
+            end > prompt_len
+            and end >= req.max_device_len
+            and int(req.input_ids[-1]) in self.eos_token_ids
+        ):
+            end -= 1
+        if end <= prompt_len:
             return None
+        if req.stop_decode_status is None:
+            req.stop_decode_status = DecodeStatus(
+                decoded_ids=[],
+                decoded_str="",
+                read_offset=0,
+                surr_offset=0,
+                sent_offset=0,
+                skip_special=req.sampling_params.skip_special_tokens,
+            )
+        state = req.stop_decode_status
+        state.decoded_ids.extend(req.input_ids[prompt_len + len(state.decoded_ids) : end].tolist())
+        tail = state.decode(self.tokenizer)
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        # Bound the text used for matching, retaining token context for incomplete characters.
+        state.decoded_str = state.decoded_str[-max_chars:]
         for s in stop_strs:
             if s in tail:
                 return s
@@ -511,10 +576,17 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
+            # max_seq_len is the model's advertised context, which can far exceed the
+            # KV pool actually allocated (see issue #111): a prompt that passes this
+            # check but can never be granted enough pages is queued forever with no
+            # error and no log line. Clamp admission to the real pool so oversized
+            # prompts fail loudly with the same error clients already understand.
+            pool_tokens = self.engine.num_pages * self.config.page_size
+            effective_max = min(max_seq_len, pool_tokens)
+            max_output_len = effective_max - input_len
             if max_output_len <= 0:
                 logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                    f"Input sequence length {input_len} exceeds {effective_max}, "
                     f"request {msg.uid} is dropped."
                 )
                 # Tell the client instead of dropping silently — otherwise its wait_for_ack
@@ -526,7 +598,7 @@ class Scheduler(SchedulerIOMixin):
                             # "prompt is too long: N tokens > M" is the phrasing Claude Code and
                             # OpenClaw match on; the Anthropic wire has no error code to read.
                             error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
+                                f"prompt is too long: {input_len} tokens > {effective_max} maximum "
                                 f"(prompt + generation); shorten the prompt or increase the KV "
                                 f"cache budget"
                             ),
@@ -541,6 +613,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            sp = msg.sampling_params
+            if sp.min_tokens > 0:
+                # min_tokens: the sampler masks these ids while the output is shorter.
+                sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
+                sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -631,6 +708,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # A request freed without ever sampling (aborted mid-prefill) would otherwise keep its
+        # admission timestamp forever; a normally-finished one popped it at its first token.
+        self._prefill_start.pop(req.uid, None)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -867,11 +947,28 @@ class Scheduler(SchedulerIOMixin):
             )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # Prefill keeps priority -- a request that never prefills never starts -- but a
+        # long run of prefill chunks must not starve in-flight decodes. When the policy
+        # says a decode is due, take one if a decode is actually runnable; otherwise stay
+        # with prefill (never spend a slot idle just to keep a promise).
+        # getattr, not attribute access: the accounting tests drive this method on a
+        # partially built Scheduler, and interleaving must be an opt-in that a stripped
+        # object simply does not have rather than something that breaks it. A missing
+        # policy is the historical prefill-first order.
+        policy = getattr(self, "_interleave", None)
+        batch = None
+        if policy is not None and policy.wants_decode():
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                policy.note_decode()
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None and policy is not None:
+                policy.note_prefill()
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None and policy is not None:
+                policy.note_decode()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
@@ -886,6 +983,11 @@ class Scheduler(SchedulerIOMixin):
         """
         if not batch.is_prefill or not batch.prompt_admissions:
             return
+        # Before the forward, which is what makes this the prefill START: _schedule_next_batch
+        # has prepared the batch but not run it.
+        now = time.monotonic()
+        for uid, _, _ in batch.prompt_admissions:
+            self._prefill_start[uid] = now
         self.send_result(
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)

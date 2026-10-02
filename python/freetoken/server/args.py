@@ -49,6 +49,12 @@ class ServerArgs(SchedulerConfig):
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
+    # Server-wide default thinking mode for reasoning-capable models: "auto" keeps the
+    # current per-request behavior; "chat" turns thinking off for every request that does
+    # not choose itself (template kwargs or a protocol-level effort/thinking field), for
+    # OpenAI-compatible clients that never send template kwargs, like Vercel AI SDK or
+    # llama-swap; "thinking" turns it on the same way.
+    default_thinking_mode: str = "auto"
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
@@ -59,6 +65,10 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    # Serve a per-request `metrics` object (TTFT, prefill/decode times and throughputs,
+    # prefix-cache hit) alongside usage. Off by default: it is a non-standard field on
+    # every protocol we speak.
+    enable_metrics_report: bool = False
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
     # Directory file:// image refs may be read from; empty rejects local files.
@@ -98,10 +108,6 @@ class ServerArgs(SchedulerConfig):
     @property
     def frontend_create_tokenizer_link(self) -> bool:
         return not self.share_tokenizer
-
-    @property
-    def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
 def _json_object(text: str) -> dict:
@@ -157,6 +163,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a positive integer") from exc
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
+        return n
+
+    def _valid_port(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer") from exc
+        if not 0 <= n <= 65535:
+            raise argparse.ArgumentTypeError("must be between 0 and 65535")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -273,6 +288,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--hf-overrides",
+        type=_json_object,
+        default=None,
+        metavar="JSON",
+        help="JSON object applied to the checkpoint config the model is built from, as vLLM's "
+        "--hf-overrides: a nested config section is updated key by key, any other value is "
+        "replaced whole. A YaRN rope_parameters override extends the servable context to "
+        "original_max_position_embeddings * factor.",
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,
@@ -355,6 +381,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dist-port",
+        type=_valid_port,
+        dest="distributed_port",
+        default=None,
+        help=(
+            "Port for the internal TP rendezvous store, loopback-only regardless of --host. "
+            "Defaults to --port + 1; override when that collides with another instance or "
+            "service on the same host."
+        ),
+    )
+
+    parser.add_argument(
         "--cuda-graph-max-bs",
         "--graph",
         type=int,
@@ -404,6 +442,20 @@ def parse_args(
             "Total KV-cache capacity in tokens; must be a multiple of the resolved page "
             "size (DSV4: 128 window page, TRTLLM backend: 64). Mutually exclusive with "
             "--num-pages."
+        ),
+    )
+
+    parser.add_argument(
+        "--decode-interleave-every",
+        type=int,
+        default=ServerArgs.decode_interleave_every,
+        help=(
+            "Force one decode step after this many consecutive prefill steps. A long "
+            "prompt is prefilled in chunks, so it occupies that many consecutive "
+            "scheduler steps; measured on an 8xRTX4090 DSV4 deployment, a 300k-token "
+            "context left an already-decoding request unscheduled for 267-317 s. "
+            "Unset keeps the historical prefill-first order (the scheduler's own TODO "
+            "names this policy)."
         ),
     )
 
@@ -542,6 +594,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--enable-metrics-report",
+        action="store_true",
+        default=ServerArgs.enable_metrics_report,
+        help=(
+            "Serve a per-request `metrics` object next to usage on /v1/chat/completions, "
+            "/v1/messages and /v1/responses: ttft_ms, prefill_time_ms and "
+            "prefill_tokens_per_second (the prefill span measured by the scheduler itself), "
+            "decode_time_ms and decode_tokens_per_second, cached_prompt_tokens and "
+            "total_time_ms. Streaming responses carry it on the same final chunk as usage, so "
+            "the request must also ask for usage (OpenAI stream_options.include_usage). "
+            "Non-standard on every protocol, hence opt-in. Under concurrency the spans are "
+            "this request's share of shared batches, not isolated engine throughput."
+        ),
+    )
+
+    parser.add_argument(
         "--sampling-defaults",
         type=str,
         default=ServerArgs.sampling_defaults,
@@ -601,6 +669,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--default-thinking-mode",
+        type=str,
+        default=ServerArgs.default_thinking_mode,
+        choices=["auto", "chat", "thinking"],
+        help=(
+            "Server-wide default thinking mode for reasoning-capable models. 'auto' keeps "
+            "the current per-request behavior; 'chat' turns thinking off for every request "
+            "that does not choose itself (chat_template_kwargs, reasoning_effort, "
+            "reasoning.effort, thinking) -- for OpenAI-compatible clients that never send "
+            "template kwargs, like Vercel AI SDK or llama-swap; 'thinking' turns it on the "
+            "same way."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-strategy",
         default=ServerArgs.moe_strategy,
         choices=["auto", *MOE_STRATEGIES],
@@ -639,6 +722,16 @@ def parse_args(
         help=(
             "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
             "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+        ),
+    )
+
+    parser.add_argument(
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
+        help=(
+            "Where the token embedding table lives. 'host' keeps it in pinned host RAM and gathers "
+            "the rows each step needs over PCIe, freeing its VRAM (single GPU only)."
         ),
     )
 
@@ -691,14 +784,33 @@ def parse_args(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
-        help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+        help=(
+            "Usable KV-cache token floor reserved before --moe-cache-auto fills experts "
+            "(the internal dummy page is additional)."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-host-pages",
+        type=int,
+        default=ServerArgs.kv_host_pages,
+        help=(
+            "Extra KV pages mirrored to pinned host RAM (QSA models): the GPU pool becomes "
+            "an LRU cache over the logical page space, extending context past VRAM capacity. "
+            "0 = off."
+        ),
     )
 
     parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
-        choices=["lru"],
-        help="The unified MoE cache eviction policy.",
+        choices=["lru", "kd", "kdfb", "rule"],
+        help=(
+            "The unified MoE cache eviction policy. lru (default); kd: evict the expert passed "
+            "over for the most tokens, then the one whose layer comes up last; kdfb: kd plus a "
+            "decayed per-expert use count; rule: kdfb plus router near misses counted as recent "
+            "(margin FREETOKEN_MOE_NEAR_MISS_THR logits). GPU decode only."
+        ),
     )
 
     parser.add_argument(
@@ -849,6 +961,9 @@ def parse_args(
         if entry:
             kwargs["quant_backend"] = entry
 
+    if kwargs["distributed_port"] is None:
+        kwargs["distributed_port"] = kwargs["server_port"] + 1
+
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 
@@ -886,16 +1001,26 @@ def parse_args(
     if is_offload_moe_strategy(kwargs["moe_strategy"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
 
-    if kwargs["model_source"] == "modelscope":
-        model_path = kwargs["model_path"]
-        if not os.path.isdir(model_path):
+    # Resolve a hub repo id ("org/model") to a local checkpoint directory. This has to
+    # happen here, after served_model_name and the parser cascade have read the repo id
+    # (they want "DeepSeek-V4-Flash-0731", not a snapshot hash) and before anything opens
+    # the checkpoint: config parsing reads model-specific files straight off disk, so a
+    # bare repo id reaches `open()` as a relative path and dies with a FileNotFoundError.
+    model_path = kwargs["model_path"]
+    if not os.path.isdir(model_path):
+        if kwargs["model_source"] == "modelscope":
             from modelscope import snapshot_download
 
             ignore_patterns = []
             if kwargs["use_dummy_weight"]:
                 ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
-            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
-            kwargs["model_path"] = model_path
+            kwargs["model_path"] = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+        else:
+            from freetoken.utils import download_hf_checkpoint
+
+            kwargs["model_path"] = download_hf_checkpoint(
+                model_path, dummy_weight=kwargs["use_dummy_weight"]
+            )
     del kwargs["model_source"]
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /
@@ -933,6 +1058,7 @@ def parse_args(
         image_max_tokens=image_max_tokens,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},
     )
+    kwargs["hf_overrides"] = kwargs["hf_overrides"] or {}
     result = ServerArgs(**kwargs)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

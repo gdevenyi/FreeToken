@@ -5,6 +5,7 @@ import errno
 import gc
 import math
 import os
+import socket
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -33,7 +34,8 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, gdn_prefill_workspace_bytes,
+    state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -56,6 +58,12 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
             f"cache-sizing flags)."
         )
 
+# Headroom the KV host offload keeps out of the GPU pool solve: the bigger logical index slab
+# is priced exactly, but prefill transients (GDN chunk workspaces, QSA score logits) also grow
+# with the logical width and need this slack (a 0.8 GiB post-capture margin OOMed a 4096-token
+# prefill; the pre-offload runs sat at ~1.05 GiB).
+_KV_OFFLOAD_SERVING_MARGIN = 512 << 20
+
 
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
@@ -74,6 +82,42 @@ def _sgl_flash_attn_available() -> bool:
         )
         return False
     return True
+
+
+def _place_embeddings_on_host(model) -> int:
+    """--embed-weights host: every input embedding table moves to pinned host RAM, except one an lm_head is tied to.
+
+    Returns the pinned bytes."""
+    from freetoken.layers.base import BaseOP
+    from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+
+    found: list[VocabParallelEmbedding] = []
+    tied: set[int] = set()
+    stack, seen = [model], set()
+    while stack:
+        op = stack.pop()
+        if id(op) in seen:
+            continue
+        seen.add(id(op))
+        if isinstance(op, ParallelLMHead):
+            if op.tied_embedding is not None:
+                tied.add(id(op.tied_embedding))
+            continue
+        if isinstance(op, VocabParallelEmbedding):
+            found.append(op)
+            continue
+        for value in vars(op).values():
+            items = value if isinstance(value, (list, tuple)) else (value,)
+            stack.extend(v for v in items if isinstance(v, BaseOP))
+    moved = [e for e in found if id(e) not in tied]
+    if not moved:
+        raise ValueError("--embed-weights host: the model has no untied input embedding to move")
+    for emb in moved:
+        emb.place_on_host()
+    torch.cuda.empty_cache()
+    size = sum(e.weight.numel() * e.weight.element_size() for e in moved)
+    logger.info_rank0(f"Token embedding in pinned host RAM ({mem_GB(size)}), gathered over PCIe")
+    return size
 
 
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
@@ -121,6 +165,9 @@ def _backend_requirements_met(name: str) -> bool:
     if any(i.requires_flashinfer for i in infos) and not _flashinfer_available():
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
+        return False
+    # requires_sm90 also admits sm_100 (FA4). Hopper-only would reject B200.
+    if any(i.requires_sm90 for i in infos) and not (is_sm90_family() or is_sm100_family()):
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
@@ -278,6 +325,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 "not installed. Install it with `pip install 'freetoken[sgl]'` (or "
                 "'freetoken[accel]'), or use --attention-backend triton."
             )
+        if info.requires_sm90 and not (is_sm90_family() or is_sm100_family()):
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} requires a compute capability "
+                "9.x GPU (FA3, sm_90 cubins) or 10.x GPU (FA4). Ada (sm_89) and consumer "
+                "Blackwell (sm_12x) are not in the published sgl_kernel flash_ops set. "
+                "Use --attention-backend fi (or triton) instead."
+            )
         if info.requires_sm100 and not is_sm100_family():
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires a compute capability "
@@ -385,6 +439,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Sampled-token logprobs (None unless some request in the batch asked): CPU
+    # copies covered by copy_done_event, padded to the batch max top_logprobs.
+    chosen_logprobs_cpu: torch.Tensor | None = None
+    top_ids_cpu: torch.Tensor | None = None
+    top_logprobs_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -431,6 +490,7 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        embed_host_bytes = _place_embeddings_on_host(self.model) if config.embed_weights == "host" else 0
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -444,11 +504,11 @@ class Engine:
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
-        # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = 0
+        # planning sees the pin quota the table (and a host embedding) already spent.
+        self._host_tables_bytes = embed_host_bytes
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
-                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+                self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -481,10 +541,38 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
-        self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        # Reserve part of the GDN prefill transient (chunk states + v_new); the rest of the
+        # prefill activations still live in the (1 - memory_ratio) headroom.
+        available_memory -= gdn_prefill_workspace_bytes(config)
+        num_gpu_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        if config.kv_host_pages > 0:
+            # KV host offload: the scheduler, page table and radix tree run in a LOGICAL page
+            # space of num_gpu_pages + kv_host_pages; the GPU K/V buffer stays a
+            # num_gpu_pages LRU cache over a pinned host mirror (kvcache/kv_host_offload.py).
+            # The QSA index slab is per LOGICAL page, so reserve its growth before solving
+            # the GPU page count.
+            from freetoken.kvcache.qsa_pool import QSAKVCache
+
+            if not issubclass(self._pool_cls, QSAKVCache):
+                raise ValueError(
+                    f"--kv-host-pages requires the QSA paged KV pool, got {self._pool_cls.__name__}"
+                )
+            spec = next(s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0)
+            slab_per_page = (
+                (config.page_size // spec.index_ratio)
+                * spec.num_index_layers * spec.index_head_dim * 2
+            )
+            # The two-pass solve prices the logical-space slab growth AND hands back the
+            # serving-margin the growth would otherwise eat (prefill transients need it).
+            reserve = config.kv_host_pages * slab_per_page + _KV_OFFLOAD_SERVING_MARGIN
+            num_gpu_pages = self._pool_cls.solve_num_pages(config, available_memory - reserve)
+            self.num_pages = num_gpu_pages + config.kv_host_pages
+        else:
+            self.num_pages = num_gpu_pages
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, num_gpu_pages, device=self.device, dtype=self.dtype,
+            num_index_pages=self.num_pages if config.kv_host_pages > 0 else None,
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -517,6 +605,21 @@ class Engine:
         # re-point here (and again on any table realloc). The graph-input snapshot that reads
         # through them belongs to the attention backend, built later in init_capture_graph.
         self.kv_cache.attach_page_table(self.page_table)
+
+        # ======================= KV host offload ========================
+        # Attached before create_attention_backend: the QSA backend reads ctx.kv_offloader
+        # at construction.
+        self.kv_offloader = None
+        if config.kv_host_pages > 0:
+            from freetoken.kvcache.kv_host_offload import KVHostOffloader
+
+            self.kv_offloader = KVHostOffloader(self.kv_cache, self.num_pages, self.device)
+            self.ctx.kv_offloader = self.kv_offloader
+            logger.info_rank0(
+                f"Allocating {num_tokens} tokens for KV cache (logical): "
+                f"{num_gpu_pages} GPU-resident pages + {config.kv_host_pages} host pages, "
+                f"pinned mirror {mem_GB(self.kv_offloader.mirror_bytes)}"
+            )
 
         # ======================= Attention backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -560,15 +663,40 @@ class Engine:
         if config.prefill_warmup:
             self._warmup_prefill()
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
+    def _make_distributed_store(self, config: EngineConfig) -> torch.distributed.Store:
+        """The rendezvous store's C10d server ignores the host it's given and always listens
+        on every interface, so an unauthenticated TCPStore ends up reachable off-box even
+        when distributed_addr says 127.0.0.1. Rank 0 pre-binds the listening socket to
+        loopback itself and hands the fd to TCPStore (master_listen_fd) to force that."""
+        timeout = timedelta(seconds=config.distributed_timeout)
+        if not config.tp_info.is_primary():
+            return torch.distributed.TCPStore(
+                "127.0.0.1", config.distributed_port, config.tp_info.size,
+                is_master=False, timeout=timeout, multi_tenant=True,
             )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", config.distributed_port))
+        sock.listen(1024)
+        self._distributed_listen_addr = sock.getsockname()
+        # TCPStore takes ownership of the fd and closes it with the store; detach so the
+        # Python socket never closes that number again after it has been reused.
+        return torch.distributed.TCPStore(
+            "127.0.0.1", config.distributed_port, config.tp_info.size,
+            is_master=True, timeout=timeout, multi_tenant=True, master_listen_fd=sock.detach(),
+        )
+
+    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        store = self._make_distributed_store(config)
+        use_gloo = config.tp_info.size == 1 or config.use_pynccl
+        torch.distributed.init_process_group(
+            backend="gloo" if use_gloo else "nccl",
+            rank=config.tp_info.rank,
+            world_size=config.tp_info.size,
+            timeout=timedelta(seconds=config.distributed_timeout),
+            store=store,
+        )
+        if use_gloo:
             tp_cpu_group = torch.distributed.group.WORLD
             assert tp_cpu_group is not None
             max_bytes = (
@@ -576,13 +704,6 @@ class Engine:
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
@@ -659,6 +780,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += gdn_prefill_workspace_bytes(config)  # GDN prefill transient
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -671,7 +793,11 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=max(
+                config.kv_reserve_tokens,
+                min_reserve,
+                (config.num_page_override or 0) * page_tokens,
+            ),
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
@@ -746,6 +872,11 @@ class Engine:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
+            if config.moe_prefill_overlap and not overlap:
+                logger.info_rank0(
+                    f"--moe-cache-auto: prefill overlap disabled, its {2 * config.model_config.num_experts} "
+                    "slot floor does not fit beside the KV reserve"
+                )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -798,9 +929,8 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         # The routing histogram rides the same switch: on its own the miss rate says how
         # often we fetch, but not whether a smarter policy could have avoided the fetch.
-        # decode_routing_stats turns it into an oracle hit rate -- the ceiling any policy
-        # holding this many slots could reach on the observed routing -- which is the number
-        # worth having before anyone rewrites eviction.
+        # decode_routing_stats turns it into routing-skew numbers, including the hit rate of
+        # the best fixed expert set per layer (not a ceiling: LRU's temporal locality can beat it).
         cache.collect_decode_freq = config.moe_collect_stats
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
@@ -941,6 +1071,40 @@ class Engine:
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
         self.kv_cache.attach_page_table(self.page_table)
 
+    def _resize_pools(
+        self, config, moe_cache_size: int | None, num_pages: int | None,
+        num_mamba_slots: int | None, num_swa_pages: int | None,
+    ) -> None:
+        """Resize the requested pools, shrinking ones first.
+
+        Each pool frees its own tensors before allocating, but a pool that grows ahead of one
+        that shrinks needs both geometries resident at once: on a nearly full card that OOMs
+        a resize whose final total fits (MoE 512 -> 1024 slots with KV 262K -> 64K tokens)."""
+        steps = []  # (shrinks, resize)
+        if moe_cache_size is not None:
+            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            steps.append((
+                moe_cache_size < self.moe_offload_cache.cache_size,
+                lambda: self.moe_offload_cache.rebuild(moe_cache_size),
+            ))
+        if num_pages is not None or num_swa_pages is not None:
+            # A window-only change (num_pages None) re-derives the window pool at the new pin
+            # against the CURRENT page count; _resize_kv_pool sets self.num_pages either way.
+            pages = num_pages if num_pages is not None else self.num_pages
+            steps.append((
+                pages < self.num_pages,
+                lambda: self._resize_kv_pool(config, pages, num_swa_pages),
+            ))
+        if num_mamba_slots is not None:
+            # Must sit between graph teardown and re-capture so the recaptured graphs bind the new
+            # state tensors. +1 for the reserved padding sink: num_mamba_slots is the usable count.
+            steps.append((
+                num_mamba_slots + 1 < self.linear_state_pool.num_slots,
+                lambda: self.linear_state_pool.rebuild(num_mamba_slots + 1),
+            ))
+        for _, resize in sorted(steps, key=lambda step: not step[0]):
+            resize()
+
     @torch.inference_mode()
     def rebuild_runtime_cache(
         self,
@@ -976,6 +1140,14 @@ class Engine:
                 raise CacheRebuildRejected(str(e)) from e
         if num_pages is not None and num_pages <= 0:
             raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
+        if num_pages is not None and self.kv_offloader is not None:
+            # The logical/physical split (host mirror, LRU maps, QSA index slab sized to the
+            # logical space) is built once at startup; a runtime resize would have to rebuild
+            # all of it. Reject recoverably instead.
+            raise CacheRebuildRejected(
+                "num_pages rebuild is not supported with --kv-host-pages (restart with a "
+                "different --kv-host-pages / --memory-ratio instead)"
+            )
         if num_mamba_slots is not None:
             if self.linear_state_pool is None:
                 raise CacheRebuildRejected(
@@ -1022,7 +1194,8 @@ class Engine:
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
             extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
+                (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
+                + gdn_prefill_workspace_bytes(config)
             ),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
@@ -1050,22 +1223,7 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
-        if moe_cache_size is not None:
-            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            self.moe_offload_cache.rebuild(moe_cache_size)
-        if num_pages is not None:
-            # sets self.num_pages (rebuilds KV + window)
-            self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
-            # Window-only change: no page-count change, but re-derive the window pool at the new
-            # pin against the CURRENT page count. This re-allocs the same-size full pool and
-            # the resized window, both inside the pool's own rebuild_from_config.
-            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
-        if num_mamba_slots is not None:
-            # Reallocate the GDN state pool (frees old tensors first). Must sit between graph
-            # teardown and re-capture so the recaptured graphs bind the new state tensors.
-            # +1 for the reserved padding sink: num_mamba_slots is the usable count.
-            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+        self._resize_pools(config, moe_cache_size, num_pages, num_mamba_slots, num_swa_pages)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
@@ -1095,6 +1253,9 @@ class Engine:
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        audit = self.moe_offload_cache.audit if self.moe_offload_cache is not None else None
+        if audit is not None and batch.is_decode:
+            audit.end_decode_step(self.moe_offload_cache)  # every side stream has joined the compute stream
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1106,14 +1267,32 @@ class Engine:
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        logprobs_out = self.sampler.compute_logprobs(batch_logits, next_tokens_gpu, args)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if self.moe_offload_cache is not None and self.moe_offload_cache.collect_stats and batch.is_decode:
+        cache = self.moe_offload_cache
+        if cache is not None and batch.is_decode and (
+            cache.collect_stats or cache.prefetch is not None or cache.verify is not None or cache.audit is not None
+        ):
             self._moe_stats_step += 1
             if self._moe_stats_step >= MOE_STATS_INTERVAL:
                 self._moe_stats_step = 0
-                self._emit_moe_stats()
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+                if cache.prefetch is not None:
+                    self._emit_prefetch_stats()
+                if cache.verify is not None:
+                    self._emit_verify_stats()
+                if cache.audit is not None:
+                    self._emit_audit_stats()
+                if cache.collect_stats:
+                    self._emit_moe_stats()
+        if logprobs_out is None:
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        chosen_logprobs, top_ids, top_logprobs = logprobs_out
+        return ForwardOutput(
+            next_tokens_gpu, next_tokens_cpu, copy_done_event,
+            chosen_logprobs_cpu=chosen_logprobs, top_ids_cpu=top_ids,
+            top_logprobs_cpu=top_logprobs,
+        )
 
     def _warmup_prefill_lens(self) -> list[int]:
         """Prefill lengths that cross every size bucket the in-repo Triton prefill kernels specialize on."""
@@ -1149,14 +1328,47 @@ class Engine:
             lens.add(8193)  # chunk_delta_h NT bucket 2 (NT > 128)
         return sorted(n for n in lens if 2 <= n <= cap)
 
+    def _emit_prefetch_stats(self) -> None:
+        """Report one window of the FREETOKEN_MOE_PREFETCH counters (one host sync), then restart them."""
+        from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
+
+        prefetch = self.moe_offload_cache.prefetch
+        window = prefetch.take_window()
+        stats = summarize(window, prefetch.mode)
+        if not stats["layer_calls"]:
+            return
+        logger.info_rank0(f"MoE prefetch {prefetch.mode} ({MOE_STATS_INTERVAL} decode steps): {format_summary(stats)}")
+        if ENV.MOE_PREFETCH_DEBUG:
+            logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(window)}")
+
+    def _emit_verify_stats(self) -> None:
+        """Report one window of the FREETOKEN_MOE_PREFETCH_VERIFY counts and the new bad records (host syncs)."""
+        _log_lines(self.moe_offload_cache.verify.report_window(MOE_STATS_INTERVAL))
+
+    def _emit_audit_stats(self) -> None:
+        """Report one window of FREETOKEN_MOE_SLOT_AUDIT totals and the new bad slots (host syncs)."""
+        _log_lines(self.moe_offload_cache.audit.report_window(MOE_STATS_INTERVAL))
+
+    def _log_prefetch_totals(self) -> None:
+        from freetoken.moe.prefetch import format_per_layer, format_summary, summarize
+
+        prefetch = self.moe_offload_cache.prefetch if self.moe_offload_cache is not None else None
+        if prefetch is None:
+            return
+        totals = prefetch.totals + prefetch.stats.cpu()
+        stats = summarize(totals, prefetch.mode)
+        if stats["layer_calls"]:
+            logger.info_rank0(f"MoE prefetch {prefetch.mode} (session, {stats['tokens']} tokens): {format_summary(stats)}")
+            logger.info_rank0(f"MoE prefetch per layer (useful/issued/misses per call): {format_per_layer(totals)}")
+
     def _emit_moe_stats(self) -> None:
         """Report one window of expert-cache behaviour, then reset the miss counters.
 
         Accumulation is device-side and captured into the decode graph, so it is free to
         leave running; reading it is not (the counters have to come back to the host), which
         is why this only fires every MOE_STATS_INTERVAL decode steps. The routing histogram
-        is deliberately *not* reset -- the oracle bound wants the whole run's distribution,
-        not one window's.
+        is deliberately *not* reset -- it describes the whole run's distribution, not one
+        window's, so the static top-k figure flattens as a session covers more topics.
         """
         cache = self.moe_offload_cache
         agg = cache.decode_miss_stats()
@@ -1182,14 +1394,12 @@ class Engine:
             )
         routing = cache.decode_routing_stats()
         if routing:
-            # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
-            # many slots per layer. If it sits near the realized hit rate, the cache is
-            # already doing as well as the routing allows and the win has to come from
-            # somewhere else (more slots, more bandwidth); if it sits far above, eviction
-            # policy is leaving something on the table.
+            # static_topk_hit is what pinning each layer's most frequent experts would score over
+            # the whole run. A realized hit rate above it means the cache is winning on temporal
+            # locality; it says nothing about how close to optimal eviction is.
             logger.info_rank0(
                 "MoE routing: "
-                f"oracle_hit={routing['oracle_hit_at_slots']:.3f} "
+                f"static_topk_hit={routing['static_topk_hit_at_slots']:.3f} "
                 f"(realized {1.0 - agg['miss_rate']:.3f}), "
                 f"slots/layer={routing['slots_per_layer']:.1f}, "
                 f"working_set={routing['working_set_mean']:.1f}"
@@ -1273,9 +1483,30 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        try:
+            self._log_prefetch_totals()
+        except Exception as exc:  # noqa: BLE001 -- a diagnostic must never block shutdown
+            logger.warning(f"MoE prefetch totals unavailable at shutdown: {exc}")
+        try:
+            verify = self.moe_offload_cache.verify if self.moe_offload_cache is not None else None
+            if verify is not None:
+                _log_lines(verify.report_session())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MoE verify totals unavailable at shutdown: {exc}")
+        try:
+            audit = self.moe_offload_cache.audit if self.moe_offload_cache is not None else None
+            if audit is not None:
+                _log_lines(audit.report_session())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MoE slot audit totals unavailable at shutdown: {exc}")
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _log_lines(lines: list[tuple[str, str]]) -> None:
+    for level, line in lines:
+        (logger.warning_rank0 if level == "warning" else logger.info_rank0)(line)
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
@@ -1970,18 +2201,17 @@ def _adjust_config(config: EngineConfig):
             )
         override("num_page_override", config.num_token_override // config.page_size)
 
-    # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
+    # The rope cos/sin table covers rotary_config.table_positions, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
     if seq_override is not None and rotary is not None and not is_dsv4:
-        if seq_override > rotary.max_position:
+        if seq_override > rotary.table_positions:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "
-                f"rope table ({rotary.max_position} positions). Serving past it would read "
-                "out of bounds; extend the checkpoint's rope_scaling / "
-                "max_position_embeddings in config.json instead."
+                f"rope table ({rotary.table_positions} positions). Serving past it would read "
+                "out of bounds; extend the rope with --hf-overrides (YaRN rope_parameters) instead."
             )
 
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process

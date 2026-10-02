@@ -70,6 +70,10 @@ def e4m3_native() -> bool:
     if _native is None:
         if FORCE_EMU:
             _native = False
+        elif torch.version.hip is not None:
+            # ROCm reports gfx1101 as capability (11, 0), which is not a CUDA
+            # compute capability and must not select the native fp8e4nv path.
+            _native = False
         else:
             from freetoken.gpu_select import assigned_visible_gpu
 
@@ -162,6 +166,16 @@ def e4m3_u8_to_f16_x128(v):
     (max 448*128 = 57344) and is exact (power-of-two scaling)."""
     h = ((v & 0x80).to(tl.uint16) << 8) | ((v & 0x7F).to(tl.uint16) << 7)
     return h.to(tl.float16, bitcast=True) * 32768.0
+
+
+@jit
+def e4m3_to_f16_x128(raw):
+    """An e4m3 value as a branched kernel loads it (fp8 on sm_89+, its uint8 bits
+    before) -> fp16 pre-scaled by 128, the same value on both."""
+    if e4m3_native_cx():
+        return raw.to(tl.float16) * 128.0
+    else:
+        return e4m3_u8_to_f16_x128(raw)
 
 
 @jit

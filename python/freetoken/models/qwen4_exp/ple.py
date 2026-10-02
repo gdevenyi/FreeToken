@@ -49,6 +49,10 @@ _TOKEN_INDEX_CACHE_SIZE = 64
 _FUSED_HASH_ENV = "FREETOKEN_PLE_FUSED_HASH"
 
 
+def _capturing(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
 def _fused_row_ids_enabled() -> bool:
     """The fused hash kernel, on unless ``FREETOKEN_PLE_FUSED_HASH=0`` takes it back to torch ops."""
     return (os.getenv(_FUSED_HASH_ENV) or "1").strip() not in ("0", "false", "False")
@@ -482,12 +486,13 @@ class NGramEmbedding(BaseOP):
 
         The fused kernel addresses the hash window through these instead of materializing the
         ``[B, ctx+max_len]`` packed window. Memoized on the shape (which is all they depend on)
-        so a captured replay reads a stable address instead of re-running the build; a build
-        that happens DURING capture is not cached, since its buffers live in the graph pool.
+        for eager forwards only: a capture always builds its own, which the graph recomputes
+        into its pool on every replay. A cached pair (the eager warmup forward right before
+        capture leaves one) would be baked in by address, then evicted and reused.
         """
         device = meta.input_ids.device
         num_tokens = meta.input_ids.numel()
-        capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        capturing = _capturing(device)
         # is_decode is part of the key, not just the shape: a decode of B requests and a
         # prefill of ONE B-token request are the same [T] and mean opposite things (one token
         # per request at offset 0 vs B offsets inside one request).
@@ -496,7 +501,7 @@ class NGramEmbedding(BaseOP):
             (num_tokens,) if meta.is_decode else tuple(meta.seq_lens),
             str(device),
         )
-        cached = self._token_index_cache.get(key)
+        cached = None if capturing else self._token_index_cache.get(key)
         if cached is not None:
             return cached
         if meta.is_decode:  # one token per request, each at offset 0
@@ -576,8 +581,19 @@ class NGramEmbedding(BaseOP):
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
         return torch.cat(blocks, dim=-1)
 
+    def lookup_row_ids(self, meta: PLEMetadata) -> torch.Tensor:
+        """``row_ids`` as the attached table's ``prefetch``/``lookup`` take them. A table that
+        hashes on the host (``reads_row_ids = False``) reads only their shape: skip the hash."""
+        if not getattr(self.table, "reads_row_ids", True):
+            return torch.empty(
+                (meta.input_ids.numel(), self.num_heads),
+                dtype=torch.int64,
+                device=meta.input_ids.device,
+            )
+        return self.row_ids(meta)
+
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
-        return self.table.lookup(self.row_ids(meta), out)
+        return self.table.lookup(self.lookup_row_ids(meta), out)
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -675,7 +691,7 @@ class PLELayer(BaseOP):
         """Hash this forward's n-grams and start the table gather on the side stream."""
         if meta is None:
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
-        row_ids = self.ple_embedding.row_ids(meta)
+        row_ids = self.ple_embedding.lookup_row_ids(meta)
         self._pending = (meta, row_ids)
         self.ple_embedding.table.prefetch(row_ids)
 
@@ -696,7 +712,7 @@ class PLELayer(BaseOP):
         elif pending is not None and pending[0] is meta:
             row_ids = pending[1]
         if row_ids is None:
-            row_ids = self.ple_embedding.row_ids(meta)
+            row_ids = self.ple_embedding.lookup_row_ids(meta)
 
         embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
         key = self.norm_key.forward(self.key_proj.forward(embeddings))

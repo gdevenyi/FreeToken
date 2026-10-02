@@ -44,15 +44,18 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    build_metrics,
     count_prompt_tokens,
     generate_events,
     generate_full,
+    metrics_enabled,
     render_messages,
     resolve_sampling,
     split_tool_lists,
     submit_generation,
     with_keepalive,
 )
+from .openai_api import _await_watching_disconnect
 from .request_logger import log_request
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
@@ -120,26 +123,35 @@ async def handle_anthropic_messages(
             default_max_tokens=(
                 getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
             ),
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
         )
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
+    metrics = metrics_enabled(state)
     if req.stream:
         events = anthropic_event_stream(
             generate_events(uid, spec, state, source="/v1/messages"),
-            req.model, uid, cache_report=cache_report,
+            req.model, uid, cache_report=cache_report, metrics=metrics,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/messages")
+        # an abandoned request must not keep decoding to max_tokens (#222's watcher)
+        result = await _await_watching_disconnect(
+            generate_full(uid, spec, state, source="/v1/messages"), request, state, [uid]
+        )
     except GenerationError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
-    response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
+    if result is None:
+        return _anthropic_error_response(499, "api_error", "client disconnected before the response was ready")
+    response = anthropic_full_response(
+        result, req.model, uid, cache_report=cache_report, metrics=metrics
+    )
     return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
@@ -153,7 +165,9 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
         messages, template_tools, _, ctk = convert_anthropic_prompt(
-            req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+            req,
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
         )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
@@ -182,6 +196,7 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
+    default_thinking_mode: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
@@ -291,7 +306,7 @@ def convert_anthropic_prompt(
     # Native extended-thinking toggle -> template kwargs, broadcast in every
     # spelling the ecosystem's templates read (a bare enable_thinking bool is
     # inert for templates that read a different knob, e.g. M3's thinking_mode).
-    from .model_meta import thinking_toggle_kwargs
+    from .model_meta import apply_default_thinking_mode, thinking_toggle_kwargs
 
     ctk: dict[str, Any] = {}
     if req.thinking:
@@ -299,6 +314,10 @@ def convert_anthropic_prompt(
             ctk = thinking_toggle_kwargs(True)
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
+    else:
+        # Any thinking block (e.g. "adaptive") is the client's explicit choice; the server
+        # default only covers requests that leave thinking out.
+        ctk = apply_default_thinking_mode(ctk, default_thinking_mode)
 
     return render_messages(messages), template_tools, parser_tools, ctk
 
@@ -308,9 +327,10 @@ def convert_anthropic_to_genspec(
     model_sampling: dict[str, Any],
     reasoning_parser: str | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
-        req, reasoning_parser=reasoning_parser
+        req, reasoning_parser=reasoning_parser, default_thinking_mode=default_thinking_mode
     )
     return GenSpec(
         messages=messages,
@@ -375,7 +395,7 @@ def _tool_result_parts(content) -> tuple[str, list[dict[str, Any]]]:
 # Output formatting: GenResult / GenEvent -> Anthropic response / events
 # --------------------------------------------------------------------------- #
 def anthropic_full_response(
-    result: GenResult, model: str, uid: int, cache_report: bool = False
+    result: GenResult, model: str, uid: int, cache_report: bool = False, metrics: bool = False
 ) -> AnthropicMessagesResponse:
     content: list[AnthropicContentBlock] = []
     if result.reasoning:
@@ -402,6 +422,12 @@ def anthropic_full_response(
         usage=_anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cached_tokens, cache_report
         ),
+        metrics=build_metrics(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            cached_tokens=result.cached_tokens,
+            timings=result.timings,
+        ) if metrics else None,
     )
 
 
@@ -420,7 +446,8 @@ def _anthropic_usage(
 
 
 async def anthropic_event_stream(
-    events: AsyncIterator[Any], model: str, uid: int, cache_report: bool = False
+    events: AsyncIterator[Any], model: str, uid: int, cache_report: bool = False,
+    metrics: bool = False,
 ) -> AsyncIterator[str]:
     """Format the protocol-neutral GenEvent stream into Anthropic SSE events.
 
@@ -444,7 +471,9 @@ async def anthropic_event_stream(
         block_open = "thinking"
         return _event(AnthropicStreamEvent(
             type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="thinking", thinking=""),
+            # The SDK types signature as a required string on the opening block, before any
+            # signature_delta. Local reasoning is unsigned, like the full-response path.
+            content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
         ))
 
     def _stop_block() -> list[str]:
@@ -576,6 +605,12 @@ async def anthropic_event_stream(
                     usage=_anthropic_usage(
                         ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report
                     ),
+                    metrics=build_metrics(
+                        prompt_tokens=ev.prompt_tokens,
+                        completion_tokens=ev.completion_tokens,
+                        cached_tokens=ev.cached_tokens,
+                        timings=ev.timings,
+                    ) if metrics else None,
                 ))
                 yield _event(AnthropicStreamEvent(type="message_stop"))
                 # Anthropic streams terminate on message_stop — no OpenAI-style

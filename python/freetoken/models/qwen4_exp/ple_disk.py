@@ -6,6 +6,10 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+import queue
+import threading
+from collections import deque
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -100,8 +104,61 @@ def resolve_row_source(folder: str) -> PleRowSource:
     return source_from_safetensors(folder)
 
 
+class _Filler:
+    """The one thread that drives the PleStore (engine-thread-only C++, no locks), FIFO.
+
+    Graph fills run here, submitted before the launch: the fill releases the captured decode's
+    WAIT, and cuGraphLaunch may block until the GPU drains, so it must not wait for the launch
+    to return (a large graph deadlocked that way; fork issue #65)."""
+
+    def __init__(self) -> None:
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name="ple-filler", daemon=True)
+        self._thread.start()
+
+    def submit(self, fn) -> Future:
+        fut: Future = Future()
+        self._jobs.put((fn, fut))
+        return fut
+
+    def _run(self) -> None:
+        while (item := self._jobs.get()) is not None:
+            fn, fut = item
+            try:
+                fut.set_result(fn())
+            except BaseException as exc:  # noqa: BLE001 -- surfaced to the engine thread
+                fut.set_exception(exc)
+
+    def close(self) -> None:
+        self._jobs.put(None)
+        self._thread.join(timeout=5)
+
+
+class _PendingFill:
+    """A graph fill submitted before its launch; ``cancel`` after a failed launch."""
+
+    def __init__(self, table: "DiskRowTable", future: Future, cancelled: threading.Event) -> None:
+        self._table, self._future, self._cancelled = table, future, cancelled
+
+    def cancel(self) -> None:
+        # no WAIT consumed the signal: clear it, or the next step's WAIT passes on stale rows
+        self._cancelled.set()
+        try:
+            self._future.result()
+        except BaseException:  # noqa: BLE001 -- the launch error is the one to surface
+            pass
+        pending = self._table._pending_fills()
+        if self._future in pending:
+            pending.remove(self._future)  # its outcome was consumed here
+        self._table._retire(self._future)
+        self._table._flag.zero_()
+
+
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
+
+    # the fill hashes on the host; lookup/prefetch read only the row_ids shape
+    reads_row_ids = False
 
     def __init__(
         self,
@@ -112,7 +169,7 @@ class DiskRowTable:
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        from freetoken.kernel import _ple_store
+        from freetoken.kernel.row_store import PleStore
 
         self.num_rows = source.total_rows
         self.head_dim = source.row_bytes  # fp8: one byte per element
@@ -128,7 +185,7 @@ class DiskRowTable:
             raise ValueError(
                 f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
             )
-        self._store = _ple_store.PleStore(
+        self._store = PleStore(
             paths=list(source.paths),
             extent_file=list(source.extent_file),
             extent_base=list(source.extent_base),
@@ -151,43 +208,80 @@ class DiskRowTable:
             max_graph_rows * self._token_bytes, dtype=torch.uint8, device=self._device
         )
         eager_bytes = max_extend_tokens * self._token_bytes
-        self._eager_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
-        self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
+        # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
+        # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
+        # that last read it has run (``_eager_read[i]``, recorded right after that copy)
+        self._eager_pinned = [alloc_pinned_tensor(eager_bytes, dtype=torch.uint8) for _ in range(2)]
+        for buf in self._eager_pinned:
+            buf.zero_()  # the warmup prefill stages nothing and reads whatever sits here
+        self._eager_read = [torch.cuda.Event(), torch.cuda.Event()]
+        self._eager_slot = 0
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
-        self._wait_sync = self._probe_wait_sync(os.getenv(_SYNC_ENV, "auto"))
-        # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
+        from freetoken.kernel.row_store import probe_wait_sync
+
+        self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
+        # one flag for all graphs: each fill's readback event orders it after the previous graph, so signals never overlap
         self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
-        self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
-    def _probe_wait_sync(self, mode: str) -> bool:
-        from freetoken.kernel import _ple_store
-
-        if mode == "gate":
-            return False
-        scratch = alloc_pinned_tensor(1, dtype=torch.int64)
-        scratch.zero_()
-        stream = torch.cuda.current_stream(self._device)
-        ok = (
-            _ple_store.memop_write(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-            and _ple_store.memop_wait_geq(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-        )
-        if ok:
-            stream.synchronize()
-            ok = int(scratch[0]) == 7
-        if mode == "wait" and not ok:
-            raise RuntimeError("FREETOKEN_PLE_SYNC=wait but stream memops are unavailable")
-        return ok
-
     # ---------------- host side (engine thread, before the forward launches) ----------------
+
+    def _filler(self) -> _Filler:
+        filler = self.__dict__.get("_filler_thread")
+        if filler is None:
+            filler = self._filler_thread = _Filler()
+        return filler
+
+    def close(self) -> None:
+        filler = self.__dict__.pop("_filler_thread", None)
+        if filler is not None:
+            filler.close()
+
+    def _current_stream(self):
+        return torch.cuda.current_stream(self._device)
+
+    def _pending_fills(self) -> deque:
+        return self.__dict__.setdefault("_pending_fill_queue", deque())
+
+    def _readback_pool(self) -> list:
+        return self.__dict__.setdefault("_readback_events", [])
+
+    def _retire(self, future: Future) -> None:
+        """Return a finished fill's readback event for reuse (engine thread only)."""
+        event = getattr(future, "readback", None)
+        if event is not None:
+            self._readback_pool().append(event)
+            future.readback = None
+
+    def _raise_failed_fill(self) -> None:
+        """Surface a finished graph fill's error on the engine thread, oldest first; a failed
+        fill signalled its WAIT, so that graph ran on stale rows."""
+        pending = self._pending_fills()
+        while pending and pending[0].done():
+            future = pending.popleft()
+            self._retire(future)
+            exc = future.exception()
+            if exc is not None:
+                raise exc
+
+    def _fill_now(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
+        """A fill that completes before its launch, on the store's thread (after any queued graph fill)."""
+        self._filler().submit(lambda: self.fill(runs, graph=graph)).result()
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
-        pinned = self._graph_pinned if graph else self._eager_pinned
+        if graph:
+            # no launch fence: the job already waited on the readback recorded after the last graph,
+            # and a fence recorded after this step's launch would wait on the WAIT this fill releases
+            pinned = self._graph_pinned
+        else:
+            self._eager_slot ^= 1
+            self._eager_read[self._eager_slot].synchronize()
+            pinned = self._eager_pinned[self._eager_slot]
         offset = 0
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
@@ -204,36 +298,49 @@ class DiskRowTable:
             return _context(ids, position, self.eos_token_id)
         return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
 
-    def host_fill_batch(self, batch: Batch, use_graph: bool):
-        """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
-        eos = self.eos_token_id
+    def host_fill_batch(self, batch: Batch, use_graph: bool) -> _PendingFill | None:
+        """Stage this batch's rows before the dispatch. Under flag-sync a graph fill is only submitted:
+        it completes on the filler thread, independently of the launch; returns its handle, else None."""
+        self._raise_failed_fill()
         if batch.is_decode:
             reqs = list(batch.reqs)
+            # the context comes from the request as it is NOW: the engine mutates it once the launch returns
+            contexts = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
-                self._readback_event.record(torch.cuda.current_stream(self._device))
+                # one event per fill: a shared one re-recorded by the next step before this job
+                # reached synchronize() would wait on a graph parked on this job's own WAIT
+                # recycled, never destroyed while serving: cuEventDestroy from the filler blocks on
+                # the driver lock a blocked cuGraphLaunch holds, and the fill it waits for never runs
+                pool = self._readback_pool()
+                readback = pool.pop() if pool else torch.cuda.Event()
+                readback.record(self._current_stream())
+                cancelled = threading.Event()
 
-                def _complete() -> None:
+                def _job() -> None:
                     try:
-                        self._readback_event.synchronize()
+                        readback.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        if cancelled.is_set():
+                            return
+                        runs = [torch.tensor([*ctx, t], dtype=torch.int64) for ctx, t in zip(contexts, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
-                        from freetoken.kernel import _ple_store
+                        from freetoken.kernel.row_store import signal
 
                         # unblock the stream before surfacing; the step's output is discarded
-                        _ple_store.signal_flag(self._flag.data_ptr())
+                        signal(self._flag)
                         raise
 
-                return _complete
+                future = self._filler().submit(_job)
+                future.readback = readback
+                self._pending_fills().append(future)
+                return _PendingFill(self, future, cancelled)
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
-            self.fill(runs, graph=use_graph)
+            runs = [torch.tensor([*ctx, t], dtype=torch.int64) for ctx, t in zip(contexts, tokens)]
+            self._fill_now(runs, graph=use_graph)
             return None
         runs = [
             torch.cat((
@@ -242,34 +349,37 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        self._fill_now(runs, graph=False)
         return None
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
-        """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
-        deferred = self.host_fill_batch(batch, use_graph)
-        yield
-        # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
-        if deferred is not None:
-            deferred()
+        """Around one dispatch: stage (or submit the graph fill) on enter; cancel a submitted fill if the launch fails."""
+        pending = self.host_fill_batch(batch, use_graph)
+        try:
+            yield
+        except BaseException:
+            if pending is not None:
+                pending.cancel()
+            raise
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         rows = row_ids.shape[0]
+        stream = torch.cuda.current_stream(self._device)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self._wait_sync:
-            from freetoken.kernel import _ple_store
+            from freetoken.kernel.row_store import wait_reset
 
-            _ple_store.memop_wait_reset(
-                torch.cuda.current_stream(self._device).cuda_stream, self._flag.data_ptr()
-            )
+            wait_reset(stream, self._flag)
         pinned, dev = (
-            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
+            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned[self._eager_slot], self._eager_dev)
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
+        if not capturing:
+            self._eager_read[self._eager_slot].record(stream)
         values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale

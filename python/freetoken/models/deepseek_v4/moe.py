@@ -106,7 +106,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
+        cache.ensure_experts(self.layer_id, topk_ids, update_state=False)  # in-place expert-id -> slot; not a decode step
         cache.copy_missing()
         if cache.collect_stats:
             cache.record_decode_stats(self.layer_id)

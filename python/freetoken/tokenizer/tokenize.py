@@ -55,6 +55,16 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
+def join_system_contents(messages: list[dict[str, Any]]) -> str:
+    """The contents of several system/developer messages as one system prompt, in order.
+    Image content (a part list left by text flattening) cannot be joined into text: raise
+    the error templates give for an image in the system turn."""
+    contents = [m.get("content") for m in messages if m.get("content")]
+    if any(not isinstance(c, str) for c in contents):
+        raise ValueError("System message cannot contain images")
+    return "\n\n".join(contents)
+
+
 def _map_developer_role(
     messages: list[dict[str, Any]], chat_template: str | None
 ) -> list[dict[str, Any]]:
@@ -65,7 +75,14 @@ def _map_developer_role(
         m.get("role") == "developer" for m in messages
     ):
         return messages
-    return [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    mapped = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    # The frontend hoisted and merged system messages before this mapping ran (templates such
+    # as Qwen's raise on a system message that is not first), so do it again for the new ones.
+    system = [m for m in mapped if m.get("role") == "system"]
+    if len(system) == 1 and mapped[0] is system[0]:
+        return mapped
+    rest = [m for m in mapped if m.get("role") != "system"]
+    return [{"role": "system", "content": join_system_contents(system)}] + rest
 
 
 class TokenizeManager:
@@ -150,10 +167,16 @@ class TokenizeManager:
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
         messages = _map_developer_role(messages, getattr(self.tokenizer, "chat_template", None))
+        # continue_final_message (an OpenAI-compatible extra, as in vLLM / SGLang): the last
+        # message is an assistant prefix the model must continue, so no generation prompt.
+        chat_template_kwargs = dict(chat_template_kwargs)
+        continue_final = bool(chat_template_kwargs.pop("continue_final_message", False))
+        if continue_final:
+            chat_template_kwargs["continue_final_message"] = True
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
+            add_generation_prompt=not continue_final,
             **chat_template_kwargs,
         )
         assert isinstance(prompt, str)
