@@ -17,7 +17,7 @@ def _config(monkeypatch, *, tie: bool, tp: int = 1, embed_weights: str = "host")
         num_key_value_heads=2, hidden_size=64, vocab_size=128, intermediate_size=128, rms_norm_eps=1e-6,
         max_position_embeddings=1024, hidden_act="silu", tie_word_embeddings=tie,
     )
-    monkeypatch.setattr(engine_config, "cached_load_hf_config", lambda path: hf)
+    monkeypatch.setattr(engine_config, "cached_load_hf_config", lambda path, *_: hf)
     monkeypatch.setattr(engine_config, "checkpoint_quant_config", lambda *args: None)
     return EngineConfig(
         model_path="/fake", tp_info=DistributedInfo(rank=0, size=tp), dtype=torch.bfloat16, embed_weights=embed_weights
