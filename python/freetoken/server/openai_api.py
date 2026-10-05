@@ -62,6 +62,43 @@ def _thinking_type(req: Any) -> str | None:
 
 
 
+def _json_mode_system_message(response_format: dict[str, Any] | None) -> dict[str, str] | None:
+    """Best-effort JSON mode hint for OpenAI response_format.
+
+    FreeToken has no constrained/guided decoding yet. OpenAI-compatible clients
+    still send response_format=json_object|json_schema. Rejecting them with 400
+    breaks those clients even though the model can emit valid JSON from a
+    prompt. Accept the wire shape and prepend a system reminder so the model is
+    steered toward JSON; the schema is NOT token-level enforced.
+    """
+    if not response_format:
+        return None
+    rtype = response_format.get("type")
+    if rtype == "json_object":
+        return {
+            "role": "system",
+            "content": (
+                "Respond with a single valid JSON object only. "
+                "Do not wrap it in markdown fences or add commentary."
+            ),
+        }
+    if rtype == "json_schema":
+        wrapper = response_format.get("json_schema") or {}
+        name = wrapper.get("name") or "response"
+        schema = wrapper.get("schema", wrapper)
+        return {
+            "role": "system",
+            "content": (
+                f"Respond with a single JSON object that validates against the "
+                f"JSON Schema below (schema name: '{name}'). Put required fields "
+                "at the top level of the object — do not wrap them under an extra "
+                "key named after the schema. Do not wrap the answer in markdown "
+                f"fences or add commentary.\nJSON Schema:\n{json.dumps(schema, ensure_ascii=False)}"
+            ),
+        }
+    return None
+
+
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
@@ -78,8 +115,12 @@ def chat_request_to_genspec(
     ctk = thinking_override_kwargs(thinking, ctk)
     if req.continue_final_message:
         ctk = {**ctk, "continue_final_message": True}
+    raw_messages = [m.model_dump(exclude_none=True) for m in req.messages]
+    hint = _json_mode_system_message(req.response_format)
+    if hint is not None:
+        raw_messages = [hint, *raw_messages]
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=render_messages(raw_messages),
         sampling_params=_resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
@@ -950,8 +991,11 @@ def _usage(
 
 
 def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
-    return response_format is not None and response_format.get("type") not in (None, "text")
+    # Soft-accept OpenAI json_object/json_schema (prompt-steered; no constrained decoding).
+    # Unknown types still 400. See _json_mode_system_message.
+    if response_format is None:
+        return False
+    return response_format.get("type") not in (None, "text", "json_object", "json_schema")
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
