@@ -28,7 +28,7 @@ from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_te
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
-from freetoken.layers.quantization import get_quant_config
+from freetoken.layers.quantization import QuantKind, get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight, init_logger
@@ -37,20 +37,16 @@ from tqdm import tqdm
 
 logger = init_logger(__name__)
 
-# Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
-# weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
-# stacked ``mtp.layers.N.mlp.experts.*`` tensors.
-_EXPERT_KEY_RE = re.compile(
+# Routed NVFP4 experts: per-expert, un-fused, under the checkpoint's dialect names (nvidia modelopt
+# or llm-compressor). Matched against the RAW weight_map key in nvfp4_banks. The
+# ``model.language_model.`` anchor excludes the MTP head's stacked ``mtp.layers.N.mlp.experts.*``.
+_EXPERT_KEY_RE = (
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
 )
+# role -> the expert bank reader's canonical (modelopt) tensor kind
+_BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
-_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
-    key_pattern=_EXPERT_KEY_RE,
-    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
-    desc="Qwen3.8-Flash-Next NVFP4 experts",
-)
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
@@ -543,8 +539,19 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 # ======================================================================================
 
 
-def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
+    """The per-expert NVFP4 layout under the checkpoint's dialect names (modelopt or llm-compressor)."""
+    quant = get_quant_config()
+    stored = quant.stored_tensors(QuantKind.NVFP4)
+    kind_map = {stored[role].name: kind for role, kind in _BANK_KINDS.items()}
+    return Nvfp4ExpertSourceSpec(
+        key_pattern=re.compile(_EXPERT_KEY_RE.format(kinds="|".join(map(re.escape, kind_map)))),
+        proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+        layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+        desc=f"Qwen3.8-Flash-Next NVFP4 experts ({quant.dialect})",
+        kind_map=kind_map,
+        global_reciprocal=stored["weight_global"].reciprocal,
+    )
 
 
 __all__ = [
