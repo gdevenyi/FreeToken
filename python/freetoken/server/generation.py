@@ -255,16 +255,17 @@ def resolve_sampling(
     return params
 
 
-def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def render_messages(messages: list[dict[str, Any]], *, hoist_system: bool = True) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
     ValueError on a non-text content part (text-only server). Shared by all adapters.
 
     Some chat templates (e.g. Qwen3.6) require the system message at index 0;
     hoist system messages to the front and merge multiples into one to satisfy
-    that constraint."""
+    that constraint. ``hoist_system=False`` leaves late system messages in place
+    for the tokenizer's inline-system policy (the Anthropic path)."""
     rendered = [_render_message(m) for m in messages]
-    if any(m.get("role") == "developer" for m in rendered):
+    if not hoist_system or any(m.get("role") == "developer" for m in rendered):
         # The tokenizer maps developer per template and then merges in order
         # (_map_developer_role); hoisting system alone here would put it ahead of
         # a developer message that came first.
