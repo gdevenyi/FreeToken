@@ -518,3 +518,62 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+_CT_NVFP4_EXPERTS = {
+    "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized", "quantization_status": "compressed",
+    "config_groups": {"group_0": {
+        "format": "nvfp4-pack-quantized", "targets": [r"re:.*mlp\.experts\..*(gate|up|down)_proj$"],
+        "weights": {"num_bits": 4, "type": "float", "symmetric": True, "group_size": 16,
+                    "strategy": "tensor_group", "dynamic": False, "scale_dtype": "torch.float8_e4m3fn"},
+        "input_activations": {"num_bits": 4, "type": "float", "symmetric": True, "group_size": 16,
+                              "strategy": "tensor_group", "dynamic": "local", "scale_dtype": "torch.float8_e4m3fn"},
+    }},
+    "ignore": ["lm_head"],
+}
+
+
+def test_compressed_tensors_experts_load_like_their_modelopt_twin(tmp_path, monkeypatch):
+    """An llm-compressor export (RedHatAI) names the routed experts weight_packed / weight_global_scale,
+    stores the quant-side global (the reciprocal of modelopt's weight_scale_2) and adds an unused
+    input_global_scale: its pieces must equal the modelopt twin's bit for bit."""
+    from freetoken.layers.quantization import QuantConfig, set_quant_config
+    from freetoken.layers.quantization import configs as qconfigs
+    from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+    from freetoken.models.qwen4_exp.weight import nvfp4_expert_spec
+
+    monkeypatch.setattr(qconfigs, "_QUANT_CONFIG", qconfigs._QUANT_CONFIG)  # restored at teardown
+    layers, experts, hid, inter = 2, 3, 32, 16
+    g = torch.Generator().manual_seed(0)
+    ct, mo = {}, {}
+    for layer in range(layers):
+        for e in range(experts):
+            for proj, (rows, cols) in {"gate_proj": (inter, hid), "up_proj": (inter, hid), "down_proj": (hid, inter)}.items():
+                base = f"{LM}.layers.{layer}.mlp.experts.{e}.{proj}"
+                packed = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8, generator=g)
+                scale = (torch.rand(rows, cols // 16, generator=g) * 4 + 0.1).to(torch.float8_e4m3fn)
+                glob = torch.rand(1, generator=g) * 1000 + 1
+                ct |= {f"{base}.weight_packed": packed, f"{base}.weight_scale": scale,
+                       f"{base}.weight_global_scale": glob, f"{base}.input_global_scale": torch.rand(1, generator=g)}
+                mo |= {f"{base}.weight": packed, f"{base}.weight_scale": scale,
+                       f"{base}.weight_scale_2": 1.0 / glob, f"{base}.input_scale": torch.rand(1, generator=g)}
+    config = SimpleNamespace(num_experts=experts, num_moe_layers=layers, moe_intermediate_size=inter)
+
+    def load(name, tensors, quant):
+        folder = tmp_path / name
+        folder.mkdir()
+        save_file(tensors, str(folder / "model.safetensors"))
+        set_quant_config(QuantConfig.from_hf({"quantization_config": quant}))
+        spec = nvfp4_expert_spec(str(folder), config)
+        pieces = iter_nvfp4_expert_pieces(str(folder), config, spec, drop_page_cache=lambda path: None, primary=False)
+        return spec, {(lay, e): piece for lay, e, _, piece in pieces}
+
+    ct_spec, ct_pieces = load("ct", ct, _CT_NVFP4_EXPERTS)
+    mo_spec, mo_pieces = load("mo", mo, {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]})
+    assert ct_spec.global_reciprocal and not mo_spec.global_reciprocal
+    assert sorted(ct_pieces) == sorted(mo_pieces) == [(lay, e) for lay in range(layers) for e in range(experts)]
+    for key, piece in ct_pieces.items():
+        assert sorted(piece) == sorted(mo_pieces[key])
+        for role, tensor in piece.items():
+            twin = mo_pieces[key][role]
+            assert tensor.dtype == twin.dtype and torch.equal(tensor.view(torch.uint8), twin.view(torch.uint8)), (key, role)
