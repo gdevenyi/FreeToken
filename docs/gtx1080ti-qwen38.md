@@ -49,7 +49,7 @@ Decode, steady state, 1K context, temperature 0 (in-process A/B with the product
 | Change | Decode tok/s |
 |---|---|
 | Before the CPU MoE and memops work (fetch 3) | 9.0 (older timing that also counted a ~6 s re-prefill, so not directly comparable) |
-| AVX2 int8 NVFP4 kernel, NUMA placement, worker hot-spin, fetch 1 | 18.15 (host-func handshake) |
+| AVX2 int8 NVFP4 kernel, NUMA placement, worker spin (now upstream #619), fetch 1 | 18.15 (host-func handshake) |
 | + 32-bit stream-memops flag handshake | 19.08 |
 | With the 262K host KV tier, before the selection-compaction fix (server) | 14.0 |
 | With the host KV tier, after it (in-process; 17.4 streamed through the server, table below) | 17.2 |
@@ -113,6 +113,8 @@ Clients: OpenAI chat/Responses and Anthropic Messages on port 8080, model `qwen3
 so the prefix cache keeps hitting.
 
 Known test failures on this card (other models' kernels that need more than 48 KB of shared memory or sm_70+):
-MiniMax-M3 sparse attention, GLM DSA, FP8 block-scale MoE, NVFP4 sparse-MLA KV; plus
+MiniMax-M3 sparse attention, GLM DSA, FP8 block-scale MoE, NVFP4 sparse-MLA KV, and upstream's DeepSeek-V4/V4.1
+fp4/fp8 kernels (`test_dsv41_pack`, `test_dsv4_fp8_block_linear`, `test_dsfp4_reference_semantics`; they fail the same way
+on upstream main on this card); plus
 `test_scheme_for_agrees_with_the_stored_tensors[sentence-transformers/all-MiniLM-L6-v2]`, which scans a local HF cache.
-Full suite at this commit: 2774 passed, 50 failed (all in that list), 234 skipped.
+Full suite after merging upstream main 377a3bc4: 2999 passed, 59 failed (all in that list), 251 skipped.
