@@ -454,6 +454,12 @@ class TestDeepSeekV32Detector(_DetectorContract):
     truncate_before = '</｜DSML｜invoke>'
 
 
+class TestDeepSeekV41Detector(_DetectorContract):
+    parser_name = 'deepseekv41'
+    block = '<｜DSML｜ calls><｜DSML｜ invoke name="read"><｜DSML｜ parameter name="filePath" string="true">/tmp/test_calc.py</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>'
+    truncate_before = '</｜DSML｜ invoke>'
+
+
 class TestQwen3CoderDetector(_DetectorContract):
     parser_name = 'qwen3_coder'
     block = '<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter></function></tool_call>'
@@ -498,5 +504,10 @@ def test_contract_classes_cover_every_concrete_detector():
         type(cls().parser().detector)
         for cls in _DetectorContract.__subclasses__()
     }
-    assert covered == set(BaseFormatDetector.__subclasses__())
+    concrete, todo = set(), list(BaseFormatDetector.__subclasses__())
+    while todo:  # a detector may extend another (DeepSeekV41Detector < DeepSeekV32Detector)
+        cls = todo.pop()
+        concrete.add(cls)
+        todo.extend(cls.__subclasses__())
+    assert covered == concrete
     assert covered == set(FunctionCallParser.ToolCallParserEnum.values())
