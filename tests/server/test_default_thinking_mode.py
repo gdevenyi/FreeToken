@@ -110,7 +110,7 @@ def test_anthropic_chat_default_applies_only_without_a_thinking_block():
 def test_anthropic_count_tokens_renders_the_generation_prompt_under_the_default(monkeypatch):
     captured = {}
 
-    async def fake_count(messages, template_tools, ctk, state):
+    async def fake_count(messages, template_tools, ctk, state, **_):
         captured["ctk"] = ctk
         return 1
 
