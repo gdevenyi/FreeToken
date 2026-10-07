@@ -326,7 +326,8 @@ def convert_anthropic_prompt(
         # default only covers requests that leave thinking out.
         ctk = apply_default_thinking_mode(ctk, default_thinking_mode)
 
-    return render_messages(messages), template_tools, parser_tools, ctk
+    # late system reminders stay in place: the tokenizer folds them instead (prefix reuse)
+    return render_messages(messages, hoist_system=False), template_tools, parser_tools, ctk
 
 
 def convert_anthropic_to_genspec(
