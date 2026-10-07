@@ -22,10 +22,10 @@ from freetoken.kernel.aot_models import expert_bank_row_bytes
 from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.weight import (
-    _NVFP4_SOURCE_SPEC,
     _ZERO_CENTERED_NORM_SUFFIXES,
     iter_weights,
     load_ple_table,
+    nvfp4_expert_spec,
 )
 from freetoken.moe.expert_banks import build_expert_banks
 from freetoken.moe.host_banks import HostResidency
@@ -271,8 +271,9 @@ def layer0_expert_banks():
     """The real NVFP4 source-bank loader, restricted to layer 0 (1.32 GiB instead of 63.5)."""
     if not torch.cuda.is_available():
         pytest.skip("expert bank pinning needs CUDA")
+    install_quant_config(MODEL_PATH)
     spec = dataclasses.replace(
-        _NVFP4_SOURCE_SPEC, layer_to_bank=lambda layer, config: 0 if layer == 0 else None
+        nvfp4_expert_spec(MODEL_PATH, None), layer_to_bank=lambda layer, config: 0 if layer == 0 else None
     )
     config = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
                              num_moe_layers=1)
