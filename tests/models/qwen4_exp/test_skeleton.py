@@ -1117,13 +1117,13 @@ def test_moe_prefetch_on_counters_match_reference(bs, policy, monkeypatch):
         calls.append(("ensure", layer, ids.clone(), None if logits is None or policy != "rule" else logits.clone()))
         return real_ensure(layer, ids, **kw)
 
-    def spy_slim(*args):
+    def spy_slim(*args, **kw):
         streams["slim"].add(torch.cuda.current_stream().cuda_stream)
-        return real_slim(*args)
+        return real_slim(*args, **kw)
 
-    def spy_multi(*args):
+    def spy_multi(*args, **kw):
         streams["demand"].add(torch.cuda.current_stream().cuda_stream)
-        return real_multi(*args)
+        return real_multi(*args, **kw)
 
     def install():
         monkeypatch.setattr(cache, "prefetch_ensure", spy_pf)
