@@ -202,33 +202,6 @@ def round_e4m3(x):
 
 
 @jit
-def e4m3_f32_to_u8(x):
-    """Encode an fp32 value that ALREADY lies on the e4m3 grid -- the output of
-    :func:`round_e4m3`, clamped to +-448 -- into its e4m3 byte code. This is the
-    encoder the pre-sm_89 emulated path needs to STORE fp8-sized data (the fp8
-    type itself is unavailable there, so the bytes live in a uint8 buffer that
-    :func:`e4m3_u8_to_f32` decodes back).
-
-    Normal range: read the (unbiased) exponent and the now-zero-padded fp32
-    mantissa back out of the fp32 header. Subnormal range (|x| < 2^-6, grid step
-    2^-9): the value is an exact multiple of 2^-9, so ``|x| * 512`` IS the mantissa
-    field -- the sign bit has to be carried in by hand, since that branch never
-    looks at the header. The same 0.015625 boundary as :func:`round_e4m3` keeps the
-    two consistent: ``e4m3_u8_to_f32(e4m3_f32_to_u8(round_e4m3(x)))`` is x's
-    single-rounded value for every input, and no code it emits is a NaN pattern (the
-    caller's +-448 clamp caps the code at 0x7E). ``-0.0`` encodes as 0x00 after
-    round_e4m3 (which documents returning +0.0 for it).
-    """
-    u = x.to(tl.uint32, bitcast=True)
-    sign = ((u >> 31) & 1).to(tl.int32)
-    exp = ((u >> 23) & 0xFF).to(tl.int32) - 127
-    mant = ((u >> 20) & 7).to(tl.int32)
-    normal = (sign << 7) | ((exp + 7) << 3) | mant
-    sub = (sign << 7) | (tl.abs(x) * 512.0).to(tl.int32)
-    return tl.where(tl.abs(x) >= 0.015625, normal, sub).to(tl.uint8)
-
-
-@jit
 def kv_load_e4m3_tile_f32(ptrs, mask):
     """Load a tile of KV e4m3 codes and widen it to fp32.
 
