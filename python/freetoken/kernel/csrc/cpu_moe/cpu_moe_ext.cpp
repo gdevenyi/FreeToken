@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-#include <cuda_runtime_api.h>
+#include <freetoken/hip_compat.h>
 #include <torch/extension.h>
 
 #if defined(__linux__)
@@ -50,6 +50,14 @@
 #endif
 
 namespace {
+
+inline void cpu_relax() {
+#if CPU_MOE_X86
+  _mm_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#endif
+}
 
 using bf16_t = uint16_t;
 
@@ -1250,11 +1258,12 @@ inline void deinterleave_bf16_f32(const bf16_t* src, float* even, float* odd, in
   }
 }
 
-// DeepSeek-V4 activation FP8 round-trip (bf16 in/out): per 128-block,
-// s = 2^ceil(log2(max(|x|,1e-4)/448)); y = round_e4m3(clamp(x/s,+-448)) * s.
-void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K) {
-  for (int b0 = 0; b0 < K; b0 += 128) {
-    const int b1 = std::min(K, b0 + 128);
+// DeepSeek-V4 / V4.1 activation FP8 round-trip (bf16 in/out): per `block` (the checkpoint's
+// fp8 block: 128 on V4, 32 on V4.1), s = 2^ceil(log2(max(|x|,1e-4)/448));
+// y = round_e4m3(clamp(x/s,+-448)) * s.
+void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K, int block) {
+  for (int b0 = 0; b0 < K; b0 += block) {
+    const int b1 = std::min(K, b0 + block);
     float amax = 1e-4f;
     for (int i = b0; i < b1; ++i) amax = std::max(amax, std::fabs(bf16_to_f32(src[i])));
     const float s = std::ldexp(1.0f, ceil_log2_pos(amax * (1.0f / 448.0f)));
@@ -1487,6 +1496,8 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
+  // ds_fp4 activation round-trip block (the checkpoint's fp8 block); set via set_act_block.
+  int act_block = 128;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
@@ -1511,23 +1522,19 @@ struct CpuMoeExecutor {
   std::mutex sync_mtx;
   std::condition_variable sync_cv;
 
-  bool stop = false;
-  std::atomic<bool> stop_flag{false};  // lock-free view of `stop` for the workers' hot spin
+  std::atomic<bool> stop{false};  // spinning workers read it without the lock
   uint64_t cur_gen = 0;
   MoeTask* cur_task = nullptr;
-  std::atomic<uint64_t> submitted{0};
-  std::atomic<uint64_t> completed{0};
-  // Workers spin (pause) for the next task for this long after finishing one before
-  // parking on the condvar: a futex wake-up + C-state exit costs 50-150 us per worker,
-  // paid once per MoE layer per decode step (~0.1 ms x 43 layers on DeepSeek-V4-Flash).
-  // 50 ms covers the intra-token gap between consecutive layers' tasks and the
-  // inter-token gap; an idle engine parks within 50 ms. FREETOKEN_CPU_MOE_SPIN_MS=0 or
-  // set_worker_spin_ms(0) opts out; the Python side turns it off when the pool plus the
-  // coordinator leave no CPU headroom for the launch thread (spinning workers then
-  // starve it: measured 3.1 vs 8.7 tok/s on a fully subscribed 30-vCPU guest).
-  std::atomic<int64_t> worker_spin_ns{50LL * 1000 * 1000};
+  // Separate cache lines: idle workers poll `submitted` while busy workers hit p1_next/p2_next.
+  alignas(64) std::atomic<uint64_t> submitted{0};
+  alignas(64) std::atomic<uint64_t> completed{0};
 
-  std::atomic<int64_t> p1_next{0};
+  // Spin-then-park waits. Off unless the Python wrapper finds spare CPUs for the spinners.
+  static constexpr auto kSpinWindow = std::chrono::milliseconds(50);
+  std::atomic<bool> spin_wait{false};
+  bool coord_pinned = false;
+
+  alignas(64) std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
@@ -1685,9 +1692,6 @@ struct CpuMoeExecutor {
       xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 32), 0);
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
-    }
-    if (const char* s = getenv("FREETOKEN_CPU_MOE_SPIN_MS")) {
-      if (s[0]) worker_spin_ns = static_cast<int64_t>(std::max(0, atoi(s))) * 1000 * 1000;
     }
     worker_node.assign(num_threads, -1);
     for (int t = 0; t < num_threads; ++t)
@@ -1938,7 +1942,6 @@ struct CpuMoeExecutor {
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       stop = true;
-      stop_flag.store(true, std::memory_order_release);
     }
     task_cv.notify_all();
     for (auto& th : workers)
@@ -1957,14 +1960,6 @@ struct CpuMoeExecutor {
                              reinterpret_cast<bf16_t*>(y_ptr)};
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
-  }
-
-  void set_worker_spin_ms(int ms) {
-    worker_spin_ns.store(static_cast<int64_t>(std::max(0, ms)) * 1000 * 1000,
-                         std::memory_order_relaxed);
-  }
-  int worker_spin_ms() const {
-    return static_cast<int>(worker_spin_ns.load(std::memory_order_relaxed) / (1000 * 1000));
   }
 
   const char* isa_name() const { return isa; }
@@ -2222,7 +2217,7 @@ struct CpuMoeExecutor {
                  gas_scratch.data() + (size_t)r * (I / 32));
       return;
     }
-    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
+    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I, act_block);
     float* ge = ge_scratch.data() + (size_t)r * (I / 2);
     float* go = go_scratch.data() + (size_t)r * (I / 2);
     deinterleave_bf16_f32(g, ge, go, I);
@@ -2294,40 +2289,36 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Tasks arrive once per MoE layer, sub-ms apart. Spinning skips a futex wakeup per worker per layer; parking after kSpinWindow keeps an idle server off the CPU.
   void worker_loop(int tid) {
     pin_self(tid);
     worker_node[tid] = this_cpu_node();
     nodes_known.fetch_add(1, std::memory_order_release);
     uint64_t my_gen = 0;
-    auto last_task = std::chrono::steady_clock::now();
+    using wclk = std::chrono::steady_clock;
+    auto last_active = wclk::now();
     for (;;) {
-      // Hot phase: spin (pause) while decode traffic flows so the next layer's task
-      // starts without a futex wake-up; park on the condvar once the engine goes idle.
-      // The clock is consulted every 1024 polls to keep the loop cheap.
-      const int64_t spin_ns = worker_spin_ns.load(std::memory_order_relaxed);
-      if (spin_ns > 0) {
+      uint64_t gen = submitted.load(std::memory_order_acquire);
+      if (gen == my_gen && spin_wait.load(std::memory_order_relaxed)) {
         unsigned polls = 0;
-        while (!stop_flag.load(std::memory_order_acquire) &&
-               submitted.load(std::memory_order_acquire) == my_gen) {
-#if CPU_MOE_X86
-          _mm_pause();
-#endif
-          if ((++polls & 1023u) == 0 &&
-              (std::chrono::steady_clock::now() - last_task) >=
-                  std::chrono::nanoseconds(spin_ns))
-            break;
+        while (gen == my_gen) {
+          cpu_relax();
+          if (stop.load(std::memory_order_relaxed)) return;
+          if ((++polls & 1023u) == 0 && wclk::now() - last_active > kSpinWindow) break;
+          gen = submitted.load(std::memory_order_acquire);
         }
       }
-      MoeTask* t;
-      {
+      if (gen == my_gen) {
         std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
+        task_cv.wait(lk, [&] { return stop.load() || cur_gen != my_gen; });
+        if (stop.load()) return;
+        gen = cur_gen;
       }
+      // submit() writes cur_task before the release store to `submitted`.
+      my_gen = gen;
+      MoeTask* t = cur_task;
       run_task_body(t, tid);
-      last_task = std::chrono::steady_clock::now();
+      last_active = wclk::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
         {
@@ -2382,7 +2373,7 @@ struct CpuMoeExecutor {
         const bf16_t* src = t->x + (size_t)tok * H;
         if (ds) {  // DSV4 FP8-round-trips the input before the gate_up GEMV
           bf16_t* xq = xq_scratch.data() + (size_t)tok * H;
-          fp8_roundtrip_bf16(src, xq, H);
+          fp8_roundtrip_bf16(src, xq, H, act_block);
           src = xq;
         }
         float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
@@ -2416,21 +2407,16 @@ struct CpuMoeExecutor {
     task_cv.notify_all();
   }
 
-  void sync() {
+  // Only a coordinator on its own core may spin: host-func callbacks and eager calls share cores with the workers.
+  void sync(bool spin = false) {
     const uint64_t target = submitted.load(std::memory_order_acquire);
-    // A decode layer's task drains in well under a millisecond: spin (pause) for the
-    // completion first so the flag coordinator answers the GPU without a futex hop;
-    // fall back to the condvar for long tasks (prefill bursts) or an opted-out spin.
-    if (worker_spin_ns.load(std::memory_order_relaxed) > 0) {
-      const auto t0 = std::chrono::steady_clock::now();
+    if (spin) {
+      using sclk = std::chrono::steady_clock;
+      const auto t0 = sclk::now();
       unsigned polls = 0;
       while (completed.load(std::memory_order_acquire) < target) {
-#if CPU_MOE_X86
-        _mm_pause();
-#endif
-        if ((++polls & 1023u) == 0 &&
-            (std::chrono::steady_clock::now() - t0) >= std::chrono::milliseconds(5))
-          break;
+        cpu_relax();
+        if ((++polls & 1023u) == 0 && sclk::now() - t0 > kSpinWindow) break;
       }
       if (completed.load(std::memory_order_acquire) >= target) return;
     }
@@ -2474,6 +2460,7 @@ struct CpuMoeExecutor {
     }
     flag_served.assign(num_slots, 0);
     coord_stop.store(false);
+    coord_pinned = CPU_MOE_HAS_AFFINITY && pin_core >= 0;
     coord_thread = std::thread([this, pin_core] {
 #if CPU_MOE_HAS_AFFINITY
       if (pin_core >= 0) {
@@ -2521,6 +2508,7 @@ struct CpuMoeExecutor {
             t = (L < static_cast<int>(flag_task.size())) ? flag_task[L] : nullptr;
           }
           if (t != nullptr) {
+            const bool spin = coord_pinned && spin_wait.load(std::memory_order_relaxed);
             // FREETOKEN_CPU_MOE_STATS=1: every 4300 dispatches (100 decode steps of a
             // 43-layer model) print the mean task wall time and mean routed experts per
             // task -- the numbers that size the hybrid fetch fraction.
@@ -2531,7 +2519,7 @@ struct CpuMoeExecutor {
             if (stats) {
               const auto t0 = coord_clock::now();
               submit(t);
-              sync();
+              sync(spin);
               const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   coord_clock::now() - t0).count();
               int routes = 0;
@@ -2548,7 +2536,7 @@ struct CpuMoeExecutor {
               }
             } else {
               submit(t);
-              sync();
+              sync(spin);
             }
           }
           // Release: the workers' y stores are visible before the GPU sees done.
@@ -2643,9 +2631,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
+      .def("set_act_block",
+           [](CpuMoeExecutor& e, int v) { e.act_block = v; },
+           py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name)
-      .def("set_worker_spin_ms", &CpuMoeExecutor::set_worker_spin_ms, py::arg("ms"))
-      .def("worker_spin_ms", &CpuMoeExecutor::worker_spin_ms)
+      .def("set_spin_wait",
+           [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
+           py::arg("enabled"))
+      .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); })
       .def("disable_numa", &CpuMoeExecutor::disable_numa)
       .def("numa_status", &CpuMoeExecutor::numa_status);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));

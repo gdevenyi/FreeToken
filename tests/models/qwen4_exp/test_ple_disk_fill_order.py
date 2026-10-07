@@ -64,7 +64,10 @@ def _table(monkeypatch) -> DiskRowTable:
     t._store = _Store(t._flag)
     t._token_readback = torch.zeros(8, dtype=torch.int32)
     t._graph_pinned = torch.zeros(64, dtype=torch.uint8)
-    t._eager_pinned = torch.zeros(64, dtype=torch.uint8)
+    t._graph_consumed = _Event()
+    t._eager_pinned = [torch.zeros(64, dtype=torch.uint8) for _ in range(2)]
+    t._eager_read = [_Event(), _Event()]
+    t._eager_slot = 0
     t._token_bytes = 1
     t.eos_token_id = EOS
     t.image_token_id = None
@@ -198,6 +201,8 @@ def test_each_fill_waits_on_its_own_steps_readback(monkeypatch):
     t = _table(monkeypatch)
     gpu = _Gpu(t._flag)
     monkeypatch.setattr(ple_disk.torch.cuda, "Event", lambda: _StreamEvent(gpu))
+    # the launch-gating fence is re-recorded after every launch, so it is just as shared
+    t._graph_consumed = _StreamEvent(gpu)
     _two_steps_behind_a_slow_filler(t, gpu)
     t._raise_failed_fill()
     _close(t)

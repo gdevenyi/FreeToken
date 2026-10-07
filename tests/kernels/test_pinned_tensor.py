@@ -125,6 +125,9 @@ def test_host_device_ptr_is_identity_under_uva():
     # cudaErrorInvalidValue. Either is fine -- what must never happen is a different
     # nonzero alias, which would silently misaddress the zero-copy gather. The in-contract
     # case (registered memory -> identity) is test_host_bank_pin_registers_and_translates.
+    # HIP also validates registration, but leaves a sticky error behind, so skip it there.
+    if torch.version.hip is not None:
+        return
     pageable = torch.empty(64, dtype=torch.uint8)
     ext = _load_pinned_extension()
     try:

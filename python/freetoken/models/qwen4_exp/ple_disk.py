@@ -207,9 +207,19 @@ class DiskRowTable:
         self._graph_dev = torch.empty(
             max_graph_rows * self._token_bytes, dtype=torch.uint8, device=self._device
         )
+        # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
+        # dispatch context once the launch returns: a record inside the capture would not be observable).
+        # Only launch-gated fills wait on it; a wait-sync fill is ordered by its own readback event.
+        self._graph_consumed = torch.cuda.Event()
         eager_bytes = max_extend_tokens * self._token_bytes
-        self._eager_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
-        self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
+        # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
+        # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
+        # that last read it has run (``_eager_read[i]``, recorded right after that copy)
+        self._eager_pinned = [alloc_pinned_tensor(eager_bytes, dtype=torch.uint8) for _ in range(2)]
+        for buf in self._eager_pinned:
+            buf.zero_()  # the warmup prefill stages nothing and reads whatever sits here
+        self._eager_read = [torch.cuda.Event(), torch.cuda.Event()]
+        self._eager_slot = 0
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
         from freetoken.kernel.row_store import probe_wait_sync
@@ -268,7 +278,16 @@ class DiskRowTable:
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
-        pinned = self._graph_pinned if graph else self._eager_pinned
+        if graph:
+            self._graph_consumed.synchronize()
+            pinned = self._graph_pinned
+        else:
+            self._eager_slot ^= 1
+            self._eager_read[self._eager_slot].synchronize()
+            pinned = self._eager_pinned[self._eager_slot]
+        self._stage(runs, pinned, graph=graph)
+
+    def _stage(self, runs: Sequence[torch.Tensor], pinned: torch.Tensor, *, graph: bool) -> None:
         offset = 0
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
@@ -312,7 +331,9 @@ class DiskRowTable:
                         if cancelled.is_set():
                             return
                         runs = [torch.tensor([*ctx, t], dtype=torch.int64) for ctx, t in zip(contexts, tokens)]
-                        self.fill(runs, graph=True)
+                        # the readback already ordered this after the previous graph; _graph_consumed may
+                        # be re-recorded behind this fill's own graph, which is parked on its WAIT
+                        self._stage(runs, self._graph_pinned, graph=True)
                     except BaseException:
                         from freetoken.kernel.row_store import signal
 
@@ -349,21 +370,27 @@ class DiskRowTable:
             if pending is not None:
                 pending.cancel()
             raise
+        if use_graph:
+            # after the launch: the next launch-gated graph fill waits on this graph, the last reader of _graph_pinned
+            self._graph_consumed.record(self._current_stream())
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         rows = row_ids.shape[0]
+        stream = torch.cuda.current_stream(self._device)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self._wait_sync:
             from freetoken.kernel.row_store import wait_reset
 
-            wait_reset(torch.cuda.current_stream(self._device), self._flag)
+            wait_reset(stream, self._flag)
         pinned, dev = (
-            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
+            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned[self._eager_slot], self._eager_dev)
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
+        if not capturing:
+            self._eager_read[self._eager_slot].record(stream)
         values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale

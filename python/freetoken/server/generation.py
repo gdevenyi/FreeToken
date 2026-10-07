@@ -26,6 +26,7 @@ from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import join_system_contents, resolve_thinking_mode
+from freetoken.tokenizer.inline_system import InlineSystemError
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -418,6 +419,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    inline_system_policy: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -523,15 +525,18 @@ def resolve_sampling(
     return params
 
 
-def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def render_messages(messages: list[dict[str, Any]], *, hoist_system: bool = True) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
     ValueError on a non-text content part (text-only server). Shared by all adapters.
 
     Some chat templates (e.g. Qwen3.6) require the system message at index 0;
     hoist system messages to the front and merge multiples into one to satisfy
-    that constraint."""
+    that constraint. ``hoist_system=False`` leaves late system messages in place for
+    the tokenizer's inline-system policy (Anthropic, --anthropic-inline-system)."""
     rendered = [_render_message(m) for m in messages]
+    if not hoist_system:
+        return rendered
     if any(m.get("role") == "developer" for m in rendered):
         # The tokenizer maps developer per template and then merges in order
         # (_map_developer_role); hoisting system alone here would put it ahead of
@@ -654,6 +659,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
             images=images,
+            inline_system_policy=spec.inline_system_policy,
         )
     )
     return uid
@@ -664,6 +670,8 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    *,
+    inline_system_policy: str | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -686,10 +694,13 @@ async def count_prompt_tokens(
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
         images=images,
+        inline_system_policy=inline_system_policy,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
         (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
+    except InlineSystemError as exc:
+        raise GenerationError(str(exc)) from exc
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
     return int(user_msg.input_ids.numel())
@@ -713,6 +724,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        inline_system_policy=spec.inline_system_policy,
     )
     try:
         manager = await asyncio.to_thread(build)

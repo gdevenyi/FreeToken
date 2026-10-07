@@ -1,4 +1,4 @@
-"""CPU MoE worker hot-spin (``FREETOKEN_CPU_MOE_SPIN_MS``), CPU only.
+"""CPU MoE pool spin-wait (``FREETOKEN_CPU_MOE_SPIN``), CPU only.
 
 Workers either catch the next task while spinning, or park on the condvar and get woken;
 both hand-offs must run every task exactly once on that task's inputs. The pool drops the
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as Fn
 
 L, E, H, I, TOP_K, BS = 2, 8, 256, 128, 2, 3
-DEFAULT_SPIN_MS = 50
+SPIN_WINDOW_S = 0.05  # kSpinWindow in csrc/cpu_moe/cpu_moe_ext.cpp
 
 
 @pytest.fixture
@@ -88,13 +88,13 @@ def _run_steps(ex, cache, steps, gap_s):
 
 
 def test_spinning_and_parked_workers_run_every_task(cache, make_executor):
-    """Spin on, spin off, and a spin window shorter than the gap between tasks (the
-    workers leave the spin and park, so the condvar wakes them) give identical outputs."""
+    """Spin on, spin off, and a gap between tasks longer than the spin window (the workers
+    leave the spin and park, so the condvar wakes them) give identical outputs."""
     runs = {}
-    for name, spin_ms, gap_s in [("spin", DEFAULT_SPIN_MS, 0), ("off", 0, 0), ("park", 1, 0.02)]:
+    for name, spin, gap_s in [("spin", True, 0), ("off", False, 0), ("park", True, 2 * SPIN_WINDOW_S)]:
         ex = make_executor(cache)
-        ex._ext.set_worker_spin_ms(spin_ms)
-        assert ex._ext.worker_spin_ms() == spin_ms
+        ex._ext.set_spin_wait(spin)
+        assert ex._ext.get_spin_wait() is spin
         runs[name] = _run_steps(ex, cache, steps=40 if gap_s == 0 else 8, gap_s=gap_s)
         del ex
     for name in ("off", "park"):
@@ -102,44 +102,53 @@ def test_spinning_and_parked_workers_run_every_task(cache, make_executor):
             assert torch.equal(got, want), f"{name} differs from spin at step {step}"
 
 
-def test_spin_ms_env_overrides_the_default(cache, make_executor, monkeypatch):
-    # an exported spin A/B setting or a small runner would move the default under test
-    monkeypatch.delenv("FREETOKEN_CPU_MOE_SPIN_MS", raising=False)
+def test_spin_env_opts_out(cache, make_executor, monkeypatch):
+    from freetoken.moe import cpu_executor
+
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)))
-    assert make_executor(cache)._ext.worker_spin_ms() == DEFAULT_SPIN_MS
-    monkeypatch.setenv("FREETOKEN_CPU_MOE_SPIN_MS", "7")
-    assert make_executor(cache)._ext.worker_spin_ms() == 7
-    monkeypatch.setenv("FREETOKEN_CPU_MOE_SPIN_MS", "0")
-    assert make_executor(cache)._ext.worker_spin_ms() == 0
+    monkeypatch.setattr(cpu_executor, "_SPIN_WAIT", True)
+    assert make_executor(cache)._ext.get_spin_wait() is True
+    monkeypatch.setattr(cpu_executor, "_SPIN_WAIT", False)
+    ex = make_executor(cache)
+    assert ex.spin_wait is False and ex._ext.get_spin_wait() is False
 
 
-@pytest.mark.parametrize("cpus, spin_ms", [(3, 0), (8, DEFAULT_SPIN_MS)])
-def test_spin_needs_a_spare_cpu_for_the_launch_thread(cache, make_executor, monkeypatch, cpus, spin_ms):
-    """Two pinned workers plus the launch thread and one more need four CPUs."""
-    monkeypatch.delenv("FREETOKEN_CPU_MOE_SPIN_MS", raising=False)
+@pytest.mark.parametrize("cpus, spin", [(3, False), (8, True)])
+def test_spin_needs_a_spare_cpu_for_the_launch_thread(cache, make_executor, monkeypatch, cpus, spin):
+    """Two pinned workers plus the main and callback threads need four CPUs."""
+    from freetoken.moe import cpu_executor
+
+    monkeypatch.setattr(cpu_executor, "_SPIN_WAIT", True)
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(cpus)))
-    assert make_executor(cache, num_threads=2)._ext.worker_spin_ms() == spin_ms
+    assert make_executor(cache, num_threads=2)._ext.get_spin_wait() is spin
 
 
-def test_a_pre_spin_extension_still_serves_with_parked_workers(cache, make_executor, monkeypatch):
-    """A prebuilt _cpu_moe .so from before the spin has no spin controls. Its workers always
-    park (the spin 0 mode), so the executor must build and run on it rather than die after the
-    whole model load."""
+@pytest.mark.parametrize("controls", [(), ("set_worker_spin_ms", "worker_spin_ms")])
+def test_a_pre_spin_extension_still_serves(cache, make_executor, monkeypatch, controls):
+    """A prebuilt _cpu_moe .so from before the spin-wait has no set_spin_wait (or only the
+    older worker-spin control). The executor must build and run on it rather than die after
+    the whole model load."""
     from freetoken.kernel import _cpu_moe
 
     real = _cpu_moe.CpuMoeExecutor
+    calls = []
 
     class PreSpinExecutor:
         def __init__(self, **kwargs):
             self._real = real(**kwargs)
-            self._real.set_worker_spin_ms(0)
+            self._real.set_spin_wait(False)
 
         def __getattr__(self, name):
-            if name in ("worker_spin_ms", "set_worker_spin_ms"):
+            if name in ("set_spin_wait", "get_spin_wait"):
                 raise AttributeError(name)
             return getattr(self._real, name)
 
+    for name in controls:
+        setattr(PreSpinExecutor, name, lambda self, *a, _n=name: calls.append((_n, *a)) or 0)
     monkeypatch.setattr(_cpu_moe, "CpuMoeExecutor", PreSpinExecutor)
     ex = make_executor(cache)
-    assert not ex._has_spin
+    if controls:
+        assert calls == [("set_worker_spin_ms", 50 if ex.spin_wait else 0)]
+    else:
+        assert ex.spin_wait is False
     _run_steps(ex, cache, steps=4, gap_s=0)
