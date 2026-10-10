@@ -697,11 +697,11 @@ def test_select_extend_tile_uses_kv_cache_element_size(
     budget identically, since (M + 2N) * D * 2 == (M*2 + 2N*2) * D."""
     import triton
 
-    from freetoken.kernel.triton.attention import _select_extend_tiles
+    from freetoken.kernel.triton.attention import _select_extend_tile
 
     block_d = triton.next_power_of_2(head_dim)
-    assert _select_extend_tiles(head_dim, block_d, smem_optin, 2)[0] == expected_16bit
-    assert _select_extend_tiles(head_dim, block_d, smem_optin, 1)[0] == expected_fp8
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 2) == expected_16bit
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 1) == expected_fp8
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
