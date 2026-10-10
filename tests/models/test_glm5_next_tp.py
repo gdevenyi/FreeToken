@@ -31,7 +31,7 @@ P = KDA_H * KDA_D
 def _text_config() -> dict:
     return {
         "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": 2,
-        "num_attention_heads": HEADS, "vocab_size": VOCAB, "hidden_act": "silu",
+        "num_attention_heads": HEADS, "num_key_value_heads": HEADS, "vocab_size": VOCAB, "hidden_act": "silu",
         "rms_norm_eps": 1e-5, "max_position_embeddings": 4096, "tie_word_embeddings": False,
         "q_lora_rank": QLORA, "kv_lora_rank": KVLORA, "qk_nope_head_dim": NOPE,
         "qk_rope_head_dim": 0, "v_head_dim": V, "mla_use_nope": True,
