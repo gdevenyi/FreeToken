@@ -60,23 +60,9 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
-def _tp_slice() -> tuple[int, int] | None:
-    """``(i_local, i_lo)``: this rank's slice of the expert intermediate axis, or None at TP=1.
-
-    TP shards every routed expert along I (gate/up output rows, down input columns), so each
-    rank caches only its own half and the MoE layer all-reduces the partial sum. The expert
-    kernel sizes its banks from ``MoEConfig.local_intermediate``, which is the same split.
-    """
-    from freetoken.distributed import try_get_tp_info
-
-    tp = try_get_tp_info()
-    if tp is None or tp.size == 1:
-        return None
-    return tp.size, tp.rank
-
-
 def _tp_shard(role: str, tensor: torch.Tensor, inter: int, tp_size: int, tp_rank: int):
-    """This rank's I-slice of one checkpoint expert tensor. ``_global`` is a per-tensor scalar
+    """This rank's I-slice of one checkpoint expert tensor (a view; the loader uses
+    ``shard_nvfp4_piece``, which cuts the same slice into its own storage). ``_global`` is a per-tensor scalar
     and has no I axis; gate/up carry I on the row axis, down on the column axis (halved for the
     packed FP4 codes, sixteenthed for the fp8 block scales)."""
     if role.endswith("_global"):
@@ -185,18 +171,9 @@ def iter_nvfp4_expert_pieces(
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
             yield name, _local(name, tensor)
 
+    # TP: _local already cut each piece to this rank's I-slice (shard_nvfp4_piece); cutting it
+    # again here would hand every rank a quarter of each expert at TP=2.
     stream = _parallel() if parallel else _serial()
-    shard = _tp_slice()
-    if shard is not None:
-        tp_size, tp_rank = shard
-        inter = config.moe_intermediate_size
-        base = stream
-
-        def _sharded():
-            for name, tensor in base:
-                yield name, _tp_shard(wanted[name][2], tensor, inter, tp_size, tp_rank)
-
-        stream = _sharded()
     return per_expert_pieces(stream, wanted.get, tensors_per_expert=9)
 
 

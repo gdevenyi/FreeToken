@@ -62,3 +62,16 @@ def test_moe_config_local_intermediate_matches_the_shard():
         cfg = MoEConfig(num_experts=8, hidden=HIDDEN, intermediate=INTER, top_k=2, tp_size=tp_size)
         assert cfg.local_intermediate == INTER // tp_size
         assert _tp_shard("gate", _roles()["gate"], INTER, tp_size, 0).shape[0] == cfg.local_intermediate
+
+
+def test_loader_slice_matches_the_reference_slice():
+    # iter_nvfp4_expert_pieces cuts with shard_nvfp4_piece (once); _tp_shard is the reference
+    from freetoken.models.nvfp4_banks import shard_nvfp4_piece
+
+    for tp_size in (2, 4):
+        for role, tensor in _roles().items():
+            for r in range(tp_size):
+                torch.testing.assert_close(
+                    shard_nvfp4_piece(role, tensor, rank=r, tp_size=tp_size),
+                    _tp_shard(role, tensor, INTER, tp_size, r),
+                )

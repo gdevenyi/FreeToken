@@ -42,7 +42,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         # tp_ok: the source stream is sliced along the intermediate axis per rank
-        # (nvfp4_banks._tp_shard) and this kernel sizes its banks from
+        # (nvfp4_banks.shard_nvfp4_piece) and this kernel sizes its banks from
         # cfg.local_intermediate, so a rank holds and reads only its own half. The routed
         # output is then a partial sum, which the MoE layer reduces (_maybe_all_reduce, or
         # one combined all-reduce in qwen4_exp's block). marlin and b12x stay off: their
