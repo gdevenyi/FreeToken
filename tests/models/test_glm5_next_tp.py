@@ -227,3 +227,41 @@ def test_nvfp4_expert_pieces_pack_into_the_ranks_bank(rank):
     assert torch.equal(out["gate_up_scale"][0, local_i:].view(u8), src["up_scale"][lo:lo + local_i].view(u8))
     assert torch.equal(out["down_scale"][0].view(u8), src["down_scale"][:, lo // 16:(lo + local_i) // 16].view(u8))
     assert out["gate_up_global"].shape == (1, 2 * local_i) and out["down_global"].shape == (1, hidden)
+
+
+@pytest.mark.parametrize("split", [0, 1])
+def test_nvfp4_dense_projection_cuts_codes_and_block_scales_together(split):
+    """nvidia's export stores the dense MLP of layers 0-2 as ModelOpt NVFP4: the packed codes and
+    their per-16 block scales must be cut on the same axis, and the per-tensor weight_scale_2 must
+    arrive as one fp16 global per local output row."""
+    from freetoken.models.glm5_next import weight as W
+
+    tp, rows, cols, fp8 = 2, 64, 128, torch.float8_e4m3fn
+    store = {
+        "src.weight": (torch.arange(rows * cols // 2) % 251).to(torch.uint8).reshape(rows, cols // 2),
+        "src.weight_scale": (torch.arange(rows * cols // 16) % 113).to(torch.uint8).reshape(rows, cols // 16).view(fp8),
+        "src.weight_scale_2": torch.tensor(0.25, dtype=torch.float32),
+        "src.input_scale": torch.tensor([0.5], dtype=torch.float32),
+    }
+
+    class _Reader:
+        def get(self, name):
+            return store[name]
+
+    ranks = []
+    for rank in range(tp):
+        _set_tp(tp, rank)
+        out = dict(W._proj(_Reader(), "src", "dst", split))
+        assert set(out) == {"dst.weight", "dst.weight_scale", "dst.weight_global", "dst.input_scale"}
+        local_rows = rows // tp if split == 0 else rows
+        assert out["dst.weight"].shape == (local_rows, cols // 2 // (tp if split == 1 else 1))
+        assert out["dst.weight_scale"].dtype == fp8
+        assert out["dst.weight_global"].dtype == torch.float16
+        assert torch.equal(out["dst.weight_global"], torch.full((local_rows,), 0.25, dtype=torch.float16))
+        assert out["dst.input_scale"].shape == () and out["dst.input_scale"].item() == 0.5
+        ranks.append(out)
+    u8 = torch.uint8
+    assert torch.equal(torch.cat([r["dst.weight"] for r in ranks], dim=split), store["src.weight"])
+    assert torch.equal(
+        torch.cat([r["dst.weight_scale"].view(u8) for r in ranks], dim=split), store["src.weight_scale"].view(u8)
+    )

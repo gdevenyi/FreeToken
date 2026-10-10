@@ -127,10 +127,31 @@ _FP8_EXPERT_RE = re.compile(
 
 
 def _proj(reader, src: str, dst: str, split: int | None = None) -> Iterator[tuple[str, torch.Tensor]]:
-    """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales.
+    """One projection as the checkpoint stores it: bf16, fp8 codes with their block scales, or
+    ModelOpt NVFP4 (nvidia export: the dense MLP of layers 0-2).
     ``split=0`` is column-parallel (output rows), ``split=1`` row-parallel (input columns)."""
     w = reader.get(f"{src}.weight")
-    if w.dtype == torch.float8_e4m3fn:
+    if w.dtype == torch.uint8:
+        # e2m1 packed two per byte + e4m3 scales per 16 inputs: both cut on the same axis, so a
+        # row-parallel cut of the packed bytes / block scales is the cut of the logical columns.
+        w = _shard(w, split)
+        yield f"{dst}.weight", w
+        yield f"{dst}.weight_scale", _shard(reader.get(f"{src}.weight_scale"), split)
+        # The per-tensor global (weight_scale_2) broadcast to one fp16 scale per local output row.
+        g = reader.get(f"{src}.weight_scale_2").reshape(-1).to(torch.float32)
+        if g.numel() != 1:
+            raise ValueError(
+                f"{src}: weight_scale_2 has {g.numel()} elements, expected one per-tensor scale"
+            )
+        yield (
+            f"{dst}.weight_global",
+            g.to(torch.float16).expand(w.shape[0]).contiguous(),
+        )
+        yield (
+            f"{dst}.input_scale",
+            reader.get(f"{src}.input_scale").reshape(()).to(torch.float32),
+        )
+    elif w.dtype == torch.float8_e4m3fn:
         if split is not None and get_tp_info().size > 1:
             raise NotImplementedError(f"{src}: fp8 projections are not sharded for TP > 1")
         yield f"{dst}.weight", w
