@@ -1418,7 +1418,7 @@ struct MoeTask {
 //     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
 constexpr int IBLK = 32;
 constexpr int HBLK = 32;
-// Down-projection tile of the generic row-major pass 2 (bf16/nvfp4/q4_0): at bs=1
+// Down-projection tile of the generic row-major pass 2 (bf16/nvfp4/q4_0/fp8_block): at bs=1
 // H/32 tiles leave the last wave of a ~20-worker pool mostly idle.
 constexpr int HBLK_ROW = 16;
 
@@ -1788,7 +1788,7 @@ struct CpuMoeExecutor {
     // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
-    if (fmt == WF_BF16 || fmt == WF_NVFP4 || fmt == WF_Q4_0) hblk = HBLK_ROW;
+    if (fmt != WF_MXFP4 && fmt != WF_DSFP4) hblk = HBLK_ROW;  // the formats do_pass2 runs
     // Row-major fp4 (nvfp4/ds_fp4) and fp8_block pre-deinterleave activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4 || fmt == WF_FP8_BLOCK);
     if (needs_di) {
