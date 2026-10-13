@@ -44,6 +44,9 @@ def fused_topk(
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
 
+_SGL_ALIGN_MAX_EXPERTS = 1024
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -97,7 +100,10 @@ def moe_align_block_size(
 
             return moe_align_block_size_triton(topk_ids, block_size, num_experts)
 
-    if not is_sgl_kernel_installed():
+    # sgl_kernel's align kernel takes num_experts + 1 counters in one block and reads out of
+    # bounds past 1024 of them (0.4.5 and 0.4.9). A prefill over an offload slot cache passes the
+    # slot count here (#676), which is thousands; the Triton kernel has no such limit.
+    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS:
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )
