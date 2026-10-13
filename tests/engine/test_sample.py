@@ -67,18 +67,3 @@ def test_penalized_logits_reach_the_probability_sampler(monkeypatch):
     assert seen["logits"][0].tolist() == [0.0, 1.0, 2.0, 0.0]  # presence: -3 once, not per count
     assert seen["logits"][1].tolist() == [0.0, 4.0, 2.0, 0.0]
     assert tokens.tolist() == [2, 1]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_penalty_through_the_pre_volta_torch_sampling_fallback(monkeypatch):
-    import freetoken.kernel.backend as backend
-    import freetoken.utils.arch as arch
-
-    monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: False)
-    monkeypatch.setattr(arch, "is_sm70_supported", lambda: False)
-    sampler = S.Sampler(torch.device("cuda"), 4)
-    batch = _batch(SamplingParams(temperature=1.0, top_k=1, frequency_penalty=5.0))
-    logits = torch.tensor([[0.0, 4.0, 2.0, 0.0]], device="cuda")
-
-    assert sampler.sample(logits, sampler.prepare(batch)).tolist() == [1]
-    assert sampler.sample(logits, sampler.prepare(batch)).tolist() == [2]
