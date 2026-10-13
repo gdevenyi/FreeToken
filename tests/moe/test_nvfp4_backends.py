@@ -398,6 +398,41 @@ def test_triton_prefill_large_batch_matches_dequant_reference(hidden, inter, tok
 
 
 @cuda
+def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit():
+    """A short prefill chunk loads only its routed experts, through the slot cache, and runs the
+    same grouped GEMM over the slots: its output must equal the whole-layer stream's exactly, and
+    its admissions must not count as decode misses."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+    device = torch.device("cuda")
+    torch.manual_seed(15)
+    M = 12
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+
+    streamed_cache, _ = _triton_cache(device)
+    streamed_cache.materialize_layer(1)
+    streamed_cache.copy_missing()
+    streamed = fused_experts_nvfp4(
+        hidden, *streamed_cache.bank_views(E), topk_weights, topk_ids.clone(), E, "silu", False
+    )
+
+    demand_cache, _ = _triton_cache(device, cache_size=2 * S)
+    demand_cache.collect_stats = True
+    slots = topk_ids.clone()
+    demand_cache.ensure_experts(1, slots, counts_as_decode=False)
+    demand_cache.copy_missing()
+    demanded = fused_experts_nvfp4(
+        hidden, *demand_cache.bank_views(), topk_weights, slots, demand_cache.cache_size, "silu", False
+    )
+
+    assert not torch.equal(slots, topk_ids), "the admission must have rewritten expert ids to slots"
+    assert torch.equal(demanded, streamed)
+    assert int(demand_cache.lru_stats.sum()) == 0
+
+
+@cuda
 def test_triton_swigluoai_matches_dequant_reference():
     """MiniMax-M3's swigluoai routed experts through the Triton prefill grouped GEMM
     and the marlin-style decode GEMV: same banks, the clamped (up+1) swiglu instead
@@ -604,3 +639,22 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+@cuda
+@pytest.mark.parametrize("num_experts", [1023, 2100])
+def test_moe_align_handles_a_slot_cache_wider_than_1024(num_experts):
+    """A prefill over the offload slot cache aligns against its slot count (#676): sgl_kernel's
+    align reads out of bounds past 1024 counters, so a 2100-slot cache must still align."""
+    from freetoken.moe.fused import moe_align_block_size
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, num_experts, (300, 10), device="cuda", dtype=torch.int32)
+    sorted_ids, expert_ids, padded = moe_align_block_size(ids, 16, num_experts)
+    n = int(padded)
+    flat = ids.flatten()
+    real = sorted_ids[:n][sorted_ids[:n] < flat.numel()]
+    assert sorted(real.tolist()) == list(range(flat.numel()))
+    block_of = torch.arange(n, device="cuda") // 16
+    rows = sorted_ids[:n] < flat.numel()
+    assert torch.equal(flat[sorted_ids[:n][rows].long()], expert_ids[block_of[rows]])

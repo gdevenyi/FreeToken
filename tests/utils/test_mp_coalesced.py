@@ -92,7 +92,7 @@ class TestCoalescedFrames:
             sub.stop()
 
 
-async def test_async_pull_coalesced():
+def test_async_pull_coalesced():
     import sys
 
     from freetoken.utils.mp import ZmqAsyncPullQueue as _AsyncPull
@@ -101,16 +101,19 @@ async def test_async_pull_coalesced():
     # zmq.asyncio needs a Selector loop on Windows; the project runs on Linux CI.
     if sys.platform == "win32":
         pytest.skip("zmq.asyncio requires SelectorEventLoop on Windows (prod runs on Linux)")
-    push = ZmqAsyncPushQueue(_addr(5604), create=True, encoder=lambda o: o)
-    pull = ZmqAsyncPullQueue(_addr(5604), create=False, decoder=_identity_decoder)
-    try:
-        await push.put({"n": 1})
-        await push.put({"n": 2})
-        await asyncio.sleep(0.1)
+    async def scenario():
+        push = ZmqAsyncPushQueue(_addr(5604), create=True, encoder=lambda o: o)
+        pull = ZmqAsyncPullQueue(_addr(5604), create=False, decoder=_identity_decoder)
+        try:
+            await push.put({"n": 1})
+            await push.put({"n": 2})
+            await asyncio.sleep(0.1)
 
-        # Even if both messages arrive in a single frame, two gets must succeed.
-        assert await pull.get() == {"n": 1}
-        assert await pull.get() == {"n": 2}
-    finally:
-        push.stop()
-        pull.stop()
+            # Even if both messages arrive in a single frame, two gets must succeed.
+            assert await pull.get() == {"n": 1}
+            assert await pull.get() == {"n": 2}
+        finally:
+            push.stop()
+            pull.stop()
+
+    asyncio.run(scenario())

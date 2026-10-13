@@ -51,7 +51,7 @@ def test_small_prefill_dispatch(monkeypatch, tokens, threshold, on_demand):
     hs = torch.randn(tokens, 16)
     layer._prefill_routed(hs, torch.full((tokens, 2), 0.5), torch.zeros(tokens, 2, dtype=torch.int32))
     if on_demand:
-        assert calls == ["ensure", "copy"] and got == {"n": None, "is_prefill": False}
+        assert calls == ["ensure", "copy"] and got == {"n": cache.cache_size, "is_prefill": True}
     else:
         assert "ensure" not in calls and "begin_prefill" not in calls[1:] and got["n"] == layer.num_experts
 
@@ -97,7 +97,7 @@ def test_small_prefill_path_does_not_depend_on_how_many_experts_a_layer_routes_t
     ids = torch.tensor([[5, 0], [1, 7], [2, 5], [4, 0]], dtype=torch.int32)
     layer._prefill_routed(torch.randn(4, 16), torch.full((4, 2), 0.5), ids.clone())
     assert calls == [("ensure", [0, 1, 2, 4]), ("copy",), ("ensure", [5, 7]), ("copy",)]
-    assert got == {"ids": (ids + 100).tolist(), "n": None, "is_prefill": False}
+    assert got == {"ids": (ids + 100).tolist(), "n": cache.cache_size, "is_prefill": True}
 
 
 def test_small_prefill_refuses_more_experts_than_the_cache_holds(monkeypatch):

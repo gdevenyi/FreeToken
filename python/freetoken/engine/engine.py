@@ -494,6 +494,9 @@ class Engine:
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
+        from freetoken.kernel.triton.autotune_cache import bound_autotune_flush_buffer
+
+        bound_autotune_flush_buffer(self.device.index)
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
@@ -947,6 +950,7 @@ class Engine:
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
+            prefill_demand_tokens=config.moe_prefill_demand_tokens,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
@@ -1868,6 +1872,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
