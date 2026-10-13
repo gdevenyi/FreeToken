@@ -639,3 +639,22 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+@cuda
+@pytest.mark.parametrize("num_experts", [1023, 2100])
+def test_moe_align_handles_a_slot_cache_wider_than_1024(num_experts):
+    """A prefill over the offload slot cache aligns against its slot count (#676): sgl_kernel's
+    align reads out of bounds past 1024 counters, so a 2100-slot cache must still align."""
+    from freetoken.moe.fused import moe_align_block_size
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, num_experts, (300, 10), device="cuda", dtype=torch.int32)
+    sorted_ids, expert_ids, padded = moe_align_block_size(ids, 16, num_experts)
+    n = int(padded)
+    flat = ids.flatten()
+    real = sorted_ids[:n][sorted_ids[:n] < flat.numel()]
+    assert sorted(real.tolist()) == list(range(flat.numel()))
+    block_of = torch.arange(n, device="cuda") // 16
+    rows = sorted_ids[:n] < flat.numel()
+    assert torch.equal(flat[sorted_ids[:n][rows].long()], expert_ids[block_of[rows]])
