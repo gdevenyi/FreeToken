@@ -161,10 +161,13 @@ def qsa_mqa_paged(
     tiles_per_program = 1 if q.shape[0] <= 32 else 8
     num_warps = 2
     if device_capability() < (7, 0):
-        # sm_61 sweep at 64K context (4 heads x 128): tl.dot runs on FMAs there, and 32-key
-        # tiles cut a 2048-row chunk from 1334 to 86 ms and a decode row from 0.84 to 0.16 ms
-        BLOCK_N = 32
-        tiles_per_program, num_warps = (1, 4) if q.shape[0] <= 32 else (32, 1)
+        # sm_61 sweep as served (4 heads x 128, 16-entry compressed pages, 224K context):
+        # tl.dot runs on FMAs there; a 2048-row chunk scores in 414 ms (1851 on one warp) and
+        # a decode row in 0.3 ms on 16-key tiles
+        if q.shape[0] <= 32:
+            BLOCK_N, tiles_per_program, num_warps = 16, 1, 1
+        else:
+            BLOCK_N, tiles_per_program, num_warps = 32, 32, 2
     _qsa_mqa_paged_kernel[
         (q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))
     ](
