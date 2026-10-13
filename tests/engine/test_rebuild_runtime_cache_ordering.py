@@ -125,12 +125,14 @@ def _build_engine(monkeypatch, ledger: _Ledger, *, moe: int, kv: int, budget: in
     config = types.SimpleNamespace(
         page_size=16, max_seq_len=4096, max_running_req=4, memory_ratio=1.0,
         cuda_graph_max_bs=4, swa_num_pages_override=None,
-        model_config=types.SimpleNamespace(vocab_size=128, model_is_mrope=False),
+        model_config=types.SimpleNamespace(
+            vocab_size=128, model_is_mrope=False, linear_attention_group=lambda: None
+        ),
     )
     page_table = torch.zeros((config.max_running_req + 1, 256), dtype=torch.int32)
     eng = types.SimpleNamespace(
         config=config, moe_offload_cache=_FakeMoeCache(ledger, moe), kv_cache=_FakeKvPool(ledger, kv),
-        linear_state_pool=None, num_pages=kv, device=torch.device("cpu"), stream=None, model=None,
+        linear_state_pool=None, kv_offloader=None, num_pages=kv, device=torch.device("cpu"), stream=None, model=None,
         _baseline_free=budget, _weights_bytes=0, page_table=page_table, max_seq_len=4096,
         ctx=types.SimpleNamespace(page_table=page_table),
         dummy_req=types.SimpleNamespace(table_idx=0),
