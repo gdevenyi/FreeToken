@@ -407,6 +407,12 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
+    if nvfp4 and block_n == 64 and head_dim >= 256:
+        # The wide bf16 profile has load_nvfp4 decode a BLOCK_N x HEAD_DIM fp32 tile for K and V
+        # across 64 threads (256 values per thread at HEAD_DIM 256): Triton 3.8 compiles that to
+        # 40 registers with ~1.4 KB of spills, ~10x slower and a ~550 MiB local-memory reservation
+        # outside the torch allocator. Narrow tiles at 4 warps do not spill and are faster on 3.6 too.
+        block_n, partial_warps = 16, 4
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)

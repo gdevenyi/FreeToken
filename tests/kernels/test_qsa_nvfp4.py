@@ -139,3 +139,58 @@ def test_qsa_nvfp4_splitk_reads_value_rows():
     ref = _decode(codes, row, block).view(3, PAGE, 1, HEAD_DIM)
     want = qsa_sparse_paged_attention(q, ref, ref, *args)
     assert torch.equal(got, want)
+
+
+def test_qsa_nvfp4_wide_head_prefill_uses_narrow_tiles(monkeypatch):
+    """At HEAD_DIM 256 the prefill profile must not decode 64-token fp32 tiles on 2 warps:
+    Triton 3.8 spills that variant (~10x slower, ~550 MiB of driver local memory)."""
+    from freetoken.kernel.triton.qsa import attend
+
+    head_dim, kv_heads, query_heads, rows, pages = 256, 2, 24, 32, 3
+    seen = []
+    kernel = attend._qsa_sparse_paged_gqa_splitk_kernel
+
+    class Spy:
+        def __getitem__(self, grid):
+            launch = kernel[grid]
+
+            def run(*args, **kwargs):
+                seen.append((kwargs["BLOCK_N"], kwargs["num_warps"]))
+                return launch(*args, **kwargs)
+            return run
+
+    torch.manual_seed(29)
+    slots = pages * PAGE
+    k = torch.randn(slots, kv_heads * head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k) * 0.25
+    codes = [torch.zeros((slots, kv_heads, head_dim // 2), dtype=torch.uint8, device="cuda") for _ in range(2)]
+    rows_s = [torch.zeros((slots, kv_heads), dtype=torch.float32, device="cuda") for _ in range(2)]
+    blocks = [torch.zeros((slots, kv_heads, head_dim // 16), dtype=torch.uint8, device="cuda") for _ in range(2)]
+    quantize_nvfp4_to_cache(
+        k, v, torch.arange(slots, dtype=torch.int32, device="cuda"), codes[0], codes[1],
+        rows_s[0], rows_s[1], blocks[0], blocks[1],
+    )
+    q = torch.randn(rows, query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    indices, block_table, token_to_req = _layout(rows, topk=128)
+    packed = (pages, PAGE, kv_heads, head_dim // 2)
+    monkeypatch.setattr(attend, "_qsa_sparse_paged_gqa_splitk_kernel", Spy())
+    got = qsa_sparse_paged_attention(
+        q, codes[0].view(packed), codes[1].view(packed), indices, block_table, token_to_req,
+        k_scale=rows_s[0], v_scale=rows_s[1], kv_quant="nvfp4",
+        k_block_scale=blocks[0], v_block_scale=blocks[1],
+    )
+    assert seen == [(16, 4)]
+
+    def decode(c, r, b):
+        lo, hi = (c & 15).to(torch.long), (c >> 4).to(torch.long)
+        code = torch.stack((lo, hi), dim=-1).reshape(*c.shape[:-1], head_dim)
+        mag = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=c.device)[code & 7]
+        val = torch.where(code < 8, mag, -mag)
+        blk = b.view(torch.float8_e4m3fn).to(torch.float32).repeat_interleave(16, dim=-1)
+        return (val * blk * r.unsqueeze(-1)).to(torch.bfloat16).view(pages, PAGE, kv_heads, head_dim)
+
+    want = qsa_sparse_paged_attention(
+        q, decode(codes[0], rows_s[0], blocks[0]), decode(codes[1], rows_s[1], blocks[1]),
+        indices, block_table, token_to_req,
+    )
+    torch.testing.assert_close(got.float(), want.float(), atol=2e-3, rtol=2e-2)
