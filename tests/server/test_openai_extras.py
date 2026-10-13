@@ -8,6 +8,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pydantic
 import pytest
 from freetoken.message import TokenizeMsg, UserReply
 from freetoken.server.api_models import (
@@ -250,8 +251,6 @@ def test_sampling_extras_reach_sampling_params():
     "field",
     [
         {"min_p": 1.5},
-        {"presence_penalty": 3.0},
-        {"frequency_penalty": -2.5},
         {"repetition_penalty": 0.0},
         {"logit_bias": {"x": 1.0}},
         {"min_tokens": -1},
@@ -261,6 +260,13 @@ def test_sampling_extras_reach_sampling_params():
 def test_bad_sampling_extras_are_400(field):
     body = run(handle_chat_completion(chat(**field), None, FakeState(), {}))
     assert body.status_code == 400, field
+
+
+@pytest.mark.parametrize("field", [{"presence_penalty": 3.0}, {"frequency_penalty": -2.5}])
+def test_out_of_range_penalties_fail_request_validation(field):
+    # main's request models bound both penalties to [-2, 2] (FastAPI answers 422)
+    with pytest.raises(pydantic.ValidationError):
+        chat(**field)
 
 
 def test_continue_final_message_needs_an_assistant_tail_and_reaches_the_template():
