@@ -95,7 +95,14 @@ def _select_extend_tiles(
     """
     first = _select_extend_tile(head_dim, block_d, smem_optin, kv_bytes)
     rungs = [(128, 64), (64, 64), (64, 32), (32, 64), (32, 32), (16, 16)]
-    return [first] + [t for t in rungs if t[0] * t[1] < first[0] * first[1]]
+    ladder = [first] + [t for t in rungs if t[0] * t[1] < first[0] * first[1]]
+    if smem_optin:
+        # skip the rungs the estimate already rules out (pre-Volta's 48KB cap rejects even
+        # head_dim 128's fast tile) instead of paying a failed compile for each
+        budget = smem_optin * 0.8
+        fit = [t for t in ladder if (t[0] * 2 + 2 * t[1] * kv_bytes) * block_d <= budget]
+        ladder = fit or ladder[-1:]
+    return ladder
 
 
 def _decode_smem_cap(block_d: int, block_dv: int, smem_optin: int, kv_bytes: int) -> tuple[int, int]:
