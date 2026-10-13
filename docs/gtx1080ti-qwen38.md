@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next on one GTX 1080 Ti
 
-Branch `1080deploy` serves [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+Branch `1080deploy` (rebuilt on upstream main 9c635a15 on 2026-10-13) serves [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
 to a single agentic user at the native 262,144-token context from one 11 GB Pascal card.
 Run it with [`scripts/freetoken-qwen38-1080.sh`](../scripts/freetoken-qwen38-1080.sh).
 
@@ -64,10 +64,17 @@ Long context through the server (recall = three codes planted at 5%, 50% and 95%
 
 | Prompt tokens | Time to first token | Prefill tok/s | Decode tok/s (streamed) | Recall |
 |---|---|---|---|---|
-| 1,077 | 9.5 s | 114 | 17.7 | - |
-| 23,003 | 1.9 min | 206 | 17.3 | 3/3 |
-| 93,809 | 8.6 min | 181 | 16.7 | 3/3 |
-| 231,494 | 29.5 min | 131 | 15.6 | 3/3 |
+| 870 | 13.8 s (first request) | 63 | 17.1 | - |
+| 19,639 | 1.6 min | 199 | 17.1 | 3/3 |
+| 115,368 | 13.0 min | 148 | 16.5 | 3/3 |
+| 255,951 | 36.3 min | 118 | 15.3 | 3/3 |
+
+Measured 2026-10-13 after the rebuild on main 9c635a15 (torch 2.14.1+cu126, Triton 3.8). Past ~220K depth a few
+prefill chunks log `selected pages dropped` (a chunk's selection spans more than the 443 host-tier slots); recall is
+unaffected. Before the rebuild (torch 2.11, Triton 3.6) the same server measured 1,077 / 23,003 / 93,809 / 231,494
+tokens at 9.5 s / 1.9 min / 8.6 min / 29.5 min, 114 / 206 / 181 / 131 tok/s prefill and 17.7 / 17.3 / 16.7 / 15.6 tok/s
+decode. In-process decode at 1K is 15.8-16.7 tok/s against 17.0-17.5 before: the host-KV-tier kernels run longer
+(flashlib's `lru_ensure` is ~40% slower under Triton 3.8).
 
 Before the indexer tiles and per-layer host-tier residency (both below), the same server took
 18.2 min for 84K tokens (11.0 tok/s decode) and 2 h 20 min for 247K (6.8 tok/s decode, with
@@ -87,7 +94,10 @@ Tool-call round trips (call, tool result, answer) pass on `/v1/chat/completions`
 - 32-bit stream memops when the device rejects the 64-bit ones (CPU MoE handshake, PLE row store).
 - PLE fill events recycled on the engine thread (a deadlock with the host-func handshake).
 - QSA selection compaction by column mark and scan (1.28 ms -> 0.17 ms per layer).
-- QSA indexer score kernel on 32-key tiles (a 2048-row chunk at 64K: 1401 -> 151 ms per layer).
+- QSA indexer score kernel on 32-key tiles on 2 warps, 16-key tiles for decode rows (a 2048-row chunk at 224K:
+  1851 -> 414 ms per layer).
+- NVFP4 MoE prefill keeps the fp32 arithmetic e2m1 decode below sm_70: upstream's fp16 bit-placement dequant
+  measured 1.8x slower on this card (2048-token chunk GEMM 125 -> 68 ms; 8K prefill 146 -> 210 tok/s).
 - Host KV tier slot maps per QSA layer: the 12 layers no longer evict each other every decode step,
   and a miss copies one layer's rows instead of all 12 (a 2048-token chunk at 64K depth: 41.8 -> 13.4 s).
 
@@ -105,6 +115,13 @@ As a systemd user service: `cp scripts/freetoken-qwen38-1080.service ~/.config/s
 enable --now freetoken-qwen38-1080`; run `sudo loginctl enable-linger $USER` so it survives logout (linger is off on this box, so the
 running instance is started with the script instead, which detaches it from the login session).
 
+Install (torch 2.14.1+cu126 and Triton 3.8: the cu130 builds dropped Pascal, and build isolation would pull them):
+
+```bash
+FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv sync --no-default-groups --group cu126 --no-install-project
+CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 uv pip install --no-build-isolation --no-deps -e .
+```
+
 After changing the C++ sources or pulling: `CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 .venv/bin/python setup.py
 build_ext --inplace` (the CPU MoE executor degrades to the host-func handshake on a stale build).
 
@@ -114,7 +131,8 @@ so the prefix cache keeps hitting.
 
 Known test failures on this card (other models' kernels that need more than 48 KB of shared memory or sm_70+):
 MiniMax-M3 sparse attention, GLM DSA, FP8 block-scale MoE, NVFP4 sparse-MLA KV, and upstream's DeepSeek-V4/V4.1
-fp4/fp8 kernels (`test_dsv41_pack`, `test_dsv4_fp8_block_linear`, `test_dsfp4_reference_semantics`; they fail the same way
-on upstream main on this card); plus
-`test_scheme_for_agrees_with_the_stored_tensors[sentence-transformers/all-MiniLM-L6-v2]`, which scans a local HF cache.
-Full suite after merging upstream main 377a3bc4: 2999 passed, 59 failed (all in that list), 251 skipped.
+fp4/fp8 kernels (`test_dsv41_pack`, `test_dsv4_fp8_block_linear`); plus
+`test_scheme_for_agrees_with_the_stored_tensors[sentence-transformers/all-MiniLM-L6-v2]`, which scans a local HF cache,
+and `test_cpu_decode_q4_0_matches_ggml_mmvq`, whose GGUF CUDA extension crashes nvcc 12.9's `cudafe++` against the
+torch 2.14 headers (GGUF is not on this deployment's path).
+Full suite after the rebuild on main 9c635a15: 3171 passed, 58 failed (all in that list), 263 skipped.
