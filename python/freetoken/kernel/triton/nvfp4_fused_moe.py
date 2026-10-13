@@ -382,8 +382,8 @@ def _prefill_nvfp4_moe_kernel(
             bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
             raw_scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0)
         if PRE_VOLTA:
-            # fp32 decode: the fp16 placement path converts through emulated bf16 on sm_61
-            # and measured ~1.7x slower there; the 2^-7 global fold below is then undone
+            # fp32 decode: the fp16 placement path measured ~1.8x slower on sm_61; the scale
+            # takes the 2^-7 back out that the global fold below adds
             if e4m3_native_cx():
                 scale = raw_scale.to(tl.float32) * (1.0 / 128.0)
             else:
