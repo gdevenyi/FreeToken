@@ -566,6 +566,9 @@ host_banks.HostResidency = types.SimpleNamespace(PINNED=types.SimpleNamespace(va
 host_banks.PinPipeline = object
 host_banks.alloc_banks = lambda _specs: {}
 host_banks.born_pinned_default = lambda: False
+host_banks.NUMA_PLACED_FORMATS = frozenset()
+host_banks.numa_placement_nodes = lambda: []
+host_banks.place_expert_rows = lambda _banks, _nodes: None
 progress = types.ModuleType("freetoken.utils.progress")
 progress.byte_bar = lambda *_args, **_kwargs: None
 sys.modules["freetoken.moe"] = moe
