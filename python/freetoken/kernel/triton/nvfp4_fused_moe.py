@@ -304,6 +304,13 @@ def _decode_nvfp4_marlin_kernel(
 
 
 @triton.jit
+def _e2m1_f32(code):
+    """e2m1 codes (int) -> exact fp32: exp|mant land in the fp16 field and 2**14 rescales."""
+    h = ((code & 0x8) << 12) | ((code & 0x7) << 9)
+    return h.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
+
+
+@triton.jit
 def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8
@@ -332,6 +339,7 @@ def _prefill_nvfp4_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     EVEN_K: tl.constexpr,
+    PRE_VOLTA: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -373,11 +381,21 @@ def _prefill_nvfp4_moe_kernel(
             byte_mask = byte_idx < K_BYTES
             bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
             raw_scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0)
-        # [BLOCK_KB, BLOCK_N]; every e2m1 * e4m3 product is exact in fp16 and in the dot dtype
-        scale = e4m3_to_f16_x128(raw_scale)
-        lo, hi = _e2m1_byte_f16_x2pow_neg14(bytes_)
-        b_lo = (lo * scale).to(a_ptr.dtype.element_ty)
-        b_hi = (hi * scale).to(a_ptr.dtype.element_ty)
+        if PRE_VOLTA:
+            # fp32 decode: the fp16 placement path converts through emulated bf16 on sm_61
+            # and measured ~1.7x slower there; the 2^-7 global fold below is then undone
+            if e4m3_native_cx():
+                scale = raw_scale.to(tl.float32) * (1.0 / 128.0)
+            else:
+                scale = e4m3_u8_to_f32(raw_scale.to(tl.uint8, bitcast=True)) * (1.0 / 128.0)
+            b_lo = (_e2m1_f32(bytes_ & 0xF) * scale).to(a_ptr.dtype.element_ty)
+            b_hi = (_e2m1_f32((bytes_ >> 4) & 0xF) * scale).to(a_ptr.dtype.element_ty)
+        else:
+            # [BLOCK_KB, BLOCK_N]; every e2m1 * e4m3 product is exact in fp16 and in the dot dtype
+            scale = e4m3_to_f16_x128(raw_scale)
+            lo, hi = _e2m1_byte_f16_x2pow_neg14(bytes_)
+            b_lo = (lo * scale).to(a_ptr.dtype.element_ty)
+            b_hi = (hi * scale).to(a_ptr.dtype.element_ty)
         if EVEN_K:
             a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
         else:
