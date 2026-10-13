@@ -105,7 +105,7 @@ accel = ["freetoken[fi,sgl]"]
 # The groups are declared conflicting, so the two can never resolve into one environment.
 [dependency-groups]
 cu130 = ["torch>=2.14,<2.15"]
-cu126 = ["torch>=2.14,<2.15"]
+cu126 = ["torch>=2.14,<2.15", "torchvision>=0.29,<0.30"]
 
 [tool.uv]
 default-groups = ["cu130"]
@@ -116,6 +116,8 @@ torch = [
     { index = "pytorch-cu126", group = "cu126" },
     { index = "pytorch-cu130", group = "cu130" },
 ]
+# PyPI's torchvision is built against the cu13 torch: its C++ ops (nms) fail to load next to a cu126 one
+torchvision = [{ index = "pytorch-cu126", group = "cu126" }]
 # No cu126 counterpart on purpose: sglang-kernel and flashinfer ship cu13 sm_75+ binaries
 # only, so a pre-Turing install leaves the `sgl` and `fi` extras off.
 
