@@ -43,6 +43,7 @@ def test_balanced_fetch_tracks_fraction():
 def test_load_hybrid_fetch_fraction(tmp_path):
     prof = {
         "version": PROFILE_VERSION,
+        "version": PROFILE_VERSION,
         "gpu": {"name": "FAKE GPU"},
         "dtype_kernels": {
             "bf16": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0},
@@ -76,6 +77,7 @@ def test_backend_pick_follows_the_served_expert_geometry(tmp_path):
     1.78 MB) benches at 32.2 GB/s -> offload, and hybrid decodes 3x slower than offload there."""
     small = {"hidden": 2048, "inter": 512, "experts": 256, "top_k": 8}
     prof = {
+        "version": PROFILE_VERSION,
         "gpu": {"name": "FAKE GPU"},
         "dtypes": {"nvfp4": "hybrid"},
         "dtype_kernels": {"nvfp4": {
@@ -181,6 +183,7 @@ def test_auto_fetch_keeps_a_split_benched_on_other_sized_experts(tmp_path, monke
     from freetoken.engine import engine as engine_mod
 
     prof = {
+        "version": PROFILE_VERSION,
         "gpu": {"name": "FAKE GPU"},
         "dtypes": {"nvfp4": "hybrid"},
         "dtype_kernels": {"nvfp4": {
@@ -221,6 +224,7 @@ def test_auto_fetch_logs_one_consistent_message_per_outcome(tmp_path, monkeypatc
 
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps({
+        "version": PROFILE_VERSION,
         "gpu": {"name": "FAKE GPU"},
         "dtype_kernels": {"nvfp4": {
             "expert_bytes": 7974912, "cpu_moe_overlap_gbs": 74.1, "pcie_gather_overlap_gbs": 25.2,
