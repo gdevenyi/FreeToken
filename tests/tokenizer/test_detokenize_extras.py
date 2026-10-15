@@ -6,11 +6,12 @@ from __future__ import annotations
 from freetoken.message import DetokenizeMsg
 from freetoken.tokenizer.detokenize import DetokenizeManager
 
-EOS, SPECIAL, THINK_END = 0, 99, 7
+EOS, SPECIAL, THINK_END, THINK_START = 0, 99, 7, 8
 
 
 class _Tok:
-    """Token ids decode to letters; 99 is a special marker, 7 the reasoning end tag."""
+    """Token ids decode to letters; 99 is a special marker, 7 / 8 the reasoning end /
+    start tags."""
 
     eos_token_id = EOS
     unk_token_id = -1
@@ -23,6 +24,8 @@ class _Tok:
                     out.append("<s>")
             elif t == THINK_END:
                 out.append("</think>")
+            elif t == THINK_START:
+                out.append("<think>")
             else:
                 out.append(chr(ord("a") + t))
         return "".join(out)
@@ -79,6 +82,27 @@ def test_reasoning_tokens_count_up_to_the_end_tag():
     assert reasoning == 3  # b, c and the tag itself
     _, none = _run(manager, 2, [1, 2, EOS])
     assert none == 0
+
+
+def test_reasoning_tokens_when_generation_stops_inside_the_block():
+    # The prompt pre-opened <think> (qwen3, thinking on) and the output never closed it:
+    # every completion token was reasoning, whether max_tokens or EOS ended it.
+    manager = DetokenizeManager(
+        _Tok(), frozenset({EOS}), think_end_id=THINK_END, think_start_id=THINK_START
+    )
+    _, by_length = _run(manager, 1, [1, 2, 3], starts_in_reasoning=True)
+    assert by_length == 3
+    _, by_eos = _run(manager, 2, [1, 2, EOS], starts_in_reasoning=True)
+    assert by_eos == 3
+    # the model opened the block itself
+    _, self_opened = _run(manager, 3, [THINK_START, 1, 2])
+    assert self_opened == 3
+    # thinking off: no block, no reasoning
+    _, off = _run(manager, 4, [1, 2, 3])
+    assert off == 0
+    # a closed block still counts up to the end tag
+    _, closed = _run(manager, 5, [1, THINK_END, 2, 3], starts_in_reasoning=True)
+    assert closed == 2
 
 
 def test_a_batch_with_one_uid_twice_advances_its_state_in_order():

@@ -84,7 +84,11 @@ def _send_generation_replies(
 def _reasoning_end_id(tokenizer) -> int | None:
     """The id of the reasoning end tag when the vocabulary has one (``</think>`` for the
     Qwen / DeepSeek / GLM families), else None. Only used to count reasoning tokens."""
-    for tag in ("</think>", "<|end_of_thinking|>"):
+    return _vocab_tag_id(tokenizer, ("</think>", "<|end_of_thinking|>"))
+
+
+def _vocab_tag_id(tokenizer, tags: tuple[str, ...]) -> int | None:
+    for tag in tags:
         try:
             tid = tokenizer.convert_tokens_to_ids(tag)
         except Exception:  # noqa: BLE001 -- a tokenizer without the tag answers unk or raises
@@ -94,10 +98,18 @@ def _reasoning_end_id(tokenizer) -> int | None:
     return None
 
 
+def _prompt_opens_reasoning(input_ids: torch.Tensor, start_id: int, end_id: int) -> bool:
+    """The prompt's last reasoning tag is an opening one: the template pre-opened the
+    block (qwen3 with thinking on), so generation starts inside it."""
+    tags = torch.nonzero((input_ids == start_id) | (input_ids == end_id)).flatten()
+    return tags.numel() > 0 and int(input_ids[tags[-1]]) == start_id
+
+
 def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
+    reasoning_tags: tuple[int, int] | None = None,
 ) -> tuple[List[UserMsg], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
@@ -132,6 +144,10 @@ def _tokenize_requests(
                 )
             )
             continue
+        if reasoning_tags is not None:
+            user_msg.sampling_params.starts_in_reasoning = _prompt_opens_reasoning(
+                user_msg.input_ids, *reasoning_tags
+            )
         backend.append(user_msg)
     return backend, errors
 
@@ -163,10 +179,18 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
+    think_start_id = _vocab_tag_id(tokenizer, ("<think>",))
+    think_end_id = _reasoning_end_id(tokenizer)
+    reasoning_tags = (
+        (think_start_id, think_end_id)
+        if think_start_id is not None and think_end_id is not None
+        else None
+    )
     detokenize_manager = DetokenizeManager(
         tokenizer,
         load_eos_token_ids(tokenizer_path, tokenizer),
-        think_end_id=_reasoning_end_id(tokenizer),
+        think_end_id=think_end_id,
+        think_start_id=think_start_id,
     )
 
     if ack_queue is not None:
@@ -279,7 +303,9 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger)
+                backend, errors = _tokenize_requests(
+                    tokenize_manager, tokenize_msg, logger, reasoning_tags
+                )
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)

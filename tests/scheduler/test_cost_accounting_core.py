@@ -60,6 +60,28 @@ def test_successful_tokenization_does_not_account_prompt_before_admission():
     assert errors == []  # in particular, no early prompt_tokens_delta UserReply
 
 
+def test_tokenization_flags_a_prompt_that_leaves_reasoning_open():
+    # The detokenizer cannot see the prompt; the tokenizer worker marks a template that
+    # pre-opened <think> (5) so an unclosed generation counts as reasoning (6 = </think>).
+    prompts = {
+        1: [10, 5, 11],  # thinking on: the generation prompt ends inside <think>
+        2: [10, 5, 6, 11],  # thinking off: the template pre-closed the block
+        3: [5, 7, 6, 10, 5, 12],  # an earlier turn's block is closed, the last one open
+        4: [10, 11],  # no reasoning tags
+    }
+
+    class Tokenizer:
+        def tokenize(self, messages):
+            (msg,) = messages
+            ids = torch.tensor(prompts[msg.uid], dtype=torch.int32)
+            return [UserMsg(uid=msg.uid, input_ids=ids, sampling_params=msg.sampling_params)]
+
+    backend, _ = _tokenize_requests(
+        Tokenizer(), [_tokenize_msg(uid) for uid in prompts], _Logger(), (5, 6)
+    )
+    assert [m.sampling_params.starts_in_reasoning for m in backend] == [True, False, True, False]
+
+
 def test_tokenization_failure_and_empty_prompt_are_terminal_without_usage():
     class Tokenizer:
         def tokenize(self, messages):

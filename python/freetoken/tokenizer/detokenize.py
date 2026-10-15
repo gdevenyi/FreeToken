@@ -75,6 +75,14 @@ class DecodeStatus:
     sent_offset: int  # length of sent out string
     skip_special: bool = False  # decode this request with skip_special_tokens
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
+    in_reasoning: bool = False  # the prompt or the output opened a reasoning block
+    generated: int = 0  # sampled tokens, EOS included
+
+    def reasoning_tokens(self) -> int:
+        if self.think_end_at is not None:
+            return self.think_end_at
+        # stopped inside the block (max_tokens, or EOS before the end tag): all of it
+        return self.generated if self.in_reasoning else 0
 
     def update(self, read_str: str, surr_str: str) -> str:
         new_text = read_str[len(surr_str) :]
@@ -101,6 +109,7 @@ class DetokenizeManager:
         tokenizer: PreTrainedTokenizerBase,
         eos_token_ids: FrozenSet[int] | None = None,
         think_end_id: int | None = None,
+        think_start_id: int | None = None,
     ) -> None:
         # uid -> DecodeStatus
         self.decode_map: Dict[int, DecodeStatus] = {}
@@ -111,6 +120,7 @@ class DetokenizeManager:
         # The reasoning end tag's id (e.g. ``</think>``): tokens generated up to and
         # including it are reported as usage.completion_tokens_details.reasoning_tokens.
         self.think_end_id = think_end_id if think_end_id is None else int(think_end_id)
+        self.think_start_id = think_start_id if think_start_id is None else int(think_start_id)
 
     def discard(self, uid: int) -> None:
         """Drop a uid's decode state without a finished DetokenizeMsg. An aborted or errored
@@ -135,7 +145,7 @@ class DetokenizeManager:
 
     def detokenize_with_meta(self, msgs: List[DetokenizeMsg]) -> tuple[List[str], List[int]]:
         """Incremental text per message plus, for a finished message, its reasoning token
-        count (0 otherwise or when the model emitted no reasoning end tag)."""
+        count (0 otherwise or when the generation never was in a reasoning block)."""
         # Each message must advance its request's decode state before the next one.
         if len({msg.uid for msg in msgs}) != len(msgs):
             parts = [self.detokenize_with_meta([msg]) for msg in msgs]
@@ -152,8 +162,10 @@ class DetokenizeManager:
                     surr_offset=0,
                     sent_offset=0,
                     skip_special=bool(getattr(msg, "skip_special_tokens", False)),
+                    in_reasoning=bool(getattr(msg, "starts_in_reasoning", False)),
                 )
             s = self.decode_map[msg.uid]
+            s.generated += 1
             if not (
                 msg.finished and not msg.matched_stop and msg.next_token in self.eos_token_ids
             ):
@@ -164,6 +176,8 @@ class DetokenizeManager:
                 and msg.next_token == self.think_end_id
             ):
                 s.think_end_at = len(s.decoded_ids)
+            if s.think_end_at is None and msg.next_token == self.think_start_id:
+                s.in_reasoning = True
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
             skip.append(s.skip_special)
@@ -199,7 +213,7 @@ class DetokenizeManager:
             incremental_output = output_str[prev_sent:emit_end] if emit_end > prev_sent else ""
             s.sent_offset = max(prev_sent, emit_end)
             incremental_strs.append(incremental_output)
-            reasoning_tokens.append((s.think_end_at or 0) if msg.finished else 0)
+            reasoning_tokens.append(s.reasoning_tokens() if msg.finished else 0)
             if msg.finished:
                 del self.decode_map[msg.uid]
 
