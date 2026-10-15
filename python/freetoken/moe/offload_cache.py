@@ -578,6 +578,16 @@ class OffloadMoeCache:
     def pool_slots(self, layer_id: int) -> int:
         return self.pool_sizes[self.pool_of_layer[layer_id]]
 
+    def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
+        """Per-bank views of the whole ``[S]`` slot cache, or of its first ``n`` slots, for a cache
+        with one pool and one bank layout, where a slot id is its bank row (the on-demand prefill
+        GEMM over the slot cache and the fork's slot checks)."""
+        assert self.banks, "set_bank_sources must register the banks first"
+        assert len(self.pool_sizes) == 1 and not self._raw_banks, "bank_views needs one slot pool and one bank layout"
+        if n is None:
+            return tuple(cache for _, cache in self.banks)
+        return tuple(cache[:n] for _, cache in self.banks)
+
     def pool_bank_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Per-bank slot views of the pool that serves ``layer_id``, indexed by its local slot ids."""
         assert self.banks, "set_bank_sources must register the banks first"
