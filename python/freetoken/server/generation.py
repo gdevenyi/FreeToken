@@ -1076,6 +1076,9 @@ async def _generate_events_impl(
         if candidate is not None and candidate.supports_streaming():
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
+    # A detector that replays its stream for the one-shot parse already decides which
+    # whitespace after a call is a separator; dropping more here would split the modes.
+    detector_owns_ws = tool_parser is not None and tool_parser.detector.one_shot_replays_stream
 
     # Logprob entries are collected only on the passthrough path: with a reasoning
     # parser or tool parsing active, text can be hidden, held back, or reclassified,
@@ -1107,7 +1110,7 @@ async def _generate_events_impl(
             else:
                 out.append(item)
                 if isinstance(item, ToolCallsDelta):
-                    suppress_ws = True
+                    suppress_ws = not detector_owns_ws
         return out
 
     def _filter_tool_text(piece: str) -> list[GenEvent]:

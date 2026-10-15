@@ -830,7 +830,11 @@ def _qwen_call(path):
     (["\n", "Then", " more.", "\n"], ["\n"], "\nThen more.\n"),
     (["\n\n"], [" Done", "."], " Done."),
     (["\n", "\n"], [" ", "Done", "."], " Done."),
-], ids=["glued", "separate", "ws-only-glued-tail", "ws-only-separate-tail"])
+    (["\n"], ["\n\n", "<div>", "x"], "\n\n<div>x"),
+    (["\n"], [" ", "<T>", " generic"], " <T> generic"),
+    (["\n"], ["\n", "</tool_call>"], "\n</tool_call>"),
+], ids=["glued", "separate", "ws-only-glued-tail", "ws-only-separate-tail", "ws-then-tag",
+        "space-then-tag", "stray-close"])
 def test_qwen_text_around_calls_parity(between, after, expected):
     # Text before, between and after calls is content in both modes, verbatim.
     # A whitespace-only gap between calls or after the last one is markup
