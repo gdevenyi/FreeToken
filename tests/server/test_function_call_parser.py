@@ -365,6 +365,25 @@ def test_dsv41_dsml_tags_lead_with_a_space():
     assert json.loads("".join(c.parameters for c in calls if c.name is None)) == {"pattern": "*.py", "path": "/src"}
 
 
+def _qwen3_coder_read(path):
+    return (
+        "<tool_call>\n<function=read>\n<parameter=filePath>\n"
+        f"{path}\n</parameter>\n</function>\n</tool_call>"
+    )
+
+
+def test_qwen3_coder_one_shot_keeps_text_between_calls():
+    text = "Hi" + _qwen3_coder_read("/a") + "\nThen more.\n" + _qwen3_coder_read("/b") + "\n"
+    result = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder").parse_non_stream(text)
+    assert result.normal_text == "Hi\nThen more.\n"
+    assert [json.loads(c.parameters) for c in result.calls] == [{"filePath": "/a"}, {"filePath": "/b"}]
+
+    parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder")
+    texts, calls = _feed(parser, text)
+    assert "".join(texts) + parser.finish_stream() == result.normal_text
+    assert [c.name for c in calls if c.name] == ["read", "read"]
+
+
 def test_streaming_support_flags():
     # Every registered detector is incremental-safe (buffered fallback remains as
     # the escape hatch for future formats, exercised via monkeypatch in
