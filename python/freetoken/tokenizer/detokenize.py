@@ -1,6 +1,6 @@
 import json
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List
 
 from freetoken.message import DetokenizeMsg
@@ -77,7 +77,9 @@ class DecodeStatus:
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
     in_reasoning: bool = False  # the prompt or the output opened a reasoning block
     generated: int = 0  # sampled tokens, EOS included
-    output_len: int = 0  # decoded text so far, before holdback: where the next token starts
+    text_end: int = 0  # decoded text so far, before holdback: where the next token starts
+    # (text start, entry) of logprob entries whose token text is still held for a stop string
+    held_logprobs: List[tuple] = field(default_factory=list)
 
     def reasoning_tokens(self) -> int:
         if self.think_end_at is not None:
@@ -151,13 +153,34 @@ class DetokenizeManager:
         (0 otherwise or when the generation never was in a reasoning block); and where each
         message's token starts in the generated text. That offset ignores stop-string
         holdback, which delays when text is sent but not where it lands."""
+        texts, counts, _, offsets = self._detokenize(msgs, [None] * len(msgs))
+        return texts, counts, offsets
+
+    def detokenize_with_logprobs(
+        self, msgs: List[DetokenizeMsg], entries: List[dict | None]
+    ) -> tuple[List[str], List[int], List[List[dict]]]:
+        """``detokenize_with_meta`` plus the logprob entries each reply carries, each stamped
+        with its token's ``text_offset``. With stop strings, an entry waits for the reply that
+        releases all its token's text, so it never precedes text that may still be trimmed;
+        entries of tokens a matched stop string trimmed come on the finished reply marked
+        ``stop_trimmed``, and that of a token it cut inside with ``stop_visible``, the length
+        of the token's text left visible."""
+        texts, counts, released, _ = self._detokenize(msgs, entries)
+        return texts, counts, released
+
+    def _detokenize(
+        self, msgs: List[DetokenizeMsg], entries: List[dict | None]
+    ) -> tuple[List[str], List[int], List[List[dict]], List[int]]:
         # Each message must advance its request's decode state before the next one.
         if len({msg.uid for msg in msgs}) != len(msgs):
-            parts = [self.detokenize_with_meta([msg]) for msg in msgs]
+            parts = [
+                self._detokenize([msg], [entry]) for msg, entry in zip(msgs, entries, strict=True)
+            ]
             return (
                 [p[0][0] for p in parts],
                 [p[1][0] for p in parts],
                 [p[2][0] for p in parts],
+                [p[3][0] for p in parts],
             )
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
@@ -196,12 +219,16 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         reasoning_tokens: List[int] = []
+        released: List[List[dict]] = []
         text_offsets: List[int] = []
-        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+        for msg, entry, read_str, surr_str in zip(
+            msgs, entries, read_texts, surr_texts, strict=True
+        ):
             s = self.decode_map[msg.uid]
-            text_offsets.append(s.output_len)
+            token_start = s.text_end
+            text_offsets.append(token_start)
             output_str = s.update(read_str, surr_str)
-            s.output_len = max(s.output_len, len(output_str))
+            s.text_end = max(s.text_end, len(output_str))
 
             prev_sent = s.sent_offset
             if msg.finished:
@@ -226,10 +253,33 @@ class DetokenizeManager:
             s.sent_offset = max(prev_sent, emit_end)
             incremental_strs.append(incremental_output)
             reasoning_tokens.append(s.reasoning_tokens() if msg.finished else 0)
+            if entry is not None:
+                s.held_logprobs.append((token_start, {**entry, "text_offset": token_start}))
+            out: List[dict] = []
+            # A held token's text ends where the next one's starts.
+            starts = [start for start, _ in s.held_logprobs]
+            ends = starts[1:] + [len(output_str)] if starts else []
+            if msg.finished or not msg.stop_strs:
+                trimmed = emit_end < len(output_str)
+                for (start, held), end in zip(s.held_logprobs, ends, strict=True):
+                    if trimmed and start >= emit_end:
+                        held = {**held, "stop_trimmed": True}
+                    elif trimmed and emit_end < end:
+                        held = {**held, "stop_visible": emit_end - start}
+                    out.append(held)
+                s.held_logprobs = []
+            elif s.held_logprobs:
+                # Wait for all of a token's text, so a stop match inside it can still mark it.
+                n = 0
+                while n < len(ends) and starts[n] < emit_end and ends[n] <= emit_end:
+                    n += 1
+                out = [held for _, held in s.held_logprobs[:n]]
+                s.held_logprobs = s.held_logprobs[n:]
+            released.append(out)
             if msg.finished:
                 del self.decode_map[msg.uid]
 
-        return incremental_strs, reasoning_tokens, text_offsets
+        return incremental_strs, reasoning_tokens, released, text_offsets
 
 
 def _gpt2_byte_decoder() -> dict[str, int]:
