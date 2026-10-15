@@ -1,5 +1,7 @@
+import json
+import weakref
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List
+from typing import Any, Dict, FrozenSet, List
 
 from freetoken.message import DetokenizeMsg
 from transformers import PreTrainedTokenizerBase
@@ -204,6 +206,72 @@ class DetokenizeManager:
         return incremental_strs, reasoning_tokens
 
 
+def _gpt2_byte_decoder() -> dict[str, int]:
+    """Inverse of GPT-2's ``bytes_to_unicode``: the printable stand-in char -> its byte."""
+    bs = [*range(ord("!"), ord("~") + 1), *range(ord("¡"), ord("¬") + 1), *range(ord("®"), ord("ÿ") + 1)]
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {chr(c): b for b, c in zip(bs, cs, strict=True)}
+
+
+class _TokenBytes:
+    """A token id's own bytes. A single-id decode cannot give them for a piece of a
+    multi-byte character (it decodes to U+FFFD), so read the vocab piece instead."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        decoder: dict = {}
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        try:
+            decoder = json.loads(backend.decoder.__getstate__())
+        except Exception:  # noqa: BLE001 -- no fast backend: fall back to the decoded text
+            pass
+        kinds = {d.get("type") for d in decoder.get("decoders", [decoder])}
+        self.byte_level = _gpt2_byte_decoder() if "ByteLevel" in kinds else None
+        self.byte_fallback = "ByteFallback" in kinds
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        self.added = {int(tid): str(getattr(tok, "content", tok)) for tid, tok in added.items()}
+        self.convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+
+    def __call__(self, tid: int, text: str) -> bytes:
+        if tid in self.added:
+            # the GPT-2 table cannot invert an added token's raw (e.g. full-width) chars
+            return self.added[tid].encode("utf-8")
+        try:
+            piece = self.convert(tid) if self.convert is not None else None
+        except Exception:  # noqa: BLE001 -- out-of-vocab id
+            piece = None
+        if isinstance(piece, str):
+            if self.byte_level is not None:
+                try:
+                    return bytes(self.byte_level[c] for c in piece)
+                except KeyError:
+                    pass
+            elif self.byte_fallback and len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+                try:
+                    return bytes([int(piece[3:5], 16)])
+                except ValueError:
+                    pass
+        return text.encode("utf-8")
+
+
+_TOKEN_BYTES: "weakref.WeakKeyDictionary[Any, _TokenBytes]" = weakref.WeakKeyDictionary()
+
+
+def _token_bytes(tokenizer: Any) -> _TokenBytes:
+    try:
+        cached = _TOKEN_BYTES.get(tokenizer)
+        if cached is None:
+            cached = _TOKEN_BYTES[tokenizer] = _TokenBytes(tokenizer)
+    except TypeError:  # not weak-referenceable or unhashable
+        return _TokenBytes(tokenizer)
+    return cached
+
+
 def build_logprobs_entry(
     tokenizer: PreTrainedTokenizerBase,
     token_id: int,
@@ -213,21 +281,27 @@ def build_logprobs_entry(
 ) -> dict:
     """Neutral sampled-token logprobs entry (UserReply.logprobs). Values are the raw
     pre-temperature logprobs the sampler computed; token text comes from a single-id
-    decode, with UTF-8 bytes alongside so clients can reassemble partial-UTF-8 pieces."""
+    decode, and ``bytes`` are the token's own bytes, so clients can reassemble a
+    character split across tokens. Ids past the real vocab (the padded tail of the
+    logits) report an empty token."""
+    token_bytes = _token_bytes(tokenizer)
 
     def _fields(tid: int) -> tuple[str, list[int]]:
-        text = tokenizer.decode([tid])
-        return text, list(text.encode("utf-8"))
+        try:
+            text = tokenizer.decode([tid])
+        except Exception:  # noqa: BLE001 -- a padded id some tokenizers refuse to decode
+            text = ""
+        return text, list(token_bytes(tid, text))
 
-    token, token_bytes = _fields(token_id)
+    token, data = _fields(token_id)
     top = []
     for tid, logprob in zip(top_ids or [], top_logprobs or []):
-        text, data = _fields(int(tid))
-        top.append({"token_id": int(tid), "token": text, "bytes": data, "logprob": float(logprob)})
+        text, cand = _fields(int(tid))
+        top.append({"token_id": int(tid), "token": text, "bytes": cand, "logprob": float(logprob)})
     return {
         "token_id": token_id,
         "token": token,
-        "bytes": token_bytes,
+        "bytes": data,
         "logprob": float(chosen_logprob),
         "top": top,
     }
