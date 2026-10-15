@@ -384,6 +384,16 @@ def test_qwen3_coder_one_shot_keeps_text_between_calls():
     assert [c.name for c in calls if c.name] == ["read", "read"]
 
 
+def test_qwen3_coder_unclosed_function_tag_is_not_a_call():
+    # The name stops at the next tag: never "x\n\n</tool_call" from a cut-off opener.
+    text = "<tool_call>\n<function=x\n\n</tool_call>"
+    result = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder").parse_non_stream(text)
+    assert result.calls == []
+    parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder")
+    _, calls = _feed(parser, text[:-len("</tool_call>")])
+    assert calls == [] and parser.recover_truncated_call() == []
+
+
 def test_streaming_support_flags():
     # Every registered detector is incremental-safe (buffered fallback remains as
     # the escape hatch for future formats, exercised via monkeypatch in
