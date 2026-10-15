@@ -841,12 +841,25 @@ class OffloadMoeCache:
     def _invalidate_prefill_buffer(self, buffer_id: int, layer_id: int) -> None:
         """Take buffer ``buffer_id``'s slots for staging ``layer_id``."""
         slots = self._inval[buffer_id]
-        old_ids = self.id_of_slot[slots]
-        self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
-        self.id_of_slot[slots] = -1
-        # usage=0 makes these slots the oldest, so the argmin(usage) victim selection in
-        # ensure_experts evicts them first.
-        self.usage[slots] = 0
+        if isinstance(slots, slice):
+            # One fixed-shape launch. The boolean-mask index
+            # (slot_for_id[old_ids[old_ids >= 0]] = -1) has a data-dependent shape, so every
+            # call hid a device-to-host sync -- and with two buffer reuses per chunk x 48
+            # layers the host waited, per layer, for ALL enqueued GPU work (the cached-context
+            # attention included), serializing the prefill-overlap pipeline.
+            from freetoken.kernel.triton.moe import invalidate_prefill_slots
+
+            if slots.stop > slots.start:
+                invalidate_prefill_slots(
+                    self.id_of_slot, self.slot_for_id, self.usage, slots.start, slots.stop - slots.start
+                )
+        else:
+            old_ids = self.id_of_slot[slots]
+            self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
+            self.id_of_slot[slots] = -1
+            # usage=0 makes these slots the oldest, so the argmin(usage) victim selection in
+            # ensure_experts evicts them first.
+            self.usage[slots] = 0
         self._stage_dirty[buffer_id] = True
         # the pad may hold rows of a wider layout or of a pool
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
