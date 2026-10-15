@@ -833,8 +833,9 @@ def _qwen_call(path):
     (["\n"], ["\n\n", "<div>", "x"], "\n\n<div>x"),
     (["\n"], [" ", "<T>", " generic"], " <T> generic"),
     (["\n"], ["\n", "</tool_call>"], "\n</tool_call>"),
+    (["\n"], ["\n", "<tool_call>", " tags"], "\n<tool_call> tags"),
 ], ids=["glued", "separate", "ws-only-glued-tail", "ws-only-separate-tail", "ws-then-tag",
-        "space-then-tag", "stray-close"])
+        "space-then-tag", "stray-close", "literal-open"])
 def test_qwen_text_around_calls_parity(between, after, expected):
     # Text before, between and after calls is content in both modes, verbatim.
     # A whitespace-only gap between calls or after the last one is markup
@@ -859,6 +860,18 @@ def test_qwen_truncated_inside_function_tag_is_not_recovered():
         ["</think><tool_cal", "l>\n", ">x<", "div><tool_call><function=x", "\n\n"],
         thinking=False, finish_reason="length")
     assert (calls, finish) == ([], "length")
+
+
+@pytest.mark.parametrize("pieces", [
+    ["The parser looks for ", "<tool_call>", " tags", " and splits", " them."],
+    ["Wrap calls in ", "<tool_call>", "...", "</tool_call>", " tags, then answer."],
+    ["Calls:\n\n", "<tool_call>", "\n", '{"name": "read"}', "\n", "</tool_call>"],
+], ids=["opener", "pair", "not-an-invoke"])
+def test_qwen_tool_call_tag_in_prose_stays_content(pieces):
+    # <tool_call> followed by anything but an invoke or its close is the tag
+    # named in text, like a bare <function= lookalike.
+    content, _, calls, finish = _qwen_parity(["r", "</think>", "\n\n"] + pieces)
+    assert (content, calls, finish) == ("".join(pieces), [], "stop")
 
 
 BARE_EDIT = ["<", "function", "=", "edit", ">\n", "<parameter=path>\n", "a.py\n", "</parameter>\n",

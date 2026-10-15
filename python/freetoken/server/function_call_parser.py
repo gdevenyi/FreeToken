@@ -809,6 +809,8 @@ class InvokeParamStreamMixin:
                        text does -- the same for any chunking (qwen3_coder)
       _ps_bare_invoke  True: an invoke without the wrapper block is a call when it
                        names a declared tool and its body starts (qwen3_coder)
+      _ps_literal_open  True: a block opener whose next non-whitespace text cannot
+                       start an invoke or the block close is text (qwen3_coder)
     """
 
     _ps_outer_open: str = ""
@@ -818,6 +820,7 @@ class InvokeParamStreamMixin:
     _ps_missing_type: str = "string"
     _ps_trim_after_block: bool = False
     _ps_bare_invoke: bool = False
+    _ps_literal_open: bool = False
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
@@ -881,7 +884,15 @@ class InvokeParamStreamMixin:
     def _ps_opens_block(self, text: str) -> str:
         """Whether ``text`` starts a block: "yes", "no" or "maybe" (too short to tell)."""
         if text.startswith(self._ps_outer_open):
-            return "yes"
+            if not self._ps_literal_open:
+                return "yes"
+            body = text[len(self._ps_outer_open):].lstrip()
+            for tok in (self._ps_invoke_open_prefix, self._ps_outer_close):
+                if body.startswith(tok):
+                    return "yes"
+                if tok.startswith(body):
+                    return "maybe"
+            return "no"
         if self._ps_outer_open.startswith(text):
             return "maybe"
         if self._ps_bare_invoke:
@@ -965,7 +976,13 @@ class InvokeParamStreamMixin:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
+                opens = self._ps_opens_block(buf)
+                if opens == "maybe":
+                    break
                 self._buffer = buf[len(self._ps_outer_open):]
+                if opens == "no":
+                    normal_parts.append(self._ps_outer_open)  # the tag named in prose
+                    continue
                 self._ps_mode = "block"
                 continue
 
@@ -2118,6 +2135,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     _ps_missing_type = "string"
     _ps_trim_after_block = True
     _ps_bare_invoke = True
+    _ps_literal_open = True
 
     """
     Detector for Qwen3-Coder XML-style function call format.
