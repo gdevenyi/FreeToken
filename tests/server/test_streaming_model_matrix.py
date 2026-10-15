@@ -894,6 +894,13 @@ def test_qwen_bare_function_after_a_wrapped_call():
     assert calls == [("read", {"filePath": "/a"}), ("edit", {"path": "a.py"})]
 
 
+def test_qwen_bare_function_swallows_a_stray_close():
+    content, _, calls, _ = _qwen_parity(
+        ["r", "</think>", "\n\n", "Doing it.\n"] + BARE_EDIT + ["\n", "</tool_call>", "\n", "Done"])
+    assert content == "Doing it.\n\nDone"
+    assert calls == [("edit", {"path": "a.py"})]
+
+
 @pytest.mark.parametrize("pieces", [
     ["Write ", "<", "function", "=", "name", ">", " tags."],
     ["<", "function", "=", "nope", ">\n", "<parameter=x>\n", "1\n", "</parameter>\n", "</function>"],

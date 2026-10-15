@@ -826,6 +826,7 @@ class InvokeParamStreamMixin:
         self._ps_mode = "idle"
         self._ps_after_block = False
         self._ps_bare = False
+        self._ps_after_bare = False
         self._ps_key = ""
         self._ps_lead = "{"
         self._ps_emitted_any = False
@@ -942,6 +943,15 @@ class InvokeParamStreamMixin:
                     break  # text after a call defers to the next step (wire order)
                 if self._ps_after_block:
                     rest = buf.lstrip()
+                    if self._ps_after_bare:
+                        if rest.startswith(self._ps_outer_close):
+                            # The model dropped the opener but kept the closer.
+                            self._ps_after_bare = False
+                            self._buffer = rest[len(self._ps_outer_close):]
+                            continue
+                        if self._ps_outer_close.startswith(rest):
+                            break
+                        self._ps_after_bare = False
                     opens = self._ps_opens_block(rest)
                     if opens == "maybe":
                         break  # a separator or a text gap: undecided until more arrives
@@ -1049,6 +1059,7 @@ class InvokeParamStreamMixin:
                         self._ps_bare = False
                         self._ps_mode = "idle"
                         self._ps_after_block = self._ps_trim_after_block
+                        self._ps_after_bare = True
                     else:
                         self._ps_mode = "block"
                     continue
