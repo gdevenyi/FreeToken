@@ -37,24 +37,31 @@ def chat_content_entry(entry: dict) -> dict:
     }
 
 
-def completions_logprobs(entries: list[dict], start_offset: int = 0) -> dict:
+def completions_logprobs(
+    entries: list[dict], offsets: list[int], text_len: int | None = None
+) -> dict:
+    """``offsets[i]`` is where entry i's token starts in the generated text (the pieces of
+    a split multi-byte character share its start). Given the finished text's ``text_len``,
+    offsets are clipped to it, since a matched stop string trims tokens off the end."""
     tokens: list[str] = []
     token_logprobs: list[float] = []
     top_logprobs: list[dict[str, float]] = []
-    text_offset: list[int] = []
-    offset = start_offset
 
     for entry in entries:
-        token = entry["token"]
-        tokens.append(token)
+        tokens.append(entry["token"])
         token_logprobs.append(entry["logprob"])
-        top_logprobs.append({candidate["token"]: candidate["logprob"] for candidate in entry["top"]})
-        text_offset.append(offset)
-        offset += len(token)
+        top: dict[str, float] = {}
+        for candidate in entry["top"]:
+            # The legacy shape keys alternatives by text, and partial-UTF-8 candidates
+            # all decode to U+FFFD: keep the most likely one per key.
+            key, logprob = candidate["token"], candidate["logprob"]
+            if key not in top or logprob > top[key]:
+                top[key] = logprob
+        top_logprobs.append(top)
 
     return {
         "tokens": tokens,
         "token_logprobs": token_logprobs,
         "top_logprobs": top_logprobs,
-        "text_offset": text_offset,
+        "text_offset": [offset if text_len is None else min(offset, text_len) for offset in offsets],
     }
