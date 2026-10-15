@@ -100,7 +100,9 @@ def _vocab_tag_id(tokenizer, tags: tuple[str, ...]) -> int | None:
 
 def _prompt_opens_reasoning(input_ids: torch.Tensor, start_id: int, end_id: int) -> bool:
     """The prompt's last reasoning tag is an opening one: the template pre-opened the
-    block (qwen3 with thinking on), so generation starts inside it."""
+    block (qwen3 with thinking on), so generation starts inside it. A raw prompt that just
+    mentions a literal <think> trips this too; harmless, since only the chat and responses
+    endpoints, whose prompts are always templated, report reasoning_tokens."""
     tags = torch.nonzero((input_ids == start_id) | (input_ids == end_id)).flatten()
     return tags.numel() > 0 and int(input_ids[tags[-1]]) == start_id
 
