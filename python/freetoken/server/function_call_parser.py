@@ -261,6 +261,11 @@ class BaseFormatDetector(ABC):
     # bot_token is a parse trigger, not a uniqueness claim.
     toolcall_opener: str | None = None
 
+    # True when detect_and_parse replays the streaming state machine: its normal_text
+    # is then already every piece of text the stream emits (before, between and after
+    # calls), so parse_non_stream must return it as is.
+    one_shot_replays_stream = False
+
     def __init__(self):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
@@ -778,6 +783,12 @@ class BaseFormatDetector(ABC):
 
 
 
+# A bare invoke opener's name: bounded so a literal "<function=" in prose or code
+# is released after at most this many chars instead of being held.
+_PS_BARE_NAME_RE = re.compile(r"([^\s<>]{1,128})>\s*")
+_PS_BARE_NAME_PARTIAL_RE = re.compile(r"[^\s<>]{0,128}")
+
+
 class InvokeParamStreamMixin:
     """Value-level streaming for invoke/parameter block formats (qwen3_coder,
     minimax — the same shape vLLM's ParserEngine covers): text outside blocks
@@ -793,6 +804,13 @@ class InvokeParamStreamMixin:
       _ps_trim_single  True: at most ONE leading/trailing trim char (qwen3_coder)
       _ps_missing_type schema type assumed for undeclared params ("string" streams,
                        "loose" buffers and loose-parses — per-family legacy typing)
+      _ps_trim_after_block  True: whitespace after a closed block is held, then
+                       dropped if another block or the end follows, kept if
+                       text does -- the same for any chunking (qwen3_coder)
+      _ps_bare_invoke  True: an invoke without the wrapper block is a call when it
+                       names a declared tool and its body starts (qwen3_coder)
+      _ps_literal_open  True: a block opener whose next non-whitespace text cannot
+                       start an invoke or the block close is text (qwen3_coder)
     """
 
     _ps_outer_open: str = ""
@@ -800,9 +818,15 @@ class InvokeParamStreamMixin:
     _ps_trim: str = "\n"
     _ps_trim_single: bool = False
     _ps_missing_type: str = "string"
+    _ps_trim_after_block: bool = False
+    _ps_bare_invoke: bool = False
+    _ps_literal_open: bool = False
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
+        self._ps_after_block = False
+        self._ps_bare = False
+        self._ps_after_bare = False
         self._ps_key = ""
         self._ps_lead = "{"
         self._ps_emitted_any = False
@@ -828,6 +852,58 @@ class InvokeParamStreamMixin:
         if self._ps_trim_single:
             return text[:-1] if text[-1:] and text[-1:] in self._ps_trim else text
         return text.rstrip(self._ps_trim)
+
+    def _ps_bare_status(self, text: str) -> str:
+        """Classify the bare invoke opener ``text`` starts with: "call", "partial"
+        (may still become one) or "literal". A declared name is required -- not
+        the unknown-tool forwarding a wrapped block gets -- and the body must
+        start, so the format quoted in prose or code stays text."""
+        rest = text[len(self._ps_invoke_open_prefix):]
+        m = _PS_BARE_NAME_RE.match(rest)
+        if m is None:
+            return "partial" if _PS_BARE_NAME_PARTIAL_RE.fullmatch(rest) else "literal"
+        if m.group(1) not in self._tool_indices:
+            return "literal"
+        body = rest[m.end():]
+        for tok in (self._ps_param_open_prefix, self._ps_invoke_close):
+            if body.startswith(tok):
+                return "call"
+            if tok.startswith(body):
+                return "partial"
+        return "literal"
+
+    def _ps_find_bare(self, buf: str, limit: int) -> Tuple[int, str]:
+        """First bare invoke opener before ``limit`` that is not literal."""
+        i = buf.find(self._ps_invoke_open_prefix)
+        while i != -1 and i < limit:
+            status = self._ps_bare_status(buf[i:])
+            if status != "literal":
+                return i, status
+            i = buf.find(self._ps_invoke_open_prefix, i + 1)
+        return -1, ""
+
+    def _ps_opens_block(self, text: str) -> str:
+        """Whether ``text`` starts a block: "yes", "no" or "maybe" (too short to tell)."""
+        if text.startswith(self._ps_outer_open):
+            if not self._ps_literal_open:
+                return "yes"
+            body = text[len(self._ps_outer_open):].lstrip()
+            # A repeated opener is a stutter: the block ignores it, as before.
+            for tok in (self._ps_invoke_open_prefix, self._ps_outer_close, self._ps_outer_open):
+                if body.startswith(tok):
+                    return "yes"
+                if tok.startswith(body):
+                    return "maybe"
+            return "no"
+        if self._ps_outer_open.startswith(text):
+            return "maybe"
+        if self._ps_bare_invoke:
+            prefix = self._ps_invoke_open_prefix
+            if text.startswith(prefix):
+                return {"call": "yes", "partial": "maybe"}.get(self._ps_bare_status(text), "no")
+            if prefix.startswith(text):
+                return "maybe"
+        return "no"
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
@@ -866,9 +942,42 @@ class InvokeParamStreamMixin:
             if mode == "idle":
                 if calls:
                     break  # text after a call defers to the next step (wire order)
+                if self._ps_after_block:
+                    rest = buf.lstrip()
+                    if self._ps_after_bare:
+                        if rest.startswith(self._ps_outer_close):
+                            # The model dropped the opener but kept the closer.
+                            self._ps_after_bare = False
+                            self._buffer = rest[len(self._ps_outer_close):]
+                            continue
+                        if self._ps_outer_close.startswith(rest):
+                            break
+                        self._ps_after_bare = False
+                    opens = self._ps_opens_block(rest)
+                    if opens == "maybe":
+                        break  # a separator or a text gap: undecided until more arrives
+                    self._ps_after_block = False
+                    if opens == "yes":
+                        buf = self._buffer = rest
                 pos = buf.find(self._ps_outer_open)
+                if self._ps_bare_invoke:
+                    bare, status = self._ps_find_bare(buf, len(buf) if pos == -1 else pos)
+                    if bare > 0:
+                        normal_parts.append(buf[:bare])
+                        self._buffer = buf[bare:]
+                        continue
+                    if bare == 0:
+                        if status == "partial":
+                            break
+                        self._ps_bare = True
+                        self._ps_mode = "block"  # parses the invoke at the buffer head
+                        continue
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self._ps_outer_open)
+                    if self._ps_bare_invoke:
+                        hold = max(
+                            hold, self._ends_with_partial_token(buf, self._ps_invoke_open_prefix)
+                        )
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
@@ -878,7 +987,13 @@ class InvokeParamStreamMixin:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
+                opens = self._ps_opens_block(buf)
+                if opens == "maybe":
+                    break
                 self._buffer = buf[len(self._ps_outer_open):]
+                if opens == "no":
+                    normal_parts.append(self._ps_outer_open)  # the tag named in prose
+                    continue
                 self._ps_mode = "block"
                 continue
 
@@ -888,6 +1003,7 @@ class InvokeParamStreamMixin:
                 if close != -1 and (inv == -1 or close < inv):
                     self._buffer = buf[close + len(self._ps_outer_close):]
                     self._ps_mode = "idle"
+                    self._ps_after_block = self._ps_trim_after_block
                     continue
                 if inv != -1:
                     m = self._ps_invoke_open_re.search(buf, inv)
@@ -939,7 +1055,14 @@ class InvokeParamStreamMixin:
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
                     self._buffer = buf[e + len(self._ps_invoke_close):]
-                    self._ps_mode = "block"
+                    if self._ps_bare:
+                        # A bare invoke is its own block: back to text after it.
+                        self._ps_bare = False
+                        self._ps_mode = "idle"
+                        self._ps_after_block = self._ps_trim_after_block
+                        self._ps_after_bare = True
+                    else:
+                        self._ps_mode = "block"
                     continue
                 if p != -1:
                     m = self._ps_param_open_re.search(buf, p)
@@ -1023,6 +1146,8 @@ class InvokeParamStreamMixin:
     def finish_streaming(self) -> str:
         residual, self._buffer = self._buffer, ""
         mode = getattr(self, "_ps_mode", "idle")
+        if getattr(self, "_ps_after_block", False) and not residual.strip():
+            residual = ""
         self._ps_reset()
         if mode != "idle" or (self._ps_outer_open and self._ps_outer_open in residual):
             return ""
@@ -2016,9 +2141,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
 class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     toolcall_opener = "<tool_call>"
+    one_shot_replays_stream = True
     _ps_trim = "\n"
     _ps_trim_single = True
     _ps_missing_type = "string"
+    _ps_trim_after_block = True
+    _ps_bare_invoke = True
+    _ps_literal_open = True
 
     """
     Detector for Qwen3-Coder XML-style function call format.
@@ -2052,8 +2181,6 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self.tool_call_separator = "\n"
 
         # Regex patterns
-        self.tool_call_block_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-        self.function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
         self.parameter_regex = re.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
         )
@@ -2063,7 +2190,8 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._ps_outer_open = "<tool_call>"
         self._ps_outer_close = "</tool_call>"
         self._ps_invoke_open_prefix = "<function="
-        self._ps_invoke_open_re = re.compile(r"<function=([^>]*)>")
+        # No "<" in a name: an opener cut off before its ">" must not run into </tool_call>.
+        self._ps_invoke_open_re = re.compile(r"<function=([^<>]*)>")
         self._ps_invoke_close = "</function>"
         self._ps_param_open_prefix = "<parameter="
         self._ps_param_open_re = re.compile(r"<parameter=([^>]*)>")
@@ -2073,44 +2201,6 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return "<function=" in text or self.bot_token in text
 
-
-    def _parse_function_call(self, function_str: str, tools: List[Tool]) -> Optional[ToolCallItem]:
-        """Parse a single <function=name>...</function> block into a ToolCallItem."""
-        try:
-            end_index = function_str.index(">")
-        except ValueError:
-            return None
-
-        func_name = function_str[:end_index].strip()
-        tool_indices = self._get_tool_indices(tools)
-        if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-            logger.warning(f"Model attempted to call undefined function: {func_name}")
-            return None
-
-        parameters_text = function_str[end_index + 1 :]
-        param_config = self._get_param_config(func_name, tools)
-        param_dict = {}
-
-        for match in self.parameter_regex.findall(parameters_text):
-            try:
-                idx = match.index(">")
-            except ValueError:
-                continue
-            param_name = match[:idx].strip()
-            param_value = match[idx + 1 :]
-            # Strip leading/trailing newlines from value
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
-
-            param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
-
-        return ToolCallItem(
-            tool_index=tool_indices.get(func_name, 0),
-            name=func_name,
-            parameters=json.dumps(param_dict, ensure_ascii=False),
-        )
 
     def _build_partial_arguments_json(self, func_name: str, partial_body: str, tools: List[Tool]) -> Optional[str]:
         """Build the current argument JSON from a partial XML tool-call body."""
@@ -2155,28 +2245,38 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return json.dumps(param_dict, ensure_ascii=False)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-
-        if "<function=" not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        # Extract function blocks from tool_call blocks (or raw text as fallback)
-        tool_call_blocks = self.tool_call_block_regex.findall(text)
-        if not tool_call_blocks:
-            tool_call_blocks = [text]
+        """One-shot parse by replaying the streaming state machine on a fresh
+        detector, so text outside blocks (before, between and after calls, in
+        order) and the calls are exactly what streaming emits for any chunking."""
+        shadow = type(self)()
+        normal: List[str] = []
+        opened: List[List] = []  # [detector tool index, name, argument fragments]
+        chunk = text
+        while True:
+            step = shadow.parse_streaming_increment(chunk, tools)
+            chunk = ""
+            normal.append(step.normal_text)
+            for item in step.calls:
+                if item.name is not None:
+                    opened.append([item.tool_index, item.name, ""])
+                elif opened:
+                    opened[-1][2] += item.parameters
+            if not step.normal_text and not step.calls:
+                break
+        normal.append(shadow.finish_streaming())
 
         calls = []
-        for block in tool_call_blocks:
-            func_matches = self.function_regex.findall(block)
-            for match in func_matches:
-                func_str = match[0] if match[0] else match[1]
-                item = self._parse_function_call(func_str, tools)
-                if item:
-                    item.tool_index = len(calls)
-                    calls.append(item)
-
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        for index, name, params in opened:
+            try:
+                json.loads(params)
+            except (json.JSONDecodeError, ValueError):
+                # Cut off mid-call: same fallback as the serving layer's stream close.
+                ledger = shadow.prev_tool_call_arr
+                args = ledger[index].get("arguments") if 0 <= index < len(ledger) else None
+                if args is not None:
+                    params = json.dumps(args, ensure_ascii=False)
+            calls.append(ToolCallItem(tool_index=len(calls), name=name, parameters=params or "{}"))
+        return StreamingParseResult(normal_text="".join(normal), calls=calls)
 
 
 class Gemma4Detector(BaseFormatDetector):
@@ -3733,6 +3833,8 @@ class FunctionCallParser:
         if not self.tools:
             return StreamingParseResult(normal_text=full_text, calls=[])
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        if self.detector.one_shot_replays_stream:
+            return parsed_result
         tool_call_list = parsed_result.calls
         if tool_call_list:
             # Keep text after the LAST tool block: the streaming path emits it, so

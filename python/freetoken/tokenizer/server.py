@@ -250,8 +250,20 @@ def tokenize_worker(
             )
             sampled_replies: List[UserReply] = []
             if len(detokenize_msg) > 0:
-                replies, reasoning_counts, text_offsets = detokenize_manager.detokenize_with_meta(
-                    detokenize_msg
+                entries = [
+                    build_logprobs_entry(
+                        detokenize_manager.tokenizer,
+                        msg.next_token,
+                        msg.chosen_logprob,
+                        msg.top_ids,
+                        msg.top_logprobs,
+                    )
+                    if msg.chosen_logprob is not None
+                    else None
+                    for msg in detokenize_msg
+                ]
+                replies, reasoning_counts, released = detokenize_manager.detokenize_with_logprobs(
+                    detokenize_msg, entries
                 )
                 sampled_replies = [
                     UserReply(
@@ -261,7 +273,6 @@ def tokenize_worker(
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
                         reasoning_tokens=reasoning_tokens,
-                        text_offset=text_offset,
                         completion_tokens_delta=1,
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
@@ -271,22 +282,10 @@ def tokenize_worker(
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                         prefill_ms=msg.prefill_ms,
-                        # Stop-string trimming can hide final visible text; keep one logprob
-                        # entry per sampled token.
-                        logprobs=(
-                            build_logprobs_entry(
-                                detokenize_manager.tokenizer,
-                                msg.next_token,
-                                msg.chosen_logprob,
-                                msg.top_ids,
-                                msg.top_logprobs,
-                            )
-                            if msg.chosen_logprob is not None
-                            else None
-                        ),
+                        logprobs=reply_logprobs or None,
                     )
-                    for msg, reply, reasoning_tokens, text_offset in zip(
-                        detokenize_msg, replies, reasoning_counts, text_offsets, strict=True
+                    for msg, reply, reasoning_tokens, reply_logprobs in zip(
+                        detokenize_msg, replies, reasoning_counts, released, strict=True
                     )
                 ]
 

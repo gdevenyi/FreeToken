@@ -27,10 +27,11 @@ from .api_models import (
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .logprobs import (
-    chat_content_entry,
     chat_logprobs_error,
+    chat_logprobs_object,
     completion_logprobs_error,
     completions_logprobs,
+    untrimmed,
 )
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -44,6 +45,8 @@ from .generation import (
     ToolCallsDelta,
     ToolCallStart,
     build_metrics,
+    chat_logprob_markers,
+    chat_logprobs_supported,
     generate_events,
     generate_full,
     metrics_enabled,
@@ -261,27 +264,25 @@ def _client_disconnected_response() -> JSONResponse:
     )
 
 
-def _chat_logprobs_conflict(req: ChatCompletionRequest, state: Any) -> str | None:
-    """Fail-close chat logprobs when a semantic parsing layer can hide or reclassify
-    generated tokens. A reasoning parser routes tokens out of visible content (and its
-    stream buffering re-chunks text), and tool parsing consumes tokens into tool_calls,
-    so logprob entries could not be aligned 1:1 with visible content tokens — and hidden
-    reasoning-token strings must never surface through logprobs entries. The raw
-    /v1/completions path has no semantic layer and keeps full logprobs support."""
+async def _chat_logprobs_conflict(req: ChatCompletionRequest, state: Any) -> str | None:
+    """Refuse chat logprobs when the server's parsers can hide or reclassify generated
+    tokens in a way the logprob segmenter cannot follow: entries must cover message
+    content only, never reasoning or tool-call tokens. The raw /v1/completions path has
+    no semantic layer and keeps full logprobs support."""
     if not req.logprobs:
         return None
-    if getattr(state.config, "reasoning_parser", None):
+    markers = await chat_logprob_markers(state)
+    if not chat_logprobs_supported(state, False, markers):
         return (
-            "logprobs on /v1/chat/completions are not supported when the server runs a "
-            "reasoning parser: reasoning tokens are hidden from message content, so "
-            "logprob entries cannot be aligned with it. Use /v1/completions for raw "
-            "token logprobs."
+            "logprobs on /v1/chat/completions are not supported with the "
+            f"{state.config.reasoning_parser!r} reasoning parser: reasoning tokens cannot "
+            "be told apart from message content. Use /v1/completions for raw token logprobs."
         )
-    if _should_parse_tools(req):
+    if not chat_logprobs_supported(state, _should_parse_tools(req), markers):
         return (
-            "logprobs with tool parsing on /v1/chat/completions are not supported: "
-            "tool-call tokens are consumed into tool_calls, so logprob entries cannot "
-            "be aligned with message content. Send tool_choice='none' or use "
+            "logprobs with tool parsing on /v1/chat/completions are not supported for the "
+            f"{state.config.tool_call_parser!r} tool-call parser: tool-call tokens cannot be "
+            "told apart from message content. Send tool_choice='none' or use "
             "/v1/completions for raw token logprobs."
         )
     return None
@@ -298,7 +299,7 @@ async def handle_chat_completion(
     logprobs_error = chat_logprobs_error(req)
     if logprobs_error is not None:
         return create_error_response(logprobs_error, param="top_logprobs")
-    logprobs_conflict = _chat_logprobs_conflict(req, state)
+    logprobs_conflict = await _chat_logprobs_conflict(req, state)
     if logprobs_conflict is not None:
         return create_error_response(logprobs_conflict, param="logprobs")
     if _response_format_unsupported(req.response_format):
@@ -403,9 +404,7 @@ async def handle_chat_completion(
             "index": index,
             "message": message,
             # OpenAI always sends the key, null when logprobs were not requested
-            "logprobs": (
-                {"content": [chat_content_entry(e) for e in result.logprobs]} if req.logprobs else None
-            ),
+            "logprobs": chat_logprobs_object(result.logprobs) if req.logprobs else None,
             "finish_reason": result.finish_reason,
         })
 
@@ -492,7 +491,7 @@ async def stream_chat_completion_chunks(
         elif isinstance(ev, ContentDelta):
             choice: dict[str, Any] = {"delta": {"content": ev.text}, "index": index, "finish_reason": None}
             if ev.logprobs:
-                choice["logprobs"] = {"content": [chat_content_entry(e) for e in ev.logprobs]}
+                choice["logprobs"] = chat_logprobs_object(ev.logprobs)
             yield _sse(_chat_chunk(req, uid, [choice]))
         elif isinstance(ev, ToolCallStart):
             open_tool = {
@@ -573,7 +572,10 @@ async def stream_chat_completion_chunks(
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
             reasoning_tokens = ev.reasoning_tokens
-            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": index, "finish_reason": ev.finish_reason}]))
+            done: dict[str, Any] = {"delta": {}, "index": index, "finish_reason": ev.finish_reason}
+            if ev.logprobs:
+                done["logprobs"] = chat_logprobs_object(ev.logprobs)
+            yield _sse(_chat_chunk(req, uid, [done]))
             timings = ev.timings
 
     usage = _usage(
@@ -662,7 +664,6 @@ async def handle_completion(
     async def _drain_one(uid: int, index: int) -> dict[str, Any] | JSONResponse:
         text = ""
         entries: list[dict] = []
-        offsets: list[int] = []
         finish_reason = "stop"
         prompt_tokens = completion_tokens = cached_tokens = 0
         async for ack in state.wait_for_ack(uid):
@@ -671,10 +672,9 @@ async def handle_completion(
             prompt_tokens += ack.prompt_tokens_delta
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
-            if req.logprobs is not None and ack.logprobs is not None:
-                entries.append(ack.logprobs)
-                offsets.append(ack.text_offset)
             text += ack.incremental_output
+            if req.logprobs is not None:
+                entries.extend(untrimmed(ack.logprobs))
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
@@ -683,7 +683,7 @@ async def handle_completion(
             "text": echo_texts[index // req.n] + text,
             "finish_reason": finish_reason,
             "logprobs": (
-                completions_logprobs(entries, offsets, len(text)) if req.logprobs is not None else None
+                completions_logprobs(entries, len(text)) if req.logprobs is not None else None
             ),
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
@@ -737,10 +737,9 @@ async def stream_completion_chunks(
 ) -> AsyncIterator[bytes]:
     prompt_tokens = 0
     sent_len = 0
-    # Logprob entries of acks with no visible text yet (held partial UTF-8 or stop
-    # prefix), carried to the next chunk that has text.
+    # Logprob entries of acks with no visible text yet (a held partial UTF-8 character, an
+    # EOS), carried to the next chunk that has text; a reply can bring several at once.
     pending: list[dict] = []
-    pending_offsets: list[int] = []
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
@@ -756,9 +755,8 @@ async def stream_completion_chunks(
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
-        if req.logprobs is not None and ack.logprobs is not None:
-            pending.append(ack.logprobs)
-            pending_offsets.append(ack.text_offset)
+        if req.logprobs is not None:
+            pending.extend(untrimmed(ack.logprobs))
         if ack.incremental_output:
             sent_len += len(ack.incremental_output)
             yield _sse(
@@ -770,16 +768,14 @@ async def stream_completion_chunks(
                         "finish_reason": None,
                         # Mid-stream, a stamp past sent_len is held-back text still to come.
                         "logprobs": (
-                            completions_logprobs(
-                                pending, pending_offsets, sent_len if ack.finished else None
-                            )
+                            completions_logprobs(pending, sent_len if ack.finished else None)
                             if pending
                             else None
                         ),
                     }],
                 )
             )
-            pending, pending_offsets = [], []
+            pending = []
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
@@ -794,7 +790,7 @@ async def stream_completion_chunks(
                 "index": index,
                 "finish_reason": finish_reason,
                 "logprobs": (
-                    completions_logprobs(pending, pending_offsets, sent_len) if pending else None
+                    completions_logprobs(pending, sent_len) if pending else None
                 ),
             }],
         )

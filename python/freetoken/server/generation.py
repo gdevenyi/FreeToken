@@ -37,8 +37,16 @@ except Exception:  # pragma: no cover — jinja2 always ships with transformers
     _TemplateError = ()
 
 from .function_call_parser import FunctionCallParser, TOOLS_TAG_LIST, ToolCallItem
+from .logprobs import (
+    LogprobMarkers,
+    LogprobSegmenter,
+    resolve_logprob_markers,
+    untrimmed,
+)
 from .reasoning_parser import (
     DSV4_SPECIAL_TOKENS,
+    THINK_END_TOKEN,
+    THINK_START_TOKEN,
     ReasoningParser,
     build_reasoning_parser,
     strip_special_tokens,
@@ -386,6 +394,9 @@ class GenDone:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     timings: GenTimings = field(default_factory=GenTimings)
+    # Content logprob entries no content delta carried (text held to the end, or
+    # dropped as a trailing separator); None when there are none.
+    logprobs: list[dict] | None = None
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -403,8 +414,8 @@ class GenResult:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     timings: GenTimings = field(default_factory=GenTimings)
-    # Neutral sampled-token logprob entries, one per sampled token (empty when the
-    # request did not ask).
+    # Neutral logprob entries of the message-content tokens (empty when the request did
+    # not ask).
     logprobs: list[dict] = field(default_factory=list)
 
 
@@ -740,8 +751,13 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
 
 def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     """Build a reasoning parser for this generation, or None if the server has no
-    reasoning parser configured. ``force_reasoning`` matches the encode-side
-    thinking mode so chat-mode content is never mislabeled as reasoning."""
+    reasoning parser configured."""
+    return build_reasoning_parser(state.config, _force_reasoning(spec, state))
+
+
+def _force_reasoning(spec: GenSpec, state: Any) -> bool:
+    """Whether the generation starts inside reasoning: matches the encode-side thinking
+    mode so chat-mode content is never mislabeled as reasoning."""
     parser_name = getattr(state.config, "reasoning_parser", None)
     if parser_name == "qwen3":
         # The qwen3 chat template opens an implicit <think> (thinking on) unless
@@ -776,7 +792,7 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         force_reasoning = (
             resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"
         )
-    return build_reasoning_parser(state.config, force_reasoning)
+    return force_reasoning
 
 
 def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:
@@ -817,9 +833,73 @@ def _parse_tool_response(
         return None
     parser = _make_tool_parser(spec, state)
     result = parser.parse_non_stream(text)
-    if not result.calls:
+    # A detector that replays its stream can drop markup without producing a call
+    # (an empty <tool_call> block): the one-shot content must drop it too.
+    if not result.calls and result.normal_text == text:
         return None
     return result.normal_text, result.calls
+
+
+_UNRESOLVED = object()
+
+
+async def chat_logprob_markers(state: Any) -> LogprobMarkers | None:
+    """The token ids chat logprobs are segmented on, resolved once per server from the
+    frontend tokenizer; None when this server has none."""
+    cached = getattr(state, "_logprob_markers", _UNRESOLVED)
+    if cached is not _UNRESOLVED:
+        return cached
+    markers = None
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is not None:
+        try:
+            manager = await asyncio.to_thread(build)
+            hidden = _QWEN_SEMANTIC_HIDDEN_TOKENS if _uses_qwen_semantic_protocol(state) else ()
+            markers = await asyncio.to_thread(
+                resolve_logprob_markers,
+                manager.tokenizer, THINK_START_TOKEN, THINK_END_TOKEN, hidden,
+            )
+        except Exception:  # noqa: BLE001 -- server fault: retried on the next request
+            return None
+    state._logprob_markers = markers
+    return markers
+
+
+def chat_logprobs_supported(state: Any, parse_tools: bool, markers: LogprobMarkers | None) -> bool:
+    """Whether chat logprobs can be confined to message content for this server's parsers:
+    the qwen3 reasoning split needs single-id think markers, and tool markup needs a
+    detector whose one-shot parse replays its stream (the segmenter shadows that stream)."""
+    config = state.config
+    reasoning = getattr(config, "reasoning_parser", None)
+    if reasoning not in (None, "qwen3"):
+        return False
+    if reasoning and (markers is None or markers.think_start is None or markers.think_end is None):
+        return False
+    if parse_tools:
+        name = getattr(config, "tool_call_parser", None)
+        detector = FunctionCallParser.ToolCallParserEnum.get(name)
+        if detector is None or not (detector.one_shot_replays_stream and detector.supports_streaming):
+            return False
+    return True
+
+
+def _wants_logprobs(spec: GenSpec) -> bool:
+    return bool(getattr(spec.sampling_params, "logprobs", False))
+
+
+async def _make_logprob_segmenter(spec: GenSpec, state: Any) -> LogprobSegmenter | None:
+    """The segmenter for a request that asked for logprobs, or None when its entries
+    cannot be confined to message content (they are then all dropped)."""
+    markers = await chat_logprob_markers(state)
+    if not chat_logprobs_supported(state, spec.parse_tools, markers):
+        return None
+    reasoning = getattr(state.config, "reasoning_parser", None) is not None
+    return LogprobSegmenter(
+        markers or LogprobMarkers(None, None, frozenset()),
+        reasoning=reasoning,
+        force_reasoning=reasoning and _force_reasoning(spec, state),
+        tool_parser=_make_tool_parser(spec, state) if spec.parse_tools else None,
+    )
 
 
 def _valid_json(text: str) -> bool:
@@ -1065,6 +1145,10 @@ async def _generate_events_impl(
         pending_logprobs = []
         return ContentDelta(text, logprobs=logprobs)
 
+    # Content entries ride the next content delta; reasoning and tool-call entries are
+    # never collected, so a hidden token's entry cannot surface on a visible chunk.
+    segmenter = await _make_logprob_segmenter(spec, state) if _wants_logprobs(spec) else None
+
     tool_parser: FunctionCallParser | None = None
     if parse_tools:
         try:
@@ -1074,14 +1158,9 @@ async def _generate_events_impl(
         if candidate is not None and candidate.supports_streaming():
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
-
-    # Logprob entries are collected only on the passthrough path: with a reasoning
-    # parser or tool parsing active, text can be hidden, held back, or reclassified,
-    # so an entry could come to describe a token that never reaches visible content.
-    # The API layer fail-closes those request combinations; this guard is the
-    # structural half of the contract — a hidden-token entry must never ride a
-    # later visible delta, whatever the caller.
-    collect_logprobs = reasoning_parser is None and tool_parser is None and not parse_tools
+    # A detector that replays its stream for the one-shot parse already decides which
+    # whitespace after a call is a separator; dropping more here would split the modes.
+    detector_owns_ws = tool_parser is not None and tool_parser.detector.one_shot_replays_stream
 
     # Streaming tool-call assembly: detectors emit fragments (name first, then
     # argument diffs); they accumulate here and the call is emitted complete when
@@ -1105,7 +1184,7 @@ async def _generate_events_impl(
             else:
                 out.append(item)
                 if isinstance(item, ToolCallsDelta):
-                    suppress_ws = True
+                    suppress_ws = not detector_owns_ws
         return out
 
     def _filter_tool_text(piece: str) -> list[GenEvent]:
@@ -1183,8 +1262,8 @@ async def _generate_events_impl(
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
-        if collect_logprobs and getattr(ack, "logprobs", None) is not None:
-            pending_logprobs.append(ack.logprobs)
+        if segmenter is not None:
+            pending_logprobs.extend(segmenter.feed(untrimmed(getattr(ack, "logprobs", None))))
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -1206,6 +1285,9 @@ async def _generate_events_impl(
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
             break
+
+    if segmenter is not None:
+        pending_logprobs.extend(segmenter.finish())
 
     # Drain residue held in the reasoning parser (a deferred tool block, or a
     # trailing partial token) so it is not silently dropped.
@@ -1274,9 +1356,10 @@ async def _generate_events_impl(
             normal_text = _filter_content(normal_text)
             if normal_text:
                 yield _content_delta(normal_text)
-            yield ToolCallsDelta(tool_calls)
-            if finish_reason != "length":
-                finish_reason = "tool_calls"
+            if tool_calls:
+                yield ToolCallsDelta(tool_calls)
+                if finish_reason != "length":
+                    finish_reason = "tool_calls"
         elif parse_tools and pending:
             stripped_pending = _filter_content(pending)
             if stripped_pending:
@@ -1293,12 +1376,12 @@ async def _generate_events_impl(
         if trailing_content:
             yield _content_delta(trailing_content)
 
-    # Entries without a content delta are intentionally dropped in streaming mode.
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
         reasoning_tokens=reasoning_tokens,
         timings=timer.finish(),
+        logprobs=pending_logprobs or None,
     )
 
 
@@ -1322,13 +1405,17 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer
         cached_tokens += ack.cached_tokens
         reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         full_content += ack.incremental_output
-        if getattr(ack, "logprobs", None) is not None:
-            logprob_entries.append(ack.logprobs)
+        logprob_entries.extend(untrimmed(getattr(ack, "logprobs", None)))
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
             break
 
+    if _wants_logprobs(spec):
+        segmenter = await _make_logprob_segmenter(spec, state)
+        logprob_entries = (
+            segmenter.feed(logprob_entries) + segmenter.finish() if segmenter is not None else []
+        )
     reasoning_text, content_text = _split_reasoning(full_content, spec, state)
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -1336,7 +1423,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer
     parsed = _parse_tool_response(content_text, spec, state)
     if parsed is not None:
         content_text, tool_calls = parsed
-        if finish_reason != "length":
+        if tool_calls and finish_reason != "length":
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
