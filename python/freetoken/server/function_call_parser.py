@@ -2160,7 +2160,8 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._ps_outer_open = "<tool_call>"
         self._ps_outer_close = "</tool_call>"
         self._ps_invoke_open_prefix = "<function="
-        self._ps_invoke_open_re = re.compile(r"<function=([^>]*)>")
+        # No "<" in a name: an opener cut off before its ">" must not run into </tool_call>.
+        self._ps_invoke_open_re = re.compile(r"<function=([^<>]*)>")
         self._ps_invoke_close = "</function>"
         self._ps_param_open_prefix = "<parameter="
         self._ps_param_open_re = re.compile(r"<parameter=([^>]*)>")

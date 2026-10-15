@@ -853,6 +853,14 @@ def test_qwen_empty_tool_block_is_dropped_in_both_modes():
     assert (content, calls, finish) == ("A\nB", [], "stop")
 
 
+def test_qwen_truncated_inside_function_tag_is_not_recovered():
+    # Cut off by max_tokens inside "<function=x": no call in either mode.
+    _, _, calls, finish = _qwen_parity(
+        ["</think><tool_cal", "l>\n", ">x<", "div><tool_call><function=x", "\n\n"],
+        thinking=False, finish_reason="length")
+    assert (calls, finish) == ([], "length")
+
+
 BARE_EDIT = ["<", "function", "=", "edit", ">\n", "<parameter=path>\n", "a.py\n", "</parameter>\n",
              "</function>"]
 
