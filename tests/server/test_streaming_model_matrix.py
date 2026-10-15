@@ -818,3 +818,32 @@ def test_qwen_tool_call_only_turn():
     ])
     assert (content, reasoning, finish) == ("", "r", "tool_calls")
     assert calls == [("read", READ_ARGS)]
+
+
+def _qwen_call(path):
+    return ["<tool_call>", "\n", "<function=read>", "\n", "<parameter=filePath>", f"\n{path}\n",
+            "</parameter>", "\n", "</function>", "\n", "</tool_call>"]
+
+
+@pytest.mark.parametrize("between, after, expected", [
+    (["\nThen more.\n"], [], "\nThen more.\n"),
+    (["\n", "Then", " more.", "\n"], ["\n"], "\nThen more.\n"),
+    (["\n\n"], [" Done", "."], " Done."),
+    (["\n", "\n"], [" ", "Done", "."], " Done."),
+], ids=["glued", "separate", "ws-only-glued-tail", "ws-only-separate-tail"])
+def test_qwen_text_around_calls_parity(between, after, expected):
+    # Text before, between and after calls is content in both modes, verbatim.
+    # A whitespace-only gap between calls or after the last one is markup
+    # separation and is dropped, however it is chunked.
+    pieces = (["r", "</think>", "\n\n", "Let me look.", "\n\n"] + _qwen_call("/a") + between
+              + _qwen_call("/b") + after)
+    content, reasoning, calls, finish = _qwen_parity(pieces)
+    assert content == "Let me look.\n\n" + expected
+    assert calls == [("read", {"filePath": "/a"}), ("read", {"filePath": "/b"})]
+    assert (reasoning, finish) == ("r", "tool_calls")
+
+
+def test_qwen_empty_tool_block_is_dropped_in_both_modes():
+    content, _, calls, finish = _qwen_parity(
+        ["r", "</think>", "\n\n", "A", "<tool_call>", "\n", "</tool_call>", "\n", "B"])
+    assert (content, calls, finish) == ("A\nB", [], "stop")

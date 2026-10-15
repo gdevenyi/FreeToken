@@ -817,7 +817,9 @@ def _parse_tool_response(
         return None
     parser = _make_tool_parser(spec, state)
     result = parser.parse_non_stream(text)
-    if not result.calls:
+    # A detector that replays its stream can drop markup without producing a call
+    # (an empty <tool_call> block): the one-shot content must drop it too.
+    if not result.calls and result.normal_text == text:
         return None
     return result.normal_text, result.calls
 
@@ -1274,9 +1276,10 @@ async def _generate_events_impl(
             normal_text = _filter_content(normal_text)
             if normal_text:
                 yield _content_delta(normal_text)
-            yield ToolCallsDelta(tool_calls)
-            if finish_reason != "length":
-                finish_reason = "tool_calls"
+            if tool_calls:
+                yield ToolCallsDelta(tool_calls)
+                if finish_reason != "length":
+                    finish_reason = "tool_calls"
         elif parse_tools and pending:
             stripped_pending = _filter_content(pending)
             if stripped_pending:
@@ -1336,7 +1339,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer
     parsed = _parse_tool_response(content_text, spec, state)
     if parsed is not None:
         content_text, tool_calls = parsed
-        if finish_reason != "length":
+        if tool_calls and finish_reason != "length":
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
