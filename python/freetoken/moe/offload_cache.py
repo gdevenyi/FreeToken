@@ -130,6 +130,9 @@ class OffloadMoeCache:
     cache_size: int
     device: torch.device
     cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
+    # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
+    prefill_demand_tokens: int = 0
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -193,6 +196,10 @@ class OffloadMoeCache:
             # the hybrid and CPU decode paths run their own kernels and would silently stay LRU
             raise ValueError(
                 f"--moe-cache-policy {self.cache_policy} needs GPU decode, not {self.decode_target!r}"
+            )
+        if self.prefill_demand_tokens and self.decode_target != "gpu":
+            raise ValueError(
+                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
             )
         if self.layer_layouts is not None:
             assert self.layout is None, "pass layout or layer_layouts, not both"
@@ -1280,6 +1287,9 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def loads_prefill_on_demand(self, num_tokens: int) -> bool:
+        return 0 < num_tokens <= self.prefill_demand_tokens
+
     def ensure_experts(
         self,
         layer_id: int,
@@ -1288,6 +1298,7 @@ class OffloadMoeCache:
         update_state: bool = True,
         router_logits: torch.Tensor | None = None,
         pin_since: torch.Tensor | None = None,
+        counts_as_decode: bool = True,
     ) -> None:
         """``update_state=False`` (small-prefill ensures) keeps a scored policy's state and
         decode-step clock still; ``router_logits`` (``[rows, num_experts]``) feed the ``rule``
@@ -1296,7 +1307,7 @@ class OffloadMoeCache:
         already keeps those slots."""
         from freetoken.moe.offload_kernels import ensure_experts, ensure_experts_scored
 
-        if self.collect_decode_freq:
+        if self.collect_decode_freq and counts_as_decode and update_state:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
@@ -1309,7 +1320,7 @@ class OffloadMoeCache:
         lowpri = self.prefetch_on
         width = expert_ids.numel()
         if self.cache_policy_id == 0 and not lowpri:
-            ensure_experts(self, layer_id, expert_ids)
+            ensure_experts(self, layer_id, expert_ids, record_stats=counts_as_decode and update_state)
         else:
             # prefetch on: LRU runs the vendored kernel (flashlib's cannot key low-priority slots)
             ensure_experts_scored(

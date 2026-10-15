@@ -125,6 +125,49 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
     assert calls["topk_ids"].tolist() == [[2, 1]]
 
 
+def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cache(monkeypatch):
+    layer, cache = _make_layer_and_cache()
+    cache.prefill_demand_tokens = 1
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    hidden_states = torch.randn(1, 8)
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, torch.tensor([[2, 1]], dtype=torch.int32)),
+    )
+    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("materialized", layer_id))
+
+    def ensure(layer_id, expert_ids, *, counts_as_decode=True):
+        calls["ensured"] = (layer_id, expert_ids.tolist(), counts_as_decode)
+        expert_ids.copy_(torch.tensor([[5, 3]], dtype=torch.int32))
+
+    monkeypatch.setattr(cache, "ensure_experts", ensure)
+    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+
+    def fake_fused(hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation, apply_router_weight_on_input,
+                   act_alpha=1.0, act_limit=float("inf")):
+        calls["w1"] = w1
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
+
+    out = layer.prefill_forward(hidden_states, torch.randn(1, 4))
+
+    assert out is hidden_states
+    assert "materialized" not in calls
+    assert calls["ensured"] == (0, [[2, 1]], False)
+    assert calls["copied"] is True
+    # the grouped GEMM reads the whole slot cache at the slots the admission wrote
+    assert calls["w1"].shape[0] == cache.cache_size
+    assert calls["topk_ids"].tolist() == [[5, 3]]
+
+    calls.clear()
+    layer.prefill_forward(torch.randn(2, 8), torch.randn(2, 4))
+    assert calls["materialized"] == 0 and "ensured" not in calls
+
+
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -237,6 +280,22 @@ def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():
             cache_size=1024,
             device=torch.device("cpu"),
             quant_format="nvfp4_marlin",
+        )
+
+
+@pytest.mark.parametrize("decode_target", ["cpu", "hybrid"])
+def test_offload_moe_cache_rejects_demand_prefill_without_gpu_decode(decode_target):
+    # a demand-loaded chunk admits its experts into GPU decode's slot cache, which cpu and hybrid decode do not read
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    with pytest.raises(ValueError, match="needs GPU decode"):
+        OffloadMoeCache(
+            num_layers=1,
+            num_experts=4,
+            cache_size=6,
+            device=torch.device("cpu"),
+            decode_target=decode_target,
+            prefill_demand_tokens=64,
         )
 
 
@@ -612,6 +671,37 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     assert config.moe_cache_size == 24
     # Family, not member: which offload-family backend auto picks is not this test's claim.
     assert is_offload_moe_strategy(config.moe_strategy)
+
+
+def test_adjust_config_drops_the_demand_prefill_threshold_for_a_dense_model():
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _adjust_config
+
+    config = EngineConfig(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.float16,
+        attention_backend="triton",
+        moe_prefill_demand_tokens=512,
+    )
+    object.__setattr__(
+        config,
+        "model_config",
+        SimpleNamespace(
+            has_swa_attention=False,
+            has_linear_attention=False,
+            is_moe=False,
+            num_layers=10,
+            expert_quant="none",
+        ),
+    )
+
+    _adjust_config(config)
+
+    assert config.moe_prefill_demand_tokens == 0
 
 
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
