@@ -428,7 +428,7 @@ def test_rebuild_fit_check_reserves_the_gdn_prefill_workspace():
         kv_cache=SimpleNamespace(validate_rebuild=validate_rebuild),
         _baseline_free=1 << 30, _weights_bytes=0, num_pages=64,
     )
-    engine._target_moe_and_expert_bytes = lambda size: (0, 0)
+    engine._target_moe_and_expert_bytes = lambda size, sizes=None: (0, 0)
     with pytest.raises(CacheRebuildRejected):
         Engine.rebuild_runtime_cache(engine, num_pages=32)
 

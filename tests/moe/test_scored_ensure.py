@@ -570,7 +570,7 @@ def test_decode_forward_hands_the_router_logits_to_ensure(monkeypatch, policy):
     )
     monkeypatch.setattr(cache, "ensure_experts", lambda lid, ids, **kw: seen.update(kw))
     monkeypatch.setattr(cache, "copy_missing", lambda: None)
-    monkeypatch.setattr(cache, "bank_views", lambda: ())
+    monkeypatch.setattr(cache, "pool_bank_views", lambda layer_id: ())
     monkeypatch.setattr(layer, "_expert_gemm", lambda *a, **kw: None)
     router_logits = torch.randn(2, 8)
     layer.decode_forward(torch.randn(2, 8), router_logits)

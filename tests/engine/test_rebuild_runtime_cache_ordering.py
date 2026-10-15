@@ -54,14 +54,15 @@ class _FakeMoeCache:
         # one uint8 per expert row -> expert_bytes_per_slot == 1 unit
         self.bank_sources = {"w13": [torch.zeros((self.num_experts, 1), dtype=torch.uint8)]}
         self.cache_size = size
+        self.decode_target = "gpu"
         self._held = size
         ledger.alloc("moe", size)
 
-    def validate_rebuild(self, cache_size: int) -> None:
+    def validate_rebuild(self, cache_size: int, pool_sizes: list[int] | None = None) -> None:
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
 
-    def rebuild(self, cache_size: int) -> None:
+    def rebuild(self, cache_size: int, pool_sizes: list[int] | None = None) -> None:
         self.validate_rebuild(cache_size)
         self.ledger.free("moe", self._held)
         self._held = 0
@@ -140,6 +141,13 @@ def _build_engine(monkeypatch, ledger: _Ledger, *, moe: int, kv: int, budget: in
         graph_runner=_FakeGraphRunner(),
         _sync_get_memory=lambda: (0, 0),
     )
+    # one MoE slot pool (#689): the rebuild splits the target into its pool sizes first
+    from freetoken.moe.pool_policy import make_pools
+
+    eng._moe_pools = lambda batch: make_pools([[0]], 8, 1, None)
+    eng._moe_expert_counts = None
+    eng._moe_pool_groups, eng._moe_layer_slot_bytes = [[0]], [1]  # one uint8 per expert row
+    eng._moe_pool_bytes = Engine._moe_pool_bytes.__get__(eng)
     eng._target_moe_and_expert_bytes = Engine._target_moe_and_expert_bytes.__get__(eng)
     eng._resize_kv_pool = Engine._resize_kv_pool.__get__(eng)
     eng._refresh_seq_state = Engine._refresh_seq_state.__get__(eng)
