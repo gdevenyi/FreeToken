@@ -657,6 +657,7 @@ async def handle_completion(
     async def _drain_one(uid: int, index: int) -> dict[str, Any] | JSONResponse:
         text = ""
         entries: list[dict] = []
+        offsets: list[int] = []
         finish_reason = "stop"
         prompt_tokens = completion_tokens = cached_tokens = 0
         async for ack in state.wait_for_ack(uid):
@@ -665,9 +666,10 @@ async def handle_completion(
             prompt_tokens += ack.prompt_tokens_delta
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
-            text += ack.incremental_output
             if req.logprobs is not None and ack.logprobs is not None:
                 entries.append(ack.logprobs)
+                offsets.append(len(text))
+            text += ack.incremental_output
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
@@ -675,7 +677,7 @@ async def handle_completion(
             "index": index,
             "text": echo_texts[index // req.n] + text,
             "finish_reason": finish_reason,
-            "logprobs": completions_logprobs(entries) if req.logprobs is not None else None,
+            "logprobs": completions_logprobs(entries, offsets) if req.logprobs is not None else None,
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
 
@@ -752,7 +754,7 @@ async def stream_completion_chunks(
                         "index": index,
                         "finish_reason": None,
                         "logprobs": (
-                            completions_logprobs([ack.logprobs], text_offset)
+                            completions_logprobs([ack.logprobs], [text_offset])
                             if req.logprobs is not None and ack.logprobs is not None
                             else None
                         ),

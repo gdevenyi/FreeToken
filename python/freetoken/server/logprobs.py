@@ -37,24 +37,29 @@ def chat_content_entry(entry: dict) -> dict:
     }
 
 
-def completions_logprobs(entries: list[dict], start_offset: int = 0) -> dict:
+def completions_logprobs(entries: list[dict], offsets: list[int]) -> dict:
+    """``offsets[i]`` is the length of the visible text sent before entry i's ack. Tokens
+    whose text was held back (part of a multi-byte character) share the offset where
+    that text later appears."""
     tokens: list[str] = []
     token_logprobs: list[float] = []
     top_logprobs: list[dict[str, float]] = []
-    text_offset: list[int] = []
-    offset = start_offset
 
     for entry in entries:
-        token = entry["token"]
-        tokens.append(token)
+        tokens.append(entry["token"])
         token_logprobs.append(entry["logprob"])
-        top_logprobs.append({candidate["token"]: candidate["logprob"] for candidate in entry["top"]})
-        text_offset.append(offset)
-        offset += len(token)
+        top: dict[str, float] = {}
+        for candidate in entry["top"]:
+            # The legacy shape keys alternatives by text, and partial-UTF-8 candidates
+            # all decode to U+FFFD: keep the most likely one per key.
+            key, logprob = candidate["token"], candidate["logprob"]
+            if key not in top or logprob > top[key]:
+                top[key] = logprob
+        top_logprobs.append(top)
 
     return {
         "tokens": tokens,
         "token_logprobs": token_logprobs,
         "top_logprobs": top_logprobs,
-        "text_offset": text_offset,
+        "text_offset": list(offsets),
     }

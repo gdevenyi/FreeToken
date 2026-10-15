@@ -215,6 +215,41 @@ def test_completion_logprobs_non_stream_and_stream() -> None:
     }
 
 
+def _crab_replies() -> list[UserReply]:
+    # 🦀 is three byte-level tokens: the first two acks carry no visible text yet.
+    pieces = [
+        reply("", logprobs=entry(9008, "\ufffd", -0.1)),
+        reply("", logprobs=entry(99, "\ufffd", -0.2)),
+        reply("🦀", logprobs=entry(222, "\ufffd", -0.3)),
+        reply(" x", logprobs=entry(1, " x", -0.4)),
+        reply("", finished=True, logprobs=entry(2, "<|im_end|>", -0.5)),
+    ]
+    return pieces
+
+
+def test_completion_text_offset_counts_visible_text() -> None:
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=1, max_tokens=8)
+    result = run(handle_completion(req, None, FakeState(_crab_replies()), {}))
+    logprobs = result["choices"][0]["logprobs"]
+    assert result["choices"][0]["text"] == "🦀 x"
+    # The split character's pieces all point at where it starts, not at
+    # len("\ufffd") steps that drift past the real text.
+    assert logprobs["text_offset"] == [0, 0, 0, 1, 3]
+
+
+def test_completion_top_logprobs_key_collision_keeps_most_likely() -> None:
+    # Partial-UTF-8 candidates all decode to U+FFFD and collide on the dict key.
+    colliding = entry(9008, "\ufffd", -1.0)
+    colliding["top"] = [
+        {"token_id": 9008, "token": "\ufffd", "bytes": [240, 159], "logprob": -1.0},
+        {"token_id": 9009, "token": "\ufffd", "bytes": [240, 160], "logprob": -2.0},
+        {"token_id": 5, "token": "a", "bytes": [97], "logprob": -3.0},
+    ]
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=3, max_tokens=8)
+    result = run(handle_completion(req, None, FakeState([reply("x", finished=True, logprobs=colliding)]), {}))
+    assert result["choices"][0]["logprobs"]["top_logprobs"] == [{"\ufffd": -1.0, "a": -3.0}]
+
+
 def test_logprobs_validation_errors() -> None:
     chat_top_out_of_range = run(
         handle_chat_completion(chat_request(logprobs=True, top_logprobs=25), None, FakeState([]), {})
