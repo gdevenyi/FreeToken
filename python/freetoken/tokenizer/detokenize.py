@@ -87,6 +87,34 @@ class DecodeStatus:
         # stopped inside the block (max_tokens, or EOS before the end tag): all of it
         return self.generated if self.in_reasoning else 0
 
+    def release_logprobs(
+        self, entry: dict | None, token_start: int, emit_end: int, text_len: int, flush: bool
+    ) -> List[dict]:
+        """Hold this token's logprob entry and release those whose text is now sent."""
+        if entry is not None:
+            self.held_logprobs.append((token_start, {**entry, "text_offset": token_start}))
+        out: List[dict] = []
+        # A held token's text ends where the next one's starts.
+        starts = [start for start, _ in self.held_logprobs]
+        ends = starts[1:] + [text_len] if starts else []
+        if flush:
+            trimmed = emit_end < text_len
+            for (start, held), end in zip(self.held_logprobs, ends, strict=True):
+                if trimmed and start >= emit_end:
+                    held = {**held, "stop_trimmed": True}
+                elif trimmed and emit_end < end:
+                    held = {**held, "stop_visible": emit_end - start}
+                out.append(held)
+            self.held_logprobs = []
+        elif self.held_logprobs:
+            # Wait for all of a token's text, so a stop match inside it can still mark it.
+            n = 0
+            while n < len(ends) and starts[n] < emit_end and ends[n] <= emit_end:
+                n += 1
+            out = [held for _, held in self.held_logprobs[:n]]
+            self.held_logprobs = self.held_logprobs[n:]
+        return out
+
     def update(self, read_str: str, surr_str: str) -> str:
         new_text = read_str[len(surr_str) :]
         if len(new_text) > 0 and not new_text.endswith("�"):
@@ -253,28 +281,11 @@ class DetokenizeManager:
             s.sent_offset = max(prev_sent, emit_end)
             incremental_strs.append(incremental_output)
             reasoning_tokens.append(s.reasoning_tokens() if msg.finished else 0)
-            if entry is not None:
-                s.held_logprobs.append((token_start, {**entry, "text_offset": token_start}))
-            out: List[dict] = []
-            # A held token's text ends where the next one's starts.
-            starts = [start for start, _ in s.held_logprobs]
-            ends = starts[1:] + [len(output_str)] if starts else []
-            if msg.finished or not msg.stop_strs:
-                trimmed = emit_end < len(output_str)
-                for (start, held), end in zip(s.held_logprobs, ends, strict=True):
-                    if trimmed and start >= emit_end:
-                        held = {**held, "stop_trimmed": True}
-                    elif trimmed and emit_end < end:
-                        held = {**held, "stop_visible": emit_end - start}
-                    out.append(held)
-                s.held_logprobs = []
-            elif s.held_logprobs:
-                # Wait for all of a token's text, so a stop match inside it can still mark it.
-                n = 0
-                while n < len(ends) and starts[n] < emit_end and ends[n] <= emit_end:
-                    n += 1
-                out = [held for _, held in s.held_logprobs[:n]]
-                s.held_logprobs = s.held_logprobs[n:]
+            if entry is not None or s.held_logprobs:
+                flush = msg.finished or not msg.stop_strs
+                out = s.release_logprobs(entry, token_start, emit_end, len(output_str), flush)
+            else:
+                out = []  # no logprobs asked for: skip the hold bookkeeping
             released.append(out)
             if msg.finished:
                 del self.decode_map[msg.uid]
