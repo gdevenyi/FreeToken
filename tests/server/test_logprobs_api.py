@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from freetoken.message import TokenizeMsg, UserReply
+from freetoken.server.generation import generate_full
 from freetoken.server.openai_api import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -840,6 +841,18 @@ def test_chat_logprobs_are_dropped_when_the_segmenter_cannot_build() -> None:
     choices = [e["choices"][0] for e in events if isinstance(e, dict) and e.get("choices")]
     assert any(c["delta"].get("content") == "answer" for c in choices)
     assert _streamed_tokens(choices) == []
+
+
+def test_generate_full_ignores_entries_when_logprobs_were_not_requested() -> None:
+    # The protocol-neutral result carries entries only for a request that asked for them,
+    # so an adapter reading it never sees unsegmented (reasoning) entries.
+    state = FakeState(
+        token_replies(["thought", "</think>", "answer"]), reasoning_parser="qwen3"
+    )
+    spec = chat_request_to_genspec(chat_request(), {})
+    result = run(generate_full(42, spec, state))
+    assert result.content == "answer"
+    assert result.logprobs == []
 
 
 async def _collect(iterator):
