@@ -761,6 +761,9 @@ async def _generate_events_impl(
         if candidate is not None and candidate.supports_streaming():
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
+    # A detector that replays its stream for the one-shot parse already decides which
+    # whitespace after a call is a separator; dropping more here would split the modes.
+    detector_owns_ws = tool_parser is not None and tool_parser.detector.one_shot_replays_stream
 
     # Streaming tool-call assembly: detectors emit fragments (name first, then
     # argument diffs); they accumulate here and the call is emitted complete when
@@ -788,7 +791,7 @@ async def _generate_events_impl(
         open_call = None
         calls_emitted += 1
         nonlocal suppress_ws
-        suppress_ws = True
+        suppress_ws = not detector_owns_ws
         return ToolCallsDelta([call])
 
     def _route_tool_text(piece: str) -> list[GenEvent]:
