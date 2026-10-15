@@ -118,6 +118,8 @@ def test_stream_and_nonstream_match_while_preserving_semantic_markers_and_litera
         "<|box_start|>(1,2),(3,4)<|box_end|>"
         "<|quad_start|>(1,2),(3,4),(5,6),(7,8)<|quad_end|>"
     )
+    # The leaked marker sits after the think block: qwen3 opens on <think> only as the
+    # first non-whitespace text, so "<|im_start|><think>" keeps "<think>" as reasoning.
     text = (
         "<think>plan</think><|im_start|>answer"
         "<|vision_start|><|image_pad|><|vision_end|>"
