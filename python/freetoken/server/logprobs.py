@@ -21,6 +21,11 @@ def completion_logprobs_error(req: Any) -> str | None:
     return None
 
 
+def untrimmed(entries: list[dict] | None) -> list[dict]:
+    """A reply's entries minus those of tokens a matched stop string cut from the text."""
+    return [entry for entry in entries or () if not entry.get("stop_trimmed")]
+
+
 def chat_content_entry(entry: dict) -> dict:
     return {
         "token": entry["token"],

@@ -43,7 +43,7 @@ class FakeState:
             yield reply
 
 
-def reply(text: str, *, finished: bool = False, logprobs: dict | None = None) -> UserReply:
+def reply(text: str, *, finished: bool = False, logprobs: list[dict] | None = None) -> UserReply:
     return UserReply(
         uid=42,
         incremental_output=text,
@@ -105,7 +105,7 @@ def test_chat_non_stream_logprobs() -> None:
         handle_chat_completion(
             chat_request(logprobs=True, top_logprobs=2),
             None,
-            FakeState([reply("Hello", logprobs=first), reply("!", finished=True, logprobs=second)]),
+            FakeState([reply("Hello", logprobs=[first]), reply("!", finished=True, logprobs=[second])]),
             {},
         )
     )
@@ -136,7 +136,7 @@ def test_chat_non_stream_logprobs() -> None:
         handle_chat_completion(
             chat_request(),
             None,
-            FakeState([reply("Hello", finished=True, logprobs=first)]),
+            FakeState([reply("Hello", finished=True, logprobs=[first])]),
             {},
         )
     )
@@ -147,7 +147,7 @@ def test_chat_stream_logprobs_follow_content_deltas() -> None:
     first = entry(1, "Hello", -0.1)
     state = FakeState(
         [
-            reply("Hello", logprobs=first),
+            reply("Hello", logprobs=[first]),
             reply(" world", finished=True),
         ]
     )
@@ -175,7 +175,7 @@ def test_completion_logprobs_non_stream_and_stream() -> None:
         handle_completion(
             req,
             None,
-            FakeState([reply("Hi", logprobs=first), reply("!", finished=True, logprobs=second)]),
+            FakeState([reply("Hi", logprobs=[first]), reply("!", finished=True, logprobs=[second])]),
             {},
         )
     )
@@ -201,7 +201,7 @@ def test_completion_logprobs_non_stream_and_stream() -> None:
                         max_tokens=8,
                         stream=True,
                     ),
-                    FakeState([reply("Hi", finished=True, logprobs=first)]),
+                    FakeState([reply("Hi", finished=True, logprobs=[first])]),
                 )
             )
         )
@@ -213,6 +213,52 @@ def test_completion_logprobs_non_stream_and_stream() -> None:
         "top_logprobs": [{"Hi": -0.1, "x": -1.1}],
         "text_offset": [0],
     }
+
+
+def _stop_trimmed_replies() -> list[UserReply]:
+    # "Hi", then a stop string "##" sampled as "#" "#": the detokenizer withheld both
+    # entries with the text and releases them, marked, on the finished reply.
+    trimmed = [{**entry(3, "#", -0.3), "stop_trimmed": True}, {**entry(3, "#", -0.4), "stop_trimmed": True}]
+    return [
+        reply("Hi", logprobs=[entry(1, "Hi", -0.1)]),
+        reply("", logprobs=None),
+        reply("", finished=True, logprobs=trimmed),
+    ]
+
+
+def test_completion_logprobs_drop_stop_trimmed_entries() -> None:
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=1, max_tokens=8, stop=["##"])
+    result = run(handle_completion(req, None, FakeState(_stop_trimmed_replies()), {}))
+    assert result["choices"][0]["logprobs"]["tokens"] == ["Hi"]
+
+    stream_req = req.model_copy(update={"stream": True})
+    events = parse_sse(run(_collect(stream_completion_chunks(42, stream_req, FakeState(_stop_trimmed_replies())))))
+    tokens = [
+        token
+        for event in events
+        if isinstance(event, dict) and event["choices"] and event["choices"][0]["logprobs"]
+        for token in event["choices"][0]["logprobs"]["tokens"]
+    ]
+    assert tokens == ["Hi"]
+
+
+def test_chat_logprobs_drop_stop_trimmed_entries() -> None:
+    req = chat_request(logprobs=True, stop=["##"])
+    result = run(handle_chat_completion(req, None, FakeState(_stop_trimmed_replies()), {}))
+    assert [e["token"] for e in result["choices"][0]["logprobs"]["content"]] == ["Hi"]
+
+    stream_req = chat_request(logprobs=True, stop=["##"], stream=True)
+    spec = chat_request_to_genspec(stream_req, {})
+    events = parse_sse(
+        run(_collect(stream_chat_completion_chunks(42, stream_req, FakeState(_stop_trimmed_replies()), spec)))
+    )
+    tokens = [
+        e["token"]
+        for event in events
+        if isinstance(event, dict) and event["choices"] and event["choices"][0].get("logprobs")
+        for e in event["choices"][0]["logprobs"]["content"]
+    ]
+    assert tokens == ["Hi"]
 
 
 def test_logprobs_validation_errors() -> None:
@@ -272,7 +318,7 @@ def test_chat_logprobs_fail_closed_under_semantic_parsing() -> None:
         handle_chat_completion(
             chat_request(logprobs=True, tools=[tool], tool_choice="none"),
             None,
-            FakeState([reply("Hi", finished=True, logprobs=entry(1, "Hi", -0.1))]),
+            FakeState([reply("Hi", finished=True, logprobs=[entry(1, "Hi", -0.1)])]),
             {},
         )
     )
@@ -285,7 +331,7 @@ def test_reasoning_logprob_is_not_carried_to_content_delta() -> None:
     # never attached to a later visible delta (where its token string would leak).
     state = FakeState(
         [
-            reply("<think>thought</think>", logprobs=entry(1, "thought", -0.1)),
+            reply("<think>thought</think>", logprobs=[entry(1, "thought", -0.1)]),
             reply("answer", finished=True),
         ],
         reasoning_parser="qwen3",

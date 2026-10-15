@@ -95,3 +95,79 @@ def test_a_batch_with_one_uid_twice_advances_its_state_in_order():
     assert texts == ["b", "</think>", "d", "c"]
     assert counts == [0, 0, 0, 2]
     assert manager.detokenize([DetokenizeMsg(uid=2, next_token=4, finished=True)]) == ["e"]
+
+
+PARTIAL, COMPLETES = 50, 51
+
+
+class _ByteTok(_Tok):
+    """50 is the first half of a two-token character: alone it decodes to U+FFFD."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        out = []
+        for i, t in enumerate(ids):
+            if t == PARTIAL:
+                out.append("" if i + 1 < len(ids) and ids[i + 1] == COMPLETES else "�")
+            elif t == COMPLETES:
+                out.append("é" if i and ids[i - 1] == PARTIAL else "�")
+            else:
+                out.append(super().decode([t], skip_special_tokens))
+        return "".join(out)
+
+
+def _run_logprobs(manager, tokens, *, finished_kwargs=None, **msg_kwargs):
+    """(text, entry token ids) per reply, each token's entry carrying its own id."""
+    replies = []
+    for i, t in enumerate(tokens):
+        last = i == len(tokens) - 1
+        kwargs = dict(msg_kwargs)
+        if last and finished_kwargs:
+            kwargs.update(finished_kwargs)
+        texts, _, released = manager.detokenize_with_logprobs(
+            [DetokenizeMsg(uid=1, next_token=t, finished=last, **kwargs)], [{"token_id": t}]
+        )
+        replies.append(
+            (texts[0], [(e["token_id"], bool(e.get("stop_trimmed"))) for e in released[0]])
+        )
+    return replies
+
+
+def test_logprob_entries_of_stop_trimmed_tokens_are_marked():
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+    assert _run_logprobs(
+        manager, [1, 2, 3], stop_strs=["cd"], finished_kwargs={"matched_stop": "cd"}
+    ) == [("b", [(1, False)]), ("", []), ("", [(2, True), (3, True)])]
+
+
+def test_logprob_entry_waits_for_its_text_when_a_stop_prefix_is_released():
+    # "b" is held as a prefix of "bc"; the second "b" releases the first, but its own
+    # text is held, so its entry must not ride that reply -- the stop then trims it.
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+    assert _run_logprobs(
+        manager, [1, 1, 2], stop_strs=["bc"], finished_kwargs={"matched_stop": "bc"}
+    ) == [("", []), ("b", [(1, False)]), ("", [(1, True), (2, True)])]
+
+
+def test_logprob_entries_kept_with_the_stop_string_or_without_a_match():
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+    kept = _run_logprobs(
+        manager, [1, 2, 3], stop_strs=["cd"], keep_stop_str=True,
+        finished_kwargs={"matched_stop": "cd"},
+    )
+    assert kept[-1] == ("cd", [(2, False), (3, False)])
+    # finished by length while "c" was held as a stop prefix: nothing was trimmed
+    by_length = _run_logprobs(manager, [1, 2], stop_strs=["cd"])
+    assert by_length == [("b", [(1, False)]), ("c", [(2, False)])]
+    # no stop strings: every entry rides its own reply, as before
+    plain = _run_logprobs(manager, [1, 2, EOS], finished_kwargs={"finish_reason": "stop"})
+    assert plain == [("b", [(1, False)]), ("c", [(2, False)]), ("", [(EOS, False)])]
+
+
+def test_logprob_entry_of_a_partial_character_rides_the_reply_that_completes_it():
+    manager = DetokenizeManager(_ByteTok(), frozenset({EOS}))
+    assert _run_logprobs(manager, [1, PARTIAL, COMPLETES, 2], stop_strs=["zz"]) == [
+        ("b", [(1, False)]),
+        ("", []),
+        ("é", [(PARTIAL, False), (COMPLETES, False)]),
+        ("c", [(2, False)]),
+    ]

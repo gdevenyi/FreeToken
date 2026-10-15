@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List
 
 from freetoken.message import DetokenizeMsg
@@ -73,6 +73,9 @@ class DecodeStatus:
     sent_offset: int  # length of sent out string
     skip_special: bool = False  # decode this request with skip_special_tokens
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
+    text_end: int = 0  # length of the decoded text through the previous token
+    # (text start, entry) of logprob entries whose token text is still held for a stop string
+    held_logprobs: List[tuple] = field(default_factory=list)
 
     def update(self, read_str: str, surr_str: str) -> str:
         new_text = read_str[len(surr_str) :]
@@ -134,10 +137,23 @@ class DetokenizeManager:
     def detokenize_with_meta(self, msgs: List[DetokenizeMsg]) -> tuple[List[str], List[int]]:
         """Incremental text per message plus, for a finished message, its reasoning token
         count (0 otherwise or when the model emitted no reasoning end tag)."""
+        texts, counts, _ = self.detokenize_with_logprobs(msgs, [None] * len(msgs))
+        return texts, counts
+
+    def detokenize_with_logprobs(
+        self, msgs: List[DetokenizeMsg], entries: List[dict | None]
+    ) -> tuple[List[str], List[int], List[List[dict]]]:
+        """``detokenize_with_meta`` plus the logprob entries each reply carries. With stop
+        strings, an entry waits for the reply that releases its token's text, so it never
+        precedes text that may still be trimmed; entries of tokens a matched stop string
+        trimmed come on the finished reply marked ``stop_trimmed``."""
         # Each message must advance its request's decode state before the next one.
         if len({msg.uid for msg in msgs}) != len(msgs):
-            parts = [self.detokenize_with_meta([msg]) for msg in msgs]
-            return [p[0][0] for p in parts], [p[1][0] for p in parts]
+            parts = [
+                self.detokenize_with_logprobs([msg], [entry])
+                for msg, entry in zip(msgs, entries, strict=True)
+            ]
+            return [p[0][0] for p in parts], [p[1][0] for p in parts], [p[2][0] for p in parts]
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         skip: List[bool] = []
@@ -171,9 +187,14 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         reasoning_tokens: List[int] = []
-        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+        released: List[List[dict]] = []
+        for msg, entry, read_str, surr_str in zip(
+            msgs, entries, read_texts, surr_texts, strict=True
+        ):
             s = self.decode_map[msg.uid]
             output_str = s.update(read_str, surr_str)
+            token_start = s.text_end
+            s.text_end = max(s.text_end, len(output_str))
 
             prev_sent = s.sent_offset
             if msg.finished:
@@ -198,10 +219,24 @@ class DetokenizeManager:
             s.sent_offset = max(prev_sent, emit_end)
             incremental_strs.append(incremental_output)
             reasoning_tokens.append((s.think_end_at or 0) if msg.finished else 0)
+            if entry is not None:
+                s.held_logprobs.append((token_start, entry))
+            out: List[dict] = []
+            if msg.finished or not msg.stop_strs:
+                trimmed = emit_end < len(output_str)
+                for start, held in s.held_logprobs:
+                    if trimmed and start >= emit_end:
+                        held = {**held, "stop_trimmed": True}
+                    out.append(held)
+                s.held_logprobs = []
+            elif s.held_logprobs:
+                out = [held for start, held in s.held_logprobs if start < emit_end]
+                s.held_logprobs = [p for p in s.held_logprobs if p[0] >= emit_end]
+            released.append(out)
             if msg.finished:
                 del self.decode_map[msg.uid]
 
-        return incremental_strs, reasoning_tokens
+        return incremental_strs, reasoning_tokens, released
 
 
 def build_logprobs_entry(

@@ -31,6 +31,7 @@ from .logprobs import (
     chat_logprobs_error,
     completion_logprobs_error,
     completions_logprobs,
+    untrimmed,
 )
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -666,8 +667,8 @@ async def handle_completion(
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
             text += ack.incremental_output
-            if req.logprobs is not None and ack.logprobs is not None:
-                entries.append(ack.logprobs)
+            if req.logprobs is not None:
+                entries.extend(untrimmed(ack.logprobs))
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
@@ -744,6 +745,7 @@ async def stream_completion_chunks(
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         if ack.incremental_output:
+            entries = untrimmed(ack.logprobs) if req.logprobs is not None else []
             yield _sse(
                 _completion_chunk(
                     req, uid,
@@ -751,11 +753,7 @@ async def stream_completion_chunks(
                         "text": ack.incremental_output,
                         "index": index,
                         "finish_reason": None,
-                        "logprobs": (
-                            completions_logprobs([ack.logprobs], text_offset)
-                            if req.logprobs is not None and ack.logprobs is not None
-                            else None
-                        ),
+                        "logprobs": completions_logprobs(entries, text_offset) if entries else None,
                     }],
                 )
             )

@@ -37,6 +37,7 @@ except Exception:  # pragma: no cover — jinja2 always ships with transformers
     _TemplateError = ()
 
 from .function_call_parser import FunctionCallParser, TOOLS_TAG_LIST, ToolCallItem
+from .logprobs import untrimmed
 from .reasoning_parser import (
     DSV4_SPECIAL_TOKENS,
     ReasoningParser,
@@ -403,8 +404,8 @@ class GenResult:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     timings: GenTimings = field(default_factory=GenTimings)
-    # Neutral sampled-token logprob entries, one per sampled token (empty when the
-    # request did not ask).
+    # Neutral sampled-token logprob entries, one per sampled token the stop string did
+    # not trim (empty when the request did not ask).
     logprobs: list[dict] = field(default_factory=list)
 
 
@@ -1188,8 +1189,8 @@ async def _generate_events_impl(
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
-        if collect_logprobs and getattr(ack, "logprobs", None) is not None:
-            pending_logprobs.append(ack.logprobs)
+        if collect_logprobs:
+            pending_logprobs.extend(untrimmed(getattr(ack, "logprobs", None)))
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -1328,8 +1329,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer
         cached_tokens += ack.cached_tokens
         reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         full_content += ack.incremental_output
-        if getattr(ack, "logprobs", None) is not None:
-            logprob_entries.append(ack.logprobs)
+        logprob_entries.extend(untrimmed(getattr(ack, "logprobs", None)))
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
