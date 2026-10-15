@@ -399,10 +399,15 @@ async def handle_chat_completion(
             message["reasoning_content"] = result.reasoning
         if result.tool_calls:
             message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
-        choice: dict[str, Any] = {"index": index, "message": message, "finish_reason": result.finish_reason}
-        if req.logprobs:
-            choice["logprobs"] = {"content": [chat_content_entry(e) for e in result.logprobs]}
-        choices.append(choice)
+        choices.append({
+            "index": index,
+            "message": message,
+            # OpenAI always sends the key, null when logprobs were not requested
+            "logprobs": (
+                {"content": [chat_content_entry(e) for e in result.logprobs]} if req.logprobs else None
+            ),
+            "finish_reason": result.finish_reason,
+        })
 
     first = results[0]
     response: dict[str, Any] = {
@@ -657,6 +662,7 @@ async def handle_completion(
     async def _drain_one(uid: int, index: int) -> dict[str, Any] | JSONResponse:
         text = ""
         entries: list[dict] = []
+        offsets: list[int] = []
         finish_reason = "stop"
         prompt_tokens = completion_tokens = cached_tokens = 0
         async for ack in state.wait_for_ack(uid):
@@ -665,9 +671,10 @@ async def handle_completion(
             prompt_tokens += ack.prompt_tokens_delta
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
-            text += ack.incremental_output
             if req.logprobs is not None and ack.logprobs is not None:
                 entries.append(ack.logprobs)
+                offsets.append(ack.text_offset)
+            text += ack.incremental_output
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
@@ -675,7 +682,9 @@ async def handle_completion(
             "index": index,
             "text": echo_texts[index // req.n] + text,
             "finish_reason": finish_reason,
-            "logprobs": completions_logprobs(entries) if req.logprobs is not None else None,
+            "logprobs": (
+                completions_logprobs(entries, offsets, len(text)) if req.logprobs is not None else None
+            ),
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
 
@@ -727,7 +736,11 @@ async def stream_completion_chunks(
     echo_text: str = "",
 ) -> AsyncIterator[bytes]:
     prompt_tokens = 0
-    text_offset = 0
+    sent_len = 0
+    # Logprob entries of acks with no visible text yet (held partial UTF-8 or stop
+    # prefix), carried to the next chunk that has text.
+    pending: list[dict] = []
+    pending_offsets: list[int] = []
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
@@ -743,7 +756,11 @@ async def stream_completion_chunks(
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if req.logprobs is not None and ack.logprobs is not None:
+            pending.append(ack.logprobs)
+            pending_offsets.append(ack.text_offset)
         if ack.incremental_output:
+            sent_len += len(ack.incremental_output)
             yield _sse(
                 _completion_chunk(
                     req, uid,
@@ -751,20 +768,37 @@ async def stream_completion_chunks(
                         "text": ack.incremental_output,
                         "index": index,
                         "finish_reason": None,
+                        # Mid-stream, a stamp past sent_len is held-back text still to come.
                         "logprobs": (
-                            completions_logprobs([ack.logprobs], text_offset)
-                            if req.logprobs is not None and ack.logprobs is not None
+                            completions_logprobs(
+                                pending, pending_offsets, sent_len if ack.finished else None
+                            )
+                            if pending
                             else None
                         ),
                     }],
                 )
             )
-            text_offset += len(ack.incremental_output)
+            pending, pending_offsets = [], []
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
 
-    yield _sse(_completion_chunk(req, uid, [{"text": "", "index": index, "finish_reason": finish_reason, "logprobs": None}]))
+    # Entries whose text never showed (EOS, a stop string, a trailing partial character)
+    # ride the finish chunk, so the joined stream matches the non-stream list.
+    yield _sse(
+        _completion_chunk(
+            req, uid,
+            [{
+                "text": "",
+                "index": index,
+                "finish_reason": finish_reason,
+                "logprobs": (
+                    completions_logprobs(pending, pending_offsets, sent_len) if pending else None
+                ),
+            }],
+        )
+    )
     usage = _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens))
     if not terminal:
         yield _StreamUsage(usage)

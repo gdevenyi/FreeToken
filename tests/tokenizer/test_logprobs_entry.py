@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from freetoken.tokenizer.detokenize import build_logprobs_entry
 
 
@@ -57,3 +61,53 @@ def test_build_logprobs_entry_empty_top() -> None:
     )
 
     assert entry["top"] == []
+
+
+def _byte_level_tokenizer():
+    """A tiny GPT-2-style ByteLevel BPE tokenizer built in memory (no download): the 256
+    byte stand-ins, one merge ("ðŁ", the first two bytes of most emoji) and one added
+    token whose content the byte table cannot invert."""
+    from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+    vocab["ðŁ"] = len(vocab)
+    tk = Tokenizer(models.BPE(vocab=vocab, merges=[("ð", "Ł")]))
+    tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    tk.decoder = decoders.ByteLevel()
+    tk.add_tokens([AddedToken("<｜end｜>", special=False)])
+    return PreTrainedTokenizerFast(tokenizer_object=tk)
+
+
+def test_logprobs_bytes_rebuild_a_split_character() -> None:
+    # 🦀 is three byte-level tokens that each decode to U+FFFD; their bytes must still
+    # concatenate back to the character.
+    tokenizer = _byte_level_tokenizer()
+    ids = tokenizer.encode("🦀", add_special_tokens=False)
+    assert len(ids) == 3
+    entries = [build_logprobs_entry(tokenizer, i, -0.5, [i], [-0.5]) for i in ids]
+    assert all(e["token"] == "�" for e in entries)
+    assert bytes(b for e in entries for b in e["bytes"]) == "🦀".encode("utf-8")
+    assert [e["top"][0]["bytes"] for e in entries] == [e["bytes"] for e in entries]
+
+
+def test_logprobs_bytes_added_and_padded_ids() -> None:
+    tokenizer = _byte_level_tokenizer()
+    added = tokenizer.convert_tokens_to_ids("<｜end｜>")
+    padded = len(tokenizer) + 10  # the logits' padded tail: no vocab entry at all
+    entry = build_logprobs_entry(tokenizer, added, -0.1, [added, padded], [-0.1, -9.0])
+    assert entry["token"] == "<｜end｜>"
+    assert entry["bytes"] == list("<｜end｜>".encode("utf-8"))
+    assert entry["top"][1] == {"token_id": padded, "token": "", "bytes": [], "logprob": -9.0}
+
+
+def test_logprobs_bytes_real_qwen_tokenizer() -> None:
+    path = os.path.expanduser("~/models/Qwen3.8-Flash-Next-NVFP4-FTW-fp8")
+    if not os.path.exists(os.path.join(path, "tokenizer.json")):
+        pytest.skip("local Qwen3.8 tokenizer not present")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    entries = [build_logprobs_entry(tokenizer, i, -0.1, [248300], [-9.0]) for i in (9008, 99, 222)]
+    assert bytes(b for e in entries for b in e["bytes"]) == "🦀".encode("utf-8")
+    assert entries[0]["top"][0]["bytes"] == []

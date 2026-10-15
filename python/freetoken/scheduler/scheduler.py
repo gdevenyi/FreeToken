@@ -414,6 +414,7 @@ class Scheduler(SchedulerIOMixin):
                         stop_strs=req.sampling_params.stop_strs or None,
                         keep_stop_str=req.sampling_params.include_stop_str_in_output,
                         skip_special_tokens=req.sampling_params.skip_special_tokens,
+                        starts_in_reasoning=req.sampling_params.starts_in_reasoning,
                         prefill_ms=(
                             0.0 if started_at is None
                             else (time.monotonic() - started_at) * 1000.0
