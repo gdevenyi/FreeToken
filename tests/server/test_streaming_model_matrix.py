@@ -847,3 +847,36 @@ def test_qwen_empty_tool_block_is_dropped_in_both_modes():
     content, _, calls, finish = _qwen_parity(
         ["r", "</think>", "\n\n", "A", "<tool_call>", "\n", "</tool_call>", "\n", "B"])
     assert (content, calls, finish) == ("A\nB", [], "stop")
+
+
+BARE_EDIT = ["<", "function", "=", "edit", ">\n", "<parameter=path>\n", "a.py\n", "</parameter>\n",
+             "</function>"]
+
+
+def test_qwen_bare_function_is_a_call_in_both_modes():
+    # The model skipped <tool_call>: an agent still needs the call executed, and
+    # neither mode may leave the markup in content.
+    content, _, calls, finish = _qwen_parity(
+        ["r", "</think>", "\n\n", "Doing it.\n"] + BARE_EDIT + ["\n", "Done", "."])
+    assert (content, finish) == ("Doing it.\n\nDone.", "tool_calls")
+    assert calls == [("edit", {"path": "a.py"})]
+
+
+def test_qwen_bare_function_after_a_wrapped_call():
+    content, _, calls, _ = _qwen_parity(
+        ["r", "</think>", "\n\n"] + _qwen_call("/a") + ["\n"] + BARE_EDIT)
+    assert content == ""
+    assert calls == [("read", {"filePath": "/a"}), ("edit", {"path": "a.py"})]
+
+
+@pytest.mark.parametrize("pieces", [
+    ["Write ", "<", "function", "=", "name", ">", " tags."],
+    ["<", "function", "=", "nope", ">\n", "<parameter=x>\n", "1\n", "</parameter>\n", "</function>"],
+    ["x ", "<", "function", "=", "read", ">", " y"],
+    ['p = "', "<", "function", "=", '"', " + name"],
+    ["if a ", "<", "f", "(b):", " pass"],
+    ["tail ", "<", "function"],
+], ids=["undeclared-name", "unknown-tool", "no-body", "code-literal", "lt-call", "truncated-prefix"])
+def test_qwen_bare_function_lookalikes_stay_content(pieces):
+    content, _, calls, finish = _qwen_parity(["r", "</think>", "\n\n"] + pieces)
+    assert (content, calls, finish) == ("".join(pieces), [], "stop")

@@ -783,6 +783,12 @@ class BaseFormatDetector(ABC):
 
 
 
+# A bare invoke opener's name: bounded so a literal "<function=" in prose or code
+# is released after at most this many chars instead of being held.
+_PS_BARE_NAME_RE = re.compile(r"([^\s<>]{1,128})>\s*")
+_PS_BARE_NAME_PARTIAL_RE = re.compile(r"[^\s<>]{0,128}")
+
+
 class InvokeParamStreamMixin:
     """Value-level streaming for invoke/parameter block formats (qwen3_coder,
     minimax — the same shape vLLM's ParserEngine covers): text outside blocks
@@ -801,6 +807,8 @@ class InvokeParamStreamMixin:
       _ps_trim_after_block  True: whitespace after a closed block is held, then
                        dropped if another block or the end follows, kept if
                        text does -- the same for any chunking (qwen3_coder)
+      _ps_bare_invoke  True: an invoke without the wrapper block is a call when it
+                       names a declared tool and its body starts (qwen3_coder)
     """
 
     _ps_outer_open: str = ""
@@ -809,10 +817,12 @@ class InvokeParamStreamMixin:
     _ps_trim_single: bool = False
     _ps_missing_type: str = "string"
     _ps_trim_after_block: bool = False
+    _ps_bare_invoke: bool = False
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
         self._ps_after_block = False
+        self._ps_bare = False
         self._ps_key = ""
         self._ps_lead = "{"
         self._ps_emitted_any = False
@@ -838,6 +848,49 @@ class InvokeParamStreamMixin:
         if self._ps_trim_single:
             return text[:-1] if text[-1:] and text[-1:] in self._ps_trim else text
         return text.rstrip(self._ps_trim)
+
+    def _ps_bare_status(self, text: str) -> str:
+        """Classify the bare invoke opener ``text`` starts with: "call", "partial"
+        (may still become one) or "literal". A declared name is required -- not
+        the unknown-tool forwarding a wrapped block gets -- and the body must
+        start, so the format quoted in prose or code stays text."""
+        rest = text[len(self._ps_invoke_open_prefix):]
+        m = _PS_BARE_NAME_RE.match(rest)
+        if m is None:
+            return "partial" if _PS_BARE_NAME_PARTIAL_RE.fullmatch(rest) else "literal"
+        if m.group(1) not in self._tool_indices:
+            return "literal"
+        body = rest[m.end():]
+        for tok in (self._ps_param_open_prefix, self._ps_invoke_close):
+            if body.startswith(tok):
+                return "call"
+            if tok.startswith(body):
+                return "partial"
+        return "literal"
+
+    def _ps_find_bare(self, buf: str, limit: int) -> Tuple[int, str]:
+        """First bare invoke opener before ``limit`` that is not literal."""
+        i = buf.find(self._ps_invoke_open_prefix)
+        while i != -1 and i < limit:
+            status = self._ps_bare_status(buf[i:])
+            if status != "literal":
+                return i, status
+            i = buf.find(self._ps_invoke_open_prefix, i + 1)
+        return -1, ""
+
+    def _ps_opens_block(self, text: str) -> str:
+        """Whether ``text`` starts a block: "yes", "no" or "maybe" (too short to tell)."""
+        if text.startswith(self._ps_outer_open):
+            return "yes"
+        if self._ps_outer_open.startswith(text):
+            return "maybe"
+        if self._ps_bare_invoke:
+            prefix = self._ps_invoke_open_prefix
+            if text.startswith(prefix):
+                return {"call": "yes", "partial": "maybe"}.get(self._ps_bare_status(text), "no")
+            if prefix.startswith(text):
+                return "maybe"
+        return "no"
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
@@ -878,17 +931,31 @@ class InvokeParamStreamMixin:
                     break  # text after a call defers to the next step (wire order)
                 if self._ps_after_block:
                     rest = buf.lstrip()
-                    if not rest or (
-                        self._ps_outer_open.startswith(rest)
-                        and len(rest) < len(self._ps_outer_open)
-                    ):
+                    opens = self._ps_opens_block(rest)
+                    if opens == "maybe":
                         break  # a separator or a text gap: undecided until more arrives
                     self._ps_after_block = False
-                    if rest.startswith(self._ps_outer_open):
+                    if opens == "yes":
                         buf = self._buffer = rest
                 pos = buf.find(self._ps_outer_open)
+                if self._ps_bare_invoke:
+                    bare, status = self._ps_find_bare(buf, len(buf) if pos == -1 else pos)
+                    if bare > 0:
+                        normal_parts.append(buf[:bare])
+                        self._buffer = buf[bare:]
+                        continue
+                    if bare == 0:
+                        if status == "partial":
+                            break
+                        self._ps_bare = True
+                        self._ps_mode = "block"  # parses the invoke at the buffer head
+                        continue
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self._ps_outer_open)
+                    if self._ps_bare_invoke:
+                        hold = max(
+                            hold, self._ends_with_partial_token(buf, self._ps_invoke_open_prefix)
+                        )
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
@@ -960,7 +1027,13 @@ class InvokeParamStreamMixin:
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
                     self._buffer = buf[e + len(self._ps_invoke_close):]
-                    self._ps_mode = "block"
+                    if self._ps_bare:
+                        # A bare invoke is its own block: back to text after it.
+                        self._ps_bare = False
+                        self._ps_mode = "idle"
+                        self._ps_after_block = self._ps_trim_after_block
+                    else:
+                        self._ps_mode = "block"
                     continue
                 if p != -1:
                     m = self._ps_param_open_re.search(buf, p)
@@ -2044,6 +2117,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     _ps_trim_single = True
     _ps_missing_type = "string"
     _ps_trim_after_block = True
+    _ps_bare_invoke = True
 
     """
     Detector for Qwen3-Coder XML-style function call format.
