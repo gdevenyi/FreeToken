@@ -1390,6 +1390,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer
     tool calls, strip special tokens. The adapters format the GenResult into their wire."""
     full_content = ""
     logprob_entries: list[dict] = []
+    wants_logprobs = _wants_logprobs(spec)
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
@@ -1405,13 +1406,14 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer
         cached_tokens += ack.cached_tokens
         reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         full_content += ack.incremental_output
-        logprob_entries.extend(untrimmed(getattr(ack, "logprobs", None)))
+        if wants_logprobs:
+            logprob_entries.extend(untrimmed(getattr(ack, "logprobs", None)))
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
             break
 
-    if _wants_logprobs(spec):
+    if wants_logprobs:
         segmenter = await _make_logprob_segmenter(spec, state)
         logprob_entries = (
             segmenter.feed(logprob_entries) + segmenter.finish() if segmenter is not None else []
