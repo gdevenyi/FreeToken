@@ -181,17 +181,21 @@ class LogprobSegmenter:
         elif blank:
             if self._content_started:
                 self._held.append(entry)
-        else:
+        elif not self._content_started:
+            # The reasoning parser strips this leading whitespace before the tool
+            # parser sees it: " <" opening a bare call is markup, not a space.
             self._content_started = True
+            self._content(entry, entry["token"].lstrip())
+        else:
             held, self._held = self._held, []
             for e in held + [entry]:
                 self._content(e)
 
-    def _content(self, entry: dict) -> None:
+    def _content(self, entry: dict, text: str | None = None) -> None:
         if self._tools is None:
             self._out.append(entry)
             return
-        text = entry["token"]
+        text = entry["token"] if text is None else text
         held = self._tools.detector._buffer
         base = self._fed - len(held)
         self._queue.append([entry, self._fed, self._fed + len(text), False])

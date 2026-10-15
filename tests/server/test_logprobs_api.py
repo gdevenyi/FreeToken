@@ -460,6 +460,19 @@ def test_chat_logprobs_text_merged_into_a_bare_call_closer_is_content() -> None:
     assert _streamed_tokens(choices) == _content_tokens(result)
 
 
+def test_chat_logprobs_leading_space_merged_into_a_bare_call_opener_is_not_content() -> None:
+    # The reasoning parser strips content's leading whitespace before the tool parser
+    # sees it, so the space of " <" is never message text.
+    call = [" <"] + CALL[3:-2]
+    replies = token_replies(["x", "</think>"] + call)
+    result, choices = _chat_both(replies, tools=[TOOL])
+
+    assert result["choices"][0]["message"]["tool_calls"]
+    assert not result["choices"][0]["message"]["content"]
+    assert _content_tokens(result) == []
+    assert _streamed_tokens(choices) == []
+
+
 def test_chat_logprobs_literal_markers_in_content_stay_content() -> None:
     # Only a marker that switches state is markup: a later </think> or a <tool_call>
     # named in prose is message text, and so is its entry.
