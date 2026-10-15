@@ -371,6 +371,30 @@ class OffloadMoeCache:
         self.prefetch = self._init_prefetch()
         self.verify = self._init_verify()
         self.audit = self._init_audit()
+        self._refuse_single_pool_features()
+
+    def _refuse_single_pool_features(self) -> None:
+        """The scored policies, prefetch, its debug checks and the on-demand prefill GEMM address
+        the cache by global slot id over one typed bank, so with several slot pools (#689) they
+        would install and read pool-local slots in the wrong rows: refuse that combination."""
+        if len(self.pool_sizes) == 1:
+            return
+        used = [
+            name
+            for name, on in (
+                (f"--moe-cache-policy {self.cache_policy}", self.cache_policy != "lru"),
+                ("FREETOKEN_MOE_PREFETCH", self.prefetch_mode not in (None, "off")),
+                ("FREETOKEN_MOE_PREFETCH_VERIFY", self.verify_mode not in (None, "off")),
+                ("FREETOKEN_MOE_SLOT_AUDIT", bool(self.slot_audit)),
+                ("--moe-prefill-demand-tokens", bool(self.prefill_demand_tokens)),
+            )
+            if on
+        ]
+        if used:
+            raise ValueError(
+                f"{', '.join(used)} need one MoE slot pool, but this cache has {len(self.pool_sizes)} "
+                "(--moe-cache-scope per-layer, or experts in several quant formats)"
+            )
 
     def _init_audit(self):
         from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled

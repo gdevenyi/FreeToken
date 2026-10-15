@@ -1312,3 +1312,26 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+@pytest.mark.parametrize(
+    "kwargs, flag",
+    [
+        ({"cache_policy": "rule"}, "--moe-cache-policy rule"),
+        ({"prefetch_mode": "on"}, "FREETOKEN_MOE_PREFETCH"),
+        ({"verify_mode": "meta"}, "FREETOKEN_MOE_PREFETCH_VERIFY"),
+        ({"slot_audit": 8}, "FREETOKEN_MOE_SLOT_AUDIT"),
+        ({"prefill_demand_tokens": 64}, "--moe-prefill-demand-tokens"),
+    ],
+)
+def test_offload_cache_refuses_global_slot_features_with_several_pools(kwargs, flag):
+    # these address slots globally over one typed bank: with pool-local slot ids they would
+    # install and read experts in another pool's rows
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    common = dict(num_layers=2, num_experts=4, cache_size=16, device=torch.device("cpu"), **kwargs)
+    with pytest.raises(ValueError, match=f"{flag}.*one MoE slot pool"):
+        OffloadMoeCache(pool_of_layer=[0, 1], pool_sizes=[8, 8], **common)
+    OffloadMoeCache(**common)
+    OffloadMoeCache(num_layers=2, num_experts=4, cache_size=16, device=torch.device("cpu"), pool_of_layer=[0, 1], pool_sizes=[8, 8])
