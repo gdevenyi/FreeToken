@@ -138,9 +138,10 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
     )
     monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("materialized", layer_id))
 
-    def ensure(layer_id, expert_ids, *, counts_as_decode=True):
+    def ensure(layer_id, expert_ids, *, counts_as_decode=True, **kwargs):
+        # the layer hands the unique routed ids (decode-width chunks); rewrite each to a slot
         calls["ensured"] = (layer_id, expert_ids.tolist(), counts_as_decode)
-        expert_ids.copy_(torch.tensor([[5, 3]], dtype=torch.int32))
+        expert_ids.add_(3)
 
     monkeypatch.setattr(cache, "ensure_experts", ensure)
     monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
@@ -157,11 +158,11 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
 
     assert out is hidden_states
     assert "materialized" not in calls
-    assert calls["ensured"] == (0, [[2, 1]], False)
+    assert calls["ensured"] == (0, [1, 2], False)
     assert calls["copied"] is True
     # the grouped GEMM reads the whole slot cache at the slots the admission wrote
     assert calls["w1"].shape[0] == cache.cache_size
-    assert calls["topk_ids"].tolist() == [[5, 3]]
+    assert calls["topk_ids"].tolist() == [[5, 4]]
 
     calls.clear()
     layer.prefill_forward(torch.randn(2, 8), torch.randn(2, 4))
