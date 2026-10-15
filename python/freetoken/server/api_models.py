@@ -77,9 +77,9 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     # Sampled-token logprobs (OpenAI chat semantics): top_logprobs (0..20) requires
-    # logprobs=true; entries cover generated tokens only (no prompt logprobs).
-    # Fail-closed (400) when a reasoning parser or tool parsing is active: entries
-    # must align 1:1 with visible content tokens (see _chat_logprobs_conflict).
+    # logprobs=true; entries cover message-content tokens only (no prompt, reasoning or
+    # tool-call tokens). 400 for parser families whose hidden tokens the segmenter
+    # cannot tell apart from content (see _chat_logprobs_conflict).
     logprobs: bool = False
     top_logprobs: int | None = None
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)

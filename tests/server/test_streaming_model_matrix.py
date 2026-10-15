@@ -708,3 +708,212 @@ def test_trailing_text_parity_with_non_stream(family):
 
     assert norm(_content(events)) == norm(full.content)
     assert [c.name for c in _calls(events)] == [c.name for c in full.tool_calls] == ["read"]
+
+
+# --------------------------------------------------------------------------- #
+# Axis 3: production Qwen3.8 parsers (qwen3 + qwen3_coder), stream == one-shot
+# --------------------------------------------------------------------------- #
+QWEN_TOOLS = TOOLS + [
+    {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "new": {"type": "string"}},
+            },
+        },
+    },
+]
+
+
+def _qwen_parity(pieces, *, thinking=True, finish_reason=None):
+    """Feed token texts one per ack to the streaming path and joined to the
+    non-streaming path; assert both expose the same content, reasoning and calls
+    (exactly, no strip) and return them."""
+    spec = GenSpec(
+        messages=[], sampling_params=None, parser_tools=QWEN_TOOLS, template_tools=QWEN_TOOLS,
+        chat_template_kwargs={} if thinking else {"enable_thinking": False},
+    )
+
+    def state(chunks):
+        return FakeState(chunks, tool_call_parser="qwen3_coder", reasoning_parser="qwen3",
+                         finish_reason=finish_reason)
+
+    async def stream(chunks):
+        return [ev async for ev in generate_events(42, spec, state(chunks))]
+
+    def calls(items):
+        return [(c.name, json.loads(c.parameters)) for c in items]
+
+    full = asyncio.run(generate_full(42, spec, state(["".join(pieces)])))
+    one_shot = (full.content, full.reasoning, calls(full.tool_calls), full.finish_reason)
+    # One token per delta (what the detokenizer sends), then the worst case: one char.
+    for chunks in (list(pieces), list("".join(pieces))):
+        events = asyncio.run(stream(chunks))
+        streamed = (_content(events), _reasoning(events), calls(_calls(events)),
+                    events[-1].finish_reason)
+        assert streamed == one_shot
+    return one_shot
+
+
+EDIT_WITH_THINK_LITERALS = [
+    "plan", "</think>", "\n\n", "Edit:", "<tool_call>", "\n<function=edit>\n<parameter=new>\n",
+    'START = "', "<think>", '"\nEND = "', "</think>", '"\n', "</parameter>\n</function>\n",
+    "</tool_call>",
+]
+
+
+def test_qwen_think_literals_in_tool_arguments_stay_in_the_call():
+    # Editing a parser's own source: the markers are argument data, and reasoning
+    # ended at the first </think> for good.
+    content, reasoning, calls, finish = _qwen_parity(EDIT_WITH_THINK_LITERALS)
+    assert reasoning == "plan"
+    assert content == "Edit:"
+    assert calls == [("edit", {"new": 'START = "<think>"\nEND = "</think>"'})]
+    assert finish == "tool_calls"
+
+
+@pytest.mark.parametrize("pieces, expected", [
+    (["r", "</think>", "\n\n", "Use ", "<think>", " tags", " and ", "</think>", "."],
+     ("Use <think> tags and </think>.", "r")),
+    (["r", "</think>", "\n\n", "if a ", "<", " b:", " pass"], ("if a < b: pass", "r")),
+    (["r", "\n", "</think>", "\n\nAnswer", " here", "\n"], ("Answer here", "r")),
+    (["\n", "r", "\n\n", "s", "</think>", "\n\n", "A", "\n\n", "B"], ("A\n\nB", "r\n\ns")),
+    (["<think>", "\n", "r", "</think>", "\n\n", "a"], ("a", "r")),
+], ids=["think-literals-in-content", "code-lt", "ws-glued", "ws-separate", "explicit-think"])
+def test_qwen_reasoning_split_parity(pieces, expected):
+    content, reasoning, calls, _ = _qwen_parity(pieces)
+    assert (content, reasoning) == expected
+    assert calls == []
+
+
+@pytest.mark.parametrize("pieces, expected", [
+    (["Use", " <think>", " here", " </think>", " too"], "Use <think> here </think> too"),
+    (["\n", "Plain", " answer", "\n"], "\nPlain answer\n"),
+], ids=["think-literals", "literal-ws"])
+def test_qwen_start_in_content_is_literal(pieces, expected):
+    # enable_thinking=false: the template closed the think block, so nothing the
+    # model writes (except an explicit leading <think>) reopens it.
+    content, reasoning, calls, _ = _qwen_parity(pieces, thinking=False)
+    assert (content, reasoning, calls) == (expected, "", [])
+
+
+def test_qwen_start_in_content_explicit_leading_think():
+    content, reasoning, _, _ = _qwen_parity(["<think>", "r", "</think>", "\n\n", "a"], thinking=False)
+    assert (content, reasoning) == ("a", "r")
+
+
+def test_qwen_truncated_in_reasoning():
+    content, reasoning, calls, finish = _qwen_parity(
+        ["thinking", " more", "\n", "</th"], finish_reason="length")
+    assert (content, reasoning, calls, finish) == ("", "thinking more\n</th", [], "length")
+
+
+def test_qwen_repeated_tool_call_opener_is_one_block():
+    content, _, calls, _ = _qwen_parity(["r", "</think>", "\n\n", "<tool_call>", "\n"] + _qwen_call("/a"))
+    assert (content, calls) == ("", [("read", {"filePath": "/a"})])
+
+
+def test_qwen_tool_call_only_turn():
+    content, reasoning, calls, finish = _qwen_parity([
+        "r", "\n", "</think>", "\n\n", "<tool_call>", "\n", "<function=read>", "\n",
+        "<parameter=filePath>", "\n/tmp/test_calc.py\n", "</parameter>", "\n", "</function>",
+        "\n", "</tool_call>",
+    ])
+    assert (content, reasoning, finish) == ("", "r", "tool_calls")
+    assert calls == [("read", READ_ARGS)]
+
+
+def _qwen_call(path):
+    return ["<tool_call>", "\n", "<function=read>", "\n", "<parameter=filePath>", f"\n{path}\n",
+            "</parameter>", "\n", "</function>", "\n", "</tool_call>"]
+
+
+@pytest.mark.parametrize("between, after, expected", [
+    (["\nThen more.\n"], [], "\nThen more.\n"),
+    (["\n", "Then", " more.", "\n"], ["\n"], "\nThen more.\n"),
+    (["\n\n"], [" Done", "."], " Done."),
+    (["\n", "\n"], [" ", "Done", "."], " Done."),
+    (["\n"], ["\n\n", "<div>", "x"], "\n\n<div>x"),
+    (["\n"], [" ", "<T>", " generic"], " <T> generic"),
+    (["\n"], ["\n", "</tool_call>"], "\n</tool_call>"),
+    (["\n"], ["\n", "<tool_call>", " tags"], "\n<tool_call> tags"),
+], ids=["glued", "separate", "ws-only-glued-tail", "ws-only-separate-tail", "ws-then-tag",
+        "space-then-tag", "stray-close", "literal-open"])
+def test_qwen_text_around_calls_parity(between, after, expected):
+    # Text before, between and after calls is content in both modes, verbatim.
+    # A whitespace-only gap between calls or after the last one is markup
+    # separation and is dropped, however it is chunked.
+    pieces = (["r", "</think>", "\n\n", "Let me look.", "\n\n"] + _qwen_call("/a") + between
+              + _qwen_call("/b") + after)
+    content, reasoning, calls, finish = _qwen_parity(pieces)
+    assert content == "Let me look.\n\n" + expected
+    assert calls == [("read", {"filePath": "/a"}), ("read", {"filePath": "/b"})]
+    assert (reasoning, finish) == ("r", "tool_calls")
+
+
+def test_qwen_empty_tool_block_is_dropped_in_both_modes():
+    content, _, calls, finish = _qwen_parity(
+        ["r", "</think>", "\n\n", "A", "<tool_call>", "\n", "</tool_call>", "\n", "B"])
+    assert (content, calls, finish) == ("A\nB", [], "stop")
+
+
+def test_qwen_truncated_inside_function_tag_is_not_recovered():
+    # Cut off by max_tokens inside "<function=x": no call in either mode.
+    _, _, calls, finish = _qwen_parity(
+        ["</think><tool_cal", "l>\n", ">x<", "div><tool_call><function=x", "\n\n"],
+        thinking=False, finish_reason="length")
+    assert (calls, finish) == ([], "length")
+
+
+@pytest.mark.parametrize("pieces", [
+    ["The parser looks for ", "<tool_call>", " tags", " and splits", " them."],
+    ["Wrap calls in ", "<tool_call>", "...", "</tool_call>", " tags, then answer."],
+    ["Calls:\n\n", "<tool_call>", "\n", '{"name": "read"}', "\n", "</tool_call>"],
+], ids=["opener", "pair", "not-an-invoke"])
+def test_qwen_tool_call_tag_in_prose_stays_content(pieces):
+    # <tool_call> followed by anything but an invoke or its close is the tag
+    # named in text, like a bare <function= lookalike.
+    content, _, calls, finish = _qwen_parity(["r", "</think>", "\n\n"] + pieces)
+    assert (content, calls, finish) == ("".join(pieces), [], "stop")
+
+
+BARE_EDIT = ["<", "function", "=", "edit", ">\n", "<parameter=path>\n", "a.py\n", "</parameter>\n",
+             "</function>"]
+
+
+def test_qwen_bare_function_is_a_call_in_both_modes():
+    # The model skipped <tool_call>: an agent still needs the call executed, and
+    # neither mode may leave the markup in content.
+    content, _, calls, finish = _qwen_parity(
+        ["r", "</think>", "\n\n", "Doing it.\n"] + BARE_EDIT + ["\n", "Done", "."])
+    assert (content, finish) == ("Doing it.\n\nDone.", "tool_calls")
+    assert calls == [("edit", {"path": "a.py"})]
+
+
+def test_qwen_bare_function_after_a_wrapped_call():
+    content, _, calls, _ = _qwen_parity(
+        ["r", "</think>", "\n\n"] + _qwen_call("/a") + ["\n"] + BARE_EDIT)
+    assert content == ""
+    assert calls == [("read", {"filePath": "/a"}), ("edit", {"path": "a.py"})]
+
+
+def test_qwen_bare_function_swallows_a_stray_close():
+    content, _, calls, _ = _qwen_parity(
+        ["r", "</think>", "\n\n", "Doing it.\n"] + BARE_EDIT + ["\n", "</tool_call>", "\n", "Done"])
+    assert content == "Doing it.\n\nDone"
+    assert calls == [("edit", {"path": "a.py"})]
+
+
+@pytest.mark.parametrize("pieces", [
+    ["Write ", "<", "function", "=", "name", ">", " tags."],
+    ["<", "function", "=", "nope", ">\n", "<parameter=x>\n", "1\n", "</parameter>\n", "</function>"],
+    ["x ", "<", "function", "=", "read", ">", " y"],
+    ['p = "', "<", "function", "=", '"', " + name"],
+    ["if a ", "<", "f", "(b):", " pass"],
+    ["tail ", "<", "function"],
+], ids=["undeclared-name", "unknown-tool", "no-body", "code-literal", "lt-call", "truncated-prefix"])
+def test_qwen_bare_function_lookalikes_stay_content(pieces):
+    content, _, calls, finish = _qwen_parity(["r", "</think>", "\n\n"] + pieces)
+    assert (content, calls, finish) == ("".join(pieces), [], "stop")

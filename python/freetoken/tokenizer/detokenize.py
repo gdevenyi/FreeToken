@@ -1,5 +1,7 @@
-from dataclasses import dataclass
-from typing import Dict, FrozenSet, List
+import json
+import weakref
+from dataclasses import dataclass, field
+from typing import Any, Dict, FrozenSet, List
 
 from freetoken.message import DetokenizeMsg
 from transformers import PreTrainedTokenizerBase
@@ -73,6 +75,45 @@ class DecodeStatus:
     sent_offset: int  # length of sent out string
     skip_special: bool = False  # decode this request with skip_special_tokens
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
+    in_reasoning: bool = False  # the prompt or the output opened a reasoning block
+    generated: int = 0  # sampled tokens, EOS included
+    text_end: int = 0  # decoded text so far, before holdback: where the next token starts
+    # (text start, entry) of logprob entries whose token text is still held for a stop string
+    held_logprobs: List[tuple] = field(default_factory=list)
+
+    def reasoning_tokens(self) -> int:
+        if self.think_end_at is not None:
+            return self.think_end_at
+        # stopped inside the block (max_tokens, or EOS before the end tag): all of it
+        return self.generated if self.in_reasoning else 0
+
+    def release_logprobs(
+        self, entry: dict | None, token_start: int, emit_end: int, text_len: int, flush: bool
+    ) -> List[dict]:
+        """Hold this token's logprob entry and release those whose text is now sent."""
+        if entry is not None:
+            self.held_logprobs.append((token_start, {**entry, "text_offset": token_start}))
+        out: List[dict] = []
+        # A held token's text ends where the next one's starts.
+        starts = [start for start, _ in self.held_logprobs]
+        ends = starts[1:] + [text_len] if starts else []
+        if flush:
+            trimmed = emit_end < text_len
+            for (start, held), end in zip(self.held_logprobs, ends, strict=True):
+                if trimmed and start >= emit_end:
+                    held = {**held, "stop_trimmed": True}
+                elif trimmed and emit_end < end:
+                    held = {**held, "stop_visible": emit_end - start}
+                out.append(held)
+            self.held_logprobs = []
+        elif self.held_logprobs:
+            # Wait for all of a token's text, so a stop match inside it can still mark it.
+            n = 0
+            while n < len(ends) and starts[n] < emit_end and ends[n] <= emit_end:
+                n += 1
+            out = [held for _, held in self.held_logprobs[:n]]
+            self.held_logprobs = self.held_logprobs[n:]
+        return out
 
     def update(self, read_str: str, surr_str: str) -> str:
         new_text = read_str[len(surr_str) :]
@@ -99,6 +140,7 @@ class DetokenizeManager:
         tokenizer: PreTrainedTokenizerBase,
         eos_token_ids: FrozenSet[int] | None = None,
         think_end_id: int | None = None,
+        think_start_id: int | None = None,
     ) -> None:
         # uid -> DecodeStatus
         self.decode_map: Dict[int, DecodeStatus] = {}
@@ -109,6 +151,7 @@ class DetokenizeManager:
         # The reasoning end tag's id (e.g. ``</think>``): tokens generated up to and
         # including it are reported as usage.completion_tokens_details.reasoning_tokens.
         self.think_end_id = think_end_id if think_end_id is None else int(think_end_id)
+        self.think_start_id = think_start_id if think_start_id is None else int(think_start_id)
 
     def discard(self, uid: int) -> None:
         """Drop a uid's decode state without a finished DetokenizeMsg. An aborted or errored
@@ -131,13 +174,42 @@ class DetokenizeManager:
                     out[i] = t
         return [t if t is not None else "" for t in out]
 
-    def detokenize_with_meta(self, msgs: List[DetokenizeMsg]) -> tuple[List[str], List[int]]:
-        """Incremental text per message plus, for a finished message, its reasoning token
-        count (0 otherwise or when the model emitted no reasoning end tag)."""
+    def detokenize_with_meta(
+        self, msgs: List[DetokenizeMsg]
+    ) -> tuple[List[str], List[int], List[int]]:
+        """Incremental text per message; for a finished message, its reasoning token count
+        (0 otherwise or when the generation never was in a reasoning block); and where each
+        message's token starts in the generated text. That offset ignores stop-string
+        holdback, which delays when text is sent but not where it lands."""
+        texts, counts, _, offsets = self._detokenize(msgs, [None] * len(msgs))
+        return texts, counts, offsets
+
+    def detokenize_with_logprobs(
+        self, msgs: List[DetokenizeMsg], entries: List[dict | None]
+    ) -> tuple[List[str], List[int], List[List[dict]]]:
+        """``detokenize_with_meta`` plus the logprob entries each reply carries, each stamped
+        with its token's ``text_offset``. With stop strings, an entry waits for the reply that
+        releases all its token's text, so it never precedes text that may still be trimmed;
+        entries of tokens a matched stop string trimmed come on the finished reply marked
+        ``stop_trimmed``, and that of a token it cut inside with ``stop_visible``, the length
+        of the token's text left visible."""
+        texts, counts, released, _ = self._detokenize(msgs, entries)
+        return texts, counts, released
+
+    def _detokenize(
+        self, msgs: List[DetokenizeMsg], entries: List[dict | None]
+    ) -> tuple[List[str], List[int], List[List[dict]], List[int]]:
         # Each message must advance its request's decode state before the next one.
         if len({msg.uid for msg in msgs}) != len(msgs):
-            parts = [self.detokenize_with_meta([msg]) for msg in msgs]
-            return [p[0][0] for p in parts], [p[1][0] for p in parts]
+            parts = [
+                self._detokenize([msg], [entry]) for msg, entry in zip(msgs, entries, strict=True)
+            ]
+            return (
+                [p[0][0] for p in parts],
+                [p[1][0] for p in parts],
+                [p[2][0] for p in parts],
+                [p[3][0] for p in parts],
+            )
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         skip: List[bool] = []
@@ -150,8 +222,10 @@ class DetokenizeManager:
                     surr_offset=0,
                     sent_offset=0,
                     skip_special=bool(getattr(msg, "skip_special_tokens", False)),
+                    in_reasoning=bool(getattr(msg, "starts_in_reasoning", False)),
                 )
             s = self.decode_map[msg.uid]
+            s.generated += 1
             if not (
                 msg.finished and not msg.matched_stop and msg.next_token in self.eos_token_ids
             ):
@@ -162,6 +236,8 @@ class DetokenizeManager:
                 and msg.next_token == self.think_end_id
             ):
                 s.think_end_at = len(s.decoded_ids)
+            if s.think_end_at is None and msg.next_token == self.think_start_id:
+                s.in_reasoning = True
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
             skip.append(s.skip_special)
@@ -171,9 +247,16 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         reasoning_tokens: List[int] = []
-        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+        released: List[List[dict]] = []
+        text_offsets: List[int] = []
+        for msg, entry, read_str, surr_str in zip(
+            msgs, entries, read_texts, surr_texts, strict=True
+        ):
             s = self.decode_map[msg.uid]
+            token_start = s.text_end
+            text_offsets.append(token_start)
             output_str = s.update(read_str, surr_str)
+            s.text_end = max(s.text_end, len(output_str))
 
             prev_sent = s.sent_offset
             if msg.finished:
@@ -197,11 +280,83 @@ class DetokenizeManager:
             incremental_output = output_str[prev_sent:emit_end] if emit_end > prev_sent else ""
             s.sent_offset = max(prev_sent, emit_end)
             incremental_strs.append(incremental_output)
-            reasoning_tokens.append((s.think_end_at or 0) if msg.finished else 0)
+            reasoning_tokens.append(s.reasoning_tokens() if msg.finished else 0)
+            if entry is not None or s.held_logprobs:
+                flush = msg.finished or not msg.stop_strs
+                out = s.release_logprobs(entry, token_start, emit_end, len(output_str), flush)
+            else:
+                out = []  # no logprobs asked for: skip the hold bookkeeping
+            released.append(out)
             if msg.finished:
                 del self.decode_map[msg.uid]
 
-        return incremental_strs, reasoning_tokens
+        return incremental_strs, reasoning_tokens, released, text_offsets
+
+
+def _gpt2_byte_decoder() -> dict[str, int]:
+    """Inverse of GPT-2's ``bytes_to_unicode``: the printable stand-in char -> its byte."""
+    bs = [*range(ord("!"), ord("~") + 1), *range(ord("¡"), ord("¬") + 1), *range(ord("®"), ord("ÿ") + 1)]
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {chr(c): b for b, c in zip(bs, cs, strict=True)}
+
+
+class _TokenBytes:
+    """A token id's own bytes. A single-id decode cannot give them for a piece of a
+    multi-byte character (it decodes to U+FFFD), so read the vocab piece instead."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        decoder: dict = {}
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        try:
+            decoder = json.loads(backend.decoder.__getstate__())
+        except Exception:  # noqa: BLE001 -- no fast backend: fall back to the decoded text
+            pass
+        kinds = {d.get("type") for d in decoder.get("decoders", [decoder])}
+        self.byte_level = _gpt2_byte_decoder() if "ByteLevel" in kinds else None
+        self.byte_fallback = "ByteFallback" in kinds
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        self.added = {int(tid): str(getattr(tok, "content", tok)) for tid, tok in added.items()}
+        self.convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+
+    def __call__(self, tid: int, text: str) -> bytes:
+        if tid in self.added:
+            # the GPT-2 table cannot invert an added token's raw (e.g. full-width) chars
+            return self.added[tid].encode("utf-8")
+        try:
+            piece = self.convert(tid) if self.convert is not None else None
+        except Exception:  # noqa: BLE001 -- out-of-vocab id
+            piece = None
+        if isinstance(piece, str):
+            if self.byte_level is not None:
+                try:
+                    return bytes(self.byte_level[c] for c in piece)
+                except KeyError:
+                    pass
+            elif self.byte_fallback and len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+                try:
+                    return bytes([int(piece[3:5], 16)])
+                except ValueError:
+                    pass
+        return text.encode("utf-8")
+
+
+_TOKEN_BYTES: "weakref.WeakKeyDictionary[Any, _TokenBytes]" = weakref.WeakKeyDictionary()
+
+
+def _token_bytes(tokenizer: Any) -> _TokenBytes:
+    try:
+        cached = _TOKEN_BYTES.get(tokenizer)
+        if cached is None:
+            cached = _TOKEN_BYTES[tokenizer] = _TokenBytes(tokenizer)
+    except TypeError:  # not weak-referenceable or unhashable
+        return _TokenBytes(tokenizer)
+    return cached
 
 
 def build_logprobs_entry(
@@ -213,21 +368,27 @@ def build_logprobs_entry(
 ) -> dict:
     """Neutral sampled-token logprobs entry (UserReply.logprobs). Values are the raw
     pre-temperature logprobs the sampler computed; token text comes from a single-id
-    decode, with UTF-8 bytes alongside so clients can reassemble partial-UTF-8 pieces."""
+    decode, and ``bytes`` are the token's own bytes, so clients can reassemble a
+    character split across tokens. Ids past the real vocab (the padded tail of the
+    logits) report an empty token."""
+    token_bytes = _token_bytes(tokenizer)
 
     def _fields(tid: int) -> tuple[str, list[int]]:
-        text = tokenizer.decode([tid])
-        return text, list(text.encode("utf-8"))
+        try:
+            text = tokenizer.decode([tid])
+        except Exception:  # noqa: BLE001 -- a padded id some tokenizers refuse to decode
+            text = ""
+        return text, list(token_bytes(tid, text))
 
-    token, token_bytes = _fields(token_id)
+    token, data = _fields(token_id)
     top = []
     for tid, logprob in zip(top_ids or [], top_logprobs or []):
-        text, data = _fields(int(tid))
-        top.append({"token_id": int(tid), "token": text, "bytes": data, "logprob": float(logprob)})
+        text, cand = _fields(int(tid))
+        top.append({"token_id": int(tid), "token": text, "bytes": cand, "logprob": float(logprob)})
     return {
         "token_id": token_id,
         "token": token,
-        "bytes": token_bytes,
+        "bytes": data,
         "logprob": float(chosen_logprob),
         "top": top,
     }

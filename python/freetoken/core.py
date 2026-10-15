@@ -54,6 +54,9 @@ class SamplingParams:
     # reports the chosen token's raw (pre-temperature) logprob and top-k alternatives.
     logprobs: bool = False
     top_logprobs: int = 0
+    # Set by the tokenizer worker when the rendered prompt leaves a <think> block open, so
+    # the detokenizer counts an unclosed generation as reasoning tokens.
+    starts_in_reasoning: bool = False
 
     @property
     def is_greedy(self) -> bool:

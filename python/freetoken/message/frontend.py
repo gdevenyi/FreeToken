@@ -62,9 +62,13 @@ class UserReply(BaseFrontendMsg):
     # On the finished reply: tokens generated up to and including the reasoning end tag
     # (0 when the model emitted none) -> usage.completion_tokens_details.reasoning_tokens.
     reasoning_tokens: int = 0
-    # Neutral sampled-token logprobs entry for this token (see
-    # tokenizer.detokenize.build_logprobs_entry); None when the request did not ask.
-    logprobs: dict | None = None
+    # Neutral sampled-token logprobs entries released with this reply (see
+    # tokenizer.detokenize.build_logprobs_entry), normally this token's own; None when
+    # there are none. Each entry's "text_offset" is where its token starts in the generated
+    # text. With stop strings an entry waits for its token's text, and entries
+    # of tokens a matched stop string trimmed arrive marked "stop_trimmed"; the token it
+    # ends inside carries "stop_visible", the length of its text that was released.
+    logprobs: list[dict] | None = None
 
 
 @dataclass
