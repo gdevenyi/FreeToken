@@ -244,3 +244,27 @@ def test_logprob_entries_released_together_keep_their_own_text_offsets():
         )
         replies.append((texts[0], [(e["token_id"], e["text_offset"]) for e in released[0]]))
     assert replies == [("b", [(1, 0)]), ("", []), ("cd", [(2, 1), (3, 2)]), ("", [(EOS, 3)])]
+
+
+def test_held_logprob_entries_release_on_a_message_without_its_own_entry():
+    # "c" is held as a prefix of "cx"; the messages that release it carry no entry
+    # (and skip the hold bookkeeping when nothing is held), yet "c"'s entry still rides them.
+    def run(tokens, entries, last_finishes):
+        manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+        replies = []
+        for i, (t, entry) in enumerate(zip(tokens, entries, strict=True)):
+            finished = last_finishes and i == len(tokens) - 1
+            texts, _, released = manager.detokenize_with_logprobs(
+                [DetokenizeMsg(uid=1, next_token=t, finished=finished, stop_strs=["cx"])], [entry]
+            )
+            replies.append((texts[0], [e["token_id"] for e in released[0]]))
+        assert manager.decode_map.get(1) is None or not manager.decode_map[1].held_logprobs
+        return replies
+
+    e = [{"token_id": t} for t in (1, 2)]
+    # released mid-stream by "d", whose message has no entry
+    assert run([1, 2, 3], [*e, None], False) == [("b", [1]), ("", []), ("cd", [2])]
+    # flushed by the finishing message, which has no entry
+    assert run([1, 2, EOS], [*e, None], True) == [("b", [1]), ("", []), ("c", [2])]
+    # a request without logprobs never carries any
+    assert run([1, 2, 3], [None] * 3, True) == [("b", []), ("", []), ("cd", [])]
