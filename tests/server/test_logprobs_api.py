@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
+
+import pytest
 
 from freetoken.message import TokenizeMsg, UserReply
 from freetoken.server.openai_api import (
@@ -43,7 +46,9 @@ class FakeState:
             yield reply
 
 
-def reply(text: str, *, finished: bool = False, logprobs: dict | None = None) -> UserReply:
+def reply(
+    text: str, *, finished: bool = False, logprobs: dict | None = None, text_offset: int = 0
+) -> UserReply:
     return UserReply(
         uid=42,
         incremental_output=text,
@@ -52,6 +57,7 @@ def reply(text: str, *, finished: bool = False, logprobs: dict | None = None) ->
         completion_tokens_delta=1 if text else 0,
         cached_tokens=0,
         logprobs=logprobs,
+        text_offset=text_offset,
     )
 
 
@@ -177,7 +183,9 @@ def test_completion_logprobs_non_stream_and_stream() -> None:
         handle_completion(
             req,
             None,
-            FakeState([reply("Hi", logprobs=first), reply("!", finished=True, logprobs=second)]),
+            FakeState(
+                [reply("Hi", logprobs=first), reply("!", finished=True, logprobs=second, text_offset=2)]
+            ),
             {},
         )
     )
@@ -223,8 +231,8 @@ def _crab_replies() -> list[UserReply]:
         reply("", logprobs=entry(9008, "\ufffd", -0.1)),
         reply("", logprobs=entry(99, "\ufffd", -0.2)),
         reply("🦀", logprobs=entry(222, "\ufffd", -0.3)),
-        reply(" x", logprobs=entry(1, " x", -0.4)),
-        reply("", finished=True, logprobs=entry(2, "<|im_end|>", -0.5)),
+        reply(" x", logprobs=entry(1, " x", -0.4), text_offset=1),
+        reply("", finished=True, logprobs=entry(2, "<|im_end|>", -0.5), text_offset=3),
     ]
     return pieces
 
@@ -237,6 +245,90 @@ def test_completion_text_offset_counts_visible_text() -> None:
     # The split character's pieces all point at where it starts, not at
     # len("\ufffd") steps that drift past the real text.
     assert logprobs["text_offset"] == [0, 0, 0, 1, 3]
+
+
+def _holdback_replies() -> list[UserReply]:
+    # "Answer: 4\nQuestion 2" under stop=["\n\n"]: the "\n" ack sends nothing (it could
+    # start the stop), and "Question" releases it along with its own text.
+    acks = [("Answer", "Answer", 0), (":", ":", 6), (" ", " ", 7), ("4", "4", 8),
+            ("\n", "", 9), ("Question", "\nQuestion", 10), (" ", " ", 18), ("2", "2", 19)]
+    return [
+        reply(text, finished=i == len(acks) - 1, logprobs=entry(i, token, -0.1), text_offset=offset)
+        for i, (token, text, offset) in enumerate(acks)
+    ]
+
+
+def _joined_stream_logprobs(replies: list[UserReply], **kwargs) -> dict[str, list]:
+    req = CompletionRequest(model="client-model", prompt="hello", max_tokens=8, stream=True, **kwargs)
+    events = parse_sse(run(_collect(stream_completion_chunks(42, req, FakeState(replies)))))
+    joined: dict[str, list] = {"tokens": [], "token_logprobs": [], "top_logprobs": [], "text_offset": []}
+    for event in events:
+        if isinstance(event, dict) and event["choices"] and event["choices"][0]["logprobs"]:
+            for key in joined:
+                joined[key] += event["choices"][0]["logprobs"][key]
+    return joined
+
+
+def test_completion_text_offset_survives_stop_prefix_holdback() -> None:
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=0, max_tokens=8, stop=["\n\n"])
+    choice = run(handle_completion(req, None, FakeState(_holdback_replies()), {}))["choices"][0]
+    logprobs = choice["logprobs"]
+    assert choice["text"] == "Answer: 4\nQuestion 2"
+    assert logprobs["text_offset"] == [0, 6, 7, 8, 9, 10, 18, 19]
+    for token, offset in zip(logprobs["tokens"], logprobs["text_offset"], strict=True):
+        assert choice["text"][offset:].startswith(token)
+    assert _joined_stream_logprobs(_holdback_replies(), logprobs=0, stop=["\n\n"]) == logprobs
+
+
+def test_completion_text_offset_clipped_to_stop_trimmed_text() -> None:
+    # "a\n\n" under stop=["\n\n"]: the second "\n" completes the stop and both are trimmed,
+    # so their offsets cannot point past the returned text.
+    replies = [
+        reply("a", logprobs=entry(1, "a", -0.1)),
+        reply("", logprobs=entry(2, "\n", -0.2), text_offset=1),
+        reply("", finished=True, logprobs=entry(2, "\n", -0.3), text_offset=2),
+    ]
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=0, max_tokens=8, stop=["\n\n"])
+    choice = run(handle_completion(req, None, FakeState(replies), {}))["choices"][0]
+    assert choice["text"] == "a"
+    assert choice["logprobs"]["text_offset"] == [0, 1, 1]
+    assert _joined_stream_logprobs(replies, logprobs=0, stop=["\n\n"]) == choice["logprobs"]
+
+
+def test_completion_text_offset_real_tokenizer_with_stops() -> None:
+    # The real Qwen3.8 tokenizer through the real detokenizer: every token's offset must
+    # point at its own text, stream and non-stream alike.
+    path = os.path.expanduser("~/models/Qwen3.8-Flash-Next-NVFP4-FTW-fp8")
+    if not os.path.exists(os.path.join(path, "tokenizer.json")):
+        pytest.skip("local Qwen3.8 tokenizer not present")
+    from transformers import AutoTokenizer
+
+    from freetoken.message import DetokenizeMsg
+    from freetoken.tokenizer.detokenize import DetokenizeManager, build_logprobs_entry
+
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    for text, stop in [("Answer: 4\nQuestion 2", "\n\n"), ("Q: hi\nA: Question time 🦀 ok", "Question:")]:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        manager = DetokenizeManager(tokenizer, frozenset({248046}))
+        replies = []
+        for i, tid in enumerate(ids):
+            last = i == len(ids) - 1
+            msg = DetokenizeMsg(uid=42, next_token=tid, finished=last, stop_strs=[stop])
+            (out,), _, (offset,) = manager.detokenize_with_meta([msg])
+            replies.append(
+                reply(out, finished=last, text_offset=offset,
+                      logprobs=build_logprobs_entry(tokenizer, tid, -0.1, [], []))
+            )
+        req = CompletionRequest(model="client-model", prompt="p", logprobs=0, max_tokens=64, stop=[stop])
+        choice = run(handle_completion(req, None, FakeState(replies), {}))["choices"][0]
+        assert choice["text"] == text
+        offsets = choice["logprobs"]["text_offset"]
+        for tid, offset in zip(ids, offsets, strict=True):
+            token = tokenizer.decode([tid])
+            if "\ufffd" not in token:
+                assert text[offset:].startswith(token), (text, token, offset)
+        assert offsets == sorted(offsets)
+        assert _joined_stream_logprobs(replies, logprobs=0, stop=[stop]) == choice["logprobs"]
 
 
 def test_completion_top_logprobs_key_collision_keeps_most_likely() -> None:

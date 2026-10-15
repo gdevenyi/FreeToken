@@ -77,6 +77,7 @@ class DecodeStatus:
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
     in_reasoning: bool = False  # the prompt or the output opened a reasoning block
     generated: int = 0  # sampled tokens, EOS included
+    output_len: int = 0  # decoded text so far, before holdback: where the next token starts
 
     def reasoning_tokens(self) -> int:
         if self.think_end_at is not None:
@@ -143,13 +144,21 @@ class DetokenizeManager:
                     out[i] = t
         return [t if t is not None else "" for t in out]
 
-    def detokenize_with_meta(self, msgs: List[DetokenizeMsg]) -> tuple[List[str], List[int]]:
-        """Incremental text per message plus, for a finished message, its reasoning token
-        count (0 otherwise or when the generation never was in a reasoning block)."""
+    def detokenize_with_meta(
+        self, msgs: List[DetokenizeMsg]
+    ) -> tuple[List[str], List[int], List[int]]:
+        """Incremental text per message; for a finished message, its reasoning token count
+        (0 otherwise or when the generation never was in a reasoning block); and where each
+        message's token starts in the generated text. That offset ignores stop-string
+        holdback, which delays when text is sent but not where it lands."""
         # Each message must advance its request's decode state before the next one.
         if len({msg.uid for msg in msgs}) != len(msgs):
             parts = [self.detokenize_with_meta([msg]) for msg in msgs]
-            return [p[0][0] for p in parts], [p[1][0] for p in parts]
+            return (
+                [p[0][0] for p in parts],
+                [p[1][0] for p in parts],
+                [p[2][0] for p in parts],
+            )
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         skip: List[bool] = []
@@ -187,9 +196,12 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         reasoning_tokens: List[int] = []
+        text_offsets: List[int] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
+            text_offsets.append(s.output_len)
             output_str = s.update(read_str, surr_str)
+            s.output_len = max(s.output_len, len(output_str))
 
             prev_sent = s.sent_offset
             if msg.finished:
@@ -217,7 +229,7 @@ class DetokenizeManager:
             if msg.finished:
                 del self.decode_map[msg.uid]
 
-        return incremental_strs, reasoning_tokens
+        return incremental_strs, reasoning_tokens, text_offsets
 
 
 def _gpt2_byte_decoder() -> dict[str, int]:

@@ -673,7 +673,7 @@ async def handle_completion(
             cached_tokens += ack.cached_tokens
             if req.logprobs is not None and ack.logprobs is not None:
                 entries.append(ack.logprobs)
-                offsets.append(len(text))
+                offsets.append(ack.text_offset)
             text += ack.incremental_output
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
@@ -682,7 +682,9 @@ async def handle_completion(
             "index": index,
             "text": echo_texts[index // req.n] + text,
             "finish_reason": finish_reason,
-            "logprobs": completions_logprobs(entries, offsets) if req.logprobs is not None else None,
+            "logprobs": (
+                completions_logprobs(entries, offsets, len(text)) if req.logprobs is not None else None
+            ),
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
 
@@ -734,7 +736,7 @@ async def stream_completion_chunks(
     echo_text: str = "",
 ) -> AsyncIterator[bytes]:
     prompt_tokens = 0
-    text_offset = 0
+    sent_len = 0
     # Logprob entries of acks with no visible text yet (held partial UTF-8 or stop
     # prefix), carried to the next chunk that has text.
     pending: list[dict] = []
@@ -756,8 +758,9 @@ async def stream_completion_chunks(
         cached_tokens += ack.cached_tokens
         if req.logprobs is not None and ack.logprobs is not None:
             pending.append(ack.logprobs)
-            pending_offsets.append(text_offset)
+            pending_offsets.append(ack.text_offset)
         if ack.incremental_output:
+            sent_len += len(ack.incremental_output)
             yield _sse(
                 _completion_chunk(
                     req, uid,
@@ -765,12 +768,15 @@ async def stream_completion_chunks(
                         "text": ack.incremental_output,
                         "index": index,
                         "finish_reason": None,
-                        "logprobs": completions_logprobs(pending, pending_offsets) if pending else None,
+                        "logprobs": (
+                            completions_logprobs(pending, pending_offsets, sent_len)
+                            if pending
+                            else None
+                        ),
                     }],
                 )
             )
             pending, pending_offsets = [], []
-            text_offset += len(ack.incremental_output)
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
@@ -784,7 +790,9 @@ async def stream_completion_chunks(
                 "text": "",
                 "index": index,
                 "finish_reason": finish_reason,
-                "logprobs": completions_logprobs(pending, pending_offsets) if pending else None,
+                "logprobs": (
+                    completions_logprobs(pending, pending_offsets, sent_len) if pending else None
+                ),
             }],
         )
     )

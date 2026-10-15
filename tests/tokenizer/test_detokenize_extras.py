@@ -42,7 +42,7 @@ def _run(manager, uid, tokens, *, finished_kwargs=None, **msg_kwargs):
         kwargs = dict(msg_kwargs)
         if last and finished_kwargs:
             kwargs.update(finished_kwargs)
-        strs, counts = manager.detokenize_with_meta(
+        strs, counts, _ = manager.detokenize_with_meta(
             [DetokenizeMsg(uid=uid, next_token=t, finished=last, **kwargs)]
         )
         text += strs[0]
@@ -115,7 +115,23 @@ def test_a_batch_with_one_uid_twice_advances_its_state_in_order():
         DetokenizeMsg(uid=2, next_token=3, finished=False),
         DetokenizeMsg(uid=1, next_token=2, finished=True),
     ]
-    texts, counts = manager.detokenize_with_meta(msgs)
+    texts, counts, offsets = manager.detokenize_with_meta(msgs)
     assert texts == ["b", "</think>", "d", "c"]
     assert counts == [0, 0, 0, 2]
+    assert offsets == [0, 1, 0, 9]
     assert manager.detokenize([DetokenizeMsg(uid=2, next_token=4, finished=True)]) == ["e"]
+
+
+def test_text_offset_is_where_the_token_starts_despite_holdback():
+    # "c" is held back as a possible start of the stop "cx", then sent with "d": its
+    # offset is still where it starts, not how much text had been sent at its ack.
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+    sent, offsets = [], []
+    for i, t in enumerate([1, 2, 3, EOS]):
+        strs, _, offs = manager.detokenize_with_meta(
+            [DetokenizeMsg(uid=1, next_token=t, finished=i == 3, stop_strs=["cx"])]
+        )
+        sent.append(strs[0])
+        offsets.append(offs[0])
+    assert sent == ["b", "", "cd", ""]
+    assert offsets == [0, 1, 2, 3]

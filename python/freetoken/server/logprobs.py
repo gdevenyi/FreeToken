@@ -37,10 +37,10 @@ def chat_content_entry(entry: dict) -> dict:
     }
 
 
-def completions_logprobs(entries: list[dict], offsets: list[int]) -> dict:
-    """``offsets[i]`` is the length of the visible text sent before entry i's ack. Tokens
-    whose text was held back (part of a multi-byte character) share the offset where
-    that text later appears."""
+def completions_logprobs(entries: list[dict], offsets: list[int], text_len: int) -> dict:
+    """``offsets[i]`` is where entry i's token starts in the generated text (the pieces of
+    a split multi-byte character share its start). Offsets are clipped to ``text_len``,
+    the text sent so far, since a stop string trims tokens off the end."""
     tokens: list[str] = []
     token_logprobs: list[float] = []
     top_logprobs: list[dict[str, float]] = []
@@ -61,5 +61,5 @@ def completions_logprobs(entries: list[dict], offsets: list[int]) -> dict:
         "tokens": tokens,
         "token_logprobs": token_logprobs,
         "top_logprobs": top_logprobs,
-        "text_offset": list(offsets),
+        "text_offset": [min(offset, text_len) for offset in offsets],
     }

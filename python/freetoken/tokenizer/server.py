@@ -248,7 +248,9 @@ def tokenize_worker(
             )
             sampled_replies: List[UserReply] = []
             if len(detokenize_msg) > 0:
-                replies, reasoning_counts = detokenize_manager.detokenize_with_meta(detokenize_msg)
+                replies, reasoning_counts, text_offsets = detokenize_manager.detokenize_with_meta(
+                    detokenize_msg
+                )
                 sampled_replies = [
                     UserReply(
                         uid=msg.uid,
@@ -257,6 +259,7 @@ def tokenize_worker(
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
                         reasoning_tokens=reasoning_tokens,
+                        text_offset=text_offset,
                         completion_tokens_delta=1,
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
@@ -280,8 +283,8 @@ def tokenize_worker(
                             else None
                         ),
                     )
-                    for msg, reply, reasoning_tokens in zip(
-                        detokenize_msg, replies, reasoning_counts, strict=True
+                    for msg, reply, reasoning_tokens, text_offset in zip(
+                        detokenize_msg, replies, reasoning_counts, text_offsets, strict=True
                     )
                 ]
 
