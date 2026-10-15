@@ -447,6 +447,19 @@ def test_chat_logprobs_bare_function_call_is_not_content() -> None:
     assert _streamed_tokens(choices) == _content_tokens(result)
 
 
+def test_chat_logprobs_text_merged_into_a_bare_call_closer_is_content() -> None:
+    # Qwen3.8 merges the closing ">" with the next character (">n"): the emitted "n"
+    # sits at the end of "</function>n", not on the "n" inside "function".
+    call = CALL[2:-3] + [">n"]
+    replies = token_replies(["plan", "</think>"] + call)
+    result, choices = _chat_both(replies, tools=[TOOL])
+
+    assert result["choices"][0]["message"]["tool_calls"]
+    assert result["choices"][0]["message"]["content"] == "n"
+    assert _content_tokens(result) == [">n"]
+    assert _streamed_tokens(choices) == _content_tokens(result)
+
+
 def test_chat_logprobs_literal_markers_in_content_stay_content() -> None:
     # Only a marker that switches state is markup: a later </think> or a <tool_call>
     # named in prose is message text, and so is its entry.

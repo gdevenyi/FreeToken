@@ -210,6 +210,10 @@ class LogprobSegmenter:
         if normal:
             if region.startswith(normal):
                 emitted = [(0, len(normal))]
+            elif region.endswith(normal):
+                # Text after markup in one token, as when a bare call's ">" merges with
+                # the next character (">n"): a leftmost match could land inside the markup.
+                emitted = [(len(region) - len(normal), len(region))]
             else:  # not seen in practice: fall back to the leftmost alignment
                 emitted, i = [], 0
                 for ch in normal:
