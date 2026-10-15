@@ -810,6 +810,11 @@ def test_qwen_truncated_in_reasoning():
     assert (content, reasoning, calls, finish) == ("", "thinking more\n</th", [], "length")
 
 
+def test_qwen_repeated_tool_call_opener_is_one_block():
+    content, _, calls, _ = _qwen_parity(["r", "</think>", "\n\n", "<tool_call>", "\n"] + _qwen_call("/a"))
+    assert (content, calls) == ("", [("read", {"filePath": "/a"})])
+
+
 def test_qwen_tool_call_only_turn():
     content, reasoning, calls, finish = _qwen_parity([
         "r", "\n", "</think>", "\n\n", "<tool_call>", "\n", "<function=read>", "\n",

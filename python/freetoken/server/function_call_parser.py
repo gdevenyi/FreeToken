@@ -888,7 +888,8 @@ class InvokeParamStreamMixin:
             if not self._ps_literal_open:
                 return "yes"
             body = text[len(self._ps_outer_open):].lstrip()
-            for tok in (self._ps_invoke_open_prefix, self._ps_outer_close):
+            # A repeated opener is a stutter: the block ignores it, as before.
+            for tok in (self._ps_invoke_open_prefix, self._ps_outer_close, self._ps_outer_open):
                 if body.startswith(tok):
                     return "yes"
                 if tok.startswith(body):
