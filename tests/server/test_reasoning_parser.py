@@ -44,9 +44,24 @@ class TestDeepSeekV32ReasoningParser(_ReasoningContract):
 
 
 class TestThinkReasoningParser(_ReasoningContract):
+    name = "glm"
+    opener = "<think>"
+    closer = "</think>"
+
+
+class TestQwen3ReasoningParser(_ReasoningContract):
     name = "qwen3"
     opener = "<think>"
     closer = "</think>"
+
+    def test_markers_after_the_first_close_are_literal(self):
+        text = "plan</think>\n\nSTART = \"<think>\"\nEND = \"</think>\"\n"
+        expected = ("plan", 'START = "<think>"\nEND = "</think>"')
+        parser = ReasoningParser(self.name, force_reasoning=True)
+        assert parser.parse_non_stream(text) == expected
+        parser = ReasoningParser(self.name, force_reasoning=True)
+        parts = [parser.parse_stream_chunk(char) for char in text] + [parser.flush()]
+        assert tuple("".join(pair[i] for pair in parts) for i in (0, 1)) == expected
 
 
 class TestMiniMaxM3ReasoningParser(_ReasoningContract):
