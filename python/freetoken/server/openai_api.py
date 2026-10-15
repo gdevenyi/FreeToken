@@ -730,6 +730,10 @@ async def stream_completion_chunks(
 ) -> AsyncIterator[bytes]:
     prompt_tokens = 0
     text_offset = 0
+    # Logprob entries of acks with no visible text yet (held partial UTF-8 or stop
+    # prefix), carried to the next chunk that has text.
+    pending: list[dict] = []
+    pending_offsets: list[int] = []
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
@@ -745,6 +749,9 @@ async def stream_completion_chunks(
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if req.logprobs is not None and ack.logprobs is not None:
+            pending.append(ack.logprobs)
+            pending_offsets.append(text_offset)
         if ack.incremental_output:
             yield _sse(
                 _completion_chunk(
@@ -753,20 +760,29 @@ async def stream_completion_chunks(
                         "text": ack.incremental_output,
                         "index": index,
                         "finish_reason": None,
-                        "logprobs": (
-                            completions_logprobs([ack.logprobs], [text_offset])
-                            if req.logprobs is not None and ack.logprobs is not None
-                            else None
-                        ),
+                        "logprobs": completions_logprobs(pending, pending_offsets) if pending else None,
                     }],
                 )
             )
+            pending, pending_offsets = [], []
             text_offset += len(ack.incremental_output)
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
 
-    yield _sse(_completion_chunk(req, uid, [{"text": "", "index": index, "finish_reason": finish_reason, "logprobs": None}]))
+    # Entries whose text never showed (EOS, a stop string, a trailing partial character)
+    # ride the finish chunk, so the joined stream matches the non-stream list.
+    yield _sse(
+        _completion_chunk(
+            req, uid,
+            [{
+                "text": "",
+                "index": index,
+                "finish_reason": finish_reason,
+                "logprobs": completions_logprobs(pending, pending_offsets) if pending else None,
+            }],
+        )
+    )
     usage = _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens))
     if not terminal:
         yield _StreamUsage(usage)

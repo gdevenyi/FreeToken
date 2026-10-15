@@ -250,6 +250,22 @@ def test_completion_top_logprobs_key_collision_keeps_most_likely() -> None:
     assert result["choices"][0]["logprobs"]["top_logprobs"] == [{"\ufffd": -1.0, "a": -3.0}]
 
 
+def test_completion_stream_logprobs_match_non_stream() -> None:
+    # Acks with no visible text must not lose their entries: they ride the next chunk
+    # with text (or the finish chunk), so the joined stream equals the non-stream list.
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=1, max_tokens=8)
+    expected = run(handle_completion(req, None, FakeState(_crab_replies()), {}))
+    stream_req = CompletionRequest(model="client-model", prompt="hello", logprobs=1, max_tokens=8, stream=True)
+    events = parse_sse(run(_collect(stream_completion_chunks(42, stream_req, FakeState(_crab_replies())))))
+    joined: dict[str, list] = {"tokens": [], "token_logprobs": [], "top_logprobs": [], "text_offset": []}
+    for event in events:
+        if isinstance(event, dict) and event["choices"] and event["choices"][0]["logprobs"]:
+            for key in joined:
+                joined[key] += event["choices"][0]["logprobs"][key]
+    assert joined == expected["choices"][0]["logprobs"]
+    assert len(joined["tokens"]) == 5
+
+
 def test_logprobs_validation_errors() -> None:
     chat_top_out_of_range = run(
         handle_chat_completion(chat_request(logprobs=True, top_logprobs=25), None, FakeState([]), {})
