@@ -40,6 +40,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     keep_stop_str: bool = False
     # Decode this request with skip_special_tokens (SamplingParams.skip_special_tokens).
     skip_special_tokens: bool = False
+    # The prompt left a reasoning block open (SamplingParams.starts_in_reasoning).
+    starts_in_reasoning: bool = False
     # Sampled-token logprobs (None unless the request asked): the chosen token's raw
     # logprob and the top alternatives, already cut to this request's top_logprobs.
     chosen_logprob: float | None = None

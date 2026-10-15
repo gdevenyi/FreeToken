@@ -65,6 +65,9 @@ class UserReply(BaseFrontendMsg):
     # Neutral sampled-token logprobs entry for this token (see
     # tokenizer.detokenize.build_logprobs_entry); None when the request did not ask.
     logprobs: dict | None = None
+    # Where this token's text starts in the generated text, even while a stop-string
+    # prefix holds it back (completions logprobs.text_offset).
+    text_offset: int = 0
 
 
 @dataclass
