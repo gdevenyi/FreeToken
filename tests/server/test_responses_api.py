@@ -338,8 +338,9 @@ def test_stream_tool_call_events():
 # Route smoke tests
 # --------------------------------------------------------------------------- #
 class FakeState:
-    def __init__(self, outputs, finish_reason=None, cached_tokens=0):
+    def __init__(self, outputs, finish_reason=None, cached_tokens=0, reasoning_tokens=0):
         self._outputs = outputs
+        self._reasoning_tokens = reasoning_tokens  # stamped on the terminal ack
         self._finish_reason = finish_reason  # stamped on the terminal ack
         self._cached_tokens = cached_tokens  # stamped on the first ack (admission reply)
         self.maintenance_state = "serving"
@@ -364,7 +365,8 @@ class FakeState:
             yield UserReply(uid=uid, incremental_output=text, finished=finished,
                             finish_reason=self._finish_reason if finished else None,
                             prompt_tokens_delta=pt, completion_tokens_delta=ct,
-                            cached_tokens=self._cached_tokens if i == 0 else 0)
+                            cached_tokens=self._cached_tokens if i == 0 else 0,
+                            reasoning_tokens=self._reasoning_tokens if finished else 0)
 
     async def stream_with_cancellation(self, gen, request, uid):
         async for chunk in gen:
@@ -776,6 +778,27 @@ def test_stream_length_truncation_emits_incomplete_event():
     final = collected[-1][1]["response"]
     assert final["status"] == "incomplete"
     assert final["incomplete_details"]["reason"] == "max_output_tokens"
+
+
+def test_route_reports_reasoning_tokens():
+    # Codex shows usage.output_tokens_details.reasoning_tokens; it was hardcoded to 0.
+    def usage(stream):
+        client = _client(FakeState([("Hello", True, 5, 9)], reasoning_tokens=7))
+        r = client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "stream": stream})
+        assert r.status_code == 200, r.text
+        if not stream:
+            return r.json()["usage"]
+        final = [
+            json.loads(line[len("data:"):])
+            for line in r.text.splitlines()
+            if line.startswith("data:") and "response.completed" in line
+        ]
+        return final[-1]["response"]["usage"]
+
+    for stream in (False, True):
+        u = usage(stream)
+        assert u["output_tokens"] == 9
+        assert u["output_tokens_details"]["reasoning_tokens"] == 7
 
 
 def test_route_length_truncation_reports_incomplete():

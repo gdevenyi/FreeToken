@@ -461,6 +461,7 @@ def build_responses_response(
         usage=_usage(
             result.prompt_tokens, result.completion_tokens,
             result.cached_tokens if cache_report else 0,
+            reasoning_tokens=result.reasoning_tokens,
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
     )
@@ -487,7 +488,9 @@ def _response_obj(
     )
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> ResponseUsage:
+def _usage(
+    prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0, reasoning_tokens: int = 0
+) -> ResponseUsage:
     # input_tokens stays inclusive of the cached prefix (OpenAI semantics);
     # cached_tokens is nonzero only under --enable-cache-report.
     return ResponseUsage(
@@ -495,7 +498,7 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
         output_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
         input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens, cache_write_tokens=0),
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=reasoning_tokens),
     )
 
 
@@ -531,6 +534,7 @@ async def responses_stream_generator(
     usage_pt = 0
     usage_ct = 0
     usage_cached = 0
+    usage_reasoning = 0
 
     def close_current() -> list[str]:
         nonlocal current, output_index
@@ -716,6 +720,7 @@ async def responses_stream_generator(
                 finish_reason = ev.finish_reason
                 usage_pt, usage_ct = ev.prompt_tokens, ev.completion_tokens
                 usage_cached = ev.cached_tokens if cache_report else 0
+                usage_reasoning = ev.reasoning_tokens
                 for f in close_current():
                     yield f
                 if finish_reason == "length":
@@ -723,7 +728,7 @@ async def responses_stream_generator(
                         type="response.incomplete", sequence_number=seq.next(),
                         response=snapshot(
                             "incomplete", output_items,
-                            usage=_usage(usage_pt, usage_ct, usage_cached),
+                            usage=_usage(usage_pt, usage_ct, usage_cached, usage_reasoning),
                             incomplete_reason="max_output_tokens",
                         ),
                     ))
@@ -732,7 +737,7 @@ async def responses_stream_generator(
                         type="response.completed", sequence_number=seq.next(),
                         response=snapshot(
                             "completed", output_items,
-                            usage=_usage(usage_pt, usage_ct, usage_cached),
+                            usage=_usage(usage_pt, usage_ct, usage_cached, usage_reasoning),
                         ),
                     ))
     except GenerationError as exc:
@@ -745,7 +750,7 @@ async def responses_stream_generator(
             type="response.failed", sequence_number=seq.next(),
             response=_response_obj(
                 response_id, created, req.model, output_items, status="failed",
-                usage=_usage(usage_pt, usage_ct, usage_cached),
+                usage=_usage(usage_pt, usage_ct, usage_cached, usage_reasoning),
                 # codex reads this code to tell a blown context window from a generic failure.
                 # model_construct because ResponseError.code is a closed Literal in the SDK.
                 error=ResponseError.model_construct(
@@ -760,7 +765,7 @@ async def responses_stream_generator(
             type="response.failed", sequence_number=seq.next(),
             response=_response_obj(
                 response_id, created, req.model, output_items, status="failed",
-                usage=_usage(usage_pt, usage_ct, usage_cached),
+                usage=_usage(usage_pt, usage_ct, usage_cached, usage_reasoning),
                 error=ResponseError(code="server_error", message=str(exc)),
             ),
         ))
