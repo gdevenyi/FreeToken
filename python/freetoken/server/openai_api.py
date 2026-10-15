@@ -399,10 +399,15 @@ async def handle_chat_completion(
             message["reasoning_content"] = result.reasoning
         if result.tool_calls:
             message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
-        choice: dict[str, Any] = {"index": index, "message": message, "finish_reason": result.finish_reason}
-        if req.logprobs:
-            choice["logprobs"] = {"content": [chat_content_entry(e) for e in result.logprobs]}
-        choices.append(choice)
+        choices.append({
+            "index": index,
+            "message": message,
+            # OpenAI always sends the key, null when logprobs were not requested
+            "logprobs": (
+                {"content": [chat_content_entry(e) for e in result.logprobs]} if req.logprobs else None
+            ),
+            "finish_reason": result.finish_reason,
+        })
 
     first = results[0]
     response: dict[str, Any] = {

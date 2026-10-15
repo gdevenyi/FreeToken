@@ -140,7 +140,9 @@ def test_chat_non_stream_logprobs() -> None:
             {},
         )
     )
-    assert without_logprobs["choices"][0].get("logprobs") is None
+    # OpenAI sends the key with null rather than leaving it out
+    assert "logprobs" in without_logprobs["choices"][0]
+    assert without_logprobs["choices"][0]["logprobs"] is None
 
 
 def test_chat_stream_logprobs_follow_content_deltas() -> None:
