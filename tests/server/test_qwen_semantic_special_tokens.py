@@ -119,7 +119,7 @@ def test_stream_and_nonstream_match_while_preserving_semantic_markers_and_litera
         "<|quad_start|>(1,2),(3,4),(5,6),(7,8)<|quad_end|>"
     )
     text = (
-        "<|im_start|><think>plan</think>answer"
+        "<think>plan</think><|im_start|>answer"
         "<|vision_start|><|image_pad|><|vision_end|>"
         f"{grounding} literal \"<|im_start|>\" and `<|image_pad|>`<|im_end|>"
     )
