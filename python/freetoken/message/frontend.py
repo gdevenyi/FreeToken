@@ -65,7 +65,8 @@ class UserReply(BaseFrontendMsg):
     # Neutral sampled-token logprobs entries released with this reply (see
     # tokenizer.detokenize.build_logprobs_entry), normally this token's own; None when
     # there are none. With stop strings an entry waits for its token's text, and entries
-    # of tokens a matched stop string trimmed arrive marked "stop_trimmed".
+    # of tokens a matched stop string trimmed arrive marked "stop_trimmed"; the token it
+    # ends inside carries "stop_visible", the length of its text that was released.
     logprobs: list[dict] | None = None
 
 

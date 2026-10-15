@@ -96,6 +96,11 @@ def resolve_logprob_markers(
     return LogprobMarkers(single_id(think_start), single_id(think_end), frozenset(hidden))
 
 
+def _visible_text(entry: dict) -> str:
+    """The part of an entry's token that reached the output text."""
+    return entry["token"][: entry.get("stop_visible")]
+
+
 class LogprobSegmenter:
     """Picks a chat generation's message-content logprob entries out of the sampled ones.
 
@@ -155,8 +160,10 @@ class LogprobSegmenter:
         return out
 
     def _split_reasoning(self, entry: dict) -> None:
-        tid = entry["token_id"]
-        blank = not entry["token"].strip()
+        # A token a stop string cut inside is only its visible text, never a marker.
+        tid = -1 if "stop_visible" in entry else entry["token_id"]
+        text = _visible_text(entry)
+        blank = not text.strip()
         if self._state == "head":
             if tid == self._markers.think_start:
                 self._held = []
@@ -185,7 +192,7 @@ class LogprobSegmenter:
             # The reasoning parser strips this leading whitespace before the tool
             # parser sees it: " <" opening a bare call is markup, not a space.
             self._content_started = True
-            self._content(entry, entry["token"].lstrip())
+            self._content(entry, text.lstrip())
         else:
             held, self._held = self._held, []
             for e in held + [entry]:
@@ -195,7 +202,7 @@ class LogprobSegmenter:
         if self._tools is None:
             self._out.append(entry)
             return
-        text = entry["token"] if text is None else text
+        text = _visible_text(entry) if text is None else text
         held = self._tools.detector._buffer
         base = self._fed - len(held)
         self._queue.append([entry, self._fed, self._fed + len(text), False])

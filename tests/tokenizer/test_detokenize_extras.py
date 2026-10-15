@@ -139,6 +139,24 @@ def test_logprob_entries_of_stop_trimmed_tokens_are_marked():
     ) == [("b", [(1, False)]), ("", []), ("", [(2, True), (3, True)])]
 
 
+def test_logprob_entry_of_a_token_a_stop_string_cuts_inside_carries_its_visible_length():
+    # "b</think>c" with stop "k>c": "</thin" of the </think> token stays visible.
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+    final = None
+    for i, t in enumerate([1, THINK_END, 2]):
+        last = i == 2
+        _, _, released = manager.detokenize_with_logprobs(
+            [DetokenizeMsg(uid=1, next_token=t, finished=last, stop_strs=["k>c"],
+                           matched_stop="k>c" if last else None)],
+            [{"token_id": t}],
+        )
+        final = released[0]
+    assert final == [
+        {"token_id": THINK_END, "stop_visible": 6},
+        {"token_id": 2, "stop_trimmed": True},
+    ]
+
+
 def test_logprob_entry_waits_for_its_text_when_a_stop_prefix_is_released():
     # "b" is held as a prefix of "bc"; the second "b" releases the first, but its own
     # text is held, so its entry must not ride that reply -- the stop then trims it.

@@ -473,6 +473,31 @@ def test_chat_logprobs_leading_space_merged_into_a_bare_call_opener_is_not_conte
     assert _streamed_tokens(choices) == []
 
 
+def _stop_cut_replies(tokens: list[str], visible: int) -> list[UserReply]:
+    """A stop string matched inside the last token: only its first ``visible`` chars
+    were released, and the detokenizer says so on its entry."""
+    texts = tokens[:-1] + [tokens[-1][:visible]]
+    replies = token_replies(tokens, finish_reason="length", texts=texts)
+    replies[-1].finish_reason = "stop"
+    replies[-1].logprobs = [{**replies[-1].logprobs[0], "stop_visible": visible}]
+    return replies
+
+
+def test_chat_logprobs_follow_the_visible_part_of_a_token_a_stop_string_cut() -> None:
+    # Only the trailing space of " !" survives the stop "!", and content trimming drops it.
+    result, choices = _chat_both(_stop_cut_replies(["x", "</think>", "Hi", " !"], 1), stop=["!"])
+    assert result["choices"][0]["message"]["content"] == "Hi"
+    assert _content_tokens(result) == ["Hi"]
+    assert _streamed_tokens(choices) == ["Hi"]
+
+    # A stop "_c" leaves "<tool" of <tool_call> as text, not a call opener.
+    replies = _stop_cut_replies(["x", "</think>", "Use", " ", "<tool_call>"], 5)
+    result, choices = _chat_both(replies, stop=["_c"], tools=[TOOL])
+    assert result["choices"][0]["message"]["content"] == "Use <tool"
+    assert _content_tokens(result) == ["Use", " ", "<tool_call>"]
+    assert _streamed_tokens(choices) == _content_tokens(result)
+
+
 def test_chat_logprobs_literal_markers_in_content_stay_content() -> None:
     # Only a marker that switches state is markup: a later </think> or a <tool_call>
     # named in prose is message text, and so is its entry.

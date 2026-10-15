@@ -144,9 +144,10 @@ class DetokenizeManager:
         self, msgs: List[DetokenizeMsg], entries: List[dict | None]
     ) -> tuple[List[str], List[int], List[List[dict]]]:
         """``detokenize_with_meta`` plus the logprob entries each reply carries. With stop
-        strings, an entry waits for the reply that releases its token's text, so it never
+        strings, an entry waits for the reply that releases all its token's text, so it never
         precedes text that may still be trimmed; entries of tokens a matched stop string
-        trimmed come on the finished reply marked ``stop_trimmed``."""
+        trimmed come on the finished reply marked ``stop_trimmed``, and that of a token it
+        cut inside with ``stop_visible``, the length of the token's text left visible."""
         # Each message must advance its request's decode state before the next one.
         if len({msg.uid for msg in msgs}) != len(msgs):
             parts = [
@@ -222,16 +223,25 @@ class DetokenizeManager:
             if entry is not None:
                 s.held_logprobs.append((token_start, entry))
             out: List[dict] = []
+            # A held token's text ends where the next one's starts.
+            starts = [start for start, _ in s.held_logprobs]
+            ends = starts[1:] + [len(output_str)] if starts else []
             if msg.finished or not msg.stop_strs:
                 trimmed = emit_end < len(output_str)
-                for start, held in s.held_logprobs:
+                for (start, held), end in zip(s.held_logprobs, ends, strict=True):
                     if trimmed and start >= emit_end:
                         held = {**held, "stop_trimmed": True}
+                    elif trimmed and emit_end < end:
+                        held = {**held, "stop_visible": emit_end - start}
                     out.append(held)
                 s.held_logprobs = []
             elif s.held_logprobs:
-                out = [held for start, held in s.held_logprobs if start < emit_end]
-                s.held_logprobs = [p for p in s.held_logprobs if p[0] >= emit_end]
+                # Wait for all of a token's text, so a stop match inside it can still mark it.
+                n = 0
+                while n < len(ends) and starts[n] < emit_end and ends[n] <= emit_end:
+                    n += 1
+                out = [held for _, held in s.held_logprobs[:n]]
+                s.held_logprobs = s.held_logprobs[n:]
             released.append(out)
             if msg.finished:
                 del self.decode_map[msg.uid]
