@@ -768,8 +768,11 @@ async def stream_completion_chunks(
                         "text": ack.incremental_output,
                         "index": index,
                         "finish_reason": None,
+                        # Mid-stream, a stamp past sent_len is held-back text still to come.
                         "logprobs": (
-                            completions_logprobs(pending, pending_offsets, sent_len)
+                            completions_logprobs(
+                                pending, pending_offsets, sent_len if ack.finished else None
+                            )
                             if pending
                             else None
                         ),

@@ -295,6 +295,23 @@ def test_completion_text_offset_clipped_to_stop_trimmed_text() -> None:
     assert _joined_stream_logprobs(replies, logprobs=0, stop=["\n\n"]) == choice["logprobs"]
 
 
+def test_completion_stream_text_offset_ahead_of_sent_text() -> None:
+    # stop=["aab"] over "aaax": two "a"s stay held while the first is sent, so the held
+    # tokens' offsets run past the text sent so far; that is where they land, not an overrun.
+    def replies() -> list[UserReply]:
+        acks = [("a", "", 0), ("a", "", 1), ("a", "a", 2), ("x", "aax", 3)]
+        return [
+            reply(text, finished=i == 3, logprobs=entry(i, token, -0.1), text_offset=offset)
+            for i, (token, text, offset) in enumerate(acks)
+        ]
+
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=0, max_tokens=8, stop=["aab"])
+    choice = run(handle_completion(req, None, FakeState(replies()), {}))["choices"][0]
+    assert choice["text"] == "aaax"
+    assert choice["logprobs"]["text_offset"] == [0, 1, 2, 3]
+    assert _joined_stream_logprobs(replies(), logprobs=0, stop=["aab"]) == choice["logprobs"]
+
+
 def test_completion_text_offset_real_tokenizer_with_stops() -> None:
     # The real Qwen3.8 tokenizer through the real detokenizer: every token's offset must
     # point at its own text, stream and non-stream alike.
