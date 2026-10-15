@@ -282,8 +282,9 @@ class OffloadMoELayer(MoELayer):
     # ------------------------------------------------------------------
     # Data movement -- one decision tree for every quant format (the banks
     # registry makes the cache machinery bank-count agnostic). Decode loads
-    # on demand; prefill streams whole layers, double-buffered when overlap
-    # is enabled. The kernels only ever see bank views plus row indices;
+    # on demand, and so does a short enough prefill chunk; a longer one
+    # streams whole layers, double-buffered when overlap is enabled. The
+    # kernels only ever see bank views plus row indices;
     # which kernel runs is decided afterwards, in ``_expert_gemm``.
     # ------------------------------------------------------------------
 
@@ -418,21 +419,23 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: stream whole layers -- double-buffered behind the
-        previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        """Prefill movement. A chunk within ``prefill_demand_tokens`` loads its routed experts
+        into the slot cache as decode does and runs the same grouped GEMM over the slots. A
+        longer one streams whole layers -- double-buffered behind the previous layer's GEMMs
+        when ``prefill_overlap`` is on, else a synchronous ``materialize_layer`` -- where
+        position == expert id, so the routing ids pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
         if (
-            0 < hidden_states.shape[0] <= _SMALL_PREFILL_TOKENS
+            0 < hidden_states.shape[0] <= max(cache.prefill_demand_tokens, _SMALL_PREFILL_TOKENS)
             and cache.decode_target in ("gpu", "hybrid")
             and not cache.is_unpinned_layer(self.layer_id)
         ):
             # A short extension (an agent turn over a cached prefix) touches a fraction of each
-            # layer's experts; fetching those beats streaming all of them (~68 GB here). An
-            # unpinned layer's copy_missing presumes position == expert id, so it streams below;
-            # unpinned layers only exist with the prefill overlap off, so no layer can enter
+            # layer's experts; fetching those beats streaming all of them (~68 GB here). It runs
+            # the prefill GEMM over the slot cache (#676), so it matches the streamed layer bit for
+            # bit. An unpinned layer's copy_missing presumes position == expert id, so it streams
+            # below; unpinned layers only exist with the prefill overlap off, so no layer can enter
             # the overlap double buffer after an earlier layer skipped begin_prefill.
             return self._expert_gemm(
                 cache,
@@ -440,9 +443,9 @@ class OffloadMoELayer(MoELayer):
                 topk_weights,
                 self._ensure_unique(cache, topk_ids),
                 views=cache.bank_views(),
-                n=None,
+                n=cache.cache_size,
                 alphas=cache.alphas_for_slots(self.layer_id),
-                is_prefill=False,
+                is_prefill=True,
             )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
@@ -490,7 +493,7 @@ class OffloadMoELayer(MoELayer):
         pin_since = cache.step.clone() if cache.cache_policy_id else None
         for start in range(0, n, _ENSURE_CHUNK_IDS):
             part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
-            cache.ensure_experts(self.layer_id, part, update_state=False, pin_since=pin_since)  # not a decode step
+            cache.ensure_experts(self.layer_id, part, update_state=False, pin_since=pin_since, counts_as_decode=False)  # not a decode step
             cache.copy_missing()
         return uniq[inverse].view_as(topk_ids)
 
