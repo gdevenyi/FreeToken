@@ -401,7 +401,7 @@ class ExpertVerifier:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             fast_index_copy_multi_jit(
-                self.scratch_ptrs, cache._copy_src_ptrs[layer], cache._copy_feat_bytes, self.iota, self.u_ids, self.u_num,
+                self.scratch_ptrs, cache._copy_src_ptrs[layer], cache._copy_feat_bytes[cache.layer_layout[layer]], self.iota, self.u_ids, self.u_num,
             )
             return
         from freetoken.kernel import fast_index_copy_jit
