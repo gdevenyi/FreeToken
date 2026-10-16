@@ -14,12 +14,23 @@ ROOT = Path(__file__).parent
 KERNEL_INCLUDE = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "include")
 
 
-def _check_toolchain() -> None:
+def _toolchain():
     path = ROOT / "python" / "freetoken" / "kernel" / "_toolchain.py"
     spec = importlib.util.spec_from_file_location("_freetoken_toolchain", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.check_nvcc_matches_torch()
+    return module
+
+
+def _check_toolchain() -> None:
+    _toolchain().check_nvcc_matches_torch()
+
+
+def _nvcc_major() -> int | None:
+    module = _toolchain()
+    nvcc = module._nvcc_path()
+    release = module.nvcc_release(nvcc) if nvcc else None
+    return release[0] if release else None
 
 
 def _is_rocm() -> bool:
@@ -93,6 +104,9 @@ else:
     # Naming archs also stops torch from picking them, which fails on a build machine without a GPU.
     device_compile = ["-O3", "-std=c++20"] + [f"-gencode=arch=compute_{a},code=sm_{a}" for a in (75, 80, 90, 100, 120)]
     device_compile.append("-gencode=arch=compute_75,code=compute_75")
+    # compute_75 PTX cannot run on Pascal, and nvcc 13 dropped sm_61
+    if (_nvcc_major() or 13) < 13:
+        device_compile.append("-gencode=arch=compute_61,code=sm_61")
 
 _check_toolchain()
 
