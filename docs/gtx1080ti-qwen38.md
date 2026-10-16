@@ -53,6 +53,7 @@ Decode, steady state, 1K context, temperature 0 (in-process A/B with the product
 | + 32-bit stream-memops flag handshake | 19.08 |
 | With the 262K host KV tier, before the selection-compaction fix (server) | 14.0 |
 | With the host KV tier, after it (in-process; 17.4 streamed through the server, table below) | 17.2 |
+| Rebuilt on main 9b68e007: #670 executor with our ports, #685, #585, KernelIo on sm_61 | 17.8 (old build 16.1-17.3 in the same session; 17.6 with the copy handshake) |
 
 Short agent turns over a cached 4K prefix (time to the first token): 40 new tokens 1.9 s, 128 about 3.2 s
 (5.9 s each when every prefill streams all experts).
@@ -64,17 +65,16 @@ Long context through the server (recall = three codes planted at 5%, 50% and 95%
 
 | Prompt tokens | Time to first token | Prefill tok/s | Decode tok/s (streamed) | Recall |
 |---|---|---|---|---|
-| 870 | 13.8 s (first request) | 63 | 17.1 | - |
-| 19,639 | 1.6 min | 199 | 17.1 | 3/3 |
-| 115,368 | 13.0 min | 148 | 16.5 | 3/3 |
-| 255,951 | 36.3 min | 118 | 15.3 | 3/3 |
+| 1,005 | 7.9 s | 128 | 17.7 | - |
+| 20,453 | 1.6 min | 212 | 17.8 | 3/3 |
+| 89,731 | 8.4 min | 178 | 17.1 | 3/3 |
+| 213,480 | 28.8 min | 124 | 15.9 | 3/3 |
 
-Measured 2026-10-13 after the rebuild on main 9c635a15 (torch 2.14.1+cu126, Triton 3.8). Past ~220K depth a few
-prefill chunks log `selected pages dropped` (a chunk's selection spans more than the 443 host-tier slots); recall is
-unaffected. Before the rebuild (torch 2.11, Triton 3.6) the same server measured 1,077 / 23,003 / 93,809 / 231,494
-tokens at 9.5 s / 1.9 min / 8.6 min / 29.5 min, 114 / 206 / 181 / 131 tok/s prefill and 17.7 / 17.3 / 16.7 / 15.6 tok/s
-decode. In-process decode at 1K is 15.8-16.7 tok/s against 17.0-17.5 before: the host-KV-tier kernels run longer
-(flashlib's `lru_ensure` is ~40% slower under Triton 3.8).
+Measured 2026-10-16 after the rebuild on main 9b68e007 (torch 2.14.1+cu126, Triton 3.8, transformers 5.18). Two
+prefill chunks of the 213K prompt logged `selected pages dropped` (a chunk's selection spans more than the 443
+host-tier slots); recall is unaffected. The rebuild on 9c635a15 measured 870 / 19,639 / 115,368 / 255,951 tokens at
+13.8 s / 1.6 min / 13.0 min / 36.3 min, 63 / 199 / 148 / 118 tok/s prefill and 17.1 / 17.1 / 16.5 / 15.3 tok/s decode.
+The Triton 3.8 decode regression of that rebuild is gone: in-process decode at 1K is 17.8 tok/s again.
 
 Before the indexer tiles and per-layer host-tier residency (both below), the same server took
 18.2 min for 84K tokens (11.0 tok/s decode) and 2 h 20 min for 247K (6.8 tok/s decode, with
@@ -91,7 +91,12 @@ Tool-call round trips (call, tool result, answer) pass on `/v1/chat/completions`
   QSA sparse attend retry ladder and 16-wide tiles (4.4x), GDN chunk tiles (12-13x per kernel, +38% prefill),
   NVFP4 MoE prefill and decode tiles, arithmetic e2m1 decode, MXFP8 GEMV sized for Pascal.
 - MXFP8 dequant fallback in bounded row chunks (the whole lm_head was a 2.4 GiB transient).
-- 32-bit stream memops when the device rejects the 64-bit ones (CPU MoE handshake, PLE row store).
+- 32-bit stream memops when the device rejects the 64-bit ones (CPU MoE handshake, PLE row store). Upstream's
+  #670 handshake writes a 64-bit task word, so in 32-bit mode the doorbell carries a registered index instead.
+- CPU MoE (#670 executor): AVX2 int8-activation NVFP4 dot (34 vs 23 GB/s for the fp32 dot) and NUMA-local
+  tiles over per-node expert rows (50 vs 36 GB/s, `ft bench bw --dtype nvfp4`); the KernelIo publish/combine
+  kernels built for sm_61 (nvcc 12). Our 16-row down tiles and expert-outer down loop were dropped: no gain
+  on the new executor.
 - PLE fill events recycled on the engine thread (a deadlock with the host-func handshake).
 - QSA selection compaction by column mark and scan (1.28 ms -> 0.17 ms per layer).
 - QSA indexer score kernel on 32-key tiles on 2 warps, 16-key tiles for decode rows (a 2048-row chunk at 224K:
@@ -119,11 +124,12 @@ Install (torch 2.14.1+cu126 and Triton 3.8: the cu130 builds dropped Pascal, and
 
 ```bash
 FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv sync --no-default-groups --group cu126 --no-install-project
-CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 uv pip install --no-build-isolation --no-deps -e .
+CC=gcc-14 CXX=g++-14 CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 uv pip install --no-build-isolation --no-deps -e .
 ```
 
-After changing the C++ sources or pulling: `CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 .venv/bin/python setup.py
-build_ext --inplace` (the CPU MoE executor degrades to the host-func handshake on a stale build).
+After changing the C++ sources or pulling: `CC=gcc-14 CXX=g++-14 CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14
+.venv/bin/python setup.py build_ext --inplace` (torch refuses gcc 16 for the CUDA extensions; a stale build fails at
+CPU MoE executor init). The startup log should say `handshake=kernel`.
 
 Clients: OpenAI chat/Responses and Anthropic Messages on port 8080, model `qwen3.8-flash-next`, tool parser
 `qwen3_coder` and reasoning parser `qwen3` auto-detected. Send reasoning back on later turns (preserve_thinking)
@@ -133,6 +139,6 @@ Known test failures on this card (other models' kernels that need more than 48 K
 MiniMax-M3 sparse attention, GLM DSA, FP8 block-scale MoE, NVFP4 sparse-MLA KV, and upstream's DeepSeek-V4/V4.1
 fp4/fp8 kernels (`test_dsv41_pack`, `test_dsv4_fp8_block_linear`); plus
 `test_scheme_for_agrees_with_the_stored_tensors[sentence-transformers/all-MiniLM-L6-v2]`, which scans a local HF cache,
-and `test_cpu_decode_q4_0_matches_ggml_mmvq`, whose GGUF CUDA extension crashes nvcc 12.9's `cudafe++` against the
-torch 2.14 headers (GGUF is not on this deployment's path).
-Full suite after the rebuild on main 9c635a15: 3171 passed, 58 failed (all in that list), 263 skipped.
+and three that fail on upstream main 9b68e007 itself (`test_every_registry_architecture_is_claimed_by_an_aot_entry`,
+`test_graph_capture_reuses_warm_offload_cache_before_capture`, `test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill`).
+Full suite after the rebuild on main 9b68e007: 3332 passed, 60 failed (all in that list), 271 skipped.
