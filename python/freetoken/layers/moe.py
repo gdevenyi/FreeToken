@@ -419,8 +419,9 @@ class OffloadMoELayer(MoELayer):
         uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
         n = uniq.numel()
         # Each ensure stamps a newer LRU step, so a later chunk evicts the earlier chunks' slots
-        # only once every other slot is gone; the engine's num_experts slot floor rules that out.
-        assert n <= cache.cache_size, f"{n} routed experts exceed the {cache.cache_size}-slot cache"
+        # only once every other slot of the layer's pool is gone.
+        pool = cache.pool_slots(self.layer_id)
+        assert n <= pool, f"{n} routed experts exceed layer {self.layer_id}'s {pool}-slot pool"
         uniq = uniq.to(torch.int32)
         for start in range(0, n, _ENSURE_CHUNK_IDS):
             part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place

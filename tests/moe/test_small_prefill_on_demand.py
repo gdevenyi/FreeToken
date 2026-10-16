@@ -105,7 +105,7 @@ def test_small_prefill_refuses_more_experts_than_the_cache_holds(monkeypatch):
     layer, cache = _layer_and_cache(torch.device("cpu"))
     monkeypatch.setattr(moe_mod, "_SMALL_PREFILL_TOKENS", 8)
     _record_paths(monkeypatch, layer, cache)
-    cache.cache_size = 4  # below the engine's num_experts floor
+    cache.pool_sizes = [4]  # a pool below the engine's num_experts floor
     ids = torch.tensor([[5, 0], [1, 7], [2, 5], [4, 0]], dtype=torch.int32)
     with pytest.raises(AssertionError, match="exceed"):
         layer._prefill_routed(torch.randn(4, 16), torch.full((4, 2), 0.5), ids)
