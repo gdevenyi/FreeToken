@@ -1258,6 +1258,7 @@ class Engine:
         #     marlin cap, non-positive pages, or too few GDN slots to run) must reject
         #     recoverably with the old cache intact -- NOT after teardown, which would
         #     leave the server unable to serve. These checks are model-agnostic.
+        moe_pool_sizes = None
         if moe_cache_size is not None:
             if self.moe_offload_cache is None:
                 raise CacheRebuildRejected(
@@ -1313,7 +1314,7 @@ class Engine:
         #     rather than freeing and then OOMing into permanent failure. The engine supplies
         #     the memory account; the pool answers whether its target geometry fits.
         target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(
-            moe_cache_size, moe_pool_sizes if moe_cache_size is not None else None
+            moe_cache_size, moe_pool_sizes
         )
         # Price the sibling GDN state pool at ITS target (physical slots = usable + padding
         # sink) and hand the bytes in -- the KV pool only budgets its own tiers.

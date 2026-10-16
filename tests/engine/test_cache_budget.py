@@ -441,6 +441,39 @@ def test_auto_moe_plan_prices_the_kv_host_tier(monkeypatch):
 
 
 
+def test_rebuild_without_a_moe_resize_reaches_the_pool_resize(monkeypatch):
+    """A KV-only rebuild (no moe_cache_size) passes the fit-check, tears down the graphs and
+    resizes the pools with no MoE pool split, instead of failing past the point of no return."""
+    from freetoken.engine.engine import Engine
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(linear_attention_group=lambda: None),
+        dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        max_extend_tokens=1024, max_seq_len=4096, kv_host_pages=0,
+    )
+    resized = {}
+
+    class Reached(Exception):
+        pass
+
+    def resize_pools(config, moe_cache_size, num_pages, num_mamba_slots, num_swa_pages, moe_pool_sizes=None):
+        resized.update(moe_cache_size=moe_cache_size, num_pages=num_pages, moe_pool_sizes=moe_pool_sizes)
+        raise Reached
+
+    engine = SimpleNamespace(
+        config=config, moe_offload_cache=None, kv_offloader=None, linear_state_pool=None,
+        kv_cache=SimpleNamespace(validate_rebuild=lambda config, **kwargs: None),
+        _baseline_free=1 << 30, _weights_bytes=0, num_pages=64, device=torch.device("cpu"),
+        graph_runner=SimpleNamespace(graph_bs_list=[1], destroy_cuda_graphs=lambda: None),
+        attn_backend=SimpleNamespace(reset_capture=lambda: None), _resize_pools=resize_pools,
+    )
+    engine._target_moe_and_expert_bytes = lambda size, sizes=None: (0, 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    with pytest.raises(Reached):
+        Engine.rebuild_runtime_cache(engine, num_pages=32)
+    assert resized == {"moe_cache_size": None, "num_pages": 32, "moe_pool_sizes": None}
+
+
 def test_rebuild_fit_check_reserves_the_gdn_prefill_workspace():
     """The runtime-rebuild fit-check prices the GDN prefill workspace like the startup sizing,
     so a rebuild cannot grow the pools back into the space reserved for it."""
@@ -506,10 +539,12 @@ def test_rebuild_fit_check_prices_the_kv_host_tier_not_logical_pages():
 
     engine = SimpleNamespace(
         config=config, kv_offloader=object(), linear_state_pool=None, kv_cache=StubQSA(),
-        moe_offload_cache=SimpleNamespace(validate_rebuild=lambda size: None),
+        moe_offload_cache=SimpleNamespace(decode_target="hybrid", validate_rebuild=lambda size, sizes=None: None),
+        _moe_pools=lambda batch: [SimpleNamespace(max_num_slots=1 << 20, min_num_slots=1, layers=[0], weight=1.0)],
+        _moe_expert_counts=None,
         _baseline_free=1 << 30, _weights_bytes=0, num_pages=1000 + 3600,
     )
-    engine._target_moe_and_expert_bytes = lambda size: (size, 1)
+    engine._target_moe_and_expert_bytes = lambda size, sizes=None: (size, 1)
     with pytest.raises(CacheRebuildRejected):
         Engine.rebuild_runtime_cache(engine, moe_cache_size=64)
 
