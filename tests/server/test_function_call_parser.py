@@ -394,6 +394,43 @@ def test_qwen3_coder_unclosed_function_tag_is_not_a_call():
     assert calls == [] and parser.recover_truncated_call() == []
 
 
+_CUT_TOOLS = [{"type": "function", "function": {
+    "name": "w", "parameters": {"type": "object", "properties": {"c": {"type": "string"}}}}}]
+_CUT_CALL = "<tool_call>\n<function=w>\n<parameter=c>\nLima\n</parameter>\n</function>\n</tool_call>"
+
+
+def _cut_both_ways(text):
+    one_shot = FunctionCallParser(_CUT_TOOLS, tool_call_parser="qwen3_coder").parse_non_stream(text)
+    parser = FunctionCallParser(_CUT_TOOLS, tool_call_parser="qwen3_coder")
+    texts, calls = _feed(parser, list(text))
+    calls += parser.finalize_stream()
+    streamed = "".join(c.parameters for c in calls if c.name is None)
+    texts.append(parser.finish_stream())
+    return one_shot, streamed, "".join(texts)
+
+
+@pytest.mark.parametrize("cut", range(len("Lima"), len("Lima\n</parameter>")))
+def test_qwen3_coder_call_cut_inside_the_parameter_close_keeps_its_value(cut):
+    # #710: max_tokens ends the call between the value and the ">" of </parameter>.
+    # Both modes must close the arguments as the same valid JSON, value kept and no
+    # markup in it or in the content.
+    start = _CUT_CALL.index("Lima")
+    one_shot, streamed, content = _cut_both_ways(_CUT_CALL[: start + cut])
+    assert [c.name for c in one_shot.calls] == ["w"]
+    assert json.loads(streamed) == {"c": "Lima"}
+    assert one_shot.calls[0].parameters == streamed
+    assert one_shot.normal_text == content == ""
+
+
+@pytest.mark.parametrize("cut", range(1, len("Lima")))
+def test_qwen3_coder_call_cut_inside_a_string_value_closes_it(cut):
+    # The streamed fragments already showed the partial value: one-shot agrees.
+    start = _CUT_CALL.index("Lima")
+    one_shot, streamed, _ = _cut_both_ways(_CUT_CALL[: start + cut])
+    assert json.loads(streamed) == {"c": "Lima"[:cut]}
+    assert one_shot.calls[0].parameters == streamed
+
+
 def test_streaming_support_flags():
     # Every registered detector is incremental-safe (buffered fallback remains as
     # the escape hatch for future formats, exercised via monkeypatch in

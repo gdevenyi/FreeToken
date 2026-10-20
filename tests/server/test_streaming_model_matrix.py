@@ -869,6 +869,26 @@ def test_qwen_truncated_inside_function_tag_is_not_recovered():
     assert (calls, finish) == ([], "length")
 
 
+@pytest.mark.parametrize("tail", ["\n", "\n<", "\n</", "\n</param", "\n</parameter"])
+def test_qwen_truncated_inside_parameter_close_keeps_the_value(tail):
+    # #710: a call cut by max_tokens after its value, inside </parameter>: the same valid
+    # arguments in both modes, and the streamed fragments add up to them.
+    pieces = ["<tool_call>", "\n<function=get_weather>\n<parameter=city>\n", "Lima", tail]
+    _, _, calls, finish = _qwen_parity(pieces, thinking=False, finish_reason="length")
+    assert (calls, finish) == ([("get_weather", {"city": "Lima"})], "length")
+    spec = GenSpec(messages=[], sampling_params=None, parser_tools=QWEN_TOOLS,
+                   template_tools=QWEN_TOOLS, chat_template_kwargs={"enable_thinking": False})
+    state = FakeState(pieces, tool_call_parser="qwen3_coder", reasoning_parser="qwen3",
+                      finish_reason="length")
+
+    async def stream():
+        return [ev async for ev in generate_events(42, spec, state)]
+
+    events = asyncio.run(stream())
+    fragments = "".join(ev.fragment for ev in events if isinstance(ev, ToolCallArgsDelta))
+    assert fragments == _calls(events)[0].parameters
+
+
 @pytest.mark.parametrize("pieces", [
     ["The parser looks for ", "<tool_call>", " tags", " and splits", " them."],
     ["Wrap calls in ", "<tool_call>", "...", "</tool_call>", " tags, then answer."],

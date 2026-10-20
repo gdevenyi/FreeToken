@@ -1143,6 +1143,47 @@ class InvokeParamStreamMixin:
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
+    def _ps_finalize_open_call(self) -> List[ToolCallItem]:
+        """The generation ended (max_tokens) inside an open call: close its arguments the
+        way the missing closers would have, so the streamed fragments end as valid JSON and
+        the one-shot replay returns the same arguments. A held suffix that could only grow
+        into the parameter closer is markup and is dropped, the value before it is kept.
+        Outside an open call (a cut header, a skipped unknown tool) nothing changes."""
+        mode = getattr(self, "_ps_mode", "idle")
+        if mode not in ("invoke", "pstr", "pbuf"):
+            return []
+        buf = self._buffer
+        ledger = self.streamed_args_for_tool[self.current_tool_id]
+        held = self._ends_with_partial_token(buf, self._ps_param_close) if mode != "invoke" else 0
+        value = buf[: len(buf) - held]
+        if mode == "pstr":
+            if not self._ps_lead_trimmed:
+                value = self._ps_trim_leading(value)
+            frag = self._json_escape_chunk(self._ps_trim_trailing(value)) + '"}'
+        elif mode == "pbuf" and held:
+            # Only the closer was cut: the typed value itself is complete.
+            raw = self._ps_trim_trailing(self._ps_trim_leading(value))
+            converted = self._ps_convert_value(self._ps_key, raw)
+            frag = (
+                self._ps_lead + json.dumps(self._ps_key, ensure_ascii=False) + ":"
+                + json.dumps(converted, ensure_ascii=False) + "}"
+            )
+        else:
+            frag = "}" if ledger else "{}"
+        index = self.current_tool_id
+        self.streamed_args_for_tool[index] += frag
+        try:
+            parsed = json.loads(self.streamed_args_for_tool[index])
+        except (json.JSONDecodeError, ValueError):
+            parsed = {}
+        self.prev_tool_call_arr[index]["arguments"] = parsed if isinstance(parsed, dict) else {}
+        self.current_tool_id += 1
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+        self._buffer = ""
+        self._ps_reset()
+        return [ToolCallItem(tool_index=index, name=None, parameters=frag)]
+
     def finish_streaming(self) -> str:
         residual, self._buffer = self._buffer, ""
         mode = getattr(self, "_ps_mode", "idle")
@@ -2201,6 +2242,10 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return "<function=" in text or self.bot_token in text
 
+    def finalize_streaming(self) -> List[ToolCallItem]:
+        """End-of-stream hook (FunctionCallParser.finalize_stream): close a call that
+        max_tokens cut off mid-arguments."""
+        return self._ps_finalize_open_call()
 
     def _build_partial_arguments_json(self, func_name: str, partial_body: str, tools: List[Tool]) -> Optional[str]:
         """Build the current argument JSON from a partial XML tool-call body."""
@@ -2263,6 +2308,9 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     opened[-1][2] += item.parameters
             if not step.normal_text and not step.calls:
                 break
+        for item in shadow.finalize_streaming():
+            if opened:
+                opened[-1][2] += item.parameters
         normal.append(shadow.finish_streaming())
 
         calls = []
