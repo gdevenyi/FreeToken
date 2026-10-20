@@ -43,7 +43,9 @@ def test_fp16_globals_load_as_fp32(tmp_path, monkeypatch, caplog):
             caplog.clear()
             FTWReader(str(path)).close()
             dense = dict(iter_ftw_weights(str(path)))
-            banks = load_ftw_banks(str(path), num_layers=1)
+            # the engine loads the banks under inference mode, which the bank reader threads do not inherit
+            with torch.inference_mode():
+                banks = load_ftw_banks(str(path), num_layers=1)
         assert sum("fp16" in r.getMessage() for r in caplog.records) == 1
 
         g = dense["model.layers.0.mlp.shared_expert.gate_proj.weight_global"]

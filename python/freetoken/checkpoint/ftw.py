@@ -1025,7 +1025,8 @@ def load_ftw_banks(
                     buf = _transient_buffer(win_len)
                     reader.read_into(memoryview(buf), window, workers=workers, chunk=chunk)
                     raw = torch.frombuffer(buf, dtype=torch.uint8, count=head_pad + layer_bytes)[head_pad:]
-                    bank.tensor.copy_(raw.view(torch.float16).view(shape))
+                    with torch.inference_mode():  # the banks are inference tensors; this thread does not inherit the mode
+                        bank.tensor.copy_(raw.view(torch.float16).view(shape))
                 pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
@@ -1035,7 +1036,8 @@ def load_ftw_banks(
                     buf = _transient_buffer(entry["nbytes"])
                     reader.read_into(memoryview(buf), entry, workers=workers, chunk=chunk)
                     raw = torch.frombuffer(buf, dtype=torch.float16, count=entry["nbytes"] // 2)
-                    bank.tensor.copy_(raw.view(bank.tensor.shape))
+                    with torch.inference_mode():  # as in _read_row
+                        bank.tensor.copy_(raw.view(bank.tensor.shape))
                 else:
                     reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
                 pins.submit(bank, residency[layer_id])
