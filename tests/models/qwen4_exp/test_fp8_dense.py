@@ -114,6 +114,22 @@ def test_fp8_linear_matches_bf16_on_the_dequantized_weight(rows: int):
 
 
 @requires_cuda
+def test_fp8_linear_row_does_not_depend_on_the_other_rows():
+    """Rows of one varlen prefill batch belong to different sequences: a row's output must not
+    move when another sequence's activations do (same M, so the GEMM config is unchanged)."""
+    from freetoken.layers.fp8_dynamic import fp8_dynamic_linear
+
+    torch.manual_seed(0)
+    w8, scale = _quantize_per_tensor((torch.randn(256, 128) * 0.02).to(torch.bfloat16))
+    w8, scale = w8.cuda(), scale.cuda()
+    mine = torch.randn(61, 128, device="cuda", dtype=torch.bfloat16)
+    other = torch.randn(53, 128, device="cuda", dtype=torch.bfloat16)
+    quiet = fp8_dynamic_linear(torch.cat([mine, other]), w8, scale)[:61]
+    loud = fp8_dynamic_linear(torch.cat([mine, other * 8]), w8, scale)[:61]
+    assert torch.equal(quiet, loud)
+
+
+@requires_cuda
 def test_quant_per_tensor_zero_input_is_finite():
     from freetoken.layers.fp8_dynamic import quant_per_tensor
 
