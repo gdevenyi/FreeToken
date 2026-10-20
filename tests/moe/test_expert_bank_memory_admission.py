@@ -44,14 +44,14 @@ def test_loader_auto_admission_consumes_effective_memory(
     chosen = []
 
     def build(*args, **kwargs):
-        chosen.append(args[5])  # _legacy_expert_banks(..., dummy, parallel, ...)
+        chosen.append(args[5])  # _method_expert_banks(..., dummy, parallel, ...)
         return expert_banks.ExpertBanks("bf16", {})
 
-    monkeypatch.setattr(expert_banks, "_legacy_expert_banks", build)
+    monkeypatch.setattr(expert_banks, "_method_expert_banks", build)
     config = SimpleNamespace(num_moe_layers=1, expert_quant="none")
 
     expert_banks.load_expert_banks(
-        str(tmp_path), config, device=torch.device("cpu"), dtype=torch.bfloat16
+        str(tmp_path), config, device=torch.device("cpu"), method=SimpleNamespace(kind=None)
     )
 
     assert chosen == [False]
@@ -76,14 +76,14 @@ def test_explicit_parallel_loader_override_bypasses_auto_admission(
         chosen.append(args[5])
         return expert_banks.ExpertBanks("bf16", {})
 
-    monkeypatch.setattr(expert_banks, "_legacy_expert_banks", build)
+    monkeypatch.setattr(expert_banks, "_method_expert_banks", build)
     config = SimpleNamespace(num_moe_layers=1, expert_quant="none")
 
     expert_banks.load_expert_banks(
         str(tmp_path),
         config,
         device=torch.device("cpu"),
-        dtype=torch.bfloat16,
+        method=SimpleNamespace(kind=None),
         parallel=True,
     )
 
