@@ -871,7 +871,6 @@ def _one_token_state() -> FakeState:
 # Result-changing vLLM fields this server does not implement: a set value must be a 400,
 # never a 200 computed as if the field were absent.
 UNIMPLEMENTED_COMPLETION_FIELDS = [
-    ("return_tokens_as_token_ids", True),
     ("logprob_token_ids", [32]),
     ("prompt_logprobs", 0),
     ("guided_json", {"type": "object"}),
@@ -1014,3 +1013,25 @@ def test_non_finite_logprobs_are_clamped_to_the_vllm_floor() -> None:
     content = chat["choices"][0]["logprobs"]["content"][0]
     assert content["logprob"] == -9999.0
     json.dumps(chat, allow_nan=False)
+
+
+def test_completion_return_tokens_as_token_ids_keys_by_id() -> None:
+    # two ids that decode to the same text stay two entries
+    a = entry(32, "\ufffd", -0.1)
+    a["top"][1].update(token_id=900, token="\ufffd")
+    req = _completion(logprobs=2, return_tokens_as_token_ids=True)
+    result = run(handle_completion(req, None, FakeState([reply("A", finished=True, logprobs=[a])]), {}))
+    expected = {
+        "tokens": ["token_id:32"],
+        "token_logprobs": [-0.1],
+        "top_logprobs": [{"token_id:32": -0.1, "token_id:900": -1.1}],
+        "text_offset": [0],
+    }
+    assert result["choices"][0]["logprobs"] == expected
+
+    stream_req = _completion(logprobs=2, return_tokens_as_token_ids=True, stream=True)
+    events = parse_sse(
+        run(_collect(stream_completion_chunks(42, stream_req, FakeState([reply("A", finished=True, logprobs=[a])]))))
+    )
+    streamed = [e["choices"][0]["logprobs"] for e in events if isinstance(e, dict) and e["choices"][0]["logprobs"]]
+    assert streamed == [expected]

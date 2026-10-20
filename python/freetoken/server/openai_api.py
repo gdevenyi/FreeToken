@@ -697,7 +697,9 @@ async def handle_completion(
             "text": echo_texts[index // req.n] + text,
             "finish_reason": finish_reason,
             "logprobs": (
-                completions_logprobs(entries, len(text)) if req.logprobs is not None else None
+                completions_logprobs(entries, len(text), req.return_tokens_as_token_ids)
+                if req.logprobs is not None
+                else None
             ),
             "_usage": (prompt_tokens, completion_tokens, cached_tokens),
         }
@@ -783,7 +785,11 @@ async def stream_completion_chunks(
                         "finish_reason": None,
                         # Mid-stream, a stamp past sent_len is held-back text still to come.
                         "logprobs": (
-                            completions_logprobs(pending, sent_len if ack.finished else None)
+                            completions_logprobs(
+                                pending,
+                                sent_len if ack.finished else None,
+                                req.return_tokens_as_token_ids,
+                            )
                             if pending
                             else None
                         ),
@@ -805,7 +811,9 @@ async def stream_completion_chunks(
                 "index": index,
                 "finish_reason": finish_reason,
                 "logprobs": (
-                    completions_logprobs(pending, sent_len) if pending else None
+                    completions_logprobs(pending, sent_len, req.return_tokens_as_token_ids)
+                    if pending
+                    else None
                 ),
             }],
         )
@@ -1145,7 +1153,6 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 # vLLM /v1/completions fields that change the result and are not implemented here: a set
 # value is a 400 rather than silently dropped by extra="allow".
 _UNIMPLEMENTED_COMPLETION_FIELDS = (
-    "return_tokens_as_token_ids",
     "logprob_token_ids",
     "prompt_logprobs",
     "guided_json",

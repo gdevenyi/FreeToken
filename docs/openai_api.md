@@ -65,6 +65,8 @@ parameters as above; plus:
 | `logprobs` | honoured, 0..32: raw pre-temperature logprobs of the sampled token and its top alternatives; -inf is sent as -9999 | honoured (`--max-logprobs`, default 20) | honoured | `n_probs` |
 | `allowed_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: sampling is masked to them at every position. With `logprobs` the values are renormalized over the set (vLLM's `processed_logprobs` at temperature 0), so `temperature > 0`, penalties, `min_tokens` and `logit_bias` are a 400 there; entries past the set are left out | honoured (raw logprobs unless `--logprobs-mode processed_logprobs`) | no | no |
 
+| `return_tokens_as_token_ids` | honoured: `tokens` and the `top_logprobs` keys are `token_id:N`, so ids that decode to the same text stay apart | honoured | n/a | no |
+
 Set values of the vLLM fields this server does not implement (`logprob_token_ids`,
 `prompt_logprobs`, `guided_*`, `structured_outputs`, `bad_words`, ...) are a 400 rather than
 ignored; `null` / `false` / empty pass. Empty prompts and more than 256 prompts x `n` are a 400.

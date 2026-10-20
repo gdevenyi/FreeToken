@@ -53,23 +53,30 @@ def chat_content_entry(entry: dict) -> dict:
     }
 
 
-def completions_logprobs(entries: list[dict], text_len: int | None = None) -> dict:
+def completions_logprobs(
+    entries: list[dict], text_len: int | None = None, as_token_ids: bool = False
+) -> dict:
     """Each entry's detokenizer-stamped ``text_offset`` is where its token starts in the
     generated text (the pieces of a split multi-byte character share its start). Given the
     finished text's ``text_len``, offsets are clipped to it, since a matched stop string
-    trims tokens off the end."""
+    trims tokens off the end. ``as_token_ids`` (vLLM return_tokens_as_token_ids) names
+    every token ``token_id:N`` instead of by its text."""
+
+    def name(item: dict) -> str:
+        return f"token_id:{item['token_id']}" if as_token_ids else item["token"]
+
     tokens: list[str] = []
     token_logprobs: list[float] = []
     top_logprobs: list[dict[str, float]] = []
 
     for entry in entries:
-        tokens.append(entry["token"])
+        tokens.append(name(entry))
         token_logprobs.append(_clamped(entry["logprob"]))
         top: dict[str, float] = {}
         for candidate in entry["top"]:
             # The legacy shape keys alternatives by text, and partial-UTF-8 candidates
             # all decode to U+FFFD: keep the most likely one per key.
-            key, logprob = candidate["token"], _clamped(candidate["logprob"])
+            key, logprob = name(candidate), _clamped(candidate["logprob"])
             if key not in top or logprob > top[key]:
                 top[key] = logprob
         top_logprobs.append(top)
