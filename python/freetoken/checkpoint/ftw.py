@@ -431,6 +431,10 @@ def _is_nvfp4_global(name: str) -> bool:
     return (m["base"] if m else name).endswith(("gate_up_global", "down_global", ".weight_global"))
 
 
+# fork-only: FTW dirs already warned about fp16 NVFP4 globals (one reader is opened per load stage)
+_FP16_GLOBALS_WARNED: set[str] = set()
+
+
 def is_ftw_checkpoint(path: str) -> bool:
     """True if ``path`` is a directory holding a FreeToken Weight (FTW) index."""
     return os.path.isfile(os.path.join(path, INDEX_NAME))
@@ -578,11 +582,14 @@ class FTWReader:
         self.dir = path
         self.shards, tensors = _validate_ftw_v1_index(path, self.index)
         self.tensors = {tensor["name"]: tensor for tensor in tensors}
-        fp16_globals = [n for n, t in self.tensors.items() if t["dtype"] == "float16" and _is_nvfp4_global(n)]
-        if fp16_globals:
-            raise ValueError(
-                f"{path!r} stores NVFP4 global scales as fp16 (e.g. {fp16_globals[0]!r}) but FreeToken reads them as fp32; "
-                "reconvert it from the source checkpoint with `ft checkpoint`"
+        # fork-only: an FTW converted before #739 keeps NVFP4 globals in fp16; the read paths upcast them to fp32
+        self.fp16_globals = {n for n, t in self.tensors.items() if t["dtype"] == "float16" and _is_nvfp4_global(n)}
+        if self.fp16_globals and os.path.realpath(path) not in _FP16_GLOBALS_WARNED:
+            _FP16_GLOBALS_WARNED.add(os.path.realpath(path))
+            logger.warning(
+                f"{path!r} stores {len(self.fp16_globals)} NVFP4 global scale entries as fp16 "
+                f"(e.g. {min(self.fp16_globals)!r}); upcasting them to fp32 at load, the fp16 rounding stays. "
+                "Reconvert with `ft checkpoint` for exact globals"
             )
         self._fds: dict[str, int] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}
@@ -774,6 +781,8 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool
                 else:
                     # torch.frombuffer rejects count=0 even with a non-empty backing map.
                     t = torch.empty(tuple(e["shape"]), dtype=dt)
+                if e["name"] in reader.fp16_globals:
+                    t = t.float()
                 if not _put((e["name"], t, buf, e["nbytes"])):
                     return
         except BaseException as ex:  # surface to consumer
@@ -952,15 +961,22 @@ def load_ftw_banks(
             )
         row_hb[name] = []
         row_view_args[name] = []
+        upcast = name in reader.fp16_globals
         for layer_id in range(num_layers):
             off = e["global_off"] + layer_id * layer_bytes
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off
-            bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
+            if upcast:
+                # read the fp16 window into a transient buffer, keep an fp32 bank
+                bank = HostBank((num_experts, *row_shape), torch.float32, backing=_backing(layer_id))
+                row_view_args[name].append(None)
+            else:
+                bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
+                row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
             row_hb[name].append(bank)
-            row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
-            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
+            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id,
+                             (head_pad, (num_experts, *row_shape)) if upcast else None))
 
     num_experts = next((e["shape"][0] for by_layer in per_layer_groups.values() for e in by_layer.values()), None)
     for base, by_layer in per_layer_groups.items():
@@ -977,7 +993,9 @@ def load_ftw_banks(
                 raise FTWFormatError(
                     f"FTW bank {base!r} layer {layer_id} is not {ALIGN}-aligned"
                 )
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            upcast = e["name"] in reader.fp16_globals
+            dtype = torch.float32 if upcast else _dtype_of(e["dtype"])
+            bank = HostBank(tuple(e["shape"]), dtype, backing=_backing(layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id))
@@ -998,15 +1016,28 @@ def load_ftw_banks(
                 bar.update(e["nbytes"])
 
             def _read_row(job):
-                _name, bank, win_off, win_len, layer_bytes, layer_id = job
-                reader.read_into(bank.memoryview(), {"global_off": win_off, "nbytes": win_len},
-                                 workers=workers, chunk=chunk)
+                _name, bank, win_off, win_len, layer_bytes, layer_id, upcast = job
+                window = {"global_off": win_off, "nbytes": win_len}
+                if upcast is None:
+                    reader.read_into(bank.memoryview(), window, workers=workers, chunk=chunk)
+                else:
+                    head_pad, shape = upcast
+                    buf = _transient_buffer(win_len)
+                    reader.read_into(memoryview(buf), window, workers=workers, chunk=chunk)
+                    raw = torch.frombuffer(buf, dtype=torch.uint8, count=head_pad + layer_bytes)[head_pad:]
+                    bank.tensor.copy_(raw.view(torch.float16).view(shape))
                 pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
             def _read_layer(job):
                 _name, bank, entry, layer_id = job
-                reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
+                if entry["name"] in reader.fp16_globals:
+                    buf = _transient_buffer(entry["nbytes"])
+                    reader.read_into(memoryview(buf), entry, workers=workers, chunk=chunk)
+                    raw = torch.frombuffer(buf, dtype=torch.float16, count=entry["nbytes"] // 2)
+                    bank.tensor.copy_(raw.view(bank.tensor.shape))
+                else:
+                    reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
@@ -1137,6 +1168,8 @@ def load_ftw_banks_to_device(path: str, *, num_layers: int, device: torch.device
                 ahead = ex.submit(_read, jobs[0])
                 for k, (name, layer_id, *_rest) in enumerate(jobs):
                     host = ahead.result()
+                    if host.dtype == torch.float16 and _is_nvfp4_global(name):
+                        host = host.float()
                     if k + 1 < len(jobs):
                         ahead = ex.submit(_read, jobs[k + 1])
                     if layer_id is None:
