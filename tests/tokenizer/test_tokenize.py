@@ -869,3 +869,15 @@ def test_tokenize_range_checks_allowed_token_ids(allowed, ok):
     else:
         with pytest.raises(ValueError, match="allowed_token_ids"):
             manager.tokenize([msg])
+
+
+@pytest.mark.parametrize(("ids", "ok"), [([0, 9, 4], True), ([3, 10], False), ([-1], False)])
+def test_tokenize_takes_token_id_prompts_as_is_within_the_vocabulary(ids, ok):
+    manager = TokenizeManager(RawTokenizer())
+    msg = TokenizeMsg(uid=1, text="", input_ids=ids, sampling_params=SamplingParams())
+    if ok:
+        out = manager.tokenize([msg])[0].input_ids
+        assert out.tolist() == ids and out.dtype == torch.int32
+    else:
+        with pytest.raises(ValueError, match="prompt token ids"):
+            manager.tokenize([msg])

@@ -54,7 +54,8 @@ effect; "400" means the server refuses the request with a clear message.
 
 ## Legacy completions: request
 
-`prompt` as a string or a list of strings (token-id prompts are refused); the same sampling
+`prompt` as a string, a list of strings, a list of token ids or a list of token-id lists
+(each id in `[0, len(tokenizer))`; not with `echo` or `suffix`); the same sampling
 parameters as above; plus:
 
 | parameter | FreeToken | vLLM | SGLang | llama.cpp |

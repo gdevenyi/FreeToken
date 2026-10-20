@@ -359,11 +359,11 @@ def test_tool_choice_none_keeps_tool_tags_as_content():
     assert choice["message"] == {"role": "assistant", "content": output}
 
 
-def test_completion_rejects_token_id_prompts():
+def test_completion_rejects_echo_with_token_id_prompts():
     state = FakeState([])
     response = run(
         handle_completion(
-            CompletionRequest(model="client-model", prompt=[1, 2, 3]),
+            CompletionRequest(model="client-model", prompt=[1, 2, 3], echo=True),
             request=None,
             state=state,
             model_sampling={},
@@ -373,7 +373,7 @@ def test_completion_rejects_token_id_prompts():
     assert response.status_code == 400
     body = json.loads(response.body)
     assert body["error"]["type"] == "invalid_request_error"
-    assert "token-id prompt" in body["error"]["message"]
+    assert "token-id prompts" in body["error"]["message"]
 
 
 def test_completion_accepts_text_prompt():

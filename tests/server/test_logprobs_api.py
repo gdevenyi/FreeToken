@@ -1035,3 +1035,54 @@ def test_completion_return_tokens_as_token_ids_keys_by_id() -> None:
     )
     streamed = [e["choices"][0]["logprobs"] for e in events if isinstance(e, dict) and e["choices"][0]["logprobs"]]
     assert streamed == [expected]
+
+
+class ManyUsersState(FakeState):
+    """Hands out a fresh uid per queued request and replies with the uid as the text."""
+
+    def __init__(self, tokenizer=None) -> None:
+        super().__init__([], tokenizer=tokenizer)
+        self.msgs = []
+
+    def new_user(self) -> int:
+        return 100 + len(self.msgs)
+
+    async def send_one(self, msg):
+        self.msgs.append(msg)
+
+    async def wait_for_ack(self, uid: int):
+        yield reply(str(uid), finished=True)
+
+
+def test_completion_token_id_prompts_fan_out_prompt_major() -> None:
+    state = ManyUsersState(tokenizer=VocabTokenizer())
+    req = _completion(prompt=[[1, 2], [3, 4, 5]], n=2)
+    result = run(handle_completion(req, None, state, {}))
+    assert [m.input_ids for m in state.msgs] == [[1, 2], [1, 2], [3, 4, 5], [3, 4, 5]]
+    assert all(m.text == "" for m in state.msgs)
+    choices = result["choices"]
+    assert [c["index"] for c in choices] == [0, 1, 2, 3]  # prompt i, sample k -> i*n + k
+    assert [c["text"] for c in choices] == ["100", "101", "102", "103"]
+
+
+def test_completion_flat_token_id_prompt_is_one_prompt() -> None:
+    state = ManyUsersState()
+    result = run(handle_completion(_completion(prompt=list(range(1, 300))), None, state, {}))
+    assert len(result["choices"]) == 1 and state.msgs[0].input_ids == list(range(1, 300))
+
+
+@pytest.mark.parametrize(
+    ("prompt", "tokenizer"),
+    [([[1], [248077]], VocabTokenizer()), ([5, -1], None), ([[2**40]], None)],
+)
+def test_completion_token_id_prompts_are_range_checked_before_queueing(prompt, tokenizer) -> None:
+    state = ManyUsersState(tokenizer=tokenizer)
+    resp = run(handle_completion(_completion(prompt=prompt), None, state, {}))
+    assert resp.status_code == 400 and "prompt token ids" in json.loads(resp.body)["error"]["message"]
+    assert state.msgs == []
+
+
+@pytest.mark.parametrize("extra", [{"echo": True}, {"suffix": "tail"}])
+def test_completion_token_id_prompts_refuse_echo_and_suffix(extra) -> None:
+    resp = run(handle_completion(_completion(prompt=[[1, 2]], **extra), None, ManyUsersState(), {}))
+    assert resp.status_code == 400

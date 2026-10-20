@@ -87,6 +87,10 @@ def _map_developer_role(
     return [{"role": "system", "content": join_system_contents(system)}] + rest
 
 
+def _ids_below(ids: List[int], bound: int) -> bool:
+    return min(ids) >= 0 and max(ids) < bound
+
+
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
@@ -105,8 +109,15 @@ class TokenizeManager:
         for msg in msgs:
             allowed = msg.sampling_params.allowed_token_ids
             # past the real vocabulary an id indexes the padded logits tail or beyond them
-            if allowed and not (min(allowed) >= 0 and max(allowed) < len(self.tokenizer)):
+            if allowed and not _ids_below(allowed, len(self.tokenizer)):
                 raise ValueError(f"allowed_token_ids must be in [0, {len(self.tokenizer)})")
+            if msg.input_ids is not None:
+                # an id past the embedding rows would fault the engine, not just this request
+                if msg.input_ids and not _ids_below(msg.input_ids, len(self.tokenizer)):
+                    raise ValueError(f"prompt token ids must be in [0, {len(self.tokenizer)})")
+                ids = torch.tensor(msg.input_ids, dtype=torch.int32)
+                results.append(UserMsg(uid=msg.uid, input_ids=ids, sampling_params=msg.sampling_params))
+                continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers

@@ -611,7 +611,8 @@ async def handle_completion(
         return create_error_response(unsupported)
     if not 1 <= req.n <= MAX_N:
         return create_error_response(f"n must be between 1 and {MAX_N}", param="n")
-    num_prompts = 1 if isinstance(req.prompt, str) else len(req.prompt)
+    prompts = _prompt_list(req.prompt)
+    num_prompts = len(prompts)
     if num_prompts * req.n > MAX_PROMPTS:
         return create_error_response(
             f"prompts x n must be at most {MAX_PROMPTS}, got {num_prompts * req.n}", param="prompt"
@@ -623,17 +624,21 @@ async def handle_completion(
         sampling = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
-    if sampling.allowed_token_ids:
-        # the tokenizer worker checks again; this one answers before anything is queued
-        vocab = await _vocab_len(state)
-        if vocab is not None and sampling.allowed_token_ids[-1] >= vocab:
+    token_prompts = _is_token_prompt(req.prompt)
+    if sampling.allowed_token_ids or token_prompts:
+        # The tokenizer worker checks again against its own tokenizer; this one answers
+        # before anything is queued (and keeps ids msgpack can carry without one).
+        bound = await _vocab_len(state) or _MAX_WIRE_TOKEN_ID
+        if sampling.allowed_token_ids and sampling.allowed_token_ids[-1] >= bound:
             return create_error_response(
-                f"allowed_token_ids must be below the vocabulary size {vocab}",
+                f"allowed_token_ids must be below the vocabulary size {bound}",
                 param="allowed_token_ids",
             )
+        if token_prompts and not all(0 <= t < bound for ids in prompts for t in ids):
+            return create_error_response(
+                f"prompt token ids must be in [0, {bound})", param="prompt"
+            )
 
-    prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
-    assert isinstance(prompts, list)
     if req.suffix is not None:
         markers = await _fim_markers(state)
         if markers is None:
@@ -653,7 +658,12 @@ async def handle_completion(
     for prompt in prompts:
         for _ in range(req.n):
             uid = state.new_user()
-            await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling))
+            msg = (
+                TokenizeMsg(uid=uid, text="", input_ids=prompt, sampling_params=sampling)
+                if token_prompts
+                else TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling)
+            )
+            await state.send_one(msg)
             uids.append(uid)
 
     if req.stream:
@@ -885,6 +895,10 @@ async def _merge_streams(
 
 
 _FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
+
+
+# Without a frontend tokenizer: the int32 the engine holds ids in (msgpack also needs a bound)
+_MAX_WIRE_TOKEN_ID = 2**31 - 1
 
 
 async def _vocab_len(state: Any) -> int | None:
@@ -1192,7 +1206,10 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if _empty_prompt(req):
         return "prompt must not be empty"
     if _is_token_prompt(req.prompt):
-        return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
+        if req.echo:
+            return "echo is not supported with token-id prompts"
+        if req.suffix is not None:
+            return "suffix is not supported with token-id prompts"
     logprobs_error = completion_logprobs_error(req)
     if logprobs_error is not None:
         return logprobs_error
@@ -1203,6 +1220,13 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
             "(supported: text, json_object, json_schema)"
         )
     return None
+
+
+def _prompt_list(prompt: Any) -> list:
+    """One entry per prompt: a string or a token-id list."""
+    if isinstance(prompt, str) or (prompt and all(isinstance(t, int) for t in prompt)):
+        return [prompt]
+    return list(prompt)
 
 
 def _is_token_prompt(prompt: Any) -> bool:
