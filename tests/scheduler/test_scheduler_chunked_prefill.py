@@ -14,6 +14,7 @@ prompt is inserted once when the final (non-chunked) chunk is processed.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 CHUNK = 8
@@ -237,3 +238,61 @@ def test_the_sliding_window_pool_cap_cannot_recut_an_image():
         for r in batch.reqs:
             r.complete_one()
     assert ends[0] == 4900 and ends[-1] == 6000
+
+
+def _passes(pm, cm, prompts, budget, isolate=True):
+    """Drain ``prompts`` ([(uid, prompt_len, read)]) and return each pass's (uid, extend_len) list."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    pm.isolate_logprob_reads = isolate
+    pm.pending_list = [
+        PendingReq(uid, torch.arange(n, dtype=torch.int32),
+                   SamplingParams(max_tokens=1, logprobs=True) if read else SamplingParams(max_tokens=4))
+        for uid, n, read in prompts
+    ]
+    passes = []
+    while pm.runnable:
+        batch = pm.schedule_next_batch(budget)
+        passes.append([(r.uid, r.extend_len) for r in batch.reqs])
+        cm.allocate_paged(batch.reqs)
+        for r in batch.reqs:
+            r.complete_one()
+    return passes
+
+
+READ, CHAT = True, False
+
+
+@pytest.mark.parametrize(
+    ("prompts", "expected"),
+    [
+        ([(1, 5, READ), (2, 6, READ)], [[(1, 5)], [(2, 6)]]),
+        ([(1, 5, CHAT), (2, 6, READ)], [[(1, 5)], [(2, 6)]]),
+        ([(1, 5, READ), (2, 6, CHAT)], [[(1, 5)], [(2, 6)]]),
+        ([(1, 5, CHAT), (2, 6, CHAT)], [[(1, 5), (2, 6)]]),
+        ([(1, 5, READ), (2, 6, READ), (3, 4, CHAT), (4, 3, CHAT)], [[(1, 5)], [(2, 6)], [(3, 4), (4, 3)]]),
+    ],
+)
+def test_isolated_logprob_read_prefills_alone(prompts, expected):
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    assert _passes(pm, cm, prompts, budget=32) == expected
+
+
+def test_isolation_off_keeps_reads_batched():
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompts = [(1, 5, READ), (2, 6, READ), (3, 4, CHAT)]
+    assert _passes(pm, cm, prompts, budget=32, isolate=False) == [[(1, 5), (2, 6), (3, 4)]]
+
+
+def test_isolated_chunked_read_continuations_stay_alone():
+    """Every chunk of a read runs alone and on the same cuts as a solo run (budget multiples)."""
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompts = [(1, 2 * CHUNK + 3, READ), (2, 4, CHAT)]
+    assert _passes(pm, cm, prompts, budget=CHUNK) == [[(1, CHUNK)], [(1, CHUNK)], [(1, 3)], [(2, 4)]]
+
+
+def test_isolated_read_waits_behind_a_chunked_chat_prompt():
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompts = [(1, CHUNK + 2, CHAT), (2, 4, READ)]
+    assert _passes(pm, cm, prompts, budget=CHUNK) == [[(1, CHUNK)], [(1, 2)], [(2, 4)]]

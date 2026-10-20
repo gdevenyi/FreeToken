@@ -324,6 +324,10 @@ class PrefillManager:
         log_cached_tokens = 0
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
+            # break, not continue: the slicing below assumes the admitted requests are a prefix
+            read = self.isolate_logprob_reads and pending_req.sampling_params.is_logprob_read
+            if read and reqs:
+                break  # a read never shares a pass
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
@@ -346,6 +350,8 @@ class PrefillManager:
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
+                if read:
+                    break  # nobody joins a read's pass
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:
