@@ -152,6 +152,7 @@ class CompletionRequest(BaseModel):
     stop_token_ids: list[int] | None = None
     include_stop_str_in_output: bool = False
     skip_special_tokens: bool | None = None
+    allowed_token_ids: list[int] | None = None
     # Accepted for OpenAI compatibility, not honoured: the batched sampling kernel has no
     # per-request generator (seed); user / metadata / store are opaque to the server.
     seed: int | None = None

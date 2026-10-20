@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -61,6 +62,13 @@ class ForwardInput(NamedTuple):
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+
+
+def logprob_candidates(ids: list[int], logprobs: list[float]) -> tuple[list[int], list[float]]:
+    """A row's top-logprob slice minus what is not a candidate: padding (-1 ids) and the
+    -inf tail of a row restricted to fewer allowed_token_ids than it asked for."""
+    keep = [k for k, (t, lp) in enumerate(zip(ids, logprobs)) if t >= 0 and math.isfinite(lp)]
+    return [int(ids[k]) for k in keep], [logprobs[k] for k in keep]
 
 
 class Scheduler(SchedulerIOMixin):
@@ -371,8 +379,10 @@ class Scheduler(SchedulerIOMixin):
                     row_chosen_logprob = float(outputs.chosen_logprobs_cpu[i].item())
                     requested_top = req.sampling_params.top_logprobs
                     if requested_top > 0 and outputs.top_ids_cpu is not None:
-                        row_top_ids = [int(t) for t in outputs.top_ids_cpu[i, :requested_top].tolist()]
-                        row_top_logprobs = outputs.top_logprobs_cpu[i, :requested_top].tolist()
+                        row_top_ids, row_top_logprobs = logprob_candidates(
+                            outputs.top_ids_cpu[i, :requested_top].tolist(),
+                            outputs.top_logprobs_cpu[i, :requested_top].tolist(),
+                        )
                     else:
                         row_top_ids = []
                         row_top_logprobs = []

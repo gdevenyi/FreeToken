@@ -54,6 +54,9 @@ class SamplingParams:
     # reports the chosen token's raw (pre-temperature) logprob and top-k alternatives.
     logprobs: bool = False
     top_logprobs: int = 0
+    # vLLM allowed_token_ids: sampling is masked to these ids (sorted, unique). A request that
+    # also asks for logprobs gets them renormalized over this set (Sampler.compute_logprobs).
+    allowed_token_ids: list[int] | None = None
     # Set by the tokenizer worker when the rendered prompt leaves a <think> block open, so
     # the detokenizer counts an unclosed generation as reasoning tokens.
     starts_in_reasoning: bool = False
@@ -70,6 +73,7 @@ class SamplingParams:
             self.min_p > 0.0
             or self.logit_bias
             or self.min_tokens > 0
+            or self.allowed_token_ids
         )
 
 

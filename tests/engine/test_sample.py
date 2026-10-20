@@ -67,3 +67,18 @@ def test_penalized_logits_reach_the_probability_sampler(monkeypatch):
     assert seen["logits"][0].tolist() == [0.0, 1.0, 2.0, 0.0]  # presence: -3 once, not per count
     assert seen["logits"][1].tolist() == [0.0, 4.0, 2.0, 0.0]
     assert tokens.tolist() == [2, 1]
+
+
+def test_sampled_rows_draw_only_allowed_ids(monkeypatch):
+    def fake_sample_impl(logits, temperatures, top_k, top_p):
+        probs = torch.softmax(logits / temperatures.unsqueeze(-1), dim=-1)
+        return torch.multinomial(probs, 1, generator=torch.Generator().manual_seed(0)).flatten()
+
+    monkeypatch.setattr(S, "sample_impl", fake_sample_impl)
+    sampler = S.Sampler(torch.device("cpu"), 6)
+    allowed = [1, 4]
+    batch = _batch(SamplingParams(temperature=1.5, allowed_token_ids=allowed), SamplingParams(temperature=0.0))
+    logits = torch.tensor([[3.0, 0.0, 3.0, 3.0, 0.0, 3.0], [0.0, 0.0, 0.0, 5.0, 0.0, 0.0]])
+    for _ in range(50):
+        tokens = sampler.sample(logits, sampler.prepare(batch))
+        assert tokens[0].item() in allowed and tokens[1].item() == 3

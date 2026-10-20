@@ -549,7 +549,7 @@ def test_logprobs_validation_errors() -> None:
 
     completion_out_of_range = run(
         handle_completion(
-            CompletionRequest(model="client-model", prompt="hello", logprobs=7),
+            CompletionRequest(model="client-model", prompt="hello", logprobs=33),
             None,
             FakeState([]),
             {},
@@ -871,7 +871,6 @@ def _one_token_state() -> FakeState:
 # Result-changing vLLM fields this server does not implement: a set value must be a 400,
 # never a 200 computed as if the field were absent.
 UNIMPLEMENTED_COMPLETION_FIELDS = [
-    ("allowed_token_ids", [32, 33]),
     ("return_tokens_as_token_ids", True),
     ("logprob_token_ids", [32]),
     ("prompt_logprobs", 0),
@@ -934,3 +933,84 @@ def test_completion_passes_the_context_length_code_through() -> None:
 
     events = parse_sse(run(_collect(stream_completion_chunks(42, _completion(stream=True), FakeState([_too_long()])))))
     assert events[0]["error"]["code"] == "context_length_exceeded"
+
+
+class VocabTokenizer(QwenTokenizer):
+    def __len__(self) -> int:
+        return 248077
+
+
+def _status(resp) -> int:
+    return getattr(resp, "status_code", 200)
+
+
+def test_completion_logprobs_cap_is_32() -> None:
+    assert _status(run(handle_completion(_completion(logprobs=32), None, _one_token_state(), {}))) == 200
+    assert _status(run(handle_completion(_completion(logprobs=33), None, _one_token_state(), {}))) == 400
+
+
+def test_completion_allowed_token_ids_reach_the_engine_sorted_and_unique() -> None:
+    state = _one_token_state()
+    req = _completion(allowed_token_ids=[33, 32, 33], logprobs=2, temperature=0)
+    assert _status(run(handle_completion(req, None, state, {"temperature": 0.6}))) == 200
+    assert state.sent.sampling_params.allowed_token_ids == [32, 33]
+
+
+@pytest.mark.parametrize(
+    ("ids", "fragment"),
+    [([], "1 to 1024"), (list(range(1025)), "1 to 1024"), ([-1, 3], "non-negative"), ([248077], "vocabulary")],
+)
+def test_completion_allowed_token_ids_out_of_range(ids, fragment) -> None:
+    state = FakeState([], tokenizer=VocabTokenizer())
+    resp = run(handle_completion(_completion(allowed_token_ids=ids), None, state, {}))
+    assert resp.status_code == 400 and fragment in json.loads(resp.body)["error"]["message"]
+    assert state.sent is None
+
+
+def test_completion_allowed_token_ids_at_the_vocab_edge_pass() -> None:
+    state = FakeState([reply("A", finished=True)], tokenizer=VocabTokenizer())
+    assert _status(run(handle_completion(_completion(allowed_token_ids=[0, 248076]), None, state, {}))) == 200
+
+
+@pytest.mark.parametrize(
+    ("extra", "model_sampling"),
+    [
+        ({"temperature": 0.7}, {}),
+        ({}, {"temperature": 0.6}),  # the checkpoint default counts, not just the request
+        ({"temperature": 0, "presence_penalty": 0.5}, {}),
+        ({"temperature": 0, "frequency_penalty": 0.5}, {}),
+        ({"temperature": 0, "repetition_penalty": 1.1}, {}),
+        ({"temperature": 0}, {"repetition_penalty": 1.05}),
+        ({"temperature": 0, "min_tokens": 1}, {}),
+        ({"temperature": 0, "logit_bias": {"32": 1.0}}, {}),
+    ],
+)
+def test_restricted_logprobs_refuse_what_they_would_not_fold_in(extra, model_sampling) -> None:
+    req = _completion(allowed_token_ids=[32, 33], logprobs=2, **extra)
+    assert _status(run(handle_completion(req, None, _one_token_state(), model_sampling))) == 400
+
+
+def test_allowed_token_ids_without_logprobs_may_sample() -> None:
+    req = _completion(allowed_token_ids=[32, 33], temperature=0.7, presence_penalty=0.5)
+    assert _status(run(handle_completion(req, None, _one_token_state(), {}))) == 200
+
+
+def test_non_finite_logprobs_are_clamped_to_the_vllm_floor() -> None:
+    inf = float("inf")
+    sampled = entry(32, "A", -inf)
+    sampled["top"][1]["logprob"] = float("nan")
+    state = FakeState([reply("A", finished=True, logprobs=[sampled])])
+    result = run(handle_completion(_completion(logprobs=2), None, state, {}))
+    lp = result["choices"][0]["logprobs"]
+    assert lp["token_logprobs"] == [-9999.0] and lp["top_logprobs"] == [{"A": -9999.0, "x": -9999.0}]
+    json.dumps(result, allow_nan=False)
+
+    chat = run(
+        handle_chat_completion(
+            chat_request(logprobs=True, top_logprobs=2), None,
+            FakeState([reply("A", finished=True, logprobs=[sampled])]), {},
+        )
+    )
+    content = chat["choices"][0]["logprobs"]["content"][0]
+    assert content["logprob"] == -9999.0
+    json.dumps(chat, allow_nan=False)

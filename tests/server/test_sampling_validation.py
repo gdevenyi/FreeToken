@@ -54,3 +54,14 @@ def test_a_positive_top_k_is_kept():
 def test_the_other_sampling_ranges_are_still_rejected(field, value):
     with pytest.raises(ValueError, match=field):
         _resolve_with(**{field: value})
+
+
+def test_allowed_token_ids_are_sorted_and_deduplicated():
+    assert _resolve_with(allowed_token_ids=[9, 3, 9, 0]).allowed_token_ids == [0, 3, 9]
+    assert _resolve_with().allowed_token_ids is None
+
+
+@pytest.mark.parametrize("ids", [[], list(range(1025)), [4, -2]])
+def test_allowed_token_ids_size_and_sign_are_checked(ids):
+    with pytest.raises(ValueError, match="allowed_token_ids"):
+        _resolve_with(allowed_token_ids=ids)

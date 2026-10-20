@@ -623,6 +623,14 @@ async def handle_completion(
         sampling = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
+    if sampling.allowed_token_ids:
+        # the tokenizer worker checks again; this one answers before anything is queued
+        vocab = await _vocab_len(state)
+        if vocab is not None and sampling.allowed_token_ids[-1] >= vocab:
+            return create_error_response(
+                f"allowed_token_ids must be below the vocabulary size {vocab}",
+                param="allowed_token_ids",
+            )
 
     prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
     assert isinstance(prompts, list)
@@ -871,6 +879,18 @@ async def _merge_streams(
 _FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
 
 
+async def _vocab_len(state: Any) -> int | None:
+    """``len(tokenizer)`` (added tokens included), or None without a frontend tokenizer."""
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None
+    try:
+        manager = await asyncio.to_thread(build)
+        return len(manager.tokenizer)
+    except Exception:  # noqa: BLE001 -- the tokenizer worker still range-checks
+        return None
+
+
 async def _fim_markers(state: Any) -> tuple[str, str, str] | None:
     """The model's fill-in-the-middle marker strings when its vocabulary has them
     (Qwen / DeepSeek-Coder style), else None."""
@@ -985,11 +1005,28 @@ def _resolve_sampling(
         stop_token_ids=req.stop_token_ids,
         include_stop_str_in_output=req.include_stop_str_in_output,
         skip_special_tokens=req.skip_special_tokens,
+        allowed_token_ids=req.allowed_token_ids if isinstance(req, CompletionRequest) else None,
     )
     if isinstance(req, CompletionRequest) and req.logprobs is not None:
         sampling_params.logprobs = True
         sampling_params.top_logprobs = req.logprobs
+        if sampling_params.allowed_token_ids:
+            _check_restricted_logprobs(sampling_params)
     return sampling_params
+
+
+def _check_restricted_logprobs(sp: SamplingParams) -> None:
+    """Logprobs restricted to allowed_token_ids are vLLM's processed_logprobs at temperature 0:
+    log_softmax over the allowed ids of the unprocessed logits. Anything vLLM would also fold
+    into them is refused rather than silently left out."""
+    if sp.temperature > 0:
+        raise ValueError("allowed_token_ids with logprobs needs temperature=0")
+    if sp.presence_penalty or sp.frequency_penalty or sp.repetition_penalty != 1.0:
+        raise ValueError("allowed_token_ids with logprobs does not support penalties")
+    if sp.min_tokens > 0:
+        raise ValueError("allowed_token_ids with logprobs does not support min_tokens")
+    if sp.logit_bias:
+        raise ValueError("allowed_token_ids with logprobs does not support logit_bias")
 
 
 def _response_id(prefix: str, req: Any, fallback: Any) -> str:
@@ -1108,7 +1145,6 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 # vLLM /v1/completions fields that change the result and are not implemented here: a set
 # value is a 400 rather than silently dropped by extra="allow".
 _UNIMPLEMENTED_COMPLETION_FIELDS = (
-    "allowed_token_ids",
     "return_tokens_as_token_ids",
     "logprob_token_ids",
     "prompt_logprobs",

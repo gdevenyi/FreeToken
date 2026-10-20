@@ -1,9 +1,12 @@
+import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import SamplingParams
 from freetoken.engine.sample import BatchSamplingArgs, Sampler
+from freetoken.scheduler.scheduler import logprob_candidates
 
 
 def test_compute_logprobs_matches_raw_log_softmax_and_sorted_top() -> None:
@@ -219,3 +222,76 @@ def test_compute_logprobs_builds_row_index_on_host(monkeypatch) -> None:
         for got, ref in zip(result, expected, strict=True):
             assert got.shape == ref.shape and got.dtype == ref.dtype
             assert torch.equal(got.nan_to_num(-7.0), ref.nan_to_num(-7.0))
+
+
+def _restricted_batch(*params: SamplingParams) -> SimpleNamespace:
+    return SimpleNamespace(reqs=[SimpleNamespace(sampling_params=p) for p in params])
+
+
+def test_restricted_logprobs_renormalize_over_the_allowed_ids() -> None:
+    sampler = Sampler(torch.device("cpu"), vocab_size=6)
+    logits = torch.tensor([[0.5, 2.0, -1.0, 3.0, 0.0, 1.0]])
+    allowed = [1, 2, 4]
+    args = sampler.prepare(
+        _restricted_batch(SamplingParams(logprobs=True, top_logprobs=3, allowed_token_ids=allowed))
+    )
+    chosen, top_ids, top_logprobs = sampler.compute_logprobs(logits, torch.tensor([1]), args)
+
+    expected = logits[0, allowed] - torch.logsumexp(logits[0, allowed], dim=-1)
+    assert torch.isclose(chosen[0], expected[0])
+    assert top_ids[0].tolist() == [1, 4, 2]
+    assert torch.allclose(top_logprobs[0], expected[[0, 2, 1]])
+    assert torch.exp(top_logprobs[0]).sum().item() == pytest.approx(1.0)
+
+
+def test_restricted_and_raw_rows_share_a_batch() -> None:
+    # K=20 over 4 labels next to a raw K=20 row: topk still runs over the whole row, and
+    # the restricted row's tail past its labels is -inf (dropped by the scheduler).
+    vocab = 64
+    sampler = Sampler(torch.device("cpu"), vocab_size=vocab)
+    logits = torch.randn(3, vocab, generator=torch.Generator().manual_seed(1))
+    labels = [32, 33, 34, 35]
+    raw = SamplingParams(logprobs=True, top_logprobs=20)
+    restricted = SamplingParams(logprobs=True, top_logprobs=20, allowed_token_ids=labels)
+    unasked = SamplingParams()
+    sampled = torch.tensor([5, 33, 7])
+
+    snapshot = logits.clone()
+    mixed = sampler.compute_logprobs(
+        logits, sampled, sampler.prepare(_restricted_batch(raw, restricted, unasked))
+    )
+    plain = sampler.compute_logprobs(
+        logits, sampled, sampler.prepare(_restricted_batch(raw, raw, unasked))
+    )
+    assert torch.equal(logits, snapshot)  # the engine's logits are not masked in place
+
+    chosen, top_ids, top_logprobs = mixed
+    assert torch.equal(chosen[0], plain[0][0])
+    assert torch.equal(top_ids[0], plain[1][0]) and torch.equal(top_logprobs[0], plain[2][0])
+
+    finite = torch.isfinite(top_logprobs[1])
+    assert finite.sum().item() == 4
+    assert sorted(top_ids[1][finite].tolist()) == labels
+    expected = torch.log_softmax(logits[1, labels], dim=-1)
+    assert torch.isclose(chosen[1], expected[1])
+
+    ids, values = logprob_candidates(top_ids[1].tolist(), top_logprobs[1].tolist())
+    assert sorted(ids) == labels and all(map(math.isfinite, values))
+
+
+def test_restricted_logprobs_on_an_all_rows_fp32_batch_leave_the_logits_alone() -> None:
+    sampler = Sampler(torch.device("cpu"), vocab_size=5)
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
+    args = sampler.prepare(
+        _restricted_batch(SamplingParams(logprobs=True, top_logprobs=2, allowed_token_ids=[0, 0, 1]))
+    )
+    assert args.logprob_all_rows
+    chosen, top_ids, _ = sampler.compute_logprobs(logits, torch.tensor([1]), args)
+    assert top_ids[0].tolist() == [1, 0]
+    assert torch.isclose(chosen[0], torch.log_softmax(torch.tensor([1.0, 2.0]), dim=-1)[1])
+    assert logits.tolist() == [[1.0, 2.0, 3.0, 4.0, 5.0]]
+
+
+def test_logprob_candidates_drop_padding_and_non_finite_entries() -> None:
+    inf = float("inf")
+    assert logprob_candidates([3, -1, 4, 5], [-0.1, -inf, -inf, float("nan")]) == ([3], [-0.1])

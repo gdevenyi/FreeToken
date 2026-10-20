@@ -33,6 +33,9 @@ class LogitsPlan:
     min_rows: torch.Tensor | None = None  # [m] int64 local rows
     min_ids: torch.Tensor | None = None  # [m, S] int64
     min_p: torch.Tensor | None = None  # [r, 1] float32 (0 = off for that row)
+    # Rows with allowed_token_ids and their ids, padded with vocab_size like min_ids.
+    allow_rows: torch.Tensor | None = None  # [a] int64 local rows
+    allow_ids: torch.Tensor | None = None  # [a, A] int64
 
 
 class RowPenalty(NamedTuple):
@@ -62,6 +65,9 @@ class BatchSamplingArgs:
     logprob_row_idx: torch.Tensor | None = None
     logprob_all_rows: bool = False
     max_top_logprobs: int = 0
+    # Logprob rows restricted to their allowed_token_ids, indexing the logprob rows above.
+    restrict_rows: torch.Tensor | None = None  # [q] int64
+    restrict_ids: torch.Tensor | None = None  # [q, A] int64, padded with vocab_size
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -74,6 +80,13 @@ def _padded_rows(rows: list[list[int]], pad: int, device: torch.device) -> torch
     """[len(rows), max_len] int64 with ``pad`` on the right."""
     width = max(1, max((len(r) for r in rows), default=1))
     return make_device_tensor([r + [pad] * (width - len(r)) for r in rows], torch.int64, device)
+
+
+def disallowed_mask(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """[a, V] bool, True outside each row's ids (the vocab_size padding column is dropped)."""
+    block = torch.ones((ids.shape[0], vocab_size + 1), dtype=torch.bool, device=ids.device)
+    block.scatter_(1, ids, False)
+    return block[:, :vocab_size]
 
 
 def apply_penalties(logits: torch.Tensor, penalties: list[RowPenalty]) -> torch.Tensor:
@@ -98,7 +111,8 @@ def apply_logits_processors(
     logits: torch.Tensor, plan: LogitsPlan, vocab_size: int
 ) -> torch.Tensor:
     """A float32 copy of ``logits`` with the plan applied to its rows: logit_bias, the
-    min_tokens mask, then min_p. Rows outside the plan are copied unchanged."""
+    allowed_token_ids and min_tokens masks, then min_p. Rows outside the plan are copied
+    unchanged."""
     out = logits.to(torch.float32, copy=True)
     sub = out[plan.rows]  # [r, V] (advanced indexing copies)
     device = sub.device
@@ -106,6 +120,10 @@ def apply_logits_processors(
 
     if plan.bias_ids is not None:
         sub.index_put_((plan.bias_rows, plan.bias_ids), plan.bias_vals, accumulate=True)
+
+    if plan.allow_ids is not None:
+        rows = sub[plan.allow_rows]
+        sub[plan.allow_rows] = rows.masked_fill(disallowed_mask(plan.allow_ids, vocab_size), neg_inf)
 
     if plan.min_ids is not None:
         block = torch.zeros((plan.min_ids.shape[0], vocab_size + 1), dtype=torch.bool, device=device)
@@ -199,9 +217,19 @@ class Sampler:
             plan.min_rows = make_device_tensor(min_rows, torch.int64, self.device)
             plan.min_ids = _padded_rows(min_ids, pad, self.device)
 
+        allow = [(local, self._allowed(p)) for local, (_, p) in enumerate(picked)]
+        allow = [(local, ids) for local, ids in allow if ids]
+        if allow:
+            plan.allow_rows = make_device_tensor([local for local, _ in allow], torch.int64, self.device)
+            plan.allow_ids = _padded_rows([ids for _, ids in allow], pad, self.device)
+
         if any(p.min_p > 0.0 for _, p in picked):
             plan.min_p = make_device_tensor([[p.min_p] for _, p in picked], torch.float32, self.device)
         return plan
+
+    def _allowed(self, p) -> list[int]:
+        # an empty list after the filter leaves the row unmasked rather than all -inf
+        return [t for t in p.allowed_token_ids or () if 0 <= t < self.vocab_size]
 
     def _prompt_mask(self, req) -> torch.Tensor:
         """[V] bool marking the request's prompt ids, uploaded once per request."""
@@ -258,6 +286,12 @@ class Sampler:
         max_top_logprobs = min(
             max((p.top_logprobs for p in params if p.logprobs), default=0), self.vocab_size
         )
+        restrict = [(i, self._allowed(p)) for i, p in enumerate(p for p in params if p.logprobs)]
+        restrict = [(i, ids) for i, ids in restrict if ids]
+        restrict_rows = restrict_ids = None
+        if restrict:
+            restrict_rows = make_device_tensor([i for i, _ in restrict], torch.int64, self.device)
+            restrict_ids = _padded_rows([ids for _, ids in restrict], self.vocab_size, self.device)
         if all(is_greedy):
             return BatchSamplingArgs(
                 temperatures=None,
@@ -266,6 +300,8 @@ class Sampler:
                 logprob_row_idx=logprob_row_idx,
                 logprob_all_rows=logprob_all_rows,
                 max_top_logprobs=max_top_logprobs,
+                restrict_rows=restrict_rows,
+                restrict_ids=restrict_ids,
             )
 
         MIN_P = MIN_T = 1e-6
@@ -299,6 +335,8 @@ class Sampler:
             logprob_row_idx=logprob_row_idx,
             logprob_all_rows=logprob_all_rows,
             max_top_logprobs=max_top_logprobs,
+            restrict_rows=restrict_rows,
+            restrict_ids=restrict_ids,
         )
 
     @nvtx_annotate("Sampler")
@@ -337,7 +375,14 @@ class Sampler:
             return None
 
         request_logits = (logits if rows is None else logits.index_select(0, rows)).float()
-        # Reported values are raw model logprobs (pre-temperature log_softmax over logits).
+        if args.restrict_rows is not None:
+            # not in place: on an fp32 batch request_logits can be the engine's logits view
+            masked = request_logits[args.restrict_rows].masked_fill(
+                disallowed_mask(args.restrict_ids, self.vocab_size), float("-inf")
+            )
+            request_logits = request_logits.index_put((args.restrict_rows,), masked)
+        # Reported values are raw model logprobs (pre-temperature log_softmax over logits),
+        # renormalized over allowed_token_ids on the restricted rows.
         request_logprobs = torch.log_softmax(request_logits, dim=-1)
 
         request_tokens = sampled_tokens.to(dtype=torch.long, device=logits.device)
