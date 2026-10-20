@@ -75,7 +75,11 @@ class PrefillAdder:
 
         # TODO: consider host cache match case (it needs the same replay cap)
         replay = self.cache_manager.prefix_replay_tokens
-        mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
+        if self.isolate_logprob_reads and req.sampling_params.is_logprob_read:
+            max_len = 0  # a resumed prefill differs numerically from a cold one
+        else:
+            max_len = max(0, req.input_len - replay) if replay else None
+        mr = self.cache_manager.match_req(req, max_len=max_len)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
