@@ -710,9 +710,13 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     from freetoken.core import Context, Req, get_global_ctx
     from freetoken.engine.graph import GraphRunner
 
+    import freetoken.engine.graph as graph_mod
+
     events = []
     _init_tp()
     monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
+    # the fake graph has no CUDA graph exec for #697's capture-time cuGraphUpload
+    monkeypatch.setattr(graph_mod, "_upload_graph", lambda graph, stream: None)
 
     class FakeGraph:
         def pool(self):
