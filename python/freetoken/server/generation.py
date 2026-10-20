@@ -446,6 +446,9 @@ class GenSpec:
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
 # vLLM's MAX_NUM_ALLOWED_TOKEN_IDS: bounds the per-row mask upload
 MAX_ALLOWED_TOKEN_IDS = 1024
+# The int32 the engine holds ids in; also keeps them within what msgpack carries. The API
+# narrows this to len(tokenizer) when it has a frontend tokenizer, the tokenizer worker always.
+MAX_TOKEN_ID = 2**31 - 1
 
 
 def resolve_sampling(
@@ -515,12 +518,12 @@ def resolve_sampling(
                 tid = int(key)
             except (TypeError, ValueError):
                 raise ValueError(f"logit_bias keys must be token ids, got {key!r}") from None
-            if tid < 0:
-                raise ValueError(f"logit_bias token id must be >= 0, got {tid}")
+            if not 0 <= tid <= MAX_TOKEN_ID:
+                raise ValueError(f"logit_bias token id must be in [0, {MAX_TOKEN_ID}], got {tid}")
             bias.append([tid, max(-100.0, min(100.0, float(value)))])  # the OpenAI range
     ids = [int(t) for t in (stop_token_ids or [])]
-    if any(t < 0 for t in ids):
-        raise ValueError("stop_token_ids must be non-negative token ids")
+    if not all(0 <= t <= MAX_TOKEN_ID for t in ids):
+        raise ValueError(f"stop_token_ids must be token ids in [0, {MAX_TOKEN_ID}]")
     allowed = None
     if allowed_token_ids is not None:
         if not 1 <= len(allowed_token_ids) <= MAX_ALLOWED_TOKEN_IDS:
@@ -528,8 +531,8 @@ def resolve_sampling(
                 f"allowed_token_ids must hold 1 to {MAX_ALLOWED_TOKEN_IDS} ids, got {len(allowed_token_ids)}"
             )
         allowed = sorted({int(t) for t in allowed_token_ids})
-        if allowed[0] < 0:
-            raise ValueError("allowed_token_ids must be non-negative token ids")
+        if not 0 <= allowed[0] <= allowed[-1] <= MAX_TOKEN_ID:
+            raise ValueError(f"allowed_token_ids must be token ids in [0, {MAX_TOKEN_ID}]")
     params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,

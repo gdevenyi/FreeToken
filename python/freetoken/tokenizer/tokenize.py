@@ -107,10 +107,10 @@ class TokenizeManager:
         results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
-            allowed = msg.sampling_params.allowed_token_ids
             # past the real vocabulary an id indexes the padded logits tail or beyond them
-            if allowed and not _ids_below(allowed, len(self.tokenizer)):
-                raise ValueError(f"allowed_token_ids must be in [0, {len(self.tokenizer)})")
+            for name, ids in msg.sampling_params.client_token_ids():
+                if not _ids_below(ids, len(self.tokenizer)):
+                    raise ValueError(f"{name} must be in [0, {len(self.tokenizer)})")
             if msg.input_ids is not None:
                 # an id past the embedding rows would fault the engine, not just this request
                 if msg.input_ids and not _ids_below(msg.input_ids, len(self.tokenizer)):

@@ -881,3 +881,18 @@ def test_tokenize_takes_token_id_prompts_as_is_within_the_vocabulary(ids, ok):
     else:
         with pytest.raises(ValueError, match="prompt token ids"):
             manager.tokenize([msg])
+
+
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        (SamplingParams(logit_bias=[[10, 1.0]]), "logit_bias"),
+        (SamplingParams(stop_token_ids=[3, 10]), "stop_token_ids"),
+    ],
+)
+def test_tokenize_range_checks_logit_bias_and_stop_token_ids(params, field):
+    manager = TokenizeManager(RawTokenizer())
+    with pytest.raises(ValueError, match=field):
+        manager.tokenize([TokenizeMsg(uid=1, text="hi", sampling_params=params)])
+    ok = SamplingParams(logit_bias=[[9, 1.0]], stop_token_ids=[0, 9])
+    assert manager.tokenize([TokenizeMsg(uid=1, text="hi", sampling_params=ok)])[0].input_ids.tolist() == [1, 2, 3]

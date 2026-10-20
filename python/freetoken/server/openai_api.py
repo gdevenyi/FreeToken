@@ -36,6 +36,7 @@ from .logprobs import (
 )
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    MAX_TOKEN_ID,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -344,6 +345,8 @@ async def handle_chat_completion(
         )
     except ValueError as exc:
         return create_error_response(str(exc))
+    if (bad := await _token_id_error(state, spec.sampling_params.client_token_ids())) is not None:
+        return bad
 
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
@@ -628,19 +631,11 @@ async def handle_completion(
     except ValueError as exc:
         return create_error_response(str(exc))
     token_prompts = _is_token_prompt(req.prompt)
-    if sampling.allowed_token_ids or token_prompts:
-        # The tokenizer worker checks again against its own tokenizer; this one answers
-        # before anything is queued (and keeps ids msgpack can carry without one).
-        bound = await _vocab_len(state) or _MAX_WIRE_TOKEN_ID
-        if sampling.allowed_token_ids and sampling.allowed_token_ids[-1] >= bound:
-            return create_error_response(
-                f"allowed_token_ids must be below the vocabulary size {bound}",
-                param="allowed_token_ids",
-            )
-        if token_prompts and not all(0 <= t < bound for ids in prompts for t in ids):
-            return create_error_response(
-                f"prompt token ids must be in [0, {bound})", param="prompt"
-            )
+    id_fields = sampling.client_token_ids()
+    if token_prompts:
+        id_fields += [("prompt", ids) for ids in prompts]
+    if (bad := await _token_id_error(state, id_fields)) is not None:
+        return bad
 
     if req.suffix is not None:
         markers = await _fim_markers(state)
@@ -900,8 +895,18 @@ async def _merge_streams(
 _FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
 
 
-# Without a frontend tokenizer: the int32 the engine holds ids in (msgpack also needs a bound)
-_MAX_WIRE_TOKEN_ID = 2**31 - 1
+async def _token_id_error(state: Any, fields: list[tuple[str, list[int]]]) -> JSONResponse | None:
+    """A 400 for the first client token id outside the vocabulary, before anything is
+    queued. Without a frontend tokenizer the bound is the engine's int32; the tokenizer
+    worker checks against its own tokenizer either way."""
+    if not fields:
+        return None
+    bound = await _vocab_len(state) or MAX_TOKEN_ID + 1
+    for name, ids in fields:
+        if not all(0 <= t < bound for t in ids):
+            what = "prompt token ids" if name == "prompt" else name
+            return create_error_response(f"{what} must be in [0, {bound})", param=name)
+    return None
 
 
 async def _vocab_len(state: Any) -> int | None:

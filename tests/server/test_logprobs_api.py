@@ -957,7 +957,7 @@ def test_completion_allowed_token_ids_reach_the_engine_sorted_and_unique() -> No
 
 @pytest.mark.parametrize(
     ("ids", "fragment"),
-    [([], "1 to 1024"), (list(range(1025)), "1 to 1024"), ([-1, 3], "non-negative"), ([248077], "vocabulary")],
+    [([], "1 to 1024"), (list(range(1025)), "1 to 1024"), ([-1, 3], "[0, 2147483647]"), ([248077], "[0, 248077)")],
 )
 def test_completion_allowed_token_ids_out_of_range(ids, fragment) -> None:
     state = FakeState([], tokenizer=VocabTokenizer())
@@ -1110,3 +1110,36 @@ def test_chat_rejects_unimplemented_fields_when_set(field, value) -> None:
 def test_chat_accepts_unimplemented_fields_left_unset(field, value) -> None:
     resp = run(handle_chat_completion(chat_request(**{field: value}), None, _one_token_state(), {}))
     assert resp["choices"][0]["message"]["content"] == "A"
+
+
+ID_FIELD_CASES = [
+    ({"logit_bias": {"248077": 1.0}}, "logit_bias", True),
+    ({"stop_token_ids": [5, 248077]}, "stop_token_ids", True),
+    ({"logit_bias": {str(2**40): 1.0}}, "logit_bias", False),  # would overflow msgpack
+    ({"stop_token_ids": [2**40]}, "stop_token_ids", False),
+]
+
+
+@pytest.mark.parametrize(("extra", "field", "with_tokenizer"), ID_FIELD_CASES)
+@pytest.mark.parametrize("route", ["completions", "chat"])
+def test_token_id_fields_outside_the_vocabulary_are_400s(extra, field, with_tokenizer, route) -> None:
+    state = FakeState([reply("A", finished=True)], tokenizer=VocabTokenizer() if with_tokenizer else None)
+    if route == "completions":
+        resp = run(handle_completion(_completion(**extra), None, state, {}))
+    else:
+        resp = run(handle_chat_completion(chat_request(**extra), None, state, {}))
+    assert getattr(resp, "status_code", 200) == 400
+    assert field in json.loads(resp.body)["error"]["message"]
+    assert state.sent is None
+
+
+@pytest.mark.parametrize("route", ["completions", "chat"])
+def test_token_id_fields_at_the_vocab_edge_pass(route) -> None:
+    extra = {"logit_bias": {"248076": 1.0}, "stop_token_ids": [0, 248076]}
+    state = FakeState([reply("A", finished=True)], tokenizer=VocabTokenizer())
+    if route == "completions":
+        resp = run(handle_completion(_completion(**extra), None, state, {}))
+    else:
+        resp = run(handle_chat_completion(chat_request(**extra), None, state, {}))
+    assert getattr(resp, "status_code", 200) == 200
+    assert state.sent.sampling_params.stop_token_ids == [0, 248076]

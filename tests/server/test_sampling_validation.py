@@ -65,3 +65,14 @@ def test_allowed_token_ids_are_sorted_and_deduplicated():
 def test_allowed_token_ids_size_and_sign_are_checked(ids):
     with pytest.raises(ValueError, match="allowed_token_ids"):
         _resolve_with(allowed_token_ids=ids)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"logit_bias": {str(2**31): 1.0}}, {"stop_token_ids": [2**31]}, {"allowed_token_ids": [2**31]}],
+)
+def test_token_ids_are_bounded_by_the_engine_int32(extra):
+    with pytest.raises(ValueError, match=next(iter(extra))):
+        _resolve_with(**extra)
+    edge = {k: ({str(2**31 - 1): 1.0} if k == "logit_bias" else [2**31 - 1]) for k in extra}
+    _resolve_with(**edge)
