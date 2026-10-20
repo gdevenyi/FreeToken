@@ -254,3 +254,93 @@ def test_host_snapshot_tier_lowers_the_gpu_snapshot_floor(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def _finish_read(policy: str, sp: SamplingParams, *, warm_prefix: bool = False):
+    """A 130-token prompt finishing on its prefill forward, with a frozen x64 snapshot at 128
+    (the deepest boundary strictly inside it) and its live state at 130. ``warm_prefix`` first
+    donates a 64-token prefix so the read resumes from a locked prefix-cache hit."""
+    num_pages = 256
+    pool = _pool()
+    pt = torch.zeros(4, 256, dtype=torch.int32)
+    cm = CacheManager(num_pages, 1, pt, "hybrid_radix", linear_state_pool=pool,
+                      logprob_read_snapshot_donate=policy)
+    prompt = list(range(1, 131))
+    if warm_prefix:
+        warm = Req(input_ids=torch.tensor(prompt[:64] + [999], dtype=torch.int32), table_idx=1,
+                   cached_len=64, output_len=1, uid=9, sampling_params=SamplingParams(),
+                   cache_handle=cm.match_req(_pend(prompt[:64])).cuda_handle)
+        pt[1, :64] = cm._allocate(64)
+        warm.linear_slot_idx, warm.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+        cm.lock(warm.cache_handle)
+        cm.cache_req(warm, finished=True)
+    mr = cm.match_req(_pend(prompt))
+    hit = mr.cuda_handle.cached_len
+    pt[0, :hit] = mr.cuda_handle.get_matched_indices()
+    pt[0, hit:130] = cm._allocate(130 - hit)
+    req = Req(input_ids=torch.tensor(prompt + [7], dtype=torch.int32), table_idx=0, cached_len=130,
+              output_len=1, uid=0, sampling_params=sp, cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
+    cm.lock(mr.cuda_handle)
+    cm.cache_req(req, finished=True)
+
+    pc = cm.prefix_cache
+    tree_pages = pc.full_evictable + pc.full_protected
+    assert len(cm.free_slots) + tree_pages == num_pages  # every page is free or tree-owned
+    assert pc.full_protected == 0 and pc.mamba_protected == 0  # nothing left locked
+    assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1  # no GDN slot leak
+    cm.check_integrity()
+    return cm, prompt
+
+
+def _resume_len(cm, prompt, n):
+    return cm.match_req(_pend(prompt[:n] + [12345])).cuda_handle.cached_len
+
+
+READ = SamplingParams(max_tokens=1, logprobs=True, top_logprobs=4, allowed_token_ids=[32, 33])
+
+
+@pytest.mark.parametrize("warm_prefix", [False, True])
+@pytest.mark.parametrize(
+    ("policy", "snapshots", "resume_at_128", "resume_at_130"),
+    [("all", 2, 128, 130), ("boundary", 1, 128, 128), ("none", 0, 0, 0)],
+)
+def test_logprob_read_snapshot_donate_policy(policy, snapshots, resume_at_128, resume_at_130, warm_prefix):
+    cm, prompt = _finish_read(policy, READ, warm_prefix=warm_prefix)
+    warm = 1 if warm_prefix else 0  # the warm-up request's own 64-token snapshot
+    assert cm.prefix_cache.mamba_evictable_size == snapshots + warm
+    assert _resume_len(cm, prompt, 128) == max(resume_at_128, 64 * warm)
+    assert _resume_len(cm, prompt, 130) == max(resume_at_130, 64 * warm)
+
+
+@pytest.mark.parametrize("policy", ["boundary", "none"])
+@pytest.mark.parametrize(
+    "sp",
+    [
+        SamplingParams(max_tokens=1),  # no logprobs
+        SamplingParams(max_tokens=2, logprobs=True, top_logprobs=4),  # not a single-token read
+    ],
+)
+def test_snapshot_donate_policy_leaves_other_requests_alone(policy, sp):
+    cm, prompt = _finish_read(policy, sp)
+    assert cm.prefix_cache.mamba_evictable_size == 2
+    assert _resume_len(cm, prompt, 130) == 130
+
+
+def test_snapshot_donate_policy_is_validated():
+    with pytest.raises(ValueError, match="snapshot donate"):
+        CacheManager(8, 1, torch.zeros(1, 8, dtype=torch.int32), "hybrid_radix",
+                     linear_state_pool=_pool(), logprob_read_snapshot_donate="some")
+
+
+def test_snapshot_donate_policy_is_a_server_arg():
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    config = SimpleNamespace(to_dict=lambda: {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        assert parse_args(["--model", "/models/anon"])[0].logprob_read_snapshot_donate == "all"
+        args, _ = parse_args(["--model", "/models/anon", "--logprob-read-snapshot-donate", "none"])
+    assert args.logprob_read_snapshot_donate == "none"

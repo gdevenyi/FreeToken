@@ -99,6 +99,7 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            logprob_read_snapshot_donate=getattr(config, "logprob_read_snapshot_donate", "all"),
         )
         self.decode_manager = DecodeManager(config.page_size)
         # Bound how long a run of prefill steps may starve in-flight decodes. A long
