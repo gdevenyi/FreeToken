@@ -1086,3 +1086,27 @@ def test_completion_token_id_prompts_are_range_checked_before_queueing(prompt, t
 def test_completion_token_id_prompts_refuse_echo_and_suffix(extra) -> None:
     resp = run(handle_completion(_completion(prompt=[[1, 2]], **extra), None, ManyUsersState(), {}))
     assert resp.status_code == 400
+
+
+# Chat implements none of them, allowed_token_ids and return_tokens_as_token_ids included.
+CHAT_UNIMPLEMENTED_FIELDS = [
+    ("allowed_token_ids", [32, 33]),
+    ("return_tokens_as_token_ids", True),
+    *UNIMPLEMENTED_COMPLETION_FIELDS,
+]
+
+
+@pytest.mark.parametrize(("field", "value"), CHAT_UNIMPLEMENTED_FIELDS)
+def test_chat_rejects_unimplemented_fields_when_set(field, value) -> None:
+    state = _one_token_state()
+    resp = run(handle_chat_completion(chat_request(**{field: value}), None, state, {}))
+    assert getattr(resp, "status_code", 200) == 400
+    assert field in json.loads(resp.body)["error"]["message"]
+    assert state.sent is None
+
+
+@pytest.mark.parametrize("value", [None, False, [], {}, ""])
+@pytest.mark.parametrize("field", [f for f, _ in CHAT_UNIMPLEMENTED_FIELDS])
+def test_chat_accepts_unimplemented_fields_left_unset(field, value) -> None:
+    resp = run(handle_chat_completion(chat_request(**{field: value}), None, _one_token_state(), {}))
+    assert resp["choices"][0]["message"]["content"] == "A"

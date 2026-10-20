@@ -49,7 +49,8 @@ effect; "400" means the server refuses the request with a clear message.
 | `user`, `metadata`, `store`, `service_tier` | accepted, ignored | accepted, ignored | accepted, ignored | accepted, ignored |
 | `request_id` | honoured: becomes the response id | honoured | `rid` | `id_slot` (different meaning) |
 | `function_call` (legacy) | 400 | 400 | 400 | no |
-| `best_of`, `use_beam_search`, `length_penalty`, `prompt_logprobs`, `echo` (chat), `truncate_prompt_tokens`, `priority`, `cache_salt`, `lora` | no | honoured | partly | partly |
+| `allowed_token_ids`, `return_tokens_as_token_ids`, `logprob_token_ids`, `prompt_logprobs`, `guided_*`, `structured_outputs`, `bad_words` | 400 when set (`null` / `false` / empty pass) | honoured | partly | partly |
+| `best_of`, `use_beam_search`, `length_penalty`, `echo` (chat), `truncate_prompt_tokens`, `priority`, `cache_salt`, `lora` | no | honoured | partly | partly |
 | `ignore_eos` | honoured (benchmarking) | honoured | honoured | honoured |
 
 ## Legacy completions: request

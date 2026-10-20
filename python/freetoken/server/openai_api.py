@@ -297,6 +297,9 @@ async def handle_chat_completion(
 ):
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
+    unimplemented = _unimplemented_field(req, _UNIMPLEMENTED_CHAT_FIELDS)
+    if unimplemented is not None:
+        return create_error_response(unimplemented)
     logprobs_error = chat_logprobs_error(req)
     if logprobs_error is not None:
         return create_error_response(logprobs_error, param="top_logprobs")
@@ -1178,6 +1181,21 @@ _UNIMPLEMENTED_COMPLETION_FIELDS = (
 )
 
 
+# chat has neither of the completions-only ones
+_UNIMPLEMENTED_CHAT_FIELDS = (
+    "allowed_token_ids",
+    "return_tokens_as_token_ids",
+    *_UNIMPLEMENTED_COMPLETION_FIELDS,
+)
+
+
+def _unimplemented_field(req: Any, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        if _is_set(getattr(req, name, None)):
+            return f"{name} is not supported by this server"
+    return None
+
+
 def _is_set(value: Any) -> bool:
     # not truthiness: prompt_logprobs=0 is a real request, and 0 == False
     if value is None or value is False:
@@ -1200,9 +1218,9 @@ def _empty_prompt(req: CompletionRequest) -> bool:
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
-    for name in _UNIMPLEMENTED_COMPLETION_FIELDS:
-        if _is_set(getattr(req, name, None)):
-            return f"{name} is not supported by this server"
+    unimplemented = _unimplemented_field(req, _UNIMPLEMENTED_COMPLETION_FIELDS)
+    if unimplemented is not None:
+        return unimplemented
     if _empty_prompt(req):
         return "prompt must not be empty"
     if _is_token_prompt(req.prompt):
