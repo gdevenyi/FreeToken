@@ -557,6 +557,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--logprob-read-isolate",
+        action="store_true",
+        default=ServerArgs.logprob_read_isolate,
+        help="Make a logprob read's (max_tokens=1 with logprobs, e.g. AnyJev label scoring) "
+        "logprobs independent of other traffic: it prefills in a pass of its own and neither "
+        "resumes from nor stores prefix-cache entries. Costs read throughput under concurrency "
+        "and all prefix reuse for reads; other requests are unchanged.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,

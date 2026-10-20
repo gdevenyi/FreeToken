@@ -35,7 +35,7 @@ LOGPROB_READ_SNAPSHOT_DONATE = ("all", "boundary", "none")
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 logprob_read_snapshot_donate: str = "all"):
+                 logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -54,6 +54,7 @@ class CacheManager:
         if logprob_read_snapshot_donate not in LOGPROB_READ_SNAPSHOT_DONATE:
             raise ValueError(f"unknown snapshot donate policy {logprob_read_snapshot_donate!r}")
         self.logprob_read_snapshot_donate = logprob_read_snapshot_donate
+        self.isolate_logprob_reads = isolate_logprob_reads
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
@@ -394,10 +395,9 @@ class CacheManager:
             # is this request's dup to free. The frozen slot is consumed either way (taken by
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
-            sp = req.sampling_params
             donate = (
                 self.logprob_read_snapshot_donate
-                if sp.logprobs and sp.max_tokens == 1
+                if req.sampling_params.is_logprob_read
                 else "all"
             )
             free_upto = old_handle.cached_len

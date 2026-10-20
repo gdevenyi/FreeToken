@@ -100,6 +100,7 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             logprob_read_snapshot_donate=getattr(config, "logprob_read_snapshot_donate", "all"),
+            isolate_logprob_reads=getattr(config, "logprob_read_isolate", False),
         )
         self.decode_manager = DecodeManager(config.page_size)
         # Bound how long a run of prefill steps may starve in-flight decodes. A long
@@ -117,6 +118,7 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            isolate_logprob_reads=getattr(config, "logprob_read_isolate", False),
         )
 
         # some alias for easy access

@@ -344,3 +344,28 @@ def test_snapshot_donate_policy_is_a_server_arg():
         assert parse_args(["--model", "/models/anon"])[0].logprob_read_snapshot_donate == "all"
         args, _ = parse_args(["--model", "/models/anon", "--logprob-read-snapshot-donate", "none"])
     assert args.logprob_read_snapshot_donate == "none"
+
+
+@pytest.mark.parametrize(
+    ("sp", "read"),
+    [
+        (READ, True),
+        (SamplingParams(max_tokens=1, logprobs=True), True),
+        (SamplingParams(max_tokens=1), False),
+        (SamplingParams(max_tokens=2, logprobs=True, top_logprobs=4), False),
+    ],
+)
+def test_is_logprob_read(sp, read):
+    assert sp.is_logprob_read is read
+
+
+def test_logprob_read_isolate_is_a_server_arg():
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    config = SimpleNamespace(to_dict=lambda: {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        assert parse_args(["--model", "/models/anon"])[0].logprob_read_isolate is False
+        args, _ = parse_args(["--model", "/models/anon", "--logprob-read-isolate"])
+    assert args.logprob_read_isolate is True

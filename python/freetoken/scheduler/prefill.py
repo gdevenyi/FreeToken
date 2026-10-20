@@ -49,6 +49,8 @@ class PrefillAdder:
     encoder_cache: EncoderCache | None = None
     # end a chunk before an image it would cut; only models whose image spans attend in both directions need it
     keep_images_whole: bool = False
+    # a logprob read (max_tokens=1 + logprobs) neither resumes from nor feeds the prefix cache
+    isolate_logprob_reads: bool = False
     # the whole budget of this pass; token_budget shrinks as requests are admitted
     pass_budget: int = 0
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
@@ -282,6 +284,8 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
+    # a logprob read prefills in a pass of its own (see PrefillAdder for the cache side)
+    isolate_logprob_reads: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -308,6 +312,7 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
+            isolate_logprob_reads=self.isolate_logprob_reads,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

@@ -72,6 +72,11 @@ class SamplingParams:
         return [(name, ids) for name, ids in fields if ids]
 
     @property
+    def is_logprob_read(self) -> bool:
+        """A scoring read (e.g. AnyJev label logprobs): one token whose logprobs are the answer."""
+        return bool(self.logprobs) and self.max_tokens == 1
+
+    @property
     def is_greedy(self) -> bool:
         return self.temperature <= 0.0 or self.top_k == 1
 
