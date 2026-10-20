@@ -7,6 +7,7 @@ import random
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from freetoken.message import TokenizeMsg, UserReply
 from freetoken.server import openai_api
@@ -98,7 +99,12 @@ class FakeState:
         self.replies = replies
         self.sent: TokenizeMsg | None = None
         if tokenizer is not None:
-            self.frontend_tokenizer = lambda: SimpleNamespace(tokenizer=tokenizer)
+            manager = SimpleNamespace(
+                tokenizer=tokenizer,
+                render_prompt=lambda msg: json.dumps(msg.text),
+                encode_prompt=lambda msg, prompt: torch.zeros(len(prompt), dtype=torch.int32),
+            )
+            self.frontend_tokenizer = lambda: manager
 
     def new_user(self) -> int:
         return 42

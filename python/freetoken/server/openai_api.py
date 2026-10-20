@@ -49,10 +49,12 @@ from .generation import (
     build_metrics,
     chat_logprob_markers,
     chat_logprobs_supported,
+    check_context_fits,
+    frontend_prompt_ids,
     generate_events,
     generate_full,
     metrics_enabled,
-    prerender_error,
+    model_context_length,
     render_messages,
     resolve_sampling,
     submit_generation,
@@ -160,7 +162,7 @@ def register_openai_routes(
     async def v1_models():
         state = get_state()
         model_id = _served_model_name(state)
-        ctx = _model_context_length(state)
+        ctx = model_context_length(state)
         efforts, default_effort = await _effort_fields(state)
         return ModelList(data=[ModelCard(
             id=model_id,
@@ -193,7 +195,7 @@ def register_openai_routes(
                 code="model_not_found",
             )
 
-        ctx = _model_context_length(state)
+        ctx = model_context_length(state)
         efforts, default_effort = await _effort_fields(state)
         return ModelCard(
             id=served_model_id,
@@ -347,13 +349,6 @@ async def handle_chat_completion(
         return create_error_response(str(exc))
     if (bad := await _token_id_error(state, spec.sampling_params.client_token_ids())) is not None:
         return bad
-
-    if req.stream:
-        # Non-stream requests already surface render failures as a clean 400
-        # through GenerationError; only the stream path needs the pre-check.
-        err = await prerender_error(spec, state)
-        if err is not None:
-            return create_error_response(str(err), code=err.code)
 
     # n > 1: one generation per choice, submitted together (the prefix cache serves the
     # shared prompt after the first prefill).
@@ -652,14 +647,26 @@ async def handle_completion(
         echo_texts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
 
     # choices are ordered prompt-major: prompt i, sample k -> index i * n + k (OpenAI)
+    prompt_ids = []
+    try:
+        for prompt in prompts:
+            if token_prompts:
+                check_context_fits(len(prompt), state)
+                prompt_ids.append(None)
+                continue
+            prompt_ids.append(await frontend_prompt_ids(
+                TokenizeMsg(uid=0, text=prompt, sampling_params=sampling), state
+            ))
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
     uids: list[int] = []
-    for prompt in prompts:
+    for prompt, ids in zip(prompts, prompt_ids):
         for _ in range(req.n):
             uid = state.new_user()
             msg = (
                 TokenizeMsg(uid=uid, text="", input_ids=prompt, sampling_params=sampling)
                 if token_prompts
-                else TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling)
+                else TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling, input_ids=ids)
             )
             await state.send_one(msg)
             uids.append(uid)
@@ -973,7 +980,7 @@ async def handle_tokenize(req: TokenizeRequest, state: Any):
         return create_error_response(str(exc))
     body: dict[str, Any] = {
         "count": len(ids),
-        "max_model_len": _model_context_length(state),
+        "max_model_len": model_context_length(state),
         "tokens": [int(t) for t in ids],
     }
     if req.return_token_strs:
@@ -1288,32 +1295,3 @@ def _served_model_name(state: Any) -> str:
     return getattr(state.config, "served_model_name", None) or state.config.model_path
 
 
-def _model_context_length(state: Any) -> int | None:
-    """The usable context: ``min(model ceiling, allocated KV tokens)``.
-
-    This is the clamp the engine already applies to its own ``max_seq_len`` (Engine.__init__,
-    and again in _refresh_seq_state after a rebuild), and therefore the limit the scheduler
-    admits against. The frontend process holds an unclamped ServerArgs copy, so publishing
-    ``config.max_seq_len`` here advertised the model's positional ceiling instead -- e.g. 262144
-    against a 178176-token pool, so the engine and this route disagreed about one quantity.
-
-    `ft launch` reads this to size each agent's context window (opencode's ``limit.context``,
-    codex's ``context_window``, ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``), so overstating it stops
-    those agents compacting before the KV pool runs out.
-    """
-    try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
-        value = int(state.config.max_seq_len)
-    except Exception:  # noqa: BLE001
-        return None
-    if value <= 0:
-        return None
-    try:
-        # Local import: api_server imports this module, so a module-level one would cycle.
-        from .api_server import kv_pool_geometry
-
-        num_pages, page_size = kv_pool_geometry(state)
-        kv_tokens = num_pages * page_size
-    except Exception:  # noqa: BLE001
-        kv_tokens = 0
-    # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.
-    return min(value, kv_tokens) if kv_tokens > 0 else value

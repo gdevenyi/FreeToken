@@ -9,6 +9,7 @@ import json
 from types import SimpleNamespace
 
 import pydantic
+import torch
 import pytest
 from freetoken.message import TokenizeMsg, UserReply
 from freetoken.server.api_models import (
@@ -52,6 +53,7 @@ class FakeState:
             manager = SimpleNamespace(
                 tokenizer=tokenizer,
                 render_prompt=lambda msg: "RENDERED:" + json.dumps(msg.text),
+                encode_prompt=lambda msg, prompt: torch.zeros(len(prompt), dtype=torch.int32),
             )
             self.frontend_tokenizer = lambda: manager
 

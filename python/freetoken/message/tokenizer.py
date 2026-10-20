@@ -90,8 +90,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
     inline_system_policy: str | None = None
-    # A token-id prompt (OpenAI / vLLM completions): used as is, ``text`` is ignored.
-    input_ids: List[int] | None = None
+    # Prompt ids served as they are (``text`` is then ignored for tokenization): a client
+    # token-id prompt (OpenAI / vLLM completions; a list, range-checked by the worker), or
+    # the int32 tensor the frontend already rendered and counted (no second tokenization).
+    input_ids: Any = None
 
 
 @dataclass

@@ -931,3 +931,194 @@ def test_chat_completion_treats_non_positive_top_k_as_disabled(top_k):
     assert response.status_code == 200
     assert state.sent is not None
     assert state.sent.sampling_params.top_k == -1
+
+
+# --------------------------------------------------------------------------- #
+# Context-length pre-check (#749): every endpoint answers an over-long request with a
+# 400 before any StreamingResponse, counting with the frontend tokenizer.
+# --------------------------------------------------------------------------- #
+CONTEXT = 64
+
+
+class _CharManager:
+    """Frontend tokenizer stand-in: the prompt is the messages' text, one id per char."""
+
+    def render_prompt(self, msg):
+        if isinstance(msg.text, str):
+            return msg.text
+        return "".join(str(m.get("content") or "") for m in msg.text)
+
+    def encode_prompt(self, msg, prompt):
+        import torch
+
+        return torch.arange(len(prompt), dtype=torch.int32)
+
+
+def _ctx_state() -> FakeState:
+    state = FakeState([
+        UserReply(uid=42, incremental_output="ok", finished=True,
+                  prompt_tokens_delta=2, completion_tokens_delta=1),
+    ])
+    state.config.max_seq_len = CONTEXT
+    state.config.max_output_tokens = None
+    state.config.enable_cache_report = False
+    state.maintenance_state = "serving"
+    manager = _CharManager()
+    state.frontend_tokenizer = lambda: manager
+
+    async def stream_with_cancellation(gen, request, uid):
+        async for chunk in gen:
+            yield chunk
+
+    state.stream_with_cancellation = stream_with_cancellation
+    return state
+
+
+def _ctx_call(endpoint: str, text: str, stream: bool, max_tokens: int | None, state):
+    from freetoken.server.anthropic_api import handle_anthropic_messages
+    from freetoken.server.anthropic_models import AnthropicMessagesRequest
+    from freetoken.server.responses_api import ResponsesRequest, handle_responses
+
+    limit = {} if max_tokens is None else {"max_tokens": max_tokens}
+    if endpoint == "chat":
+        req = ChatCompletionRequest(
+            model="m", messages=[{"role": "user", "content": text}], stream=stream, **limit
+        )
+        return run(handle_chat_completion(req, None, state, {}))
+    if endpoint == "completions":
+        req = CompletionRequest(model="m", prompt=text, stream=stream, **limit)
+        return run(handle_completion(req, None, state, {}))
+    if endpoint == "responses":
+        extra = {} if max_tokens is None else {"max_output_tokens": max_tokens}
+        req = ResponsesRequest(model="m", input=text, stream=stream, **extra)
+        return run(handle_responses(req, None, state, {}))
+    req = AnthropicMessagesRequest(
+        model="m", max_tokens=max_tokens or 8, stream=stream,
+        messages=[{"role": "user", "content": text}],
+    )
+    return run(handle_anthropic_messages(req, None, state, {}))
+
+
+def _error_message(endpoint: str, body: dict) -> tuple[str, str | None]:
+    err = body["error"]
+    if endpoint == "anthropic":
+        assert err["type"] == "invalid_request_error"
+        return err["message"], None
+    return err["message"], err.get("code")
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses", "anthropic"])
+def test_an_overlong_prompt_is_a_400_before_any_stream(endpoint, stream):
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    response = _ctx_call(endpoint, "a" * (CONTEXT + 10), stream, None, state)
+    assert isinstance(response, JSONResponse), type(response)
+    assert response.status_code == 400
+    message, code = _error_message(endpoint, json.loads(response.body))
+    # Claude Code and OpenClaw match on this exact prefix.
+    assert message.startswith(f"prompt is too long: {CONTEXT + 10} tokens > {CONTEXT} maximum")
+    if endpoint != "anthropic":
+        assert code == "context_length_exceeded"
+    assert state.sent is None  # never reached the worker
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses", "anthropic"])
+def test_an_explicit_max_tokens_that_does_not_fit_is_clamped_not_rejected(endpoint, stream):
+    # Agents always send a large max_tokens and run near a full context: only a prompt
+    # that does not fit by itself is a 400; the scheduler clamps the output budget.
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    response = _ctx_call(endpoint, "a" * 40, stream, CONTEXT * 4, state)
+    assert not isinstance(response, JSONResponse) or response.status_code == 200
+    assert state.sent is not None and state.sent.sampling_params.max_tokens == CONTEXT * 4
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses", "anthropic"])
+def test_a_prompt_one_token_short_of_the_context_still_runs(endpoint, stream):
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    response = _ctx_call(endpoint, "a" * (CONTEXT - 1), stream, None, state)
+    assert not isinstance(response, JSONResponse) or response.status_code == 200
+    assert state.sent is not None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses", "anthropic"])
+def test_a_request_that_fits_carries_its_counted_ids_to_the_worker(endpoint, stream):
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    response = _ctx_call(endpoint, "a" * 40, stream, None, state)
+    assert not (isinstance(response, JSONResponse) and response.status_code != 200)
+    # The worker serves exactly the ids the frontend counted instead of tokenizing again.
+    assert state.sent is not None and state.sent.input_ids is not None
+    assert state.sent.input_ids.numel() == 40
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses"])
+def test_an_omitted_max_tokens_is_still_clamped_not_rejected(endpoint):
+    # The server's default output budget also passes through; the scheduler clamps it.
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    response = _ctx_call(endpoint, "a" * 40, False, None, state)
+    assert not isinstance(response, JSONResponse) or response.status_code == 200
+    assert state.sent is not None and state.sent.sampling_params.max_tokens > CONTEXT - 40
+
+
+def test_the_tokenizer_worker_serves_prepared_ids_without_retokenizing():
+    import torch
+
+    from freetoken.core import SamplingParams
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    def boom(*args, **kwargs):
+        raise AssertionError("re-tokenized a prepared prompt")
+
+    manager = TokenizeManager(SimpleNamespace(chat_template="t", encode=boom, apply_chat_template=boom))
+    ids = torch.tensor([5, 6, 7], dtype=torch.int32)
+    msg = TokenizeMsg(uid=1, text=[{"role": "user", "content": "x"}],
+                      sampling_params=SamplingParams(), input_ids=ids)
+    (user_msg,) = manager.tokenize([msg])
+    assert user_msg.input_ids.tolist() == [5, 6, 7]
+
+
+def test_a_prompt_that_fills_the_context_exactly_is_a_400():
+    # Same condition as the scheduler: no room for one output token.
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    response = _ctx_call("chat", "a" * CONTEXT, True, None, state)
+    assert isinstance(response, JSONResponse) and response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "context_length_exceeded"
+    assert state.sent is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_overlong_token_id_prompt_is_a_400_counted_by_its_length(stream):
+    from fastapi.responses import JSONResponse
+
+    state = _ctx_state()
+    req = CompletionRequest(model="m", prompt=[1] * (CONTEXT + 3), stream=stream)
+    response = run(handle_completion(req, None, state, {}))
+    assert isinstance(response, JSONResponse) and response.status_code == 400
+    body = json.loads(response.body)["error"]
+    assert body["message"].startswith(f"prompt is too long: {CONTEXT + 3} tokens > {CONTEXT}")
+    assert body["code"] == "context_length_exceeded"
+    assert state.sent is None
+
+
+def test_a_token_id_prompt_that_fits_reaches_the_worker_as_its_ids():
+    state = _ctx_state()
+    req = CompletionRequest(model="m", prompt=[5, 6, 7])
+    run(handle_completion(req, None, state, {}))
+    assert state.sent is not None and state.sent.input_ids == [5, 6, 7]

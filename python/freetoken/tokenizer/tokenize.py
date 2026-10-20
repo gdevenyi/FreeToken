@@ -111,26 +111,18 @@ class TokenizeManager:
             for name, ids in msg.sampling_params.client_token_ids():
                 if not _ids_below(ids, len(self.tokenizer)):
                     raise ValueError(f"{name} must be in [0, {len(self.tokenizer)})")
-            if msg.input_ids is not None:
+            if isinstance(msg.input_ids, torch.Tensor) and not msg.images:
+                # the frontend's own encoding of this prompt (frontend_prompt_ids)
+                input_ids = msg.input_ids.view(-1).to(torch.int32)
+            elif msg.input_ids is not None:
                 # an id past the embedding rows would fault the engine, not just this request
                 if msg.input_ids and not _ids_below(msg.input_ids, len(self.tokenizer)):
                     raise ValueError(f"prompt token ids must be in [0, {len(self.tokenizer)})")
                 ids = torch.tensor(msg.input_ids, dtype=torch.int32)
                 results.append(UserMsg(uid=msg.uid, input_ids=ids, sampling_params=msg.sampling_params))
                 continue
-            prompt = self.render_prompt(msg)
-            # A jinja chat template owns every special token (HF's apply_chat_template
-            # tokenizes with add_special_tokens=False for the same reason): tokenizers
-            # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
-            # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
-            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
-            )
-            input_ids = input_ids.view(-1).to(torch.int32)
+            else:
+                input_ids = self.encode_prompt(msg, self.render_prompt(msg))
             if msg.images:
                 if self.mm_processor is None:
                     raise ValueError("image input is not supported for this model")
@@ -150,6 +142,20 @@ class TokenizeManager:
                     UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
                 )
         return results
+
+    def encode_prompt(self, msg: TokenizeMsg, prompt: str) -> torch.Tensor:
+        """The tokenizer half of ``tokenize``: ``prompt`` (from ``render_prompt``) as 1-D
+        int32 ids, exposed so the frontend can count a request before committing a stream."""
+        # A jinja chat template owns every special token (HF's apply_chat_template
+        # tokenizes with add_special_tokens=False for the same reason): tokenizers
+        # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
+        # the template already rendered one. Raw-string prompts and the dsv4
+        # encoder path keep the default.
+        templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+        input_ids: torch.Tensor = self.tokenizer.encode(  # type: ignore
+            prompt, return_tensors="pt", add_special_tokens=not templated
+        )
+        return input_ids.view(-1).to(torch.int32)
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can

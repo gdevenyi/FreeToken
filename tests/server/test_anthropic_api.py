@@ -753,6 +753,15 @@ class _FakeTokenizeManager:
             for m in msgs
         ]
 
+    # The generation path's frontend pre-check renders and encodes separately.
+    def render_prompt(self, msg):
+        return str(msg.text)
+
+    def encode_prompt(self, msg, prompt):
+        import torch
+
+        return torch.zeros(len(prompt), dtype=torch.int32)
+
 
 def _count_client(manager=None, maintenance_state="serving"):
     fake = FakeState([])

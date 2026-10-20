@@ -14,6 +14,7 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import math
 import time
@@ -441,6 +442,9 @@ class GenSpec:
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
     inline_system_policy: str | None = None
+    # Prompt ids counted by the frontend pre-check, handed to the worker so it does not
+    # render and tokenize again (also reused by every choice of an n > 1 request).
+    prompt_ids: Any = field(default=None, repr=False, compare=False)
 
     @property
     def parse_tools(self) -> bool:
@@ -685,22 +689,112 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
-    calls this — it takes the neutral spec, not a wire request type."""
+    calls this — it takes the neutral spec, not a wire request type. Raises
+    GenerationError (a 400 in every adapter) when the prompt cannot be rendered or does
+    not fit the context, before anything is committed to the client."""
     refs = collect_image_refs(spec.messages)
     images = await _resolve_images(refs, state) if refs else None
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=spec.messages,
-            sampling_params=spec.sampling_params,
-            chat_template_kwargs=spec.chat_template_kwargs,
-            tools=spec.template_tools,
-            images=images,
-            inline_system_policy=spec.inline_system_policy,
-        )
+    msg = TokenizeMsg(
+        uid=0,
+        text=spec.messages,
+        sampling_params=spec.sampling_params,
+        chat_template_kwargs=spec.chat_template_kwargs,
+        tools=spec.template_tools,
+        images=images,
+        inline_system_policy=spec.inline_system_policy,
     )
-    return uid
+    if spec.prompt_ids is None:
+        spec.prompt_ids = await frontend_prompt_ids(msg, state)
+    msg.uid = state.new_user()
+    msg.input_ids = spec.prompt_ids
+    await state.send_one(msg)
+    return msg.uid
+
+
+def model_context_length(state: Any) -> int | None:
+    """The usable context: ``min(model ceiling, allocated KV tokens)``.
+
+    This is the clamp the engine already applies to its own ``max_seq_len`` (Engine.__init__,
+    and again in _refresh_seq_state after a rebuild), and therefore the limit the scheduler
+    admits against. The frontend process holds an unclamped ServerArgs copy, so publishing
+    ``config.max_seq_len`` here advertised the model's positional ceiling instead -- e.g. 262144
+    against a 178176-token pool, so the engine and this route disagreed about one quantity.
+
+    `ft launch` reads this to size each agent's context window (opencode's ``limit.context``,
+    codex's ``context_window``, ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``), so overstating it stops
+    those agents compacting before the KV pool runs out.
+    """
+    try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
+        value = int(state.config.max_seq_len)
+    except Exception:  # noqa: BLE001
+        return None
+    if value <= 0:
+        return None
+    try:
+        # Local import: api_server imports the protocol modules, which import this one.
+        from .api_server import kv_pool_geometry
+
+        num_pages, page_size = kv_pool_geometry(state)
+        kv_tokens = num_pages * page_size
+    except Exception:  # noqa: BLE001
+        kv_tokens = 0
+    # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.
+    return min(value, kv_tokens) if kv_tokens > 0 else value
+
+
+def check_context_fits(prompt_tokens: int, state: Any) -> None:
+    """Raise the scheduler's context_length_exceeded error up front when the prompt leaves
+    no room for one output token. A max_tokens that does not fit is not an error: the
+    scheduler clamps it to the room left, as agents that always send a large one expect."""
+    limit = model_context_length(state)
+    if limit is not None and prompt_tokens >= limit:
+        # "prompt is too long: N tokens > M" is the phrasing Claude Code and OpenClaw match
+        # on (the scheduler sends the same text).
+        raise GenerationError(
+            f"prompt is too long: {prompt_tokens} tokens > {limit} maximum (prompt + generation); "
+            f"shorten the prompt or increase the KV cache budget",
+            "context_length_exceeded",
+        )
+
+
+async def frontend_prompt_ids(msg: TokenizeMsg, state: Any) -> Any | None:
+    """Render and tokenize ``msg`` frontend-side and check it against the context, so a
+    request that cannot run is a 400 *before* an adapter commits an SSE stream (once headers
+    go out the failure can only ride in-stream, where some agents show nothing but "empty
+    response", and clients that compact on "prompt is too long" never see it).
+
+    Returns the prompt ids for the worker to serve as they are (no second tokenization), or
+    None when there is nothing to hand over: no frontend tokenizer (minimal embeddings), one
+    that fails to *initialize* (a server fault, not this request's), or an image prompt (the
+    worker's multimodal processor expands it; only the render is checked here and the
+    scheduler keeps the length check). Raises GenerationError for a render or encode failure
+    (the worker's own classification) and for a prompt that does not fit."""
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None
+    try:
+        manager = await asyncio.to_thread(build)
+    except Exception:  # noqa: BLE001 -- server fault, not this request's problem
+        return None
+    if manager is None:
+        return None
+
+    if msg.images:
+        def work() -> Any:
+            manager.render_prompt(dataclasses.replace(msg, images=None))
+            return None
+    else:
+        def work() -> Any:
+            return manager.encode_prompt(msg, manager.render_prompt(msg))
+
+    try:
+        ids = await asyncio.to_thread(work)
+    except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
+        raise GenerationError(f"could not encode request: {exc}") from exc
+    if ids is None:
+        return None
+    check_context_fits(int(ids.numel()), state)
+    return ids
 
 
 async def count_prompt_tokens(
@@ -742,37 +836,6 @@ async def count_prompt_tokens(
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
     return int(user_msg.input_ids.numel())
-
-
-async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
-    """Render ``spec``'s prompt frontend-side, returning the failure a streaming
-    adapter should surface as an HTTP 400 *before* committing an SSE stream —
-    once headers go out, a template rejection can only ride in-stream, where
-    some agents show nothing but "empty response". Render only; the worker
-    still renders and encodes authoritatively. Best-effort: a state without a
-    frontend tokenizer, or one that fails to *initialize*, skips validation
-    rather than blocking the generation path.
-    """
-    build = getattr(state, "frontend_tokenizer", None)
-    if build is None:
-        return None
-    msg = TokenizeMsg(
-        uid=0,
-        text=spec.messages,
-        sampling_params=SamplingParams(),
-        chat_template_kwargs=spec.chat_template_kwargs,
-        tools=spec.template_tools,
-        inline_system_policy=spec.inline_system_policy,
-    )
-    try:
-        manager = await asyncio.to_thread(build)
-    except Exception:  # noqa: BLE001 -- server fault, not this request's problem
-        return None
-    try:
-        await asyncio.to_thread(manager.render_prompt, msg)
-    except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
-        return GenerationError(f"could not encode request: {exc}")
-    return None
 
 
 def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
