@@ -68,6 +68,16 @@ class GenerationError(ValueError):
 # re-parse a serialized OpenAI stream.
 # --------------------------------------------------------------------------- #
 @dataclass
+class PromptAdmitted:
+    """The scheduler admitted the prompt: its token count and prefix-cache hit are known
+    before any output. Sent once, ahead of the first delta, so a protocol that reports
+    input usage up front (Anthropic's message_start) need not wait for GenDone."""
+
+    prompt_tokens: int
+    cached_tokens: int = 0
+
+
+@dataclass
 class ReasoningDelta:
     text: str
 
@@ -120,7 +130,7 @@ class GenDone:
     timings: dict[str, Any] | None = None
 
 
-GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
+GenEvent = PromptAdmitted | ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
 
 
 @dataclass
@@ -696,7 +706,7 @@ async def generate_events(
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
-            elif first_token_at is None:
+            elif first_token_at is None and not isinstance(ev, PromptAdmitted):
                 first_token_at = time.monotonic()
             yield ev
     except GenerationError as exc:
@@ -840,6 +850,7 @@ async def _generate_events_impl(
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     timings: dict[str, Any] | None = None
+    admitted = False
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -850,6 +861,9 @@ async def _generate_events_impl(
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
             usage.timings = timings
+        if ack.prompt_tokens_delta and not admitted:
+            admitted = True
+            yield PromptAdmitted(usage.prompt_tokens, usage.cached_tokens)
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
