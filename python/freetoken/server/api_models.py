@@ -167,6 +167,8 @@ class CompletionRequest(BaseModel):
 
 
 MAX_N = 16  # choices per request; each is a full generation, so keep the fan-out bounded
+# prompts x n per /v1/completions request: every one is queued before any is awaited
+MAX_PROMPTS = 256
 
 
 class TokenizeRequest(BaseModel):

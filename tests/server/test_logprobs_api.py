@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from freetoken.message import TokenizeMsg, UserReply
+from freetoken.server import openai_api
 from freetoken.server.generation import generate_full
 from freetoken.server.openai_api import (
     ChatCompletionRequest,
@@ -857,3 +858,79 @@ def test_generate_full_ignores_entries_when_logprobs_were_not_requested() -> Non
 
 async def _collect(iterator):
     return [chunk async for chunk in iterator]
+
+
+def _completion(**kwargs) -> CompletionRequest:
+    return CompletionRequest(**{"model": "client-model", "prompt": "hello", "max_tokens": 1, **kwargs})
+
+
+def _one_token_state() -> FakeState:
+    return FakeState([reply("A", finished=True, logprobs=[entry(32, "A", -0.1)])])
+
+
+# Result-changing vLLM fields this server does not implement: a set value must be a 400,
+# never a 200 computed as if the field were absent.
+UNIMPLEMENTED_COMPLETION_FIELDS = [
+    ("allowed_token_ids", [32, 33]),
+    ("return_tokens_as_token_ids", True),
+    ("logprob_token_ids", [32]),
+    ("prompt_logprobs", 0),
+    ("guided_json", {"type": "object"}),
+    ("guided_regex", "[AB]"),
+    ("guided_choice", ["A", "B"]),
+    ("guided_grammar", "root ::= \"A\""),
+    ("structured_outputs", {"choice": ["A"]}),
+    ("bad_words", ["B"]),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), UNIMPLEMENTED_COMPLETION_FIELDS)
+def test_completion_rejects_unimplemented_fields_when_set(field, value) -> None:
+    resp = run(handle_completion(_completion(logprobs=2, **{field: value}), None, _one_token_state(), {}))
+    assert getattr(resp, "status_code", 200) == 400
+    assert field in json.loads(resp.body)["error"]["message"]
+
+
+@pytest.mark.parametrize("value", [None, False, [], {}, ""])
+@pytest.mark.parametrize("field", [f for f, _ in UNIMPLEMENTED_COMPLETION_FIELDS])
+def test_completion_accepts_unimplemented_fields_left_unset(field, value) -> None:
+    resp = run(handle_completion(_completion(**{field: value}), None, _one_token_state(), {}))
+    assert resp["choices"][0]["text"] == "A"
+
+
+@pytest.mark.parametrize("prompt", ["", [], [""], ["ok", ""], [[]]])
+def test_completion_rejects_empty_prompts(prompt) -> None:
+    state = _one_token_state()
+    resp = run(handle_completion(_completion(prompt=prompt), None, state, {}))
+    assert resp.status_code == 400
+    assert state.sent is None  # nothing was queued
+
+
+def test_completion_suffix_only_fim_prompt_is_not_empty() -> None:
+    reason = openai_api._completion_unsupported_reason(_completion(prompt="", suffix="tail"))
+    assert reason is None
+
+
+@pytest.mark.parametrize(("num_prompts", "n", "status"), [(256, 1, 200), (257, 1, 400), (86, 3, 400)])
+def test_completion_caps_prompts_times_n(num_prompts, n, status) -> None:
+    replies = [reply("A", finished=True)]
+    resp = run(handle_completion(_completion(prompt=["p"] * num_prompts, n=n), None, FakeState(replies), {}))
+    assert getattr(resp, "status_code", 200) == status
+
+
+def _too_long() -> UserReply:
+    return UserReply(
+        uid=42, incremental_output="", finished=True,
+        error="prompt is too long: 9 tokens > 8 maximum", error_code="context_length_exceeded",
+    )
+
+
+def test_completion_passes_the_context_length_code_through() -> None:
+    resp = run(handle_completion(_completion(), None, FakeState([_too_long()]), {}))
+    error = json.loads(resp.body)["error"]
+    assert resp.status_code == 400
+    assert error["code"] == "context_length_exceeded"
+    assert error["message"].startswith("prompt is too long: ")
+
+    events = parse_sse(run(_collect(stream_completion_chunks(42, _completion(stream=True), FakeState([_too_long()])))))
+    assert events[0]["error"]["code"] == "context_length_exceeded"
