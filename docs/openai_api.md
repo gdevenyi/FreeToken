@@ -40,7 +40,7 @@ effect; "400" means the server refuses the request with a clear message.
 | `skip_special_tokens` | honoured; default off here, the reasoning and tool parsers read the tags | honoured (default on) | honoured (default on) | n/a |
 | `n` | honoured, 1..16, one generation per choice (the prefix cache shares the prompt) | honoured | honoured | `n_cmpl` |
 | `stream`, `stream_options.include_usage` | honoured | honoured | honoured | honoured |
-| `logprobs`, `top_logprobs` | 400 on this route (see #224); `/v1/completions` `logprobs` 400 | honoured | honoured | `n_probs` |
+| `logprobs`, `top_logprobs` | honoured (`top_logprobs` 0..20; message content only, under the supported reasoning and tool parsers) | honoured | honoured | `n_probs` |
 | `tools`, `tool_choice` (`auto` / `none` / `required` / named), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
 | `reasoning_effort`, `thinking`, `chat_template_kwargs` | honoured | `chat_template_kwargs` | honoured | honoured |
 | `continue_final_message` | honoured (the last assistant message is continued, no generation prompt) | honoured | honoured | no |
