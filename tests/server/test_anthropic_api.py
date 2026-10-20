@@ -475,6 +475,71 @@ def test_stream_empty_turn_terminates():
     assert types == ["message_start", "message_delta", "message_stop"]
 
 
+@pytest.mark.parametrize("cache_report", [False, True])
+def test_stream_message_start_reports_the_admitted_prompt_usage(cache_report):
+    # #718: message_start carries the prompt's input/cache split, the same one the final
+    # message_delta reports, instead of hard-coded zeros.
+    from freetoken.server.generation import PromptAdmitted
+
+    collected = _collect_events(
+        [PromptAdmitted(1200, 1024), ContentDelta("hi"),
+         GenDone("stop", 1200, 5, cached_tokens=1024)],
+        cache_report=cache_report,
+    )
+    types = [e[0] for e in collected]
+    assert types.count("message_start") == 1 and types[0] == "message_start"
+    start = collected[0][1]["message"]["usage"]
+    delta = next(d for t, d in collected if t == "message_delta")["usage"]
+    assert start == {**delta, "output_tokens": 0}
+    expected = {"input_tokens": 176, "cache_read_input_tokens": 1024} if cache_report \
+        else {"input_tokens": 1200}
+    assert start == {**expected, "output_tokens": 0}
+
+
+def test_stream_keepalive_before_admission_sends_message_start_first(monkeypatch):
+    # A long queue/prefill must not open with a ping: message_start goes out first (zeros,
+    # the counts are not known yet), and the later admission does not send a second one.
+    from freetoken.server.generation import PromptAdmitted
+
+    monkeypatch.setattr(A, "KEEPALIVE_INTERVAL_S", 0.01)
+
+    async def slow():
+        await asyncio.sleep(0.1)
+        yield PromptAdmitted(10, 0)
+        yield ContentDelta("hi")
+        yield GenDone("stop", 10, 1)
+
+    async def run():
+        out = []
+        async for frame in A.anthropic_event_stream(slow(), "claude-x", 1):
+            out.append(frame.split("\n")[0][len("event: "):])
+        return out
+
+    types = asyncio.run(run())
+    assert types[0] == "message_start" and types[1] == "ping"
+    assert types.count("message_start") == 1
+    assert types[-2:] == ["message_delta", "message_stop"]
+
+
+def test_generate_events_announces_prompt_admission():
+    # The admission ack's counts leave the primitive as an event before any content.
+    from freetoken.server.generation import PromptAdmitted, generate_events
+
+    fake = FakeState([("", False, 1200, 0), ("hi", True, 0, 1)])
+    fake.cached = 1024
+    spec = A.convert_anthropic_to_genspec(
+        AnthropicMessagesRequest(model="m", max_tokens=8, messages=[{"role": "user", "content": "x"}]),
+        {},
+    )
+
+    async def run():
+        return [ev async for ev in generate_events(1, spec, fake)]
+
+    events = asyncio.run(run())
+    assert events[0] == PromptAdmitted(1200, 1024)
+    assert sum(isinstance(ev, PromptAdmitted) for ev in events) == 1
+
+
 # --------------------------------------------------------------------------- #
 # Route smoke tests (real app + shared primitive + fake engine)
 # --------------------------------------------------------------------------- #
@@ -492,6 +557,7 @@ class FakeState:
         )
         self._uid = 0
         self._count_manager = None
+        self.cached = 0
 
     def frontend_tokenizer(self):
         return self._count_manager
@@ -511,6 +577,7 @@ class FakeState:
                 finished=finished,
                 prompt_tokens_delta=pt,
                 completion_tokens_delta=ct,
+                cached_tokens=self.cached if pt else 0,
             )
 
     async def stream_with_cancellation(self, gen, request, uid):
@@ -574,6 +641,8 @@ def test_route_stream_text():
             etypes.append(etype)
         if etype == "content_block_delta" and data and data["delta"].get("type") == "text_delta":
             text += data["delta"]["text"]
+        if etype == "message_start":
+            assert data["message"]["usage"]["input_tokens"] == 5
     assert etypes[0] == "message_start"
     assert "content_block_start" in etypes
     assert etypes[-1] == "message_stop"

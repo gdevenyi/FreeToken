@@ -40,6 +40,7 @@ from .generation import (
     GenerationError,
     GenResult,
     GenSpec,
+    PromptAdmitted,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
@@ -502,14 +503,21 @@ async def anthropic_event_stream(
         block_index += 1
         return frames
 
-    # message_start (input_tokens filled in by the terminal message_delta).
-    yield _event(AnthropicStreamEvent(
-        type="message_start",
-        message=AnthropicMessagesResponse(
-            id=f"msg_{uid}", content=[], model=model,
-            usage=AnthropicUsage(input_tokens=0, output_tokens=0),
-        ),
-    ))
+    started = False
+
+    def _message_start(usage: AnthropicUsage) -> str:
+        nonlocal started
+        started = True
+        return _event(AnthropicStreamEvent(
+            type="message_start",
+            message=AnthropicMessagesResponse(
+                id=f"msg_{uid}", content=[], model=model, usage=usage,
+            ),
+        ))
+
+    # message_start waits for the prompt's admission so it can carry the real input/cache
+    # usage; anything that must go out first (a keepalive, an error) sends it with zeros.
+    zero_usage = AnthropicUsage(input_tokens=0, output_tokens=0)
 
     def _open_tool(name: str | None, ordinal: int | None, stable: bool = True) -> list[str]:
         nonlocal block_open, tool_args_sent, tool_ordinal, tool_stable
@@ -543,6 +551,15 @@ async def anthropic_event_stream(
     events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
     try:
         async for ev in events:
+            if isinstance(ev, PromptAdmitted):
+                if not started:
+                    yield _message_start(
+                        _anthropic_usage(ev.prompt_tokens, 0, ev.cached_tokens, cache_report)
+                    )
+                continue
+            if not started:
+                yield _message_start(zero_usage)
+
             if ev is KEEPALIVE:
                 yield _event(AnthropicStreamEvent(type="ping"))
 
@@ -625,10 +642,14 @@ async def anthropic_event_stream(
                 yield _event(AnthropicStreamEvent(type="message_stop"))
                 # Anthropic streams terminate on message_stop — no OpenAI-style
                 # `data: [DONE]` sentinel (it would be an unknown event to strict clients).
+        if not started:
+            yield _message_start(zero_usage)
     except GenerationError as exc:
         # Request-side failure (template rejection / over-length prompt). Match the
         # non-streaming path's classification so Claude Code treats it as a client error
         # rather than a server fault to retry.
+        if not started:
+            yield _message_start(zero_usage)
         if block_open:
             for f in _stop_block():
                 yield f
@@ -636,6 +657,8 @@ async def anthropic_event_stream(
             type="error", error=AnthropicError(type="invalid_request_error", message=str(exc)),
         ))
     except Exception as exc:  # noqa: BLE001 — surface as an Anthropic error event
+        if not started:
+            yield _message_start(zero_usage)
         if block_open:
             for f in _stop_block():
                 yield f

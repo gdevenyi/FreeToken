@@ -523,7 +523,9 @@ def test_tool_call_events_shape_and_order():
     block = '<tool_call>\n{"name": "read", "arguments": {"filePath": "/a"}}\n</tool_call>'
     events = _stream_events(["Checking. ", block + "\n", "Done"], "qwen25")
     kinds = [type(ev).__name__ for ev in events]
-    # text, call open + streamed args + close, trailing text, done — in wire order
+    # admission, text, call open + streamed args + close, trailing text, done — in wire order
+    assert kinds.pop(0) == "PromptAdmitted"
+    events = events[1:]
     assert kinds[0] == "ContentDelta" and kinds[1] == "ToolCallStart"
     assert kinds[-3:] == ["ToolCallsDelta", "ContentDelta", "GenDone"]
     assert all(k == "ToolCallArgsDelta" for k in kinds[2:-3])
