@@ -2,7 +2,8 @@
 
 The weight is e4m3 ``[out_local, in_local]`` with one fp32 ``weight_scale`` (shape ``()``),
 produced by the model's weight reader from the bf16 checkpoint tensor (after TP sharding).
-The activation is quantized per call with a dynamic per-tensor scale: one Triton launch (a
+The activation is quantized per call with a dynamic per-row scale (``quant_per_row``, applied
+after the GEMM). ``quant_per_tensor`` is the older per-tensor cast: one Triton launch (a
 single program walking the tensor) for tiny inputs, two above ``_SPLIT_MIN_ELEMENTS`` (a
 block-parallel amax, then a reduce+cast). Both compute the same arithmetic, so the split is
 a pure speed choice. No host sync anywhere (the scales stay on the device), so the decode
@@ -116,17 +117,56 @@ def quant_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return out, scale
 
 
+@triton.jit
+def _quant_rows_kernel(x_ptr, out_ptr, scale_ptr, k, BLOCK: tl.constexpr):
+    """One program per row: that row's max|x|, then its cast."""
+    row = tl.program_id(0).to(tl.int64)
+    x_row = x_ptr + row * k
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for start in range(0, k, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        acc = tl.maximum(acc, tl.abs(tl.load(x_row + offs, mask=offs < k, other=0.0).to(tl.float32)))
+    amax = tl.maximum(tl.max(acc, axis=0), 1e-12)
+    tl.store(scale_ptr + row, amax / 448.0)
+    inv = 448.0 / amax
+    for start in range(0, k, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < k
+        v = tl.load(x_row + offs, mask=mask, other=0.0).to(tl.float32) * inv
+        v = tl.minimum(tl.maximum(v, -448.0), 448.0)
+        tl.store(out_ptr + row * k + offs, v.to(tl.float8e4nv), mask=mask)
+
+
+def quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(x_fp8, scale)`` with ``x ~= x_fp8 * scale``; ``x`` contiguous ``[M, K]``, ``scale`` fp32 ``[M, 1]``."""
+    m, k = x.shape
+    out = torch.empty_like(x, dtype=FP8)
+    scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m:
+        _quant_rows_kernel[(m,)](x, out, scale, k, BLOCK=1024, num_warps=4)
+    return out, scale
+
+
 def fp8_dynamic_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> torch.Tensor:
     """``x @ (weight * weight_scale)^T`` in W8A8; ``weight`` [N, K] e4m3 row-major, whose ``.t()``
-    is the column-major operand cuBLASLt wants (a stride change, never a copy)."""
+    is the column-major operand cuBLASLt wants (a stride change, never a copy).
+
+    The activation scale is per row, so a row never depends on the other sequences of its
+    batch. It is applied after the GEMM: cuBLASLt's rowwise-scaled mode is 1.4-2.9x slower
+    than the tensorwise one on sm_120."""
     *lead, k = x.shape
     x2 = x.reshape(-1, k).contiguous()
-    x8, scale = quant_per_tensor(x2)
+    if x2.shape[0] == 1:  # one row: per-tensor is per-row, and the scale rides in the GEMM epilogue
+        x8, scale = quant_per_tensor(x2)
+        y = torch._scaled_mm(x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=x.dtype)
+        return y.reshape(*lead, weight.shape[0])
+    x8, row_scale = quant_per_row(x2)
     y = torch._scaled_mm(
-        x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=x.dtype
+        x8, weight.t(), scale_a=weight_scale.new_ones(()), scale_b=weight_scale, out_dtype=x.dtype
     )
+    y.mul_(row_scale)
     return y.reshape(*lead, weight.shape[0])
 
 
@@ -207,5 +247,6 @@ __all__ = [
     "Fp8DynamicLinear",
     "Fp8DynamicRowParallel",
     "fp8_dynamic_linear",
+    "quant_per_row",
     "quant_per_tensor",
 ]
