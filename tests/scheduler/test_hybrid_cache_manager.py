@@ -256,11 +256,10 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
 
 
-def _finish_read(policy: str, sp: SamplingParams, *, warm_prefix: bool = False):
+def _finish_read(policy: str, sp: SamplingParams, *, warm_prefix: bool = False, num_pages: int = 256):
     """A 130-token prompt finishing on its prefill forward, with a frozen x64 snapshot at 128
     (the deepest boundary strictly inside it) and its live state at 130. ``warm_prefix`` first
     donates a 64-token prefix so the read resumes from a locked prefix-cache hit."""
-    num_pages = 256
     pool = _pool()
     pt = torch.zeros(4, 256, dtype=torch.int32)
     cm = CacheManager(num_pages, 1, pt, "hybrid_radix", linear_state_pool=pool,
@@ -344,3 +343,93 @@ def test_snapshot_donate_policy_is_a_server_arg():
         assert parse_args(["--model", "/models/anon"])[0].logprob_read_snapshot_donate == "all"
         args, _ = parse_args(["--model", "/models/anon", "--logprob-read-snapshot-donate", "none"])
     assert args.logprob_read_snapshot_donate == "none"
+
+
+@pytest.mark.parametrize(
+    ("sp", "read"),
+    [
+        (READ, True),
+        (SamplingParams(max_tokens=1, logprobs=True), True),
+        (SamplingParams(max_tokens=1), False),
+        (SamplingParams(max_tokens=2, logprobs=True, top_logprobs=4), False),
+    ],
+)
+def test_is_logprob_read(sp, read):
+    assert sp.is_logprob_read is read
+
+
+def test_logprob_read_isolate_is_a_server_arg():
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    config = SimpleNamespace(to_dict=lambda: {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        assert parse_args(["--model", "/models/anon"])[0].logprob_read_isolate is False
+        args, _ = parse_args(["--model", "/models/anon", "--logprob-read-isolate"])
+    assert args.logprob_read_isolate is True
+
+
+def _assert_no_leak(cm, num_pages=256):
+    pc, pool = cm.prefix_cache, cm.linear_state_pool
+    assert len(cm.free_slots) + pc.full_evictable + pc.full_protected == num_pages
+    assert pc.full_protected == 0 and pc.mamba_protected == 0
+    assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1
+    cm.check_integrity()
+
+
+@pytest.mark.parametrize("isolate", [False, True])
+def test_isolated_logprob_read_ignores_and_keeps_out_of_the_prefix_cache(isolate):
+    """An identical earlier read donated under "all"; an isolated read still prefills cold and stores nothing."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, prompt = _finish_read("all", READ, num_pages=512)  # room for both reads: no eviction
+    cm.isolate_logprob_reads = isolate
+    tree = (cm.prefix_cache.full_evictable, cm.prefix_cache.mamba_evictable_size)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=2, page_table=cm.page_table),
+                        DecodeManager(page_size=1), isolate_logprob_reads=isolate)
+    pm.pending_list = [PendingReq(1, torch.tensor(prompt, dtype=torch.int32), READ)]
+    if isolate:  # nor may the host tier rehydrate a prefix for it
+        cm.host_tier = SimpleNamespace(has_kv=True, lookup=lambda *_: pytest.fail("host tier lookup"))
+    batch = pm.schedule_next_batch(4096)
+    (req,) = batch.reqs
+    assert req.cache_handle.cached_len == batch.log_cached_tokens == (0 if isolate else 128)
+
+    cm.allocate_paged(batch.reqs)
+    req.complete_one()
+    if isolate:  # a cold 130-token extend tracks the x64 boundary at 128 (build_fla_metadata)
+        req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
+    cm.cache_req(req, finished=True)
+    if isolate:
+        assert (cm.prefix_cache.full_evictable, cm.prefix_cache.mamba_evictable_size) == tree
+    _assert_no_leak(cm, num_pages=512)
+
+
+@pytest.mark.parametrize(("policy", "isolate"), [("none", False), ("all", True), ("boundary", True)])
+def test_non_donating_read_chunk_commit_leaves_the_tree_alone(policy, isolate):
+    """The prefill-commit branch donated the x64 snapshot whatever the read policy said."""
+    num_pages, pool = 256, _pool()
+    pt = torch.zeros(4, 256, dtype=torch.int32)
+    cm = CacheManager(num_pages, 1, pt, "hybrid_radix", linear_state_pool=pool,
+                      logprob_read_snapshot_donate=policy, isolate_logprob_reads=isolate)
+    prompt = list(range(1, 131))
+    mr = cm.match_req(_pend(prompt))
+    pt[0, :130] = cm._allocate(130)
+    row = pt[0, :130].clone()
+    req = Req(input_ids=torch.tensor(prompt + [7], dtype=torch.int32), table_idx=0, cached_len=130,
+              output_len=1, uid=0, sampling_params=READ, cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
+    cm.lock(mr.cuda_handle)
+
+    cm.cache_req(req, finished=False)
+    assert cm.prefix_cache.full_evictable + cm.prefix_cache.full_protected == 0
+    assert cm.prefix_cache.mamba_evictable_size + cm.prefix_cache.mamba_protected == 0
+    assert torch.equal(pt[0, :130], row)  # the request still owns its pages
+
+    cm.cache_req(req, finished=True)
+    assert len(cm.free_slots) == num_pages
+    _assert_no_leak(cm)

@@ -35,7 +35,7 @@ LOGPROB_READ_SNAPSHOT_DONATE = ("all", "boundary", "none")
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 logprob_read_snapshot_donate: str = "all"):
+                 logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -54,6 +54,7 @@ class CacheManager:
         if logprob_read_snapshot_donate not in LOGPROB_READ_SNAPSHOT_DONATE:
             raise ValueError(f"unknown snapshot donate policy {logprob_read_snapshot_donate!r}")
         self.logprob_read_snapshot_donate = logprob_read_snapshot_donate
+        self.isolate_logprob_reads = isolate_logprob_reads
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
@@ -145,7 +146,7 @@ class CacheManager:
             # (KV bytes + GDN snapshot). If the tree match fell short, rehydrate the deeper
             # host entry into fresh pages, re-insert it into the tree and re-match.
             tier = self.host_tier
-            if tier is not None and tier.has_kv:
+            if tier is not None and tier.has_kv and len(ids) > 0:
                 hit = tier.lookup(ids, self.page_size)
                 if (hit is not None and hit.kv_pages is not None and hit.gdn_slot is not None
                         and hit.host_len > m.cached_len):
@@ -374,6 +375,11 @@ class CacheManager:
             req.cache_handle = new_handle
             self.lock(new_handle)
 
+    def _donate_policy(self, req: Req) -> str:
+        if not req.sampling_params.is_logprob_read:
+            return "all"
+        return "none" if self.isolate_logprob_reads else self.logprob_read_snapshot_donate
+
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote
@@ -394,12 +400,7 @@ class CacheManager:
             # is this request's dup to free. The frozen slot is consumed either way (taken by
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
-            sp = req.sampling_params
-            donate = (
-                self.logprob_read_snapshot_donate
-                if sp.logprobs and sp.max_tokens == 1
-                else "all"
-            )
+            donate = self._donate_policy(req)
             free_upto = old_handle.cached_len
             L = req.mamba_last_track_seqlen
             if (
@@ -439,6 +440,10 @@ class CacheManager:
             return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
+        # A non-donating read keeps its own pages and frozen slot until the finish frees them.
+        if self._donate_policy(req) == "none":
+            req.mamba_last_track_seqlen = None
+            return
         L = req.mamba_last_track_seqlen
         if L is None:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
