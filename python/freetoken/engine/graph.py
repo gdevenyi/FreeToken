@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
+from freetoken.env import ENV
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -120,7 +121,7 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
 
     Otherwise the first replay pushes every node behind the graph's own stream WAIT, and a large graph then blocks cudaGraphLaunch until the WAIT is released. PLE wait-sync releases it only after the launch returns, so that deadlocks.
     """
-    upload = _cu_graph_upload()
+    upload = _cu_graph_upload() if ENV.GRAPH_UPLOAD else None
     if upload is None:
         return
     rc = upload(graph.raw_cuda_graph_exec(), stream.cuda_stream)

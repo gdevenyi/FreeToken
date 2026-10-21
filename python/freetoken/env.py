@@ -77,6 +77,9 @@ class EnvClassSingleton:
     MAMBA_SSM_DTYPE = EnvStr("float32")
     # cap the longest prefill warmup forward; 0 = the engine's own chunk cap
     WARMUP_MAX_LEN = EnvInt(0)
+    # cuGraphUpload each decode graph at capture (#697); off keeps the first-launch upload, which
+    # replays ~0.2 ms/step faster on Qwen3.8-Flash / RTX 5080 but can block the first launch on a stream WAIT
+    GRAPH_UPLOAD = EnvBool(True)
     # GPU-decode MoE: run a layer's expert miss copy on a side stream under the shared expert
     MOE_COPY_OVERLAP = EnvBool(False)
     # GPU-decode MoE cross-layer prefetch: off | measure (predict and count, no copies) | on (predict and copy)
