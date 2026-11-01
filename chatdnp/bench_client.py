@@ -127,7 +127,7 @@ def stream_chat(a, prompt, max_tokens):
         "first_to_last_s": last - first,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
-        "cached_tokens": details.get("cached_tokens"),
+        "cached_tokens": details.get("cached_tokens", 0),  # the server omits the details for 0
     }
 
 
@@ -178,7 +178,7 @@ def ttft_1k(a):
         stream_chat(a, make_words("ttft", a.seed, i, words), a.ttft_output_tokens) for i in range(a.ttft_repeats)
     ]
     for s in samples:
-        if (s["cached_tokens"] or 0) > 0.1 * s["prompt_tokens"]:
+        if s["cached_tokens"] > 0.1 * s["prompt_tokens"]:
             print(f"WARNING: TTFT sample has {s['cached_tokens']} cached tokens: use a new --seed", file=sys.stderr)
     return (
         statistics.median(s["ttft_s"] for s in samples),

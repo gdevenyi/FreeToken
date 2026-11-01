@@ -1,6 +1,7 @@
 """Prefix cache and images: repeated images must hit, a different image must not reuse image tokens.
 
-Needs a server with --enable-cache-report (usage.prompt_tokens_details.cached_tokens).
+Needs a server with --enable-cache-report (usage.prompt_tokens_details.cached_tokens). The server
+omits that object for 0 cached tokens, so a server without the flag fails checks 2, 4 and 6.
 Each run has its own nonce in the images and the text, so a run on a warm server is still cold.
 
  1 cold        image A + text, nothing cached
@@ -69,13 +70,10 @@ class Probe:
             sys.exit(f"IMAGE_HIT_PROBE FAIL: HTTP {r.status_code}: {r.text[:300]}")
         j = r.json()
         u = j.get("usage") or {}
-        details = u.get("prompt_tokens_details")
-        if details is None or "cached_tokens" not in details:
-            sys.exit(f"IMAGE_HIT_PROBE FAIL: no cached_tokens in usage (--enable-cache-report?): {u}")
         return {
             "reply": j["choices"][0]["message"].get("content") or "",
             "prompt": u.get("prompt_tokens", 0),
-            "cached": details["cached_tokens"],
+            "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
             "dt": dt,
         }
 

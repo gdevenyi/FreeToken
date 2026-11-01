@@ -1,8 +1,8 @@
 """Does the served model see images? Synthetic PNGs made with Pillow, plus a text-only check.
 
 Image 1: text HELLO 42 with a blue circle. Image 2: text GREEN TEA with a green circle.
-The reply must read the text and name the colour, and must not name the colour of the other image
-(image 2 contains the word GREEN, so only the absence of "blue" shows that the model saw the circle).
+The reply has the form "TEXT: ...; CIRCLE: ...". The text part must read the text and the circle
+part must name the colour and not the colour of the other image.
 Prints one line per check with timing and usage, and ends with VISION_PROBE PASS or FAIL.
 
 usage: vision_probe.py [--base-url URL] [--model NAME] [--max-tokens N]
@@ -19,10 +19,13 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 CHECKS = [
-    ("HELLO 42", "blue", (30, 60, 220), ["hello", "42", "blue"], ["green"]),
-    ("GREEN TEA", "green", (20, 170, 60), ["green", "tea"], ["blue"]),
+    ("HELLO 42", "blue", (30, 60, 220), "green"),
+    ("GREEN TEA", "green", (20, 170, 60), "blue"),
 ]
-QUESTION = "Read the text in this image and name the colour of the circle. Reply in one short sentence."
+QUESTION = (
+    "Read the text in this image and name the colour of the circle. "
+    "Reply in exactly this form, with nothing else: TEXT: <the text>; CIRCLE: <the colour>"
+)
 
 
 def png_data_url(text, rgb):
@@ -70,14 +73,14 @@ def main():
     a.base_url = a.base_url.rstrip("/")
 
     ok = True
-    for text, colour, rgb, want, refuse in CHECKS:
+    for text, colour, rgb, other in CHECKS:
         content = [
             {"type": "image_url", "image_url": {"url": png_data_url(text, rgb)}},
             {"type": "text", "text": QUESTION},
         ]
         status, reply, usage, dt = chat(a, content)
-        low = reply.lower()
-        good = status == 200 and all(w in low for w in want) and not any(w in low for w in refuse)
+        read, _, circle = reply.lower().partition("circle:")
+        good = status == 200 and text.lower() in read and colour in circle and other not in circle
         ok &= report(f"image {text!r} {colour} circle", good, reply, usage, dt)
 
     status, reply, usage, dt = chat(a, "What is 2+2? Reply with only the number.")
