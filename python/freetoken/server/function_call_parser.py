@@ -406,6 +406,18 @@ class BaseFormatDetector(ABC):
             return "integer"
         return "loose"
 
+    @staticmethod
+    def _literal_allows_null(schema: Dict) -> bool:
+        """Whether an ``enum``/``const`` lists JSON null."""
+        if "const" in schema:
+            return schema["const"] is None
+        return isinstance(schema.get("enum"), list) and None in schema["enum"]
+
+    @staticmethod
+    def _is_nullable_string(prop: Dict) -> bool:
+        ptype = str(prop.get("type", "string")).strip().lower()
+        return prop.get("nullable") is True and ptype in ("string", "str", "enum")
+
     def _normalize_param_schema(self, schema: Dict, root_schema: Dict, _depth: int = 0) -> Dict:
         """Resolve the schema parts needed for tool argument typing."""
         if not isinstance(schema, dict):
@@ -416,11 +428,11 @@ class BaseFormatDetector(ABC):
             non_null = [t for t in param_type if t != "null"]
             result = dict(schema)
             result["type"] = non_null[0] if len(non_null) == 1 else "loose"
-            if len(non_null) != len(param_type):
+            if len(non_null) != len(param_type) or self._literal_allows_null(schema):
                 result["nullable"] = True
             return result
         if isinstance(param_type, str):
-            return schema
+            return {**schema, "nullable": True} if self._literal_allows_null(schema) else schema
         all_of = schema.get("allOf")
         if (
             isinstance(all_of, list)
@@ -446,7 +458,7 @@ class BaseFormatDetector(ABC):
                 branch_type = branch.get("type")
                 if not isinstance(branch_type, str):
                     branch_type = self._literal_schema_type(branch)
-                nullable = nullable or branch_type == "null"
+                nullable = nullable or branch_type == "null" or self._literal_allows_null(branch)
                 if isinstance(branch_type, str) and branch_type != "null":
                     types.append(branch_type)
             types = list(dict.fromkeys(types))
@@ -465,6 +477,8 @@ class BaseFormatDetector(ABC):
             return result
         result = dict(schema)
         result["type"] = self._literal_schema_type(schema) or "loose"
+        if self._literal_allows_null(schema):
+            result["nullable"] = True
         return result
 
     def _get_tool_schema(self, func_name: str, tools: List[Tool]) -> Dict:
@@ -491,6 +505,12 @@ class BaseFormatDetector(ABC):
 
     def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
         """Convert parameter value based on schema type. Safe alternative to eval()."""
+        prop = param_config.get(param_name)
+        if isinstance(prop, dict) and self._is_nullable_string(prop):
+            # Exactly "null" only: NULL can be a SQL value, and an enum can list the word itself.
+            enum = prop.get("enum")
+            return None if value == "null" and not (isinstance(enum, list) and "null" in enum) else value
+
         if value.lower() == "null":
             return None
 
@@ -534,11 +554,10 @@ class BaseFormatDetector(ABC):
         prop = param_config.get(param_name, {})
         if not isinstance(prop, dict):
             return "string"
-        ptype = str(prop.get("type", "string")).strip().lower()
         # Not the literal-streaming path: only the buffered one can turn a whole value into null.
-        if prop.get("nullable") is True and ptype in ("string", "str", "enum"):
+        if self._is_nullable_string(prop):
             return "nullable_string"
-        return ptype
+        return str(prop.get("type", "string")).strip().lower()
 
     @staticmethod
     def _json_escape_chunk(text: str) -> str:
