@@ -40,6 +40,7 @@ from .generation import (
     prerender_error,
     render_messages,
     resolve_sampling,
+    send_new_request,
     submit_generation,
 )
 
@@ -494,11 +495,16 @@ async def handle_completion(
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                req, model_sampling, default_max_tokens=default_max_tokens
-            ))
-        )
+        try:
+            await send_new_request(
+                state,
+                uid,
+                TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
+                    req, model_sampling, default_max_tokens=default_max_tokens
+                )),
+            )
+        except GenerationError as exc:
+            return create_error_response(str(exc))
         chunks = stream_completion_chunks(uid, req, state, echo_text=echo_texts[0])
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
@@ -510,15 +516,20 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(
-                uid=uid,
-                text=prompt,
-                sampling_params=_resolve_sampling(
-                    req, model_sampling, default_max_tokens=default_max_tokens
+        try:
+            await send_new_request(
+                state,
+                uid,
+                TokenizeMsg(
+                    uid=uid,
+                    text=prompt,
+                    sampling_params=_resolve_sampling(
+                        req, model_sampling, default_max_tokens=default_max_tokens
+                    ),
                 ),
             )
-        )
+        except GenerationError as exc:
+            return create_error_response(str(exc))
 
         async def _drain_one(uid: int = uid, index: int = index):
             nonlocal prompt_tokens, completion_tokens, cached_tokens

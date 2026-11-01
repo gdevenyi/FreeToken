@@ -378,13 +378,26 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
+async def send_new_request(state: Any, uid: int, msg: TokenizeMsg) -> None:
+    """Send a request registered by new_user. A field the wire cannot encode is the client's
+    error, and the scheduler never sees the request, so its bookkeeping is removed here."""
+    try:
+        await state.send_one(msg)
+    # RecursionError: serialize_type on client JSON nested too deep (measured at 500 lists)
+    except (OverflowError, UnicodeEncodeError, TypeError, RecursionError) as exc:
+        state.forget_unsent_user(uid)
+        raise GenerationError(f"request cannot be encoded: {exc}") from exc
+
+
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
     refs = collect_image_refs(spec.messages)
     images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
-    await state.send_one(
+    await send_new_request(
+        state,
+        uid,
         TokenizeMsg(
             uid=uid,
             text=spec.messages,
@@ -393,7 +406,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
             images=images,
             inline_system_policy=spec.inline_system_policy,
-        )
+        ),
     )
     return uid
 

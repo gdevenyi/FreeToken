@@ -55,6 +55,9 @@ class StatsTracker:
         if uid in self._inflight:
             self._aborting.add(uid)
 
+    def on_unsent(self, uid: int) -> None:
+        self._inflight.discard(uid)
+
     def observe(self, reply: Any, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
         if getattr(reply, "completion_tokens_delta", 0) > 0:
