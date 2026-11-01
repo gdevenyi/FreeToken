@@ -1522,6 +1522,15 @@ class Engine:
                     if cell not in seen:
                         seen.add(cell)
                         lens.add(tokens)
+            from freetoken.layers import moe as moe_layer
+
+            threshold = moe_layer._SMALL_PREFILL_TOKENS
+            if 0 < threshold < cap:
+                # up to the threshold prefill takes the decode kernel, so the short lengths above reach no whole-layer GEMM
+                from freetoken.kernel.nvfp4_moe import prefill_bucket_lens
+
+                lens.add(threshold + 1)
+                lens.update(prefill_bucket_lens(threshold + 1, cap, top_k, mc.num_experts, self.device.index))
         if cap >= 4096:
             # act_and_mul flips BLOCK_D at M >= 4096; also GDN chunk_delta_h NT bucket 1 (NT > 32)
             lens.add(4096)
