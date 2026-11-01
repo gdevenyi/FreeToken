@@ -11,7 +11,8 @@ from freetoken.message.tokenizer import BaseTokenizerMsg
 from freetoken.server.anthropic_api import handle_anthropic_messages
 from freetoken.server.anthropic_models import AnthropicMessagesRequest
 from freetoken.server.api_models import ChatCompletionRequest, CompletionRequest
-from freetoken.server.api_server import FrontendManager
+from freetoken.server import api_server
+from freetoken.server.api_server import FrontendManager, GenerateRequest
 from freetoken.server.openai_api import handle_chat_completion, handle_completion
 from freetoken.server.responses_api import ResponsesRequest, handle_responses
 from freetoken.utils.mp import ZmqAsyncPushQueue
@@ -108,6 +109,31 @@ def test_a_large_id_that_packs_is_still_sent():
     handler, req = _chat(stop_token_ids=[2**63], logit_bias={str(2**63): 1.0}, stream=True)
     state = _state()
     response = asyncio.run(handler(req, None, state, {}))
+    assert response.status_code == 200
+    assert len(state.sent) == 1
+    assert state.stats.active == 1
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"prompt": "\ud800", "max_tokens": 1}, {"prompt": "hi", "max_tokens": HUGE}],
+    ids=["lone-surrogate", "huge-max-tokens"],
+)
+def test_generate_unencodable_field_is_a_400_with_no_bookkeeping_left(monkeypatch, fields):
+    state = _state()
+    monkeypatch.setattr(api_server, "get_global_state", lambda: state)
+    response = asyncio.run(asyncio.wait_for(api_server.generate(GenerateRequest(**fields), None), 10))
+    assert response.status_code == 400
+    assert "request cannot be encoded" in json.loads(response.body)["error"]
+    assert state.stats.active == 0
+    assert state.ack_map == {} and state.event_map == {}
+    assert state.sent == []
+
+
+def test_generate_with_a_packable_request_is_still_sent(monkeypatch):
+    state = _state()
+    monkeypatch.setattr(api_server, "get_global_state", lambda: state)
+    response = asyncio.run(api_server.generate(GenerateRequest(prompt="hi", max_tokens=1), None))
     assert response.status_code == 200
     assert len(state.sent) == 1
     assert state.stats.active == 1

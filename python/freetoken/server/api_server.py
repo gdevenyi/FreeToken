@@ -46,6 +46,7 @@ from .bind import serve as serve_bound
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
+from .generation import GenerationError, send_new_request
 from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
@@ -982,16 +983,21 @@ async def generate(req: GenerateRequest, request: Request):
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
     uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=req.prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
+    try:
+        await send_new_request(
+            state,
+            uid,
+            TokenizeMsg(
+                uid=uid,
+                text=req.prompt,
+                sampling_params=SamplingParams(
+                    ignore_eos=req.ignore_eos,
+                    max_tokens=req.max_tokens,
+                ),
             ),
         )
-    )
+    except GenerationError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
     return StreamingResponse(
         state.stream_with_cancellation(state.stream_generate(uid), request, uid),
