@@ -771,3 +771,30 @@ def test_nested_markup_in_parameter_value_stays_opaque_outside_minimax_m3(parser
     )
 
     assert args == {"node": "<code>1</code>"}
+
+NULLABLE_STRINGS = [
+    pytest.param({"anyOf": [{"type": "string"}, {"type": "null"}]}, id="anyof"),
+    pytest.param({"oneOf": [{"type": "null"}, {"type": "string"}]}, id="oneof"),
+    pytest.param({"type": ["string", "null"]}, id="type-list"),
+    pytest.param({"type": "string", "nullable": True}, id="openapi"),
+]
+
+
+@pytest.mark.parametrize("schema", NULLABLE_STRINGS)
+@pytest.mark.parametrize("streaming", [False, True], ids=["one-shot", "streaming"])
+@pytest.mark.parametrize(("raw", "expected"), [("null", None), ("hi", "hi"), ("", ""), ("a\nb", "a\nb")])
+def test_qwen_nullable_string_null_is_json_null(schema, streaming, raw, expected):
+    args = _parse_args("qwen3_coder", schema, None, f"\n{raw}\n", streaming=streaming)
+    assert args == {"limit": expected}
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["one-shot", "streaming"])
+def test_qwen_plain_string_keeps_the_literal_null(streaming):
+    args = _parse_args("qwen3_coder", {"type": "string"}, None, "\nnull\n", streaming=streaming)
+    assert args == {"limit": "null"}
+
+
+@pytest.mark.parametrize("schema", NULLABLE_STRINGS)
+@pytest.mark.parametrize("parser_name", ["glm47", "minimax"])
+def test_other_buffered_detectors_stream_null_for_a_nullable_string(parser_name, schema):
+    assert _parse_args(parser_name, schema, None, "null", streaming=True) == {"limit": None}
