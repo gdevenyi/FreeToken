@@ -1,11 +1,12 @@
 """Does the server stop generating when the client closes the socket?
 
 For a streamed and a non-streaming completion (ignore_eos, --max-tokens tokens): open a socket, wait
-until the server generates, close the socket, then poll GET /v1/stats. The request is gone when
-requests.active is back at the value from before the request, and at least --margin s before the
-request could have finished by itself. A short request after that must also return quickly.
-With FT_LOG set, the new part of that log must have an "Aborting request" line for each disconnect.
-Other clients of the same server can delay the return to the old value and cause a false FAIL.
+until the server generates, close the socket, then poll GET /v1/stats. requests.active counts a
+request until the engine reports it finished, so it must come back to the value from before the
+request within --watch s. After that requests.completion_tokens_total must stop growing, and the
+total must stay below --max-tokens. A short request after that must also return quickly.
+With FT_LOG set, the new part of that log must have an "Aborting request" line for each disconnect,
+and "Scheduler is idle" after it. Other clients of the same server can cause a false FAIL.
 
 Ends with DISCONNECT_PROBE PASS or FAIL.
 
@@ -55,6 +56,7 @@ def open_request(a, stream):
 
 def drop(a, stream, baseline):
     """One disconnect. Returns (ok, facts)."""
+    tokens_before = stats(a)["requests"]["completion_tokens_total"]
     sock = open_request(a, stream)
     t0 = time.monotonic()
     received = b""
@@ -85,6 +87,10 @@ def drop(a, stream, baseline):
             break
         time.sleep(0.05)
     after = stats(a)
+    time.sleep(a.quiet)
+    later = stats(a)
+    generated = later["requests"]["completion_tokens_total"] - tokens_before
+    still = later["requests"]["completion_tokens_total"] - after["requests"]["completion_tokens_total"]
 
     t2 = time.monotonic()
     r = requests.post(
@@ -104,6 +110,8 @@ def drop(a, stream, baseline):
         "active_during": during["requests"]["active"],
         "active_back_after_s": None if back is None else round(back, 2),
         "active_after": after["requests"]["active"],
+        "generated_tokens": generated,
+        "tokens_after_gone": still,
         "kv_pages_during": (during.get("kv") or {}).get("used_pages"),
         "kv_pages_after": (after.get("kv") or {}).get("used_pages"),
         "decode_tps_after": after["throughput"]["decode_tps"],
@@ -122,6 +130,7 @@ def main():
     ap.add_argument("--watch", type=float, default=10.0, help="seconds to wait for the request to go away")
     ap.add_argument("--chunks", type=int, default=50, help="stream: chunks to read before the disconnect")
     ap.add_argument("--hold", type=float, default=2.0, help="non-streaming: seconds of generation before it")
+    ap.add_argument("--quiet", type=float, default=1.0, help="seconds in which no new token may appear")
     ap.add_argument("--short-limit", type=float, default=10.0, help="limit for the short request after it, s")
     a = ap.parse_args()
     a.base_url = a.base_url.rstrip("/")
@@ -144,10 +153,15 @@ def main():
         with open(log, errors="replace") as f:
             f.seek(offset)
             new = f.read()
-        aborts = new.count("Aborting request")
-        ok = aborts >= drops
+        parts = new.split("Aborting request")
+        aborts = len(parts) - 1
+        idle = sum("Scheduler is idle" in part for part in parts[1:])
+        ok = aborts >= drops and idle >= drops
         all_ok &= ok
-        print(f"{'pass' if ok else 'FAIL'} FT_LOG {log}: {aborts} 'Aborting request' lines, want >= {drops}")
+        print(
+            f"{'pass' if ok else 'FAIL'} FT_LOG {log}: {aborts} 'Aborting request' lines, "
+            f"{idle} followed by 'Scheduler is idle', want >= {drops}"
+        )
     print("DISCONNECT_PROBE", "PASS" if all_ok else "FAIL")
     sys.exit(0 if all_ok else 1)
 

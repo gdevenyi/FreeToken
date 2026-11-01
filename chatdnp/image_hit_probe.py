@@ -9,7 +9,11 @@ Each run has its own nonce in the images and the text, so a run on a warm server
  3 other image image B + the same text: must NOT reuse image tokens, and must read image B
  4 repeat      request 1 again: must be cached
  5 long cold   long text (--long-tokens, chunked prefill) + image A + question: nothing cached, reads image A
- 6 long repeat the same with a new question: the prefix must be cached
+ 6 long turn 2 request 5 + the reply + new text: the prefix must be cached, reads the image
+
+Requests 2 and 6 extend the earlier prompt, like an agent session. A prompt that replaces the last
+text is a different case: the hybrid cache resumes only at its snapshots, so such a prompt can get
+0 cached tokens with a long shared head, with or without an image.
 
 "Image tokens" = prompt tokens of request 1 less those of the same text without the image.
 Ends with IMAGE_HIT_PROBE PASS or FAIL.
@@ -30,7 +34,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 HIT_FRACTION = 0.8
 UNIT = "The quick brown fox jumps over the lazy dog near the quiet river bank. "
-CHARS_PER_TOKEN = 5.27  # this filler on the Qwen3.8 tokenizer
+CHARS_PER_TOKEN = 4.71  # this filler on the Qwen3.8 tokenizer, measured with usage.prompt_tokens
 
 
 def png_data_url(word, number, rgb, nonce):
@@ -141,20 +145,17 @@ def main():
     filler = f"[{nonce}] " + UNIT * int(a.long_tokens * CHARS_PER_TOKEN / len(UNIT))
     long_head = {"type": "text", "text": filler}
 
-    def long_turn(question):
-        return [{"role": "user", "content": [long_head, image_a, {"type": "text", "text": question}]}]
-
-    res = p.chat(long_turn(text["text"]))
+    long_first = [{"role": "user", "content": [long_head, image_a, text]}]
+    res = p.chat(long_first)
     low = res["reply"].lower()
     long_prompt = res["prompt"]
     p.check("5 long cold", res, res["cached"] < 0.1 * long_prompt and "cedar" in low, "cached < 10%, reads CEDAR")
-    res = p.chat(long_turn("What colour is the rectangle in this image? Reply with the colour only."))
+    question = "What colour is the rectangle in this image? Reply with the colour only."
+    long_next = long_first + [{"role": "assistant", "content": res["reply"]}, {"role": "user", "content": question}]
+    res = p.chat(long_next)
     need = HIT_FRACTION * long_prompt
     p.check(
-        "6 long repeat, new text",
-        res,
-        res["cached"] >= need and "red" in res["reply"].lower(),
-        f"cached >= {need:.0f}, says red",
+        "6 long turn 2", res, res["cached"] >= need and "red" in res["reply"].lower(), f"cached >= {need:.0f}, says red"
     )
 
     print(json.dumps({"image_tokens": image_tokens, "long_prompt_tokens": long_prompt}))
