@@ -777,12 +777,20 @@ NULLABLE_STRINGS = [
     pytest.param({"oneOf": [{"type": "null"}, {"type": "string"}]}, id="oneof"),
     pytest.param({"type": ["string", "null"]}, id="type-list"),
     pytest.param({"type": "string", "nullable": True}, id="openapi"),
+    pytest.param({"enum": ["a", None]}, id="enum"),
+    pytest.param({"type": "string", "enum": ["a", None]}, id="typed-enum"),
+    pytest.param({"anyOf": [{"const": "a"}, {"const": None}]}, id="anyof-const"),
+    pytest.param({"anyOf": [{"type": "string"}, {"enum": [None]}]}, id="anyof-enum"),
+    pytest.param({"oneOf": [{"type": "string"}, {"const": None}]}, id="oneof-const"),
 ]
 
 
 @pytest.mark.parametrize("schema", NULLABLE_STRINGS)
 @pytest.mark.parametrize("streaming", [False, True], ids=["one-shot", "streaming"])
-@pytest.mark.parametrize(("raw", "expected"), [("null", None), ("hi", "hi"), ("", ""), ("a\nb", "a\nb")])
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("null", None), ("hi", "hi"), ("", ""), ("a\nb", "a\nb"), ("NULL", "NULL"), ("Null", "Null")],
+)
 def test_qwen_nullable_string_null_is_json_null(schema, streaming, raw, expected):
     args = _parse_args("qwen3_coder", schema, None, f"\n{raw}\n", streaming=streaming)
     assert args == {"limit": expected}
@@ -794,7 +802,15 @@ def test_qwen_plain_string_keeps_the_literal_null(streaming):
     assert args == {"limit": "null"}
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["one-shot", "streaming"])
+def test_qwen_enum_that_lists_the_word_null_keeps_the_string(streaming):
+    schema = {"type": ["string", "null"], "enum": ["a", "null"]}
+    assert _parse_args("qwen3_coder", schema, None, "\nnull\n", streaming=streaming) == {"limit": "null"}
+
+
 @pytest.mark.parametrize("schema", NULLABLE_STRINGS)
 @pytest.mark.parametrize("parser_name", ["glm47", "minimax"])
-def test_other_buffered_detectors_stream_null_for_a_nullable_string(parser_name, schema):
-    assert _parse_args(parser_name, schema, None, "null", streaming=True) == {"limit": None}
+@pytest.mark.parametrize("streaming", [False, True], ids=["one-shot", "streaming"])
+@pytest.mark.parametrize(("raw", "expected"), [("null", None), ("NULL", "NULL")])
+def test_other_buffered_detectors_nullable_string(parser_name, schema, streaming, raw, expected):
+    assert _parse_args(parser_name, schema, None, raw, streaming=streaming) == {"limit": expected}
