@@ -20,11 +20,12 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .config import use_fp8_dense
+from .config import use_fp8_dense, use_fp8_lmhead
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
@@ -136,14 +137,17 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
-        )
+        if use_fp8_lmhead(config):
+            self.lm_head = Fp8ParallelLMHead(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size)
+        else:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:

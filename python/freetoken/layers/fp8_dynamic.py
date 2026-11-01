@@ -27,6 +27,7 @@ from freetoken.kernel.triton.e4m3_compat import f32_to_e4m3
 from freetoken.utils import div_even
 
 from .base import BaseOP
+from .embedding import ParallelLMHead
 
 FP8 = torch.float8_e4m3fn
 E4M3_MAX = 448.0
@@ -221,9 +222,26 @@ class Fp8DynamicRowParallel(Fp8DynamicLinear):
         )
 
 
+class Fp8ParallelLMHead(ParallelLMHead):
+    """``ParallelLMHead`` whose vocab shard is a per-tensor e4m3 weight (FREETOKEN_FP8_LMHEAD=1).
+
+    Only the GEMM changes; the all_gather in ``logits`` is untouched. Untied embeddings only: a tied head shares the bf16 embedding table.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+        self.weight = torch.empty(self.num_embeddings_tp, embedding_dim, dtype=FP8)
+        self.weight_scale = torch.empty((), dtype=torch.float32)
+
+    def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        y = fp8_dynamic_linear(x, self.weight, self.weight_scale)
+        return y if self.bias is None else y + self.bias
+
+
 __all__ = [
     "FP8",
     "E4M3_MAX",
+    "Fp8ParallelLMHead",
     "Fp8DynamicColMerged",
     "Fp8DynamicLinear",
     "Fp8DynamicRowParallel",

@@ -8,6 +8,7 @@ import torch
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
     fp8_dense_enabled,
+    fp8_lmhead_enabled,
     mrope_layout_from_rope_params,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -123,6 +124,16 @@ def use_fp8_dense(config: ModelConfig, fused_module: str) -> bool:
     if config.attn_quant != "fp8_dynamic":
         return False
     return config.quant is None or config.quant.scheme_for(fused_module) is None
+
+
+def use_fp8_lmhead(config: ModelConfig) -> bool:
+    """Whether the lm_head is load-time per-tensor FP8; the model builder and the weight reader must get one answer, or ``lm_head.weight_scale`` fails a strict load.
+
+    The head must be untied (a tied head shares the bf16 table). What counts is a scheme for lm_head itself, not a QuantConfig at all: this model ships NVFP4 experts with lm_head in the ignore list.
+    """
+    if not fp8_lmhead_enabled() or config.tie_word_embeddings:
+        return False
+    return config.quant is None or config.quant.scheme_for("lm_head") is None
 
 
 def parse_config(hf_config: Any) -> ModelConfig:

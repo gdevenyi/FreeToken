@@ -23,7 +23,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
-from freetoken.models.config import VISION_KEY_PREFIXES, fp8_dense_enabled
+from freetoken.models.config import VISION_KEY_PREFIXES, fp8_dense_enabled, fp8_lmhead_enabled
 from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -35,7 +35,7 @@ from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight,
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
-from .config import parse_config, use_fp8_dense
+from .config import parse_config, use_fp8_dense, use_fp8_lmhead
 
 logger = init_logger(__name__)
 
@@ -311,6 +311,8 @@ _FP8_DENSE_SUFFIXES = (
     ".self_attn.o_proj.weight",
     ".linear_attn.out_proj.weight",
 )
+# behind its own flag: this one moves the logits (see models.config.fp8_lmhead_enabled)
+_FP8_LMHEAD_SUFFIX = "lm_head.weight"
 _E4M3_MAX = 448.0
 
 
@@ -322,10 +324,10 @@ def _quantize_per_tensor(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _fp8_dense(
-    name: str, t: torch.Tensor, config, world: int
+    name: str, t: torch.Tensor, config, world: int, *, dense: bool = True, lm_head: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """The (already sharded) dense tensor as the fp8_dynamic model expects it."""
-    if name.endswith(".linear_attn.in_proj.weight"):
+    if dense and name.endswith(".linear_attn.in_proj.weight"):
         g = config.linear_attention_group()
         nk = div_even(g.num_key_heads, world, allow_replicate=True)
         nv = div_even(g.num_value_heads, world, allow_replicate=True)
@@ -337,7 +339,7 @@ def _fp8_dense(
         yield base + "in_proj_qkvz.weight_scale", scale
         # clone, not contiguous(): a contiguous row slice comes back as a view, which keeps the whole bf16 in_proj resident
         yield base + "in_proj_ba.weight", t[qkvz:].clone()
-    elif name.endswith(_FP8_DENSE_SUFFIXES):
+    elif (dense and name.endswith(_FP8_DENSE_SUFFIXES)) or (lm_head and name.endswith(_FP8_LMHEAD_SUFFIX)):
         w8, scale = _quantize_per_tensor(t)
         yield name, w8
         yield name[: -len("weight")] + "weight_scale", scale
@@ -379,15 +381,20 @@ def iter_weights(
     quant = get_quant_config()
     reader = _DenseReader(quant, spec.packed_modules_mapping)
     # the sharding geometry and the fp8 split need the parsed config, under the QuantConfig the builder saw; a plain TP=1 read never touches it
-    config = replace(parse_config(hf_config), quant=quant) if tp.size > 1 or fp8_dense_enabled() else None
+    needs_config = tp.size > 1 or fp8_dense_enabled() or fp8_lmhead_enabled()
+    config = replace(parse_config(hf_config), quant=quant) if needs_config else None
+    lmhead = config is not None and use_fp8_lmhead(config)
     fp8 = config is not None and config.attn_quant == "fp8_dynamic"
     if fp8:
         logger.info("qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), FREETOKEN_FP8_DENSE=1")
+    if lmhead:
+        logger.info("qwen4_exp lm_head: load-time per-tensor FP8, FREETOKEN_FP8_LMHEAD=1")
 
     def emit(name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
         tensor = _shard(name, tensor, config, tp.rank, tp.size)
-        if fp8 and _fp8_dense_applies(name, config):
-            yield from _fp8_dense(name, tensor, config, tp.size)
+        dense = fp8 and _fp8_dense_applies(name, config)
+        if dense or lmhead:
+            yield from _fp8_dense(name, tensor, config, tp.size, dense=dense, lm_head=lmhead)
         else:
             yield name, tensor
 
@@ -415,7 +422,7 @@ def iter_weights(
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
-    if fp8 and device.type == "cuda":
+    if (fp8 or lmhead) and device.type == "cuda":
         # hand the bf16 originals and fp32 temporaries back, so the expert-cache planner (free VRAM after load) sees the halved dense footprint
         torch.cuda.empty_cache()
 

@@ -137,12 +137,15 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
         return self.logits(x)
 
+    def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """The local vocab-shard GEMM; the seam a quantized head overrides."""
+        if self.tied_embedding is not None:
+            return self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
+        return self.quant_method.apply(self, x)
+
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         """Full-vocab logits of the rows of ``x``; reads no batch state."""
-        if self.tied_embedding is not None:
-            logits = self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
-        else:
-            logits = self.quant_method.apply(self, x)
+        logits = self._local_logits(x)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
