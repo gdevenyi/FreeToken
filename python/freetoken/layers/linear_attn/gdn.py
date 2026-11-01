@@ -6,6 +6,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
+from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.layers.quantization import QuantConfig
 from freetoken.utils import div_even
 
@@ -34,9 +35,12 @@ class GatedDeltaNet(BaseOP):
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "silu",
         *, quant_config: QuantConfig | None = None, prefix: str = "", out_heads_tiled: bool = False,
+        dynamic_fp8: bool = False,
     ):
         self.layer_id = layer_id
         self._out_heads_tiled = out_heads_tiled
+        # load-time per-tensor FP8: splits the fusion as a quantized checkpoint does, for a checkpoint that declares no scheme here
+        self._dynamic_fp8 = dynamic_fp8
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
         # hybrid-radix snapshot scatter h[h_row]->slot is a plain copy) only when the two head
@@ -70,8 +74,17 @@ class GatedDeltaNet(BaseOP):
             self._local_num_v_heads, self._local_num_v_heads,
         ]
         # the two linears of a checkpoint-declared scheme are not sharded per rank
-        assert not (tp.size > 1 and self._split_in_proj), "GDN TP shards bf16 projections only"
-        if self._split_in_proj:
+        assert not (tp.size > 1 and self._split_in_proj), "GDN TP shards bf16 or load-time fp8 projections only"
+        if self._dynamic_fp8:
+            self.in_proj_qkvz = Fp8DynamicColMerged(
+                hidden_size, [self.conv_dim, self.value_dim],
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
+            )
+            self.in_proj_ba = LinearColParallelMerged(
+                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
+            )
+        elif self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
@@ -96,10 +109,13 @@ class GatedDeltaNet(BaseOP):
         self.A_log = torch.empty(self._local_num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         # row-parallel: it takes this rank's v heads and all-reduces; at TP=1 it is exactly LinearReplicated
-        self.out_proj = LinearOProj(
-            self.value_dim, hidden_size, has_bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.out_proj",
-        )
+        if self._dynamic_fp8:
+            self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size)
+        else:
+            self.out_proj = LinearOProj(
+                self.value_dim, hidden_size, has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.out_proj",
+            )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -167,15 +183,15 @@ class GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device, pool)
             batch.fla_metadata = fla
 
-        if self._split_in_proj:
+        nk, nv = self._local_num_k_heads, self._local_num_v_heads
+        if self._split_in_proj or self._dynamic_fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
-            conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            conv_in, z = torch.split(qkvz, self._in_proj_split[:2], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b, a = torch.split(ba, [nv, nv], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
-        nk, nv = self._local_num_k_heads, self._local_num_v_heads
         kd, vd = self._local_key_dim, self._local_value_dim
         z = z.reshape(total, nv, self.head_v_dim)
         li = pool.local_index(self.layer_id)
