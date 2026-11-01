@@ -3,9 +3,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
 from freetoken.layers.quantization import QuantConfig
+from freetoken.utils import div_even
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -50,12 +52,25 @@ class GatedDeltaNet(BaseOP):
         self.value_dim = num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
+        # TP: k heads and their v-head groups split across ranks; the fla kernels take the GQA ratio
+        # from the shapes and kvcache.linear_state_pool._linear_local_dims shards the state the same way
+        tp = get_tp_info()
+        self._local_num_k_heads = div_even(num_k_heads, tp.size, allow_replicate=True)
+        self._local_num_v_heads = div_even(num_v_heads, tp.size, allow_replicate=True)
+        self._local_key_dim = self._local_num_k_heads * head_k_dim
+        self._local_value_dim = self._local_num_v_heads * head_v_dim
+        self._local_conv_dim = 2 * self._local_key_dim + self._local_value_dim
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
         self._split_in_proj = (
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        self._in_proj_split = [
+            self._local_conv_dim, self._local_value_dim,
+            self._local_num_v_heads, self._local_num_v_heads,
+        ]
+        # the two linears of a checkpoint-declared scheme are not sharded per rank
+        assert not (tp.size > 1 and self._split_in_proj), "GDN TP shards bf16 projections only"
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
@@ -68,18 +83,20 @@ class GatedDeltaNet(BaseOP):
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
+                hidden_size, [self.conv_dim, self.value_dim, num_v_heads, num_v_heads],
+                has_bias=False, local_output_sizes=self._in_proj_split,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
-        self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
+        self.conv1d = _DepthwiseConv1d(self._local_conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast before the decode kernel. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self._local_num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self._local_num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
-        self.out_proj = LinearReplicated(
+        # row-parallel: it takes this rank's v heads and all-reduces; at TP=1 it is exactly LinearReplicated
+        self.out_proj = LinearOProj(
             self.value_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
@@ -158,7 +175,9 @@ class GatedDeltaNet(BaseOP):
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
-        z = z.reshape(total, self.num_v_heads, self.head_v_dim)
+        nk, nv = self._local_num_k_heads, self._local_num_v_heads
+        kd, vd = self._local_key_dim, self._local_value_dim
+        z = z.reshape(total, nv, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
         if not batch.is_prefill:
@@ -173,10 +192,10 @@ class GatedDeltaNet(BaseOP):
                 mixed = self._conv_verify(conv_in, fla, pool)
             else:
                 mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
+            q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, nv, self.head_v_dim).to(dtype)
             core_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log, a=a, dt_bias=self.dt_bias,  # already fp32 (stored fp32)
                 softplus_beta=1.0, softplus_threshold=20.0,
@@ -192,13 +211,13 @@ class GatedDeltaNet(BaseOP):
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
+            q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, nv, self.head_v_dim).to(dtype)
             g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
+            g = g.reshape(1, total, nv)
+            beta = beta.float().reshape(1, total, nv)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
@@ -218,8 +237,8 @@ class GatedDeltaNet(BaseOP):
         out = self.norm.forward(core_out, z).reshape(total, -1)
         if self._out_heads_tiled:
             # grouped value heads (k-head major) -> tiled (k-head minor), the column order of a GGUF ssm_out
-            r = self.num_v_heads // self.num_k_heads
-            out = out.view(total, self.num_k_heads, r, self.head_v_dim).transpose(1, 2).reshape(total, -1)
+            r = nv // nk
+            out = out.view(total, nk, r, self.head_v_dim).transpose(1, 2).reshape(total, -1)
         return self.out_proj.forward(out)
 
 
