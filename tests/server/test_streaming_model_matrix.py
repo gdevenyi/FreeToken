@@ -753,12 +753,12 @@ QWEN_TOOLS = TOOLS + [
 ]
 
 
-def _qwen_parity(pieces, *, thinking=True, finish_reason=None, matched_stop=None, tools=QWEN_TOOLS):
+def _qwen_parity(pieces, *, thinking=True, finish_reason=None, matched_stop=None, tools=QWEN_TOOLS, sampling=None):
     """Feed token texts one per ack to the streaming path and joined to the
     non-streaming path; assert both expose the same content, reasoning and calls
     (exactly, no strip) and return them."""
     spec = GenSpec(
-        messages=[], sampling_params=None, parser_tools=tools, template_tools=tools,
+        messages=[], sampling_params=sampling, parser_tools=tools, template_tools=tools,
         chat_template_kwargs={} if thinking else {"enable_thinking": False},
     )
 
@@ -812,14 +812,21 @@ def test_qwen_omitted_think_close_then_real_call_is_a_call():
         ({"finish_reason": None}, "stop"),
         ({"finish_reason": "stop", "matched_stop": "END"}, "stop"),
         ({"finish_reason": "stop", "tools": None}, "stop"),
+        ({"finish_reason": "stop", "sampling": SimpleNamespace(stop_token_ids=[248059])}, "stop"),
     ],
-    ids=["max-tokens", "unknown-finish", "client-stop-string", "no-parsed-tools"],
+    ids=["max-tokens", "unknown-finish", "client-stop-string", "no-parsed-tools", "client-stop-token"],
 )
 def test_qwen_omitted_think_close_stays_reasoning_unless_the_model_stopped(kwargs, finish):
     block = "<tool_call>\n<function=edit>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
     assert _qwen_parity(["The format is:\n", block], **kwargs) == (
         "", f"The format is:\n{block}", [], finish
     )
+
+
+def test_qwen_blank_tool_name_recovers_no_call():
+    block = "<tool_call><function=></function></tool_call>"
+    blank = [{"type": "function", "function": {"parameters": {}}}]
+    assert _qwen_parity(["F:\n", block], finish_reason="stop", tools=blank)[2] == []
 
 
 def test_qwen_quote_with_an_open_value_does_not_run_as_the_real_call():

@@ -528,10 +528,13 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     return build_reasoning_parser(state.config, force_reasoning, tool_names)
 
 
-def _reasoning_finish(finish_reason: str | None, matched_stop: str | None) -> str | None:
+def _reasoning_finish(spec: GenSpec, finish_reason: str | None, matched_stop: str | None) -> str | None:
     """The finish reason the reasoning parser sees, before any adapter default."""
-    # A client stop string cut the text as max_tokens does: the model did not end the turn there.
-    return None if matched_stop is not None else finish_reason
+    # A client stop string or stop token cuts the text as max_tokens does: the model may not have
+    # ended the turn there. The scheduler reports a stop-token hit as a plain "stop", same as EOS.
+    if matched_stop is not None or getattr(spec.sampling_params, "stop_token_ids", None):
+        return None
+    return finish_reason
 
 
 def _split_reasoning(
@@ -851,7 +854,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     # trailing partial token) so it is not silently dropped.
     if reasoning_parser is not None:
         flush_reasoning, flush_content = reasoning_parser.flush(
-            _reasoning_finish(engine_finish_reason, engine_matched_stop)
+            _reasoning_finish(spec, engine_finish_reason, engine_matched_stop)
         )
         if flush_reasoning:
             stripped_reasoning = strip_special_tokens(flush_reasoning, specials)
@@ -940,7 +943,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
             break
 
     reasoning_text, content_text = _split_reasoning(
-        full_content, spec, state, _reasoning_finish(engine_finish_reason, engine_matched_stop)
+        full_content, spec, state, _reasoning_finish(spec, engine_finish_reason, engine_matched_stop)
     )
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
