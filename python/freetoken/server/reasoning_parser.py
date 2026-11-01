@@ -463,7 +463,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
         )
-        self._tool_names = frozenset(tool_names or ())
+        self._tool_names = frozenset(n for n in tool_names or () if n)
         # The generation start, held while it can still grow into ws* + "<think>".
         self._head: Optional[str] = ""
         self._trim_content = False
