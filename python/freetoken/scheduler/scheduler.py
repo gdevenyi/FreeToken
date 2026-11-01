@@ -468,7 +468,9 @@ class Scheduler(SchedulerIOMixin):
             # EOS and stop strings win over length.
             # Overlap can advance device_len one token ahead of this host reply.
             hit_length = req.input_ids.numel() >= req.max_device_len
-            hit_eos = not params.ignore_eos and token in self.eos_token_ids
+            hit_eos = (
+                not params.ignore_eos and token in self.eos_token_ids
+            ) or token in params.stop_token_ids
             matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
             if hit_length or hit_eos or matched_stop is not None:
                 finished = True
@@ -483,6 +485,8 @@ class Scheduler(SchedulerIOMixin):
             finish_reason=finish_reason,
             matched_stop=matched_stop,
             stop_strs=params.stop_strs or None,
+            keep_stop_str=params.include_stop_str_in_output,
+            skip_special_tokens=params.skip_special_tokens,
         )
         return msg, len(committed)
 
@@ -600,6 +604,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            sp = msg.sampling_params
+            if sp.min_tokens > 0:
+                # min_tokens: the sampler masks these ids while the output is shorter.
+                sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
+                sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
