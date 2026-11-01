@@ -61,7 +61,7 @@ restore() {
   tmux kill-session -t ftc 2>/dev/null || true
   wait_free || true
   # run_qwen38.sh reads MODEL too: an inherited MODEL once kept production down
-  local run=(env -u MODEL -u TREE -u CAND_ENV -u CAND_FLAGS "$HOME/run_qwen38.sh")
+  local run=(env -u MODEL -u TREE -u CAND_ENV -u CAND_FLAGS -u PYTHONPATH -u LD_PRELOAD "$HOME/run_qwen38.sh")
   local prod
   prod=$("${run[@]}" check | sed -n 's/^cd \([^ ]*\) .*/\1/p')
   say "production tree $prod at $(git -C "$prod" log --oneline -1)"
