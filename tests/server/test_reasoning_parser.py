@@ -1,10 +1,65 @@
 """Character-boundary contracts for every reasoning detector and template mode."""
+import random
 from types import SimpleNamespace
 
 import pytest
 
 from freetoken.server.generation import GenSpec, _make_reasoning_parser
 from freetoken.server.reasoning_parser import BaseReasoningParser, ReasoningParser
+
+
+def _qwen_call(name, value="rm -rf build"):
+    return (
+        f"<tool_call>\n<function={name}>\n<parameter=command>\n{value}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+
+_PAD = ("More reasoning about the user request that goes on for a while. " * 12).strip()
+_BASH = _qwen_call("bash")
+_EXAMPLE = _qwen_call("example_function_name", "value_1")
+QWEN_TOOL_MARKER_IDS = [
+    ("A-prose-quote-far-close",
+     f"I must wrap the call in a <tool_call> block.\n{_PAD}\n</think>\n\nAnswer.", ["bash"],
+     f"I must wrap the call in a <tool_call> block.\n{_PAD}", "Answer."),
+    ("B-prose-quote-near-close",
+     "I must wrap the call in a <tool_call> block.\nOK.\n</think>\n\nAnswer.", ["bash"],
+     "I must wrap the call in a <tool_call> block.\nOK.", "Answer."),
+    ("C-real-looking-quote-far-close",
+     f"The format is:\n{_BASH}\nNot yet.\n{_PAD}\n</think>\n\nI will ask.", ["bash"],
+     f"The format is:\n{_BASH}\nNot yet.\n{_PAD}", "I will ask."),
+    ("C2-quote-right-before-close",
+     f"The format is:\n{_BASH}\n</think>\n\nI will ask.", ["bash"],
+     f"The format is:\n{_BASH}", "I will ask."),
+    ("C3-two-quotes-far-close",
+     f"Format:\n{_BASH}\n{_BASH}\n{_PAD}\n</think>\nAsk.", ["bash"],
+     f"Format:\n{_BASH}\n{_BASH}\n{_PAD}", "Ask."),
+    ("C4-close-inside-the-arguments",
+     f"Edit.\n{_qwen_call('bash', '</think>')}", ["bash"],
+     "Edit.\n<tool_call>\n<function=bash>\n<parameter=command>",
+     "</parameter>\n</function>\n</tool_call>"),
+    ("D-omitted-close-real-call", f"I will list files.\n{_BASH}", ["bash"],
+     "I will list files.", _BASH),
+    ("D2-no-tool-list", f"I will list files.\n{_BASH}", None, "I will list files.", _BASH),
+    ("D3-parallel-calls", f"Two.\n{_BASH}\n{_BASH}\n", ["bash"], "Two.", f"{_BASH}\n{_BASH}\n"),
+    ("D4-closer-dropped", "Go.\n<tool_call><function=bash></function>", ["bash"],
+     "Go.", "<tool_call><function=bash></function>"),
+    ("D5-closer-text-in-arguments",
+     f"Go.\n{_qwen_call('bash', 'echo </tool_call> done')}", ["bash"],
+     "Go.", _qwen_call("bash", "echo </tool_call> done")),
+    ("D6-quote-then-text-then-real-call", f"Like:\n{_BASH}\nSo.\n{_BASH}", ["bash"],
+     f"Like:\n{_BASH}\nSo.", _BASH),
+    ("E-template-example-unknown-name", f"Format:\n{_EXAMPLE}\n{_PAD}\n</think>\nAsk.", ["bash"],
+     f"Format:\n{_EXAMPLE}\n{_PAD}", "Ask."),
+    ("E2-unknown-name-at-eos", f"Format:\n{_EXAMPLE}", ["bash"], f"Format:\n{_EXAMPLE}", ""),
+    ("F-text-after-the-call-no-close", f"Go.\n{_BASH}\nDone.", ["bash"], f"Go.\n{_BASH}\nDone.", ""),
+    ("G-cut-inside-the-call", "Go.\n<tool_call>\n<function=bash>\n<parameter=command>\nrm",
+     ["bash"], "Go.\n<tool_call>\n<function=bash>\n<parameter=command>\nrm", ""),
+    ("H-marker-then-prose", "a <tool_call> b <tool_call>", ["bash"], "a <tool_call> b <tool_call>", ""),
+    ("I-marker-then-json", 'a <tool_call>\n{"name": "bash"}\n</tool_call>', None,
+     'a <tool_call>\n{"name": "bash"}\n</tool_call>', ""),
+]
+QWEN_TOOL_MARKER_CASES = [case[1:] for case in QWEN_TOOL_MARKER_IDS]
 
 
 class _ReasoningContract:
@@ -62,6 +117,38 @@ class TestQwen3ReasoningParser(_ReasoningContract):
         parser = ReasoningParser(self.name, force_reasoning=True)
         parts = [parser.parse_stream_chunk(char) for char in text] + [parser.flush()]
         assert tuple("".join(pair[i] for pair in parts) for i in (0, 1)) == expected
+
+    @pytest.mark.parametrize(
+        ("text", "tools", "reasoning", "content"),
+        QWEN_TOOL_MARKER_CASES,
+        ids=[case[0] for case in QWEN_TOOL_MARKER_IDS],
+    )
+    def test_tool_marker_in_reasoning(self, text, tools, reasoning, content):
+        def parser():
+            return ReasoningParser(self.name, force_reasoning=True, tool_names=tools)
+
+        expected = (reasoning, content)
+        assert parser().parse_non_stream(text) == expected
+        rng = random.Random(7)
+        chunkings = [[text], list(text)]
+        for _ in range(20):
+            parts, i = [], 0
+            while i < len(text):
+                n = rng.randint(1, 80)
+                parts.append(text[i:i + n])
+                i += n
+            chunkings.append(parts)
+        for chunks in chunkings:
+            stream = parser()
+            out = [stream.parse_stream_chunk(chunk) for chunk in chunks] + [stream.flush()]
+            assert tuple("".join(pair[i] for pair in out) for i in (0, 1)) == expected
+
+    def test_long_real_call_is_not_released_before_the_generation_ends(self):
+        # Past the old 512-char hold: a quote this long must still be reclaimable.
+        call = _qwen_call("bash", "x" * 4096)
+        parser = ReasoningParser(self.name, force_reasoning=True, tool_names=["bash"])
+        assert parser.parse_stream_chunk("plan\n" + call) == ("plan", "")
+        assert parser.flush() == ("", call)
 
 
 class TestMiniMaxM3ReasoningParser(_ReasoningContract):
