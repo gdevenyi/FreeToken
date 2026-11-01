@@ -1,0 +1,5 @@
+line-length = 120
+
+[lint.per-file-ignores]
+# recovered option scan: its tests unpack (status, body) and often use one of the two
+"proxy_scope.py" = ["RUF059", "RUF015", "BLE001"]
