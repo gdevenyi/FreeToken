@@ -15,6 +15,7 @@ several runs can concatenate them. --out has the raw samples.
 usage: bench_client.py --base-url URL --repeats N --concurrent C --out F [--seed S] [--ttft-repeats R]
 """
 
+import os
 import argparse
 import json
 import random
@@ -189,7 +190,7 @@ def ttft_1k(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default=os.environ.get("FT_BASE", "http://127.0.0.1:8000"))
     ap.add_argument("--model", default="Qwen3.8-Flash-Next")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--concurrent", type=int, default=8)

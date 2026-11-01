@@ -3,7 +3,8 @@
 #   LABEL=w1 TREE=~/ft-candidate CAND_ENV="FREETOKEN_FP8_DENSE=1" CAND_FLAGS="..." TESTS="smoke vision bench" window.sh
 # Start it detached, because the window continues after ssh closes:
 #   nohup setsid env LABEL=... ./window.sh > /dev/null 2>&1 < /dev/null &
-# The candidate binds 127.0.0.1:8000 only, so clients get connection errors during the window, never a test server.
+# The candidate binds 127.0.0.1:$CAND_PORT only (default 8100; the TP store takes the next port). Port 8000 stays closed
+# during the window, so production clients get connection errors, never the test server.
 # All output, and the full output of each test, goes to $OUT/${LABEL}_window.log. The script writes
 # to that file directly and not through a pipe: a dead reader must not stop the script before restore().
 # Knobs: PYC (python for the tools, default $TREE/.venv/bin/python; it needs requests and Pillow),
@@ -16,6 +17,8 @@ LABEL=${LABEL:?}; TREE=${TREE:?}; CAND_ENV=${CAND_ENV:-}; CAND_FLAGS=${CAND_FLAG
 TESTS=${TESTS:-smoke vision bench}; READY_MIN=${READY_MIN:-20}
 PYC=${PYC:-$TREE/.venv/bin/python}
 OUT=${OUT:-$HOME/logs/windows}
+CAND_PORT=${CAND_PORT:-8100}
+export FT_BASE=http://127.0.0.1:$CAND_PORT
 mkdir -p "$OUT" || exit 1
 OUT=$(cd "$OUT" && pwd)
 LOG=~/logs/ft_$LABEL.log
@@ -27,9 +30,9 @@ NV=${MODEL:-$NV}   # MODEL=<snapshot dir> serves another checkpoint in the windo
 ts() { date "+%F %T"; }
 say() { echo "[$(ts)] $*"; }
 
-wait_free() {  # no server on :8000/:8001 and both GPUs nearly empty
+wait_free() {  # no server on the production or candidate ports, and both GPUs nearly empty
   for i in $(seq 1 60); do
-    busy=$(ss -ltn | grep -cE ":800[01] ")
+    busy=$(ss -ltn | grep -cE ":(8000|8001|$CAND_PORT|$((CAND_PORT + 1))) ")
     mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | tail -1)
     [ "$busy" = 0 ] && [ "$mem" -lt 2000 ] && { say "GPUs free (max used ${mem} MiB)"; return 0; }
     # anchored on the python interpreter: the tmux server's argv keeps its first "... bin/ft serve ..."
@@ -43,7 +46,7 @@ wait_free() {  # no server on :8000/:8001 and both GPUs nearly empty
 ready() {  # a 200 from a 1-token chat completion; /v1/models answers while weights load
   local deadline=$(( $(date +%s) + 60 * $1 )) sess=$2
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 http://127.0.0.1:8000/v1/chat/completions \
+    code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 "http://127.0.0.1:$3/v1/chat/completions" \
       -H "Content-Type: application/json" \
       -d '{"model":"Qwen3.8-Flash-Next","messages":[{"role":"user","content":"hi"}],"max_tokens":1}')
     [ "$code" = 200 ] && return 0
@@ -77,12 +80,12 @@ say "stopping production"
 tmux kill-session -t ft 2>/dev/null || true
 wait_free || { restore; echo "WINDOWDONE $LABEL (candidate not started)" >&3; exit 1; }
 
-cmd="cd $TREE && env $CAND_ENV $TREE/.venv/bin/ft serve --model $NV --served-model-name Qwen3.8-Flash-Next --host 127.0.0.1 --port 8000 --tp-size 2 --gpu 0,1 $CAND_FLAGS"
+cmd="cd $TREE && env $CAND_ENV $TREE/.venv/bin/ft serve --model $NV --served-model-name Qwen3.8-Flash-Next --host 127.0.0.1 --port $CAND_PORT --tp-size 2 --gpu 0,1 $CAND_FLAGS"
 say "candidate: $cmd"
 : > "$LOG"
 t0=$(date +%s)
 tmux new-session -d -s ftc "$cmd 2>&1 | tee -a $LOG"
-if ! ready "$READY_MIN" ftc; then
+if ! ready "$READY_MIN" ftc "$CAND_PORT"; then
   say "CANDIDATE FAILED to become ready after $(( $(date +%s) - t0 )) s"
   grep -aE "Error|error|Traceback|assert|Exception" "$LOG" | sed -E "s/\x1b\[[0-9;]*m//g" | tail -40
   tail -40 "$LOG" | sed -E "s/\x1b\[[0-9;]*m//g"
@@ -95,7 +98,7 @@ cd "$D" || { restore; exit 1; }
 for t in $TESTS; do
   case $t in
     smoke)
-      S=$(curl -s -m 120 http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+      S=$(curl -s -m 120 $FT_BASE/v1/chat/completions -H "Content-Type: application/json" \
         -d '{"model":"Qwen3.8-Flash-Next","messages":[{"role":"user","content":"What is 17 times 23? Reply with only the number."}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"enable_thinking":false}}' \
         | $PYC -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'].strip())" 2>&1)
       say "SMOKE 17*23 -> $S" ;;
@@ -105,10 +108,10 @@ for t in $TESTS; do
     bench)
       # each run has its own seed: the same seed again would hit the prefix cache and skew TTFT
       say "--- bench_client warm-up (concurrent 4)"
-      $PYC bench_client.py --base-url http://127.0.0.1:8000 --repeats 1 --concurrent 4 --seed 100 --out "$OUT/${LABEL}_warm.json"
+      $PYC bench_client.py --base-url $FT_BASE --repeats 1 --concurrent 4 --seed 100 --out "$OUT/${LABEL}_warm.json"
       for r in 1 2 3; do
         say "--- bench_client run $r (concurrent 8)"
-        $PYC bench_client.py --base-url http://127.0.0.1:8000 --repeats 1 --concurrent 8 --seed $((100 + r)) --out "$OUT/${LABEL}_reb$r.json"
+        $PYC bench_client.py --base-url $FT_BASE --repeats 1 --concurrent 8 --seed $((100 + r)) --out "$OUT/${LABEL}_reb$r.json"
       done ;;
     settle) say "--- settle: idle ${SETTLE_S:-480} s (a new server benches lower for its first minutes)"; sleep "${SETTLE_S:-480}"; say "settle done" ;;
     gsm8k)  say "--- GSM8K-300 @1536"; $PYC gsm8k_probe.py --n 300 --concurrency 8 --max-tokens 1536 --label "${LABEL}-1536" --out "$OUT/${LABEL}_gsm8k_1536.json" ;;
@@ -117,7 +120,7 @@ for t in $TESTS; do
     stall)  say "--- stall_probe (200k prefill vs a live stream)"; $PYC stall_probe.py --tokens 200000 --out "$OUT/${LABEL}_stall.json" ;;
     revisit) say "--- revisit_probe (16 sessions x 24k)"; $PYC revisit_probe.py --sessions 16 --tokens 24000 --out "$OUT/${LABEL}_revisit.json" ;;
     revisitheavy) say "--- revisit_probe (12 sessions x 48k)"; $PYC revisit_probe.py --sessions 12 --tokens 48000 --out "$OUT/${LABEL}_revisit_heavy.json" ;;
-    geometry) say "--- geometry"; curl -s -m 10 http://127.0.0.1:8000/v1/cache/status | $PYC -c "import json,sys; d=json.load(sys.stdin); print(json.dumps({k: d.get(k) for k in ('state','geometry','pools','unit_bytes','budget') if k in d}))" 2>&1 ;;
+    geometry) say "--- geometry"; curl -s -m 10 $FT_BASE/v1/cache/status | $PYC -c "import json,sys; d=json.load(sys.stdin); print(json.dumps({k: d.get(k) for k in ('state','geometry','pools','unit_bytes','budget') if k in d}))" 2>&1 ;;
     listen)
       say "--- listening sockets of the candidate's processes (no LAN address expected)"
       pids=$(pgrep -f "$(basename "$TREE")/.venv/bin/pytho[n]" | paste -sd"|")

@@ -86,7 +86,7 @@ def ask(a, index, item):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default=os.environ.get("FT_BASE", "http://127.0.0.1:8000"))
     ap.add_argument("--model", default="Qwen3.8-Flash-Next")
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--concurrency", type=int, default=8)

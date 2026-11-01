@@ -11,6 +11,7 @@ how many resume points the snapshot pool kept, and turn2_latency_s is the wall t
 usage: revisit_probe.py [--sessions 16] [--tokens 24000] [--concurrency 4] [--out f.json]
 """
 
+import os
 import argparse
 import json
 import statistics
@@ -20,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+ap.add_argument("--base-url", default=os.environ.get("FT_BASE", "http://127.0.0.1:8000"))
 ap.add_argument("--model", default="Qwen3.8-Flash-Next")
 ap.add_argument("--sessions", type=int, default=16)
 ap.add_argument("--tokens", type=int, default=24000, help="prefix tokens per session (about)")

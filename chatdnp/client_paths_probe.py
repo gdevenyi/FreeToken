@@ -2,10 +2,11 @@
 through LiteLLM) and an OpenAI tool call whose schema uses $ref/$defs and a nullable anyOf."""
 
 import json
+import os
 
 import requests
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("FT_BASE", "http://127.0.0.1:8000")
 MODEL = "Qwen3.8-Flash-Next"
 fails = 0
 

@@ -7,6 +7,7 @@ the prefill window, the stream's rate outside it, and the long request's time to
 usage: stall_probe.py [--tokens 200000] [--base-url http://127.0.0.1:8000] [--out f.json]
 """
 
+import os
 import argparse
 import itertools
 import json
@@ -16,7 +17,7 @@ import time
 import requests
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+ap.add_argument("--base-url", default=os.environ.get("FT_BASE", "http://127.0.0.1:8000"))
 ap.add_argument("--model", default="Qwen3.8-Flash-Next")
 ap.add_argument("--tokens", type=int, default=200000, help="long prompt, tokens (about)")
 ap.add_argument("--stream-tokens", type=int, default=6000)

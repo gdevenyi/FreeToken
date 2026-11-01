@@ -1,7 +1,9 @@
 # chatdnp tools
 
 Benchmark and probe tools for the FreeToken server on chatdnp. The server has 2x RTX 6000 Ada, TP=2,
-and serves `Qwen3.8-Flash-Next` on `http://127.0.0.1:8000`.
+and serves `Qwen3.8-Flash-Next` on `http://127.0.0.1:8000`. In a GPU window, `window.sh` serves the
+candidate on `CAND_PORT` (default 8100) and sets `FT_BASE`, the default base URL of every probe, so
+port 8000 stays closed and production clients never reach a test server.
 
 Clone on the server, and run the tools from `chatdnp/`:
 

@@ -8,6 +8,7 @@ Prints one line per check with timing and usage, and ends with VISION_PROBE PASS
 usage: vision_probe.py [--base-url URL] [--model NAME] [--max-tokens N]
 """
 
+import os
 import argparse
 import base64
 import io
@@ -66,7 +67,7 @@ def report(name, ok, reply, usage, dt):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default=os.environ.get("FT_BASE", "http://127.0.0.1:8000"))
     ap.add_argument("--model", default="Qwen3.8-Flash-Next")
     ap.add_argument("--max-tokens", type=int, default=64)
     a = ap.parse_args()

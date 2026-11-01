@@ -91,7 +91,7 @@ class Probe:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default=os.environ.get("FT_BASE", "http://127.0.0.1:8000"))
     ap.add_argument("--model", default="Qwen3.8-Flash-Next")
     ap.add_argument("--long-tokens", type=int, default=23000)
     ap.add_argument("--nonce", type=int, default=int(time.time() * 1000) ^ (os.getpid() << 16))
