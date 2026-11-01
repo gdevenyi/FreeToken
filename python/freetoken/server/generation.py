@@ -524,7 +524,8 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         force_reasoning = (
             resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"
         )
-    return build_reasoning_parser(state.config, force_reasoning)
+    tool_names = [(tool.get("function") or {}).get("name") for tool in spec.parser_tools or []]
+    return build_reasoning_parser(state.config, force_reasoning, tool_names)
 
 
 def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:

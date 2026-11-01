@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, Iterable, List, Optional, Tuple, Type
 
 # DeepSeek-V4 / V3.2 protocol special-token strings. The detokenizer decodes with
 # skip_special_tokens=False (so the DSML tool markers survive for the tool parser),
@@ -418,6 +418,9 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
+_QWEN_NAME_END_RE = re.compile(r"[<>]")
+
+
 class Qwen3ReasoningParser(ThinkReasoningParser):
     """Qwen3 ``<think>`` parser with one positional rule for both paths.
 
@@ -431,18 +434,39 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
     The one-shot parse replays the streaming machine, so the two cannot drift.
 
     Qwen's chat template also asks for ``<tool_call>`` XML, and models occasionally
-    go straight to that block without ``</think>``. Reasoning then ends at the
-    marker and the block stays verbatim in content for the Qwen tool-call parser,
-    which still decides whether it is a valid structured call. A ``</think>`` within
-    ``TOOL_HOLD_MAX`` of the marker reclaims it as a quote inside reasoning.
+    go straight to that block without ``</think>``. The template prints that format,
+    so reasoning can quote it, and the text that decides between the two can be any
+    distance away. A ``<tool_call>`` therefore ends reasoning in one case only: with
+    no ``</think>`` in the generation, it starts a run of well-formed call blocks that
+    the generation ends on. The run stays verbatim in content for the Qwen tool-call
+    parser. Any other marker stays in reasoning, and a run is held until EOS, because
+    only EOS rules out a later ``</think>``.
+
+    A quote that is well-formed and is the last thing generated is the same text as
+    a real call, so it is a call. A real call followed by text, or cut before
+    ``</function>``, stays in reasoning: not running a quoted command is worth more
+    than recovering a malformed turn.
     """
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    _FUNC_OPEN = "<function="
+    _FUNC_CLOSE = "</function>"
+    _PARAM_OPEN = "<parameter="
+    _PARAM_CLOSE = "</parameter>"
+    _BLOCK_CLOSE = "</tool_call>"
+
+    def __init__(
+        self,
+        force_reasoning: bool = False,
+        stream_reasoning: bool = True,
+        *,
+        tool_names: Optional[Iterable[str]] = None,
+    ) -> None:
         super().__init__(
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
         )
+        self._tool_names = frozenset(tool_names) if tool_names else None
         # The generation start, held while it can still grow into ws* + "<think>".
         self._head: Optional[str] = ""
         self._trim_content = False
@@ -452,7 +476,9 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
         clone = type(self)(
-            force_reasoning=self.force_reasoning, stream_reasoning=self.stream_reasoning
+            force_reasoning=self.force_reasoning,
+            stream_reasoning=self.stream_reasoning,
+            tool_names=self._tool_names,
         )
         first = clone.parse_streaming_increment(text)
         rest = clone.flush()
@@ -496,33 +522,8 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
         reasoning = ""
         if self._in_reasoning:
             end = buf.find(self.think_end_token)
-            tool = buf.find(self.tool_start_token)
-            # Past TOOL_HOLD_MAX the stream has already released the block, so a whole-text
-            # parse must not reclaim it either; every chunking then gives one answer.
-            if tool != -1 and (end == -1 or end - tool > self.TOOL_HOLD_MAX):
-                held = buf[tool:]
-                if final or end != -1 or len(held) >= self.TOOL_HOLD_MAX + len(self.think_end_token):
-                    self._in_reasoning = False
-                    return ReasoningParseResult(
-                        reasoning_text=self._reasoning_piece(buf[:tool].rstrip(), closing=True),
-                        normal_text=held,
-                    )
-                body = buf[:tool].rstrip()
-                self._buffer = buf[len(body):]
-                return ReasoningParseResult(
-                    reasoning_text=self._reasoning_piece(body, closing=False)
-                )
             if end == -1:
-                if final:
-                    return ReasoningParseResult(
-                        reasoning_text=self._reasoning_piece(buf.rstrip(), closing=True)
-                    )
-                safe, _ = self._split_trailing_partial(buf)
-                body = safe.rstrip()
-                self._buffer = buf[len(body):]
-                return ReasoningParseResult(
-                    reasoning_text=self._reasoning_piece(body, closing=False)
-                )
+                return self._consume_open_reasoning(buf, final)
             reasoning = self._reasoning_piece(buf[:end].rstrip(), closing=True)
             self._in_reasoning = False
             self._trim_content = True
@@ -536,6 +537,100 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
         if not final:
             self._buffer = buf[len(body):]
         return ReasoningParseResult(reasoning_text=reasoning, normal_text=body)
+
+    def _consume_open_reasoning(self, buf: str, final: bool) -> ReasoningParseResult:
+        """Reasoning with no ``</think>`` in ``buf``: everything up to a possible call run goes out."""
+        tool = buf.find(self.tool_start_token)
+        status = "quote"
+        while tool != -1:
+            status = self._tool_run_status(buf, tool)
+            if status != "quote":
+                break
+            tool = buf.find(self.tool_start_token, tool + 1)
+        if final:
+            if status == "call":
+                self._in_reasoning = False
+                return ReasoningParseResult(
+                    reasoning_text=self._reasoning_piece(buf[:tool].rstrip(), closing=True),
+                    normal_text=buf[tool:],
+                )
+            return ReasoningParseResult(
+                reasoning_text=self._reasoning_piece(buf.rstrip(), closing=True)
+            )
+        safe = buf[:tool] if tool != -1 else self._split_trailing_partial(buf)[0]
+        body = safe.rstrip()
+        self._buffer = buf[len(body):]
+        return ReasoningParseResult(reasoning_text=self._reasoning_piece(body, closing=False))
+
+    def _tool_run_status(self, text: str, pos: int) -> str:
+        """Classify the text from a marker at ``pos``: "call" if it is a run of whole blocks
+        as of now, "quote" if no more text can make it one, else "hold". Same grammar as
+        Qwen3CoderDetector; a name outside the request's tools is a quote (the template's
+        example_function_name), and that detector's lenient forms just stay in reasoning."""
+        while True:  # at a block opener
+            pos += len(self.tool_start_token)
+            pos = self._invoke_end(text, self._skip_space(text, pos))
+            if isinstance(pos, str):
+                return pos
+            while True:  # after an invoke
+                pos = self._skip_space(text, pos)
+                if pos == len(text):
+                    return "call"  # the model may stop without the block closer
+                opens = self._starts(text, pos, self._FUNC_OPEN)
+                if opens != "yes":
+                    break
+                pos = self._invoke_end(text, pos)
+                if isinstance(pos, str):
+                    return pos
+            closes = self._starts(text, pos, self._BLOCK_CLOSE)
+            if closes != "yes":
+                return "hold" if closes == "maybe" or opens == "maybe" else "quote"
+            pos = self._skip_space(text, pos + len(self._BLOCK_CLOSE))
+            if pos == len(text):
+                return "call"
+            opens = self._starts(text, pos, self.tool_start_token)
+            if opens != "yes":
+                return "hold" if opens == "maybe" else "quote"
+
+    def _invoke_end(self, text: str, pos: int) -> int | str:
+        """Offset after the whole invoke at ``pos``, or "hold" / "quote"."""
+        opens = self._starts(text, pos, self._FUNC_OPEN)
+        if opens != "yes":
+            return "hold" if opens == "maybe" else "quote"
+        pos += len(self._FUNC_OPEN)
+        name_end = _QWEN_NAME_END_RE.search(text, pos)
+        if name_end is None:
+            return "hold"
+        name = text[pos:name_end.start()].strip()
+        if name_end.group() == "<" or (self._tool_names is not None and name not in self._tool_names):
+            return "quote"
+        pos = name_end.end()
+        while True:
+            pos = self._skip_space(text, pos)
+            if text.startswith(self._PARAM_OPEN, pos):
+                value_end = text.find(self._PARAM_CLOSE, pos)
+                if value_end == -1:
+                    return "hold"
+                pos = value_end + len(self._PARAM_CLOSE)
+                continue
+            closes = self._starts(text, pos, self._FUNC_CLOSE)
+            if closes == "yes":
+                return pos + len(self._FUNC_CLOSE)
+            if closes == "maybe" or self._starts(text, pos, self._PARAM_OPEN) == "maybe":
+                return "hold"
+            return "quote"
+
+    @staticmethod
+    def _skip_space(text: str, pos: int) -> int:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        return pos
+
+    @staticmethod
+    def _starts(text: str, pos: int, token: str) -> str:
+        if text.startswith(token, pos):
+            return "yes"
+        return "maybe" if token.startswith(text[pos:pos + len(token)]) else "no"
 
     def _split_trailing_partial(self, text: str) -> tuple[str, str]:
         # A later <think> is literal, never a marker: only the two tokens that end reasoning count.
@@ -1026,12 +1121,14 @@ class ReasoningParser:
         reasoning_parser: str,
         force_reasoning: bool = True,
         stream_reasoning: bool = True,
+        tool_names: Optional[Iterable[str]] = None,
     ) -> None:
         parser_class = self.ReasoningParserEnum.get(reasoning_parser)
         if parser_class is None:
             raise ValueError(f"Unsupported reasoning_parser: {reasoning_parser}")
+        extra = {"tool_names": tool_names} if issubclass(parser_class, Qwen3ReasoningParser) else {}
         self.detector = parser_class(
-            force_reasoning=force_reasoning, stream_reasoning=stream_reasoning
+            force_reasoning=force_reasoning, stream_reasoning=stream_reasoning, **extra
         )
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
@@ -1050,7 +1147,9 @@ class ReasoningParser:
         return result.reasoning_text, result.normal_text
 
 
-def build_reasoning_parser(config, force_reasoning: bool) -> Optional[ReasoningParser]:
+def build_reasoning_parser(
+    config, force_reasoning: bool, tool_names: Optional[Iterable[str]] = None
+) -> Optional[ReasoningParser]:
     """Construct the configured reasoning parser, or ``None`` when the server has
     no reasoning parser set. Shared by every protocol adapter's generation path."""
     name = getattr(config, "reasoning_parser", None)
@@ -1060,7 +1159,7 @@ def build_reasoning_parser(config, force_reasoning: bool) -> Optional[ReasoningP
         # MiniMax-M2's template always starts generation inside an implicit
         # <think> block and the model only emits the closing </think> marker.
         force_reasoning = True
-    return ReasoningParser(name, force_reasoning=force_reasoning)
+    return ReasoningParser(name, force_reasoning=force_reasoning, tool_names=tool_names)
 
 
 SUPPORTED_REASONING_PARSERS = list(ReasoningParser.ReasoningParserEnum.keys())

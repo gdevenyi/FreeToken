@@ -781,6 +781,28 @@ def _qwen_parity(pieces, *, thinking=True, finish_reason=None):
     return one_shot
 
 
+def _qwen_quote(name):
+    return ("The format is:\n<tool_call>\n" f"<function={name}>\n<parameter=path>\nrm -rf build\n"
+            "</parameter>\n</function>\n</tool_call>\nNot yet.\n")
+
+
+@pytest.mark.parametrize("name", ["edit", "example_function_name"], ids=["declared", "template-example"])
+def test_qwen_tool_call_quoted_in_reasoning_is_not_a_call(name):
+    # The quote and its </think> are further apart than any fixed hold: no call on either path.
+    pad = "More reasoning about the request. " * 30
+    pieces = [_qwen_quote(name), pad, "\n</think>", "\n\nI will ask first."]
+    content, reasoning, calls, finish = _qwen_parity(pieces)
+    assert (content, calls, finish) == ("I will ask first.", [], "stop")
+    assert reasoning == (_qwen_quote(name) + pad).strip()
+
+
+def test_qwen_omitted_think_close_then_real_call_is_a_call():
+    block = "<tool_call>\n<function=edit>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
+    content, reasoning, calls, finish = _qwen_parity(["I will edit.\n", block])
+    assert (content, reasoning, finish) == ("", "I will edit.", "tool_calls")
+    assert calls == [("edit", {"path": "a.py"})]
+
+
 EDIT_WITH_THINK_LITERALS = [
     "plan", "</think>", "\n\n", "Edit:", "<tool_call>", "\n<function=edit>\n<parameter=new>\n",
     'START = "', "<think>", '"\nEND = "', "</think>", '"\n', "</parameter>\n</function>\n",
