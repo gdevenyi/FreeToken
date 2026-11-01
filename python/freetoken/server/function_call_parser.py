@@ -416,6 +416,8 @@ class BaseFormatDetector(ABC):
             non_null = [t for t in param_type if t != "null"]
             result = dict(schema)
             result["type"] = non_null[0] if len(non_null) == 1 else "loose"
+            if len(non_null) != len(param_type):
+                result["nullable"] = True
             return result
         if isinstance(param_type, str):
             return schema
@@ -436,6 +438,7 @@ class BaseFormatDetector(ABC):
             if not isinstance(branches, list):
                 continue
             types = []
+            nullable = False
             for branch in branches:
                 if not isinstance(branch, dict):
                     continue
@@ -443,11 +446,14 @@ class BaseFormatDetector(ABC):
                 branch_type = branch.get("type")
                 if not isinstance(branch_type, str):
                     branch_type = self._literal_schema_type(branch)
+                nullable = nullable or branch_type == "null"
                 if isinstance(branch_type, str) and branch_type != "null":
                     types.append(branch_type)
             types = list(dict.fromkeys(types))
             result = dict(schema)
             result["type"] = types[0] if len(types) == 1 else "loose"
+            if nullable:
+                result["nullable"] = True
             return result
         if isinstance(schema.get("properties"), dict):
             result = dict(schema)
@@ -528,7 +534,11 @@ class BaseFormatDetector(ABC):
         prop = param_config.get(param_name, {})
         if not isinstance(prop, dict):
             return "string"
-        return str(prop.get("type", "string")).strip().lower()
+        ptype = str(prop.get("type", "string")).strip().lower()
+        # Not the literal-streaming path: only the buffered one can turn a whole value into null.
+        if prop.get("nullable") is True and ptype in ("string", "str", "enum"):
+            return "nullable_string"
+        return ptype
 
     @staticmethod
     def _json_escape_chunk(text: str) -> str:
