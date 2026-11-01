@@ -24,6 +24,12 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# Prefills of at most this many tokens load only their routed experts (the decode path's
+# on-demand LRU) instead of streaming every expert of every layer; 0 = off.
+_SMALL_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_SMALL_PREFILL_TOKENS", "0"))
+# ids per LRU ensure in that path: the kernel's block is next_pow2(ids) x next_pow2(slots), and a
+# block much wider than decode's spills to local memory whose launch reservation can OOM
+_ENSURE_CHUNK_IDS = 32
 
 
 class MoELayer(BaseOP):
@@ -354,6 +360,23 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if (
+            0 < hidden_states.shape[0] <= _SMALL_PREFILL_TOKENS
+            and cache.decode_target in ("gpu", "hybrid")
+            and not cache.has_unpinned_layers
+        ):
+            # A short extension touches a fraction of each layer's experts, so fetch those. A streamed
+            # forward zeroes staging slots this path may register, so no layer streams beside it.
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                self._ensure_unique(cache, topk_ids),
+                views=cache.pool_bank_views(self.layer_id),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -382,6 +405,26 @@ class OffloadMoELayer(MoELayer):
         )
         cache.release_prefill_layer(self.layer_id)
         return out
+
+    def _ensure_unique(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make this layer's routed experts resident and return ``topk_ids`` mapped to slots.
+
+        The LRU kernel is sized for decode: its block is next_pow2(ids) x next_pow2(slots), so a
+        prefill's tokens x top_k ids overflow Triton's element limit, and even a block under it
+        can fail to launch on a full GPU. It gets the unique ids (at most num_experts) in
+        decode-width chunks; each chunk's misses are copied before the next ensure reuses the plan."""
+        uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
+        n = uniq.numel()
+        # Each ensure stamps a newer LRU step, so a later chunk evicts the earlier chunks' slots
+        # only once every other slot of the layer's pool is gone.
+        pool = cache.pool_slots(self.layer_id)
+        assert n <= pool, f"{n} routed experts exceed layer {self.layer_id}'s {pool}-slot pool"
+        uniq = uniq.to(torch.int32)
+        for start in range(0, n, _ENSURE_CHUNK_IDS):
+            part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
+            cache.ensure_experts(self.layer_id, part)
+            cache.copy_missing()
+        return uniq[inverse].view_as(topk_ids)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

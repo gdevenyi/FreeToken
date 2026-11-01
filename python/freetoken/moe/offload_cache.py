@@ -795,6 +795,10 @@ class OffloadMoeCache:
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id; a locked_hybrid layer's decode fetches go through ``locked_fetch`` instead."""
         return layer_id in self._unpinned_layers
 
+    @property
+    def has_unpinned_layers(self) -> bool:
+        return bool(self._unpinned_layers)
+
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
         keeps no GPU-resident alphas (bf16 / triton-nvfp4). Slots of other layers
