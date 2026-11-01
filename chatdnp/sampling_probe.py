@@ -1,6 +1,6 @@
 """Sampling parameters the 2026-09-26 build must accept or refuse, over HTTP.
 
-Refused with 400: temperature -1, top_p 0, top_p 1.5, presence_penalty 9 (outside [-2, 2]).
+Refused with 400: temperature -1, top_p 0, top_p 1.5, and with 422 from upstream #527 pydantic bounds: presence_penalty 9 (outside [-2, 2]).
 Accepted (200): top_k 0 and top_k -1 (both mean "disabled"), min_p, presence/frequency penalty,
 repetition_penalty, logit_bias, min_tokens, stop_token_ids, and a plain request.
 Also checks usage.completion_tokens_details.reasoning_tokens on a short thinking turn.
@@ -35,7 +35,7 @@ cases = [
     ({"temperature": -1}, 400),
     ({"top_p": 0}, 400),
     ({"top_p": 1.5}, 400),
-    ({"presence_penalty": 9}, 400),
+    ({"presence_penalty": 9}, 422),
     ({}, 200),
     ({"top_k": 0}, 200),
     ({"top_k": -1}, 200),
