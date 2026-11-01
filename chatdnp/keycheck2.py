@@ -96,10 +96,24 @@ for name, t in W.iter_weights(
 missing = sorted(set(built) - set(emitted))
 unexpected = sorted(set(emitted) - set(built))
 mismatch = sorted(k for k in set(built) & set(emitted) if built[k] != emitted[k])
+
+
+def widened(k):
+    """GDN keeps these in float32 on purpose (gdn.py). load_state_dict copies the bf16 values in without loss."""
+    return (
+        k.endswith((".A_log", ".dt_bias"))
+        and built[k] == (emitted[k][0], torch.float32)
+        and emitted[k][1] == torch.bfloat16
+    )
+
+
+expected = [k for k in mismatch if widened(k)]
+mismatch = [k for k in mismatch if not widened(k)]
 # buffers the model owns but never loads (rope tables, counters) show up as "missing"; list them
 print(
     f"rank {rank}/{world}: built {len(built)} emitted {len(emitted)} "
-    f"missing {len(missing)} unexpected {len(unexpected)} shape/dtype mismatch {len(mismatch)}"
+    f"missing {len(missing)} unexpected {len(unexpected)} shape/dtype mismatch {len(mismatch)} "
+    f"(expected float32 GDN parameters: {len(expected)})"
 )
 for k in missing[:12]:
     print("  MISSING   ", k, built[k])
