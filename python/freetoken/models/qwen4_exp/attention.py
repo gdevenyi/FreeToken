@@ -27,8 +27,11 @@ from freetoken.layers import (
     LinearOProj,
     LinearReplicated,
 )
+from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import div_even, nvtx_annotate
+
+from .config import use_fp8_dense
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -138,20 +141,24 @@ class Qwen4ExpAttention(BaseOP):
         self._local_qo_dim = self._local_num_q * self.head_dim
         self._local_kv_dim = self._local_num_kv * self.head_dim
         self._qkv_split = [self._local_qo_dim * 2, self._local_kv_dim, self._local_kv_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size,
-            [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim],
-            has_bias=False,
-            local_output_sizes=self._qkv_split,
-            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
-        )
-        # row-parallel, NOT LinearReplicated: under TP>1 qkv_proj is column-parallel, so this
-        # rank's attention output is its own head slice and o_proj must consume the sharded
-        # input dim and all-reduce the partial sums. At TP=1 the two are equivalent.
-        self.o_proj = LinearOProj(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.o_proj",
-        )
+        qkv_sizes = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        if use_fp8_dense(config, f"{prefix}.qkv_proj"):  # W8A8 through _scaled_mm, weights quantized by the loader
+            self.qkv_proj = Fp8DynamicColMerged(
+                config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split
+            )
+            self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size)
+        else:
+            self.qkv_proj = LinearColParallelMerged(
+                config.hidden_size, qkv_sizes, has_bias=False,
+                local_output_sizes=self._qkv_split,
+                quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+            )
+            # row-parallel: this rank's attention output is its own head slice, so o_proj takes the
+            # sharded input and all-reduces; at TP=1 it is exactly LinearReplicated
+            self.o_proj = LinearOProj(
+                self.qo_attn_dim, config.hidden_size, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config

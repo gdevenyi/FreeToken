@@ -24,6 +24,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
+from .config import use_fp8_dense
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
@@ -53,6 +54,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         quant_config=config.quant,
         prefix=prefix,
         out_heads_tiled=config.qwen4_args.gdn_out_heads_tiled,
+        dynamic_fp8=use_fp8_dense(config, f"{prefix}.in_proj_qkvz"),
     )
 
 

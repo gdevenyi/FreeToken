@@ -7,6 +7,7 @@ import torch
 
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
+    fp8_dense_enabled,
     mrope_layout_from_rope_params,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -114,6 +115,16 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+def use_fp8_dense(config: ModelConfig, fused_module: str) -> bool:
+    """Whether a mixer runs as load-time per-tensor FP8; the model builder and the weight reader must get one answer.
+
+    ``fused_module`` is the mixer's input fusion (``<attn>.qkv_proj`` or ``<gdn>.in_proj_qkvz``). A scheme the checkpoint declares for it wins and goes through QuantConfig.
+    """
+    if config.attn_quant != "fp8_dynamic":
+        return False
+    return config.quant is None or config.quant.scheme_for(fused_module) is None
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
@@ -143,6 +154,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    # synthetic, for a checkpoint that ships these modules unquantized: use_fp8_dense applies it per mixer
+    attn_quant = "fp8_dynamic" if fp8_dense_enabled() else "none"
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
@@ -258,6 +271,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
+        attn_quant=attn_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )

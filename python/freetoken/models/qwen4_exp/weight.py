@@ -15,7 +15,7 @@ import json
 import os
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator
 
 import safetensors
@@ -23,7 +23,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
-from freetoken.models.config import VISION_KEY_PREFIXES
+from freetoken.models.config import VISION_KEY_PREFIXES, fp8_dense_enabled
 from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -31,11 +31,13 @@ from freetoken.models.nvfp4_banks import (
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight, init_logger
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
-from .config import parse_config
+from .config import parse_config, use_fp8_dense
+
+logger = init_logger(__name__)
 
 # Routed NVFP4 experts: per-expert, un-fused. Matched against the RAW weight_map key in nvfp4_banks.
 # The ``model.language_model.`` anchor excludes the MTP head's stacked ``mtp.layers.N.mlp.experts.*`` tensors.
@@ -302,6 +304,57 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     return shard_tensor(name, t, rank=rank, world_size=world, num_kv_heads=None)
 
 
+# Load-time per-tensor FP8 (use_fp8_dense, layers/fp8_dynamic.py): these keep their name and gain a sibling ``weight_scale``;
+# GDN ``in_proj`` splits into the fp8 ``in_proj_qkvz`` and the bf16 ``in_proj_ba`` (the gate rows stay bf16, as in block-fp8 checkpoints).
+_FP8_DENSE_SUFFIXES = (
+    ".self_attn.qkv_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".linear_attn.out_proj.weight",
+)
+_E4M3_MAX = 448.0
+
+
+def _quantize_per_tensor(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(e4m3 weight, fp32 scale ())`` with ``w ~= weight * scale``."""
+    w = w.float()
+    scale = (w.abs().amax() / _E4M3_MAX).clamp_min(1e-12)
+    return (w / scale).clamp_(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), scale.reshape(())
+
+
+def _fp8_dense(
+    name: str, t: torch.Tensor, config, world: int
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """The (already sharded) dense tensor as the fp8_dynamic model expects it."""
+    if name.endswith(".linear_attn.in_proj.weight"):
+        g = config.linear_attention_group()
+        nk = div_even(g.num_key_heads, world, allow_replicate=True)
+        nv = div_even(g.num_value_heads, world, allow_replicate=True)
+        qkvz = 2 * nk * g.key_head_dim + 2 * nv * g.value_head_dim  # [q | k | v | z] local rows
+        assert t.shape[0] == qkvz + 2 * nv, (name, t.shape, qkvz, nv)
+        base = name[: -len("in_proj.weight")]
+        w8, scale = _quantize_per_tensor(t[:qkvz])
+        yield base + "in_proj_qkvz.weight", w8
+        yield base + "in_proj_qkvz.weight_scale", scale
+        # clone, not contiguous(): a contiguous row slice comes back as a view, which keeps the whole bf16 in_proj resident
+        yield base + "in_proj_ba.weight", t[qkvz:].clone()
+    elif name.endswith(_FP8_DENSE_SUFFIXES):
+        w8, scale = _quantize_per_tensor(t)
+        yield name, w8
+        yield name[: -len("weight")] + "weight_scale", scale
+    else:
+        yield name, t
+
+
+def _fp8_dense_applies(name: str, config) -> bool:
+    """The builder's use_fp8_dense answer for the mixer that owns this tensor."""
+    mixer = name.rpartition(".")[0].rpartition(".")[0]
+    if name.endswith((".linear_attn.in_proj.weight", ".linear_attn.out_proj.weight")):
+        return use_fp8_dense(config, f"{mixer}.in_proj_qkvz")
+    if name.endswith((".self_attn.qkv_proj.weight", ".self_attn.o_proj.weight")):
+        return use_fp8_dense(config, f"{mixer}.qkv_proj")
+    return False
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -323,9 +376,21 @@ def iter_weights(
     tp = get_tp_info()
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
-    # the sharding geometry needs the parsed config; a TP=1 read never touches it
-    config = parse_config(hf_config) if tp.size > 1 else None
+    quant = get_quant_config()
+    reader = _DenseReader(quant, spec.packed_modules_mapping)
+    # the sharding geometry and the fp8 split need the parsed config, under the QuantConfig the builder saw; a plain TP=1 read never touches it
+    config = replace(parse_config(hf_config), quant=quant) if tp.size > 1 or fp8_dense_enabled() else None
+    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+    if fp8:
+        logger.info("qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), FREETOKEN_FP8_DENSE=1")
+
+    def emit(name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+        tensor = _shard(name, tensor, config, tp.rank, tp.size)
+        if fp8 and _fp8_dense_applies(name, config):
+            yield from _fp8_dense(name, tensor, config, tp.size)
+        else:
+            yield name, tensor
+
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -341,15 +406,18 @@ def iter_weights(
                 tensor = f.get_tensor(raw_name)
                 emitted = None if name.startswith(VISION_KEY_PREFIXES) else reader.add(name, tensor)
                 if emitted is None:
-                    yield name, _shard(name, tensor, config, tp.rank, tp.size)
+                    yield from emit(name, tensor)
                 else:
                     for fused_name, fused_tensor in emitted:
-                        yield fused_name, _shard(fused_name, fused_tensor, config, tp.rank, tp.size)
+                        yield from emit(fused_name, fused_tensor)
 
     if reader.pending:
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
+    if fp8 and device.type == "cuda":
+        # hand the bf16 originals and fp32 temporaries back, so the expert-cache planner (free VRAM after load) sees the halved dense footprint
+        torch.cuda.empty_cache()
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
