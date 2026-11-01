@@ -259,6 +259,12 @@ class FrontendManager:
         self.stats.on_new_user(uid)
         return uid
 
+    def forget_unsent_user(self, uid: int) -> None:
+        """Undo new_user for a request that never left: no reply will ever clear it."""
+        self.ack_map.pop(uid, None)
+        self.event_map.pop(uid, None)
+        self.stats.on_unsent(uid)
+
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
