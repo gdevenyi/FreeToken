@@ -44,7 +44,7 @@ effect; "400" means the server refuses the request with a clear message.
 | `tools`, `tool_choice` (`auto` / `none` / `required` / named), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
 | `reasoning_effort`, `thinking`, `chat_template_kwargs` | honoured | `chat_template_kwargs` | honoured | honoured |
 | `continue_final_message` | honoured (the last assistant message is continued, no generation prompt) | honoured | honoured | no |
-| `response_format` `json_object` / `json_schema`, guided decoding | 400 (no constrained decoding) | honoured (xgrammar / guidance) | honoured (xgrammar / outlines / llguidance) | `grammar`, `json_schema` |
+| `response_format` `json_object` / `json_schema`, guided decoding | accepted, not enforced (no constrained decoding); other types 400 | honoured (xgrammar / guidance) | honoured (xgrammar / outlines / llguidance) | `grammar`, `json_schema` |
 | `seed` | accepted, not honoured (one batched sampling kernel, no per-request generator) | honoured | `sampling_seed` | honoured |
 | `user`, `metadata`, `store`, `service_tier` | accepted, ignored | accepted, ignored | accepted, ignored | accepted, ignored |
 | `request_id` | honoured: becomes the response id | honoured | `rid` | `id_slot` (different meaning) |
@@ -94,8 +94,8 @@ render them, so `count` equals the `prompt_tokens` that generation reports.
 
 ## Not implemented, on purpose
 
-- Constrained decoding (`response_format` json / json_schema, regex, grammar): needs a
-  grammar engine on the sampling path.
+- Constrained decoding (enforcing `response_format` json / json_schema, regex, grammar): needs
+  a grammar engine on the sampling path.
 - Prompt logprobs and `echo` with `logprobs`: need the prefill logits.
 - Per-request `seed`: the batched sampling kernel draws from one generator.
 - Embeddings, reranking, scoring, audio: not generation.

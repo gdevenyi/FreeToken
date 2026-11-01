@@ -223,8 +223,10 @@ async def handle_chat_completion(
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if _response_format_unsupported(req.response_format):
+        rtype = (req.response_format or {}).get("type")
         return create_error_response(
-            "response_format json_object/json_schema is not supported (no constrained decoding)",
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)",
             param="response_format",
         )
     if req.n != 1:
@@ -833,8 +835,11 @@ def _usage(
 
 
 def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
-    return response_format is not None and response_format.get("type") not in (None, "text")
+    # No constrained decoding, but clients that ask for JSON in the prompt still need the
+    # wire field accepted instead of a hard 400. Unknown types stay refused.
+    if response_format is None:
+        return False
+    return response_format.get("type") not in (None, "text", "json_object", "json_schema")
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
@@ -843,7 +848,11 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if req.logprobs is not None:
         return "logprobs is not supported"
     if _response_format_unsupported(req.response_format):
-        return "response_format json_object/json_schema is not supported (no constrained decoding)"
+        rtype = (req.response_format or {}).get("type")
+        return (
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)"
+        )
     return None
 
 
