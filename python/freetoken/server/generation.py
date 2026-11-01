@@ -116,6 +116,7 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
     timings: dict[str, Any] | None = None
 
 
@@ -129,6 +130,7 @@ class GenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
     timings: dict[str, Any] | None = None
 
 
@@ -142,6 +144,7 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
     timings: dict[str, Any] | None = None
 
 
@@ -222,12 +225,20 @@ def resolve_sampling(
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    min_p: float | None = None,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    repetition_penalty: float | None = None,
+    logit_bias: dict[str, float] | dict[int, float] | None = None,
+    min_tokens: int = 0,
+    stop_token_ids: list[int] | None = None,
+    include_stop_str_in_output: bool = False,
+    skip_special_tokens: bool | None = None,
     timings_per_token: bool = False,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
-    filling unspecified fields from the checkpoint's recommended defaults."""
+    filling unspecified fields from the checkpoint's recommended defaults. Range errors
+    raise ValueError (the adapters answer 400)."""
 
     def pick(value, key, framework):
         return value if value is not None else model_sampling.get(key, framework)
@@ -250,17 +261,49 @@ def resolve_sampling(
     # "off", and a checkpoint's generation_config.json can carry it too.
     if resolved_top_k <= 0:
         resolved_top_k = -1
-    return SamplingParams(
+    resolved_min_p = float(pick(min_p, "min_p", 0.0))
+    resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
+    if not 0.0 <= resolved_min_p <= 1.0:
+        raise ValueError(f"min_p must be in [0, 1], got {resolved_min_p}")
+    # not `<= 0`: NaN compares False and would poison every seen token's logit
+    if not (math.isfinite(resolved_rep) and resolved_rep > 0.0):
+        raise ValueError(f"repetition_penalty must be a positive finite number, got {resolved_rep}")
+    if min_tokens < 0:
+        raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
+    bias: list[list[float]] | None = None
+    if logit_bias:
+        bias = []
+        for key, value in logit_bias.items():
+            try:
+                tid = int(key)
+            except (TypeError, ValueError):
+                raise ValueError(f"logit_bias keys must be token ids, got {key!r}") from None
+            if tid < 0:
+                raise ValueError(f"logit_bias token id must be >= 0, got {tid}")
+            bias.append([tid, max(-100.0, min(100.0, float(value)))])  # the OpenAI range
+    ids = [int(t) for t in (stop_token_ids or [])]
+    if any(t < 0 for t in ids):
+        raise ValueError("stop_token_ids must be non-negative token ids")
+    params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
         temperature=resolved_temperature,
         top_k=resolved_top_k,
         top_p=resolved_top_p,
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
-        presence_penalty=presence_penalty,
-        frequency_penalty=frequency_penalty,
+        min_p=resolved_min_p,
+        presence_penalty=float(presence_penalty),
+        frequency_penalty=float(frequency_penalty),
+        repetition_penalty=resolved_rep,
+        logit_bias=bias,
+        min_tokens=int(min_tokens),
+        stop_token_ids=ids,
+        include_stop_str_in_output=bool(include_stop_str_in_output),
         timings_per_token=timings_per_token,
     )
+    if skip_special_tokens is not None:
+        params.skip_special_tokens = bool(skip_special_tokens)
+    return params
 
 
 def render_messages(messages: list[dict[str, Any]], *, hoist_system: bool = True) -> list[dict[str, Any]]:
@@ -793,6 +836,7 @@ async def _generate_events_impl(
         usage.prompt_tokens += ack.prompt_tokens_delta
         usage.completion_tokens += ack.completion_tokens_delta
         usage.cached_tokens += ack.cached_tokens
+        usage.reasoning_tokens = max(usage.reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
             usage.timings = timings
@@ -878,6 +922,7 @@ async def _generate_events_impl(
     yield GenDone(
         finish_reason, usage.prompt_tokens, usage.completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=usage.cached_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
         timings=timings,
     )
 
@@ -889,6 +934,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    reasoning_tokens = 0
     timings: dict[str, Any] | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
@@ -898,6 +944,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
         full_content += ack.incremental_output
@@ -926,5 +973,6 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
         timings=timings,
     )
