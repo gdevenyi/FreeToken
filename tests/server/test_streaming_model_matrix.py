@@ -143,13 +143,14 @@ REASONING_FAMILIES = {
 
 
 class FakeState:
-    def __init__(self, chunks, tool_call_parser, reasoning_parser=None, finish_reason=None):
+    def __init__(self, chunks, tool_call_parser, reasoning_parser=None, finish_reason=None, matched_stop=None):
         self.config = SimpleNamespace(
             tool_call_parser=tool_call_parser,
             reasoning_parser=reasoning_parser,
         )
         self._chunks = chunks
         self._finish_reason = finish_reason
+        self._matched_stop = matched_stop
 
     async def wait_for_ack(self, uid):
         last = len(self._chunks) - 1
@@ -159,6 +160,7 @@ class FakeState:
                 incremental_output=chunk,
                 finished=(i == last),
                 finish_reason=self._finish_reason if i == last else None,
+                matched_stop=self._matched_stop if i == last else None,
                 prompt_tokens_delta=1 if i == 0 else 0,
                 completion_tokens_delta=1,
             )
@@ -188,8 +190,8 @@ def _stream_events(chunks, tool, reasoning=None, finish_reason=None):
     return asyncio.run(run())
 
 
-def _full_result(text, tool, reasoning=None):
-    state = FakeState([text], tool_call_parser=tool, reasoning_parser=reasoning)
+def _full_result(text, tool, reasoning=None, finish_reason=None):
+    state = FakeState([text], tool_call_parser=tool, reasoning_parser=reasoning, finish_reason=finish_reason)
     return asyncio.run(generate_full(42, _spec(), state))
 
 
@@ -327,7 +329,7 @@ def test_qwen3_missing_think_closer_recovers_structured_tool_call():
     # transition directly to a valid XML call; recover the boundary before the
     # tool parser runs, without treating reasoning itself as executable.
     text = THINKING + CALL_BLOCKS["qwen3_coder"]
-    events = _stream_events(_random_chunks(text, 23), "qwen3_coder", "qwen3")
+    events = _stream_events(_random_chunks(text, 23), "qwen3_coder", "qwen3", finish_reason="stop")
     _assert_stream_invariants(events, "qwen3_coder")
     assert _reasoning(events).strip() == THINKING
     calls = _calls(events)
@@ -336,7 +338,7 @@ def test_qwen3_missing_think_closer_recovers_structured_tool_call():
     assert json.loads(calls[0].parameters) == READ_ARGS
     assert events[-1].finish_reason == "tool_calls"
 
-    full = _full_result(text, "qwen3_coder", "qwen3")
+    full = _full_result(text, "qwen3_coder", "qwen3", finish_reason="stop")
     assert full.reasoning.strip() == THINKING
     assert full.content == ""
     assert [call.name for call in full.tool_calls] == ["read"]
@@ -751,18 +753,18 @@ QWEN_TOOLS = TOOLS + [
 ]
 
 
-def _qwen_parity(pieces, *, thinking=True, finish_reason=None):
+def _qwen_parity(pieces, *, thinking=True, finish_reason=None, matched_stop=None, tools=QWEN_TOOLS):
     """Feed token texts one per ack to the streaming path and joined to the
     non-streaming path; assert both expose the same content, reasoning and calls
     (exactly, no strip) and return them."""
     spec = GenSpec(
-        messages=[], sampling_params=None, parser_tools=QWEN_TOOLS, template_tools=QWEN_TOOLS,
+        messages=[], sampling_params=None, parser_tools=tools, template_tools=tools,
         chat_template_kwargs={} if thinking else {"enable_thinking": False},
     )
 
     def state(chunks):
         return FakeState(chunks, tool_call_parser="qwen3_coder", reasoning_parser="qwen3",
-                         finish_reason=finish_reason)
+                         finish_reason=finish_reason, matched_stop=matched_stop)
 
     async def stream(chunks):
         return [ev async for ev in generate_events(42, spec, state(chunks))]
@@ -798,8 +800,33 @@ def test_qwen_tool_call_quoted_in_reasoning_is_not_a_call(name):
 
 def test_qwen_omitted_think_close_then_real_call_is_a_call():
     block = "<tool_call>\n<function=edit>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
-    content, reasoning, calls, finish = _qwen_parity(["I will edit.\n", block])
+    content, reasoning, calls, finish = _qwen_parity(["I will edit.\n", block], finish_reason="stop")
     assert (content, reasoning, finish) == ("", "I will edit.", "tool_calls")
+    assert calls == [("edit", {"path": "a.py"})]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "finish"),
+    [
+        ({"finish_reason": "length"}, "length"),
+        ({"finish_reason": None}, "stop"),
+        ({"finish_reason": "stop", "matched_stop": "END"}, "stop"),
+        ({"finish_reason": "stop", "tools": None}, "stop"),
+    ],
+    ids=["max-tokens", "unknown-finish", "client-stop-string", "no-parsed-tools"],
+)
+def test_qwen_omitted_think_close_stays_reasoning_unless_the_model_stopped(kwargs, finish):
+    block = "<tool_call>\n<function=edit>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
+    assert _qwen_parity(["The format is:\n", block], **kwargs) == (
+        "", f"The format is:\n{block}", [], finish
+    )
+
+
+def test_qwen_quote_with_an_open_value_does_not_run_as_the_real_call():
+    quote = "<tool_call><function=edit><parameter=path>rm -rf /\nInstead"
+    block = "<tool_call>\n<function=edit>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
+    content, reasoning, calls, finish = _qwen_parity([f"Never:\n{quote}\n", block], finish_reason="stop")
+    assert (content, reasoning, finish) == ("", f"Never:\n{quote}", "tool_calls")
     assert calls == [("edit", {"path": "a.py"})]
 
 

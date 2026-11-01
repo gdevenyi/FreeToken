@@ -137,9 +137,9 @@ def test_think_no_reasoning_passthrough(name):
 
 
 def test_qwen3_missing_think_closer_preserves_tool_block_for_tool_parser():
-    parser = ReasoningParser("qwen3", force_reasoning=True)
+    parser = ReasoningParser("qwen3", force_reasoning=True, tool_names=["run_command"])
     text = "I need a shell.<tool_call><function=run_command></function></tool_call>"
-    reasoning, content = parser.parse_non_stream(text)
+    reasoning, content = parser.parse_non_stream(text, "stop")
     assert reasoning == "I need a shell."
     assert content == "<tool_call><function=run_command></function></tool_call>"
 

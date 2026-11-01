@@ -18,6 +18,12 @@ def _qwen_call(name, value="rm -rf build"):
 _PAD = ("More reasoning about the user request that goes on for a while. " * 12).strip()
 _BASH = _qwen_call("bash")
 _EXAMPLE = _qwen_call("example_function_name", "value_1")
+_LS = _qwen_call("bash", "ls")
+_WEATHER = _qwen_call("get_weather", "Paris")
+_OPEN_QUOTE = "<tool_call><function=bash><parameter=command>rm -rf /\nOK instead"
+_TWO_PARAM_OPEN_QUOTE = (
+    "<tool_call><function=bash><parameter=command>rm</parameter><parameter=x>y\nInstead"
+)
 QWEN_TOOL_MARKER_IDS = [
     ("A-prose-quote-far-close",
      f"I must wrap the call in a <tool_call> block.\n{_PAD}\n</think>\n\nAnswer.", ["bash"],
@@ -40,13 +46,14 @@ QWEN_TOOL_MARKER_IDS = [
      "</parameter>\n</function>\n</tool_call>"),
     ("D-omitted-close-real-call", f"I will list files.\n{_BASH}", ["bash"],
      "I will list files.", _BASH),
-    ("D2-no-tool-list", f"I will list files.\n{_BASH}", None, "I will list files.", _BASH),
+    ("D2-no-tool-list", f"I will list files.\n{_BASH}", None, f"I will list files.\n{_BASH}", ""),
+    ("D2b-empty-tool-list", f"I will list files.\n{_BASH}", [], f"I will list files.\n{_BASH}", ""),
     ("D3-parallel-calls", f"Two.\n{_BASH}\n{_BASH}\n", ["bash"], "Two.", f"{_BASH}\n{_BASH}\n"),
     ("D4-closer-dropped", "Go.\n<tool_call><function=bash></function>", ["bash"],
      "Go.", "<tool_call><function=bash></function>"),
     ("D5-closer-text-in-arguments",
      f"Go.\n{_qwen_call('bash', 'echo </tool_call> done')}", ["bash"],
-     "Go.", _qwen_call("bash", "echo </tool_call> done")),
+     f"Go.\n{_qwen_call('bash', 'echo </tool_call> done')}", ""),
     ("D6-quote-then-text-then-real-call", f"Like:\n{_BASH}\nSo.\n{_BASH}", ["bash"],
      f"Like:\n{_BASH}\nSo.", _BASH),
     ("E-template-example-unknown-name", f"Format:\n{_EXAMPLE}\n{_PAD}\n</think>\nAsk.", ["bash"],
@@ -56,10 +63,42 @@ QWEN_TOOL_MARKER_IDS = [
     ("G-cut-inside-the-call", "Go.\n<tool_call>\n<function=bash>\n<parameter=command>\nrm",
      ["bash"], "Go.\n<tool_call>\n<function=bash>\n<parameter=command>\nrm", ""),
     ("H-marker-then-prose", "a <tool_call> b <tool_call>", ["bash"], "a <tool_call> b <tool_call>", ""),
-    ("I-marker-then-json", 'a <tool_call>\n{"name": "bash"}\n</tool_call>', None,
+    ("I-marker-then-json", 'a <tool_call>\n{"name": "bash"}\n</tool_call>', ["bash"],
      'a <tool_call>\n{"name": "bash"}\n</tool_call>', ""),
+    ("J-open-value-swallows-real-call", f"Never:\n{_OPEN_QUOTE}\n{_LS}", ["bash"],
+     f"Never:\n{_OPEN_QUOTE}", _LS),
+    ("J2-open-value-other-real-call", f"Never:\n{_OPEN_QUOTE}\n{_WEATHER}", ["bash", "get_weather"],
+     f"Never:\n{_OPEN_QUOTE}", _WEATHER),
+    ("J3-second-param-open", f"Never:\n{_TWO_PARAM_OPEN_QUOTE}\n{_LS}", ["bash"],
+     f"Never:\n{_TWO_PARAM_OPEN_QUOTE}", _LS),
+    ("J4-open-value-runs-into-param-tag",
+     "N:\n<tool_call><function=bash><parameter=command>rm -rf /\n<parameter=command>ls</parameter></function>",
+     ["bash"],
+     "N:\n<tool_call><function=bash><parameter=command>rm -rf /\n<parameter=command>ls</parameter></function>",
+     ""),
+    ("K-param-tag-without-gt",
+     "F:\n<tool_call>\n<function=bash>\n<parameter=command</parameter>\n</function>\n</tool_call>",
+     ["bash"],
+     "F:\n<tool_call>\n<function=bash>\n<parameter=command</parameter>\n</function>\n</tool_call>",
+     ""),
+    ("L-one-unknown-name-in-a-run", f"Go.\n{_BASH}\n{_EXAMPLE}", ["bash"], f"Go.\n{_BASH}\n{_EXAMPLE}", ""),
+    ("M-function-tag-in-value", f"Go.\n{_qwen_call('bash', '<function=x>')}", ["bash"],
+     f"Go.\n{_qwen_call('bash', '<function=x>')}", ""),
 ]
 QWEN_TOOL_MARKER_CASES = [case[1:] for case in QWEN_TOOL_MARKER_IDS]
+
+
+def _chunkings(text):
+    rng = random.Random(7)
+    chunkings = [[text], list(text)]
+    for _ in range(20):
+        parts, i = [], 0
+        while i < len(text):
+            n = rng.randint(1, 80)
+            parts.append(text[i:i + n])
+            i += n
+        chunkings.append(parts)
+    return chunkings
 
 
 class _ReasoningContract:
@@ -128,27 +167,47 @@ class TestQwen3ReasoningParser(_ReasoningContract):
             return ReasoningParser(self.name, force_reasoning=True, tool_names=tools)
 
         expected = (reasoning, content)
-        assert parser().parse_non_stream(text) == expected
-        rng = random.Random(7)
-        chunkings = [[text], list(text)]
-        for _ in range(20):
-            parts, i = [], 0
-            while i < len(text):
-                n = rng.randint(1, 80)
-                parts.append(text[i:i + n])
-                i += n
-            chunkings.append(parts)
-        for chunks in chunkings:
+        assert parser().parse_non_stream(text, "stop") == expected
+        for chunks in _chunkings(text):
             stream = parser()
-            out = [stream.parse_stream_chunk(chunk) for chunk in chunks] + [stream.flush()]
+            out = [stream.parse_stream_chunk(chunk) for chunk in chunks] + [stream.flush("stop")]
             assert tuple("".join(pair[i] for pair in out) for i in (0, 1)) == expected
+
+    @pytest.mark.parametrize("finish_reason", ["length", None])
+    def test_tool_run_needs_a_normal_stop(self, finish_reason):
+        text = f"The format is:\n{_BASH}"
+        expected = (text, "")
+        parser = ReasoningParser(self.name, force_reasoning=True, tool_names=["bash"])
+        assert parser.parse_non_stream(text, finish_reason) == expected
+        for chunks in _chunkings(text):
+            stream = ReasoningParser(self.name, force_reasoning=True, tool_names=["bash"])
+            out = [stream.parse_stream_chunk(c) for c in chunks] + [stream.flush(finish_reason)]
+            assert tuple("".join(pair[i] for pair in out) for i in (0, 1)) == expected
+
+    @pytest.mark.parametrize(
+        ("tools", "held", "breaker"),
+        [
+            (None, "", "<tool_call>"),
+            (["bash"], "<tool_call>\n", "<function=other>"),
+            (["bash"], "<tool_call>\n<function=bash>\n<parameter=command>\nrm", "\n<tool_call>x"),
+            (["bash"], "<tool_call>\n<function=bash>\n<parameter=command>\nrm", "\n<function=x"),
+            (["bash"], "<tool_call>\n<function=bash>\n", "<parameter=a b"),
+            (["bash"], _BASH + "\n", "Not yet."),
+        ],
+        ids=["no-tools", "unknown-name", "tool-call-in-value", "function-in-value", "bad-param-tag",
+             "text-after-run"],
+    )
+    def test_broken_run_goes_to_reasoning_when_seen(self, tools, held, breaker):
+        parser = ReasoningParser(self.name, force_reasoning=True, tool_names=tools)
+        assert parser.parse_stream_chunk("plan\n" + held) == ("plan", "")
+        assert parser.parse_stream_chunk(breaker) == ("\n" + held + breaker, "")
 
     def test_long_real_call_is_not_released_before_the_generation_ends(self):
         # Past the old 512-char hold: a quote this long must still be reclaimable.
         call = _qwen_call("bash", "x" * 4096)
         parser = ReasoningParser(self.name, force_reasoning=True, tool_names=["bash"])
         assert parser.parse_stream_chunk("plan\n" + call) == ("plan", "")
-        assert parser.flush() == ("", call)
+        assert parser.flush("stop") == ("", call)
 
 
 class TestMiniMaxM3ReasoningParser(_ReasoningContract):

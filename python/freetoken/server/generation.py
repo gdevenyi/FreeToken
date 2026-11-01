@@ -528,13 +528,21 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     return build_reasoning_parser(state.config, force_reasoning, tool_names)
 
 
-def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:
+def _reasoning_finish(finish_reason: str | None, matched_stop: str | None) -> str | None:
+    """The finish reason the reasoning parser sees, before any adapter default."""
+    # A client stop string cut the text as max_tokens does: the model did not end the turn there.
+    return None if matched_stop is not None else finish_reason
+
+
+def _split_reasoning(
+    text: str, spec: GenSpec, state: Any, finish_reason: str | None = None
+) -> tuple[str, str]:
     """Return ``(reasoning, content)``. A no-op (``("", text)``) when no reasoning
     parser is configured, preserving the original behavior for other models."""
     parser = _make_reasoning_parser(spec, state)
     if parser is None:
         return "", text
-    return parser.parse_non_stream(text)
+    return parser.parse_non_stream(text, finish_reason)
 
 
 def _leaked_special_tokens(state: Any) -> list[str]:
@@ -842,7 +850,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     # Drain residue held in the reasoning parser (a deferred tool block, or a
     # trailing partial token) so it is not silently dropped.
     if reasoning_parser is not None:
-        flush_reasoning, flush_content = reasoning_parser.flush()
+        flush_reasoning, flush_content = reasoning_parser.flush(
+            _reasoning_finish(engine_finish_reason, engine_matched_stop)
+        )
         if flush_reasoning:
             stripped_reasoning = strip_special_tokens(flush_reasoning, specials)
             if stripped_reasoning:
@@ -929,7 +939,9 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
             engine_matched_stop = getattr(ack, "matched_stop", None)
             break
 
-    reasoning_text, content_text = _split_reasoning(full_content, spec, state)
+    reasoning_text, content_text = _split_reasoning(
+        full_content, spec, state, _reasoning_finish(engine_finish_reason, engine_matched_stop)
+    )
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
     tool_calls: list[ToolCallItem] = []

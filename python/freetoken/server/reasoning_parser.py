@@ -107,6 +107,9 @@ class BaseReasoningParser:
     # recoverable; anything longer commits to "real tool call" and streams live.
     TOOL_HOLD_MAX = 512
 
+    # How the generation ended, set by ReasoningParser before the end-of-generation parse.
+    finish_reason: Optional[str] = None
+
     def __init__(
         self,
         think_start_token: str,
@@ -418,7 +421,17 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
-_QWEN_NAME_END_RE = re.compile(r"[<>]")
+_QWEN_TAG_NAME_RE = re.compile(r"[^<>\s]*")
+# A value ends at its closer. Any other call tag first means a quote ran into later text.
+_QWEN_VALUE_END_RE = re.compile(r"</parameter>|<parameter=|<function=|<tool_call>|</tool_call>")
+# Strict block grammar, state -> {tag: next state}. A run may end only in "invoked" or "closed".
+_QWEN_RUN_GRAMMAR = {
+    "start": {"<tool_call>": "opened"},
+    "opened": {"<function=": "invoke"},
+    "invoke": {"<parameter=": "invoke", "</function>": "invoked"},
+    "invoked": {"<function=": "invoke", "</tool_call>": "closed"},
+    "closed": {"<tool_call>": "opened"},
+}
 
 
 class Qwen3ReasoningParser(ThinkReasoningParser):
@@ -433,26 +446,10 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
     whitespace-only tails so its deltas join to exactly the one-shot result.
     The one-shot parse replays the streaming machine, so the two cannot drift.
 
-    Qwen's chat template also asks for ``<tool_call>`` XML, and models occasionally
-    go straight to that block without ``</think>``. The template prints that format,
-    so reasoning can quote it, and the text that decides between the two can be any
-    distance away. A ``<tool_call>`` therefore ends reasoning in one case only: with
-    no ``</think>`` in the generation, it starts a run of well-formed call blocks that
-    the generation ends on. The run stays verbatim in content for the Qwen tool-call
-    parser. Any other marker stays in reasoning, and a run is held until EOS, because
-    only EOS rules out a later ``</think>``.
-
-    A quote that is well-formed and is the last thing generated is the same text as
-    a real call, so it is a call. A real call followed by text, or cut before
-    ``</function>``, stays in reasoning: not running a quoted command is worth more
-    than recovering a malformed turn.
+    With no ``</think>``, a ``<tool_call>`` ends reasoning only if the generation ended by a normal
+    stop, the request declares the function, and the marker starts a strict run of whole blocks that
+    is the last thing generated. Otherwise it stays reasoning: running a quote is far worse than a miss.
     """
-
-    _FUNC_OPEN = "<function="
-    _FUNC_CLOSE = "</function>"
-    _PARAM_OPEN = "<parameter="
-    _PARAM_CLOSE = "</parameter>"
-    _BLOCK_CLOSE = "</tool_call>"
 
     def __init__(
         self,
@@ -466,7 +463,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
         )
-        self._tool_names = frozenset(tool_names) if tool_names else None
+        self._tool_names = frozenset(tool_names or ())
         # The generation start, held while it can still grow into ws* + "<think>".
         self._head: Optional[str] = ""
         self._trim_content = False
@@ -480,6 +477,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             stream_reasoning=self.stream_reasoning,
             tool_names=self._tool_names,
         )
+        clone.finish_reason = self.finish_reason
         first = clone.parse_streaming_increment(text)
         rest = clone.flush()
         return ReasoningParseResult(
@@ -540,7 +538,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
 
     def _consume_open_reasoning(self, buf: str, final: bool) -> ReasoningParseResult:
         """Reasoning with no ``</think>`` in ``buf``: everything up to a possible call run goes out."""
-        tool = buf.find(self.tool_start_token)
+        tool = buf.find(self.tool_start_token) if self._tool_names else -1
         status = "quote"
         while tool != -1:
             status = self._tool_run_status(buf, tool)
@@ -548,7 +546,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
                 break
             tool = buf.find(self.tool_start_token, tool + 1)
         if final:
-            if status == "call":
+            if status == "call" and self.finish_reason == "stop":
                 self._in_reasoning = False
                 return ReasoningParseResult(
                     reasoning_text=self._reasoning_piece(buf[:tool].rstrip(), closing=True),
@@ -563,74 +561,38 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
         return ReasoningParseResult(reasoning_text=self._reasoning_piece(body, closing=False))
 
     def _tool_run_status(self, text: str, pos: int) -> str:
-        """Classify the text from a marker at ``pos``: "call" if it is a run of whole blocks
-        as of now, "quote" if no more text can make it one, else "hold". Same grammar as
-        Qwen3CoderDetector; a name outside the request's tools is a quote (the template's
-        example_function_name), and that detector's lenient forms just stay in reasoning."""
-        while True:  # at a block opener
-            pos += len(self.tool_start_token)
-            pos = self._invoke_end(text, self._skip_space(text, pos))
-            if isinstance(pos, str):
-                return pos
-            while True:  # after an invoke
-                pos = self._skip_space(text, pos)
-                if pos == len(text):
-                    return "call"  # the model may stop without the block closer
-                opens = self._starts(text, pos, self._FUNC_OPEN)
-                if opens != "yes":
-                    break
-                pos = self._invoke_end(text, pos)
-                if isinstance(pos, str):
-                    return pos
-            closes = self._starts(text, pos, self._BLOCK_CLOSE)
-            if closes != "yes":
-                return "hold" if closes == "maybe" or opens == "maybe" else "quote"
-            pos = self._skip_space(text, pos + len(self._BLOCK_CLOSE))
-            if pos == len(text):
-                return "call"
-            opens = self._starts(text, pos, self.tool_start_token)
-            if opens != "yes":
-                return "hold" if opens == "maybe" else "quote"
-
-    def _invoke_end(self, text: str, pos: int) -> int | str:
-        """Offset after the whole invoke at ``pos``, or "hold" / "quote"."""
-        opens = self._starts(text, pos, self._FUNC_OPEN)
-        if opens != "yes":
-            return "hold" if opens == "maybe" else "quote"
-        pos += len(self._FUNC_OPEN)
-        name_end = _QWEN_NAME_END_RE.search(text, pos)
-        if name_end is None:
-            return "hold"
-        name = text[pos:name_end.start()].strip()
-        if name_end.group() == "<" or (self._tool_names is not None and name not in self._tool_names):
-            return "quote"
-        pos = name_end.end()
+        """Classify the text from a marker at ``pos``: "call" if it is a run of whole blocks as
+        of now, "quote" if no more text can make it one, else "hold". Every form accepted here
+        parses the same in Qwen3CoderDetector; its lenient forms just stay in reasoning."""
+        state = "start"
         while True:
-            pos = self._skip_space(text, pos)
-            if text.startswith(self._PARAM_OPEN, pos):
-                value_end = text.find(self._PARAM_CLOSE, pos)
-                if value_end == -1:
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+            if pos == len(text):
+                return "call" if state in ("invoked", "closed") else "hold"
+            tags = _QWEN_RUN_GRAMMAR[state]
+            tag = next((t for t in tags if text.startswith(t, pos)), None)
+            if tag is None:
+                partial = any(t.startswith(text[pos:pos + len(t)]) for t in tags)
+                return "hold" if partial else "quote"
+            state = tags[tag]
+            pos += len(tag)
+            if tag in ("<function=", "<parameter="):
+                name = _QWEN_TAG_NAME_RE.match(text, pos)
+                pos = name.end()
+                if pos == len(text):
                     return "hold"
-                pos = value_end + len(self._PARAM_CLOSE)
-                continue
-            closes = self._starts(text, pos, self._FUNC_CLOSE)
-            if closes == "yes":
-                return pos + len(self._FUNC_CLOSE)
-            if closes == "maybe" or self._starts(text, pos, self._PARAM_OPEN) == "maybe":
-                return "hold"
-            return "quote"
-
-    @staticmethod
-    def _skip_space(text: str, pos: int) -> int:
-        while pos < len(text) and text[pos].isspace():
-            pos += 1
-        return pos
-
-    @staticmethod
-    def _starts(text: str, pos: int, token: str) -> str:
-        if text.startswith(token, pos):
-            return "yes"
-        return "maybe" if token.startswith(text[pos:pos + len(token)]) else "no"
+                valid = name.group() in self._tool_names if tag == "<function=" else name.group()
+                if text[pos] != ">" or not valid:
+                    return "quote"
+                pos += 1
+            if tag == "<parameter=":
+                value_end = _QWEN_VALUE_END_RE.search(text, pos)
+                if value_end is None:
+                    return "hold"
+                if value_end.group() != "</parameter>":
+                    return "quote"
+                pos = value_end.end()
 
     def _split_trailing_partial(self, text: str) -> tuple[str, str]:
         # A later <think> is literal, never a marker: only the two tokens that end reasoning count.
@@ -1131,8 +1093,9 @@ class ReasoningParser:
             force_reasoning=force_reasoning, stream_reasoning=stream_reasoning, **extra
         )
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
+    def parse_non_stream(self, full_text: str, finish_reason: Optional[str] = None) -> Tuple[str, str]:
         """Return ``(reasoning_text, normal_text)`` for a complete completion."""
+        self.detector.finish_reason = finish_reason
         result = self.detector.detect_and_parse(full_text)
         return result.reasoning_text, result.normal_text
 
@@ -1141,8 +1104,9 @@ class ReasoningParser:
         result = self.detector.parse_streaming_increment(chunk_text)
         return result.reasoning_text, result.normal_text
 
-    def flush(self) -> Tuple[str, str]:
+    def flush(self, finish_reason: Optional[str] = None) -> Tuple[str, str]:
         """Drain buffered residue at end-of-stream as ``(reasoning_delta, normal_delta)``."""
+        self.detector.finish_reason = finish_reason
         result = self.detector.flush()
         return result.reasoning_text, result.normal_text
 
