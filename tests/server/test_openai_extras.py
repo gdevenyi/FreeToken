@@ -135,6 +135,40 @@ def test_completion_echo_streams_the_prompt_first():
     assert events[-1] == "[DONE]"
 
 
+def test_completion_refuses_an_empty_prompt_list():
+    state = FakeState()
+    for stream in (False, True):
+        req = CompletionRequest(model="unit-model", prompt=[], stream=stream)
+        response = run(handle_completion(req, None, state, {}))
+        assert response.status_code == 400
+        assert json.loads(response.body)["error"]["message"] == "prompt must not be empty"
+    assert state.sent == []
+
+
+class _RejectingState(FakeState):
+    async def wait_for_ack(self, uid: int):
+        yield UserReply(
+            uid=uid,
+            incremental_output="",
+            finished=True,
+            error="prompt is too long",
+            error_code="context_length_exceeded",
+        )
+
+
+def test_completion_keeps_the_error_code():
+    req = CompletionRequest(model="unit-model", prompt="x")
+    response = run(handle_completion(req, None, _RejectingState(), {}))
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "context_length_exceeded"
+
+    req = CompletionRequest(model="unit-model", prompt="x", stream=True)
+    response = run(handle_completion(req, None, _RejectingState(), {}))
+    events = parse_sse(run(_collect(response.body_iterator)))
+    assert events[0]["error"]["code"] == "context_length_exceeded"
+    assert events[-1] == "[DONE]"
+
+
 class _FimTokenizer:
     unk_token_id = -1
 

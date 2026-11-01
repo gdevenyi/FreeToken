@@ -526,7 +526,7 @@ async def handle_completion(
             finish_reason = "stop"
             async for ack in state.wait_for_ack(uid):
                 if getattr(ack, "error", None):
-                    return create_error_response(ack.error)
+                    return create_error_response(ack.error, code=getattr(ack, "error_code", None))
                 prompt_tokens += ack.prompt_tokens_delta
                 completion_tokens += ack.completion_tokens_delta
                 cached_tokens += ack.cached_tokens
@@ -581,7 +581,7 @@ async def stream_completion_chunks(
         yield _sse(_completion_chunk(req, uid, [{"text": echo_text, "index": 0, "finish_reason": None, "logprobs": None}]))
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
-            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
+            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": getattr(ack, "error_code", None)}})
             yield b"data: [DONE]\n\n"
             return
         prompt_tokens += ack.prompt_tokens_delta
@@ -843,6 +843,8 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
+    if isinstance(req.prompt, list) and not req.prompt:
+        return "prompt must not be empty"
     if _is_token_prompt(req.prompt):
         return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
     if req.logprobs is not None:
