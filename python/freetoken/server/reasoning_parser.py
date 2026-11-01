@@ -393,7 +393,7 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
 
 class ThinkReasoningParser(BaseReasoningParser):
     """Generic ``<think>``/``</think>`` reasoning parser for models that wrap their
-    chain-of-thought in think tags (Qwen3/3.5, GLM-4.x, MiniMax-M2). No DSML tool
+    chain-of-thought in think tags (GLM-4.x, MiniMax-M2). No DSML tool
     marker — reasoning ends at ``</think>``.
 
     Families with a tool format that can follow an omitted ``</think>`` should
@@ -419,12 +419,22 @@ class ThinkReasoningParser(BaseReasoningParser):
 
 
 class Qwen3ReasoningParser(ThinkReasoningParser):
-    """Qwen3 reasoning with recovery for an omitted ``</think>`` before XML tools.
+    """Qwen3 ``<think>`` parser with one positional rule for both paths.
 
-    Qwen's chat template starts generation inside ``<think>`` and asks for
-    ``<tool_call>`` XML. Models occasionally transition directly to that block.
-    Preserve the block for the Qwen tool-call parser, which still decides whether
-    it is a valid structured call.
+    Reasoning is open from the start when the template pre-opened it
+    (``force_reasoning``) or when the generation itself opens with ``<think>``
+    (stripped once). It ends at the FIRST ``</think>`` and is never re-entered:
+    every later ``<think>``/``</think>`` -- quoted in prose, code or tool-call
+    arguments -- is literal content. Reasoning is whitespace-trimmed at both
+    ends, and so is content that follows a real ``</think>``; streaming holds
+    whitespace-only tails so its deltas join to exactly the one-shot result.
+    The one-shot parse replays the streaming machine, so the two cannot drift.
+
+    Qwen's chat template also asks for ``<tool_call>`` XML, and models occasionally
+    go straight to that block without ``</think>``. Reasoning then ends at the
+    marker and the block stays verbatim in content for the Qwen tool-call parser,
+    which still decides whether it is a valid structured call. A ``</think>`` within
+    ``TOOL_HOLD_MAX`` of the marker reclaims it as a quote inside reasoning.
     """
 
     def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
@@ -433,6 +443,109 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
         )
+        # The generation start, held while it can still grow into ws* + "<think>".
+        self._head: Optional[str] = ""
+        self._trim_content = False
+        self._reasoning_started = False
+        self._content_started = False
+        self._unstreamed_reasoning = ""
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        clone = type(self)(
+            force_reasoning=self.force_reasoning, stream_reasoning=self.stream_reasoning
+        )
+        first = clone.parse_streaming_increment(text)
+        rest = clone.flush()
+        return ReasoningParseResult(
+            reasoning_text=first.reasoning_text + rest.reasoning_text,
+            normal_text=first.normal_text + rest.normal_text,
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        if self._head is not None:
+            self._head += new_text
+            head = self._head.lstrip()
+            if head.startswith(self.think_start_token):
+                self._head = None
+                self._in_reasoning = True
+                return self._consume(head[len(self.think_start_token):], final=False)
+            if not head or self.think_start_token.startswith(head):
+                return ReasoningParseResult()
+            new_text, self._head = self._head, None
+        return self._consume(new_text, final=False)
+
+    def flush(self) -> ReasoningParseResult:
+        text, self._head = self._head or "", None
+        return self._consume(text, final=True)
+
+    def _reasoning_piece(self, piece: str, closing: bool) -> str:
+        if not self._reasoning_started:
+            piece = piece.lstrip()
+            self._reasoning_started = bool(piece)
+        if self.stream_reasoning:
+            return piece
+        self._unstreamed_reasoning += piece
+        if not closing:
+            return ""
+        piece, self._unstreamed_reasoning = self._unstreamed_reasoning, ""
+        return piece
+
+    def _consume(self, text: str, final: bool) -> ReasoningParseResult:
+        buf = self._buffer + text
+        self._buffer = ""
+        reasoning = ""
+        if self._in_reasoning:
+            end = buf.find(self.think_end_token)
+            tool = buf.find(self.tool_start_token)
+            # Past TOOL_HOLD_MAX the stream has already released the block, so a whole-text
+            # parse must not reclaim it either; every chunking then gives one answer.
+            if tool != -1 and (end == -1 or end - tool > self.TOOL_HOLD_MAX):
+                held = buf[tool:]
+                if final or end != -1 or len(held) >= self.TOOL_HOLD_MAX + len(self.think_end_token):
+                    self._in_reasoning = False
+                    return ReasoningParseResult(
+                        reasoning_text=self._reasoning_piece(buf[:tool].rstrip(), closing=True),
+                        normal_text=held,
+                    )
+                body = buf[:tool].rstrip()
+                self._buffer = buf[len(body):]
+                return ReasoningParseResult(
+                    reasoning_text=self._reasoning_piece(body, closing=False)
+                )
+            if end == -1:
+                if final:
+                    return ReasoningParseResult(
+                        reasoning_text=self._reasoning_piece(buf.rstrip(), closing=True)
+                    )
+                safe, _ = self._split_trailing_partial(buf)
+                body = safe.rstrip()
+                self._buffer = buf[len(body):]
+                return ReasoningParseResult(
+                    reasoning_text=self._reasoning_piece(body, closing=False)
+                )
+            reasoning = self._reasoning_piece(buf[:end].rstrip(), closing=True)
+            self._in_reasoning = False
+            self._trim_content = True
+            buf = buf[end + len(self.think_end_token):]
+        if not self._trim_content:
+            return ReasoningParseResult(reasoning_text=reasoning, normal_text=buf)
+        if not self._content_started:
+            buf = buf.lstrip()
+            self._content_started = bool(buf)
+        body = buf.rstrip()
+        if not final:
+            self._buffer = buf[len(body):]
+        return ReasoningParseResult(reasoning_text=reasoning, normal_text=body)
+
+    def _split_trailing_partial(self, text: str) -> tuple[str, str]:
+        # A later <think> is literal, never a marker: only the two tokens that end reasoning count.
+        best = 0
+        for token in (self.think_end_token, self.tool_start_token):
+            for k in range(min(len(token) - 1, len(text)), best, -1):
+                if text.endswith(token[:k]):
+                    best = k
+                    break
+        return (text[:-best], text[-best:]) if best else (text, "")
 
 
 class MiniMaxM3ReasoningParser(BaseReasoningParser):
