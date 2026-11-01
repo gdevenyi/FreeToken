@@ -319,6 +319,18 @@ def prefill_config(M: int, top_k: int, num_experts: int, device_index: int) -> D
                 FAST_DECODE=_prefill_fast_decode(block_m, per_expert, device_index))
 
 
+def prefill_bucket_lens(lo: int, hi: int, top_k: int, num_experts: int, device_index: int) -> list[int]:
+    """One M in ``[lo, hi]`` per distinct prefill_config: the first M of each bucket, and ``hi`` for the last one."""
+    lens: list[int] = []
+    last = None
+    for M in range(lo, hi + 1):
+        cfg = prefill_config(M, top_k, num_experts, device_index)
+        if cfg != last:
+            lens.append(M)
+            last = cfg
+    return lens[:-1] + [hi] if lens else lens
+
+
 def prefill_gemm(
     a: torch.Tensor,
     packed: torch.Tensor,
