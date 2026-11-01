@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 from freetoken.distributed import DistributedCommunicator, get_tp_info
+from freetoken.kernel.triton.e4m3_compat import f32_to_e4m3
 from freetoken.utils import div_even
 
 from .base import BaseOP
@@ -57,7 +58,7 @@ def _quant_fused_kernel(x_ptr, out_ptr, scale_ptr, n, BLOCK: tl.constexpr):
         mask = offs < n
         v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * inv
         v = tl.minimum(tl.maximum(v, -448.0), 448.0)
-        tl.store(out_ptr + offs, v.to(tl.float8e4nv), mask=mask)
+        tl.store(out_ptr + offs, f32_to_e4m3(v), mask=mask)
 
 
 @triton.jit
@@ -94,7 +95,7 @@ def _reduce_cast_kernel(
     mask = offs < n
     v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * (448.0 / amax)
     v = tl.minimum(tl.maximum(v, -448.0), 448.0)
-    tl.store(out_ptr + offs, v.to(tl.float8e4nv), mask=mask)
+    tl.store(out_ptr + offs, f32_to_e4m3(v), mask=mask)
 
 
 def quant_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -133,7 +134,7 @@ def _quant_rows_kernel(x_ptr, out_ptr, scale_ptr, k, BLOCK: tl.constexpr):
         mask = offs < k
         v = tl.load(x_row + offs, mask=mask, other=0.0).to(tl.float32) * inv
         v = tl.minimum(tl.maximum(v, -448.0), 448.0)
-        tl.store(out_ptr + row * k + offs, v.to(tl.float8e4nv), mask=mask)
+        tl.store(out_ptr + row * k + offs, f32_to_e4m3(v), mask=mask)
 
 
 def quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
