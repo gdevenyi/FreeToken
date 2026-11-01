@@ -60,6 +60,13 @@ class SchedulerIOMixin:
                     create=False,
                     decoder=BaseBackendMsg.decoder,
                 )
+            # Load leaves ranks minutes apart (see distributed_timeout), far past the timed wait
+            # below: every SUB must exist before it starts. This barrier waits on that timeout.
+            self.sync_all_ranks()
+            if tp_info.is_primary():
+                # a SUB's subscribe reaches the publisher asynchronously; broadcasting
+                # before it lands drops the message and both ranks block forever
+                self._send_into_ranks.wait_for_subscribers(tp_info.size - 1)
 
         self.receive_msg = recv
         self.send_result = send
