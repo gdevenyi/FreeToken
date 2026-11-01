@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 from freetoken.message.tokenizer import BaseTokenizerMsg
+from freetoken.server import api_server
 from freetoken.server.anthropic_api import handle_anthropic_messages
 from freetoken.server.anthropic_models import AnthropicMessagesRequest
 from freetoken.server.api_models import ChatCompletionRequest, CompletionRequest
-from freetoken.server import api_server
 from freetoken.server.api_server import FrontendManager, GenerateRequest
 from freetoken.server.openai_api import handle_chat_completion, handle_completion
 from freetoken.server.responses_api import ResponsesRequest, handle_responses
@@ -40,7 +40,10 @@ def _state() -> FrontendManager:
     push.socket = SimpleNamespace(send=send)
     state = FrontendManager(
         config=SimpleNamespace(
-            served_model_name="m", tool_call_parser=None, reasoning_parser=None, max_seq_len=4096
+            served_model_name="m",
+            tool_call_parser=None,
+            reasoning_parser=None,
+            max_seq_len=4096,
         ),
         send_tokenizer=push,
         recv_tokenizer=None,
@@ -52,7 +55,9 @@ def _state() -> FrontendManager:
 
 
 def _chat(**fields):
-    return handle_chat_completion, ChatCompletionRequest(model="m", messages=MESSAGES, **fields)
+    return handle_chat_completion, ChatCompletionRequest(
+        model="m", messages=MESSAGES, **fields
+    )
 
 
 def _completion(**fields):
@@ -106,7 +111,9 @@ def test_unencodable_field_is_a_400_with_no_bookkeeping_left(build):
 
 def test_a_large_id_that_packs_is_still_sent():
     # ids in [2**63, 2**64) fit the wire; the sampler and the scheduler ignore them
-    handler, req = _chat(stop_token_ids=[2**63], logit_bias={str(2**63): 1.0}, stream=True)
+    handler, req = _chat(
+        stop_token_ids=[2**63], logit_bias={str(2**63): 1.0}, stream=True
+    )
     state = _state()
     response = asyncio.run(handler(req, None, state, {}))
     assert response.status_code == 200
@@ -119,10 +126,14 @@ def test_a_large_id_that_packs_is_still_sent():
     [{"prompt": "\ud800", "max_tokens": 1}, {"prompt": "hi", "max_tokens": HUGE}],
     ids=["lone-surrogate", "huge-max-tokens"],
 )
-def test_generate_unencodable_field_is_a_400_with_no_bookkeeping_left(monkeypatch, fields):
+def test_generate_unencodable_field_is_a_400_with_no_bookkeeping_left(
+    monkeypatch, fields
+):
     state = _state()
     monkeypatch.setattr(api_server, "get_global_state", lambda: state)
-    response = asyncio.run(asyncio.wait_for(api_server.generate(GenerateRequest(**fields), None), 10))
+    response = asyncio.run(
+        asyncio.wait_for(api_server.generate(GenerateRequest(**fields), None), 10)
+    )
     assert response.status_code == 400
     assert "request cannot be encoded" in json.loads(response.body)["error"]
     assert state.stats.active == 0
@@ -133,7 +144,9 @@ def test_generate_unencodable_field_is_a_400_with_no_bookkeeping_left(monkeypatc
 def test_generate_with_a_packable_request_is_still_sent(monkeypatch):
     state = _state()
     monkeypatch.setattr(api_server, "get_global_state", lambda: state)
-    response = asyncio.run(api_server.generate(GenerateRequest(prompt="hi", max_tokens=1), None))
+    response = asyncio.run(
+        api_server.generate(GenerateRequest(prompt="hi", max_tokens=1), None)
+    )
     assert response.status_code == 200
     assert len(state.sent) == 1
     assert state.stats.active == 1
