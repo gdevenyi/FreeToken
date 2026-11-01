@@ -32,6 +32,7 @@ class LogitsPlan:
     # vocab_size, a scratch column that is dropped) they must not sample yet.
     min_rows: torch.Tensor | None = None  # [m] int64 local rows
     min_ids: torch.Tensor | None = None  # [m, S] int64
+    min_left: torch.Tensor | None = None  # [m] int64 tokens the row must still generate
     min_p: torch.Tensor | None = None  # [r, 1] float32 (0 = off for that row)
 
 
@@ -112,6 +113,31 @@ def apply_logits_processors(
     return out
 
 
+def _verify_plan(plan: LogitsPlan, width: int) -> LogitsPlan:
+    """``plan`` over a verify batch of ``width`` rows per request. Row j of a request stands
+    j tokens further along, so min_tokens releases its mask j rows early."""
+    offsets = torch.arange(width, device=plan.rows.device)
+
+    def rows(t: torch.Tensor) -> torch.Tensor:
+        return (t.unsqueeze(1) * width + offsets).flatten()
+
+    def repeat(t: torch.Tensor) -> torch.Tensor:
+        return t.repeat_interleave(width, dim=0)
+
+    out = LogitsPlan(rows=rows(plan.rows), temps=repeat(plan.temps))
+    if plan.bias_ids is not None:
+        out.bias_rows = rows(plan.bias_rows)
+        out.bias_ids = repeat(plan.bias_ids)
+        out.bias_vals = repeat(plan.bias_vals)
+    if plan.min_ids is not None:
+        entry, j = (offsets < plan.min_left.unsqueeze(1)).nonzero(as_tuple=True)
+        out.min_rows = plan.min_rows[entry] * width + j
+        out.min_ids = plan.min_ids[entry]
+    if plan.min_p is not None:
+        out.min_p = repeat(plan.min_p)
+    return out
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -176,6 +202,7 @@ class Sampler:
 
         min_rows: list[int] = []
         min_ids: list[list[int]] = []
+        min_left: list[int] = []
         for local, (req, p) in enumerate(picked):
             if p.min_tokens > 0 and p.min_tokens_stop_ids:
                 # device_len, not the host ids: under overlap scheduling the previous token
@@ -184,9 +211,11 @@ class Sampler:
                 if generated < p.min_tokens:
                     min_rows.append(local)
                     min_ids.append([t for t in p.min_tokens_stop_ids if 0 <= t < self.vocab_size])
+                    min_left.append(p.min_tokens - generated)
         if min_rows:
             plan.min_rows = make_device_tensor(min_rows, torch.int64, self.device)
             plan.min_ids = _padded_rows(min_ids, pad, self.device)
+            plan.min_left = make_device_tensor(min_left, torch.int64, self.device)
 
         if any(p.min_p > 0.0 for _, p in picked):
             plan.min_p = make_device_tensor([[p.min_p] for _, p in picked], torch.float32, self.device)
@@ -301,6 +330,8 @@ class Sampler:
         width = k + 1
         if args.penalties:
             logits = self._penalize_rows(logits, args, drafts)
+        if args.plan is not None:
+            logits = apply_logits_processors(logits, _verify_plan(args.plan, width), self.vocab_size)
         if args.temperatures is None:
             return torch.argmax(logits, dim=-1)
 
@@ -320,6 +351,13 @@ class Sampler:
         # (row j, draft i) pairs with i < j: row j has seen drafts 0..j-1
         pair_rows, pair_drafts = torch.tril_indices(width, k, offset=-1, device=logits.device)
         earlier = torch.ones(k, k, dtype=torch.bool, device=logits.device).tril(-1)
+        for req_row, counts, penalty, prompt_mask in args.repetitions:
+            block = logits[req_row * width : (req_row + 1) * width]
+            seen = ((counts > 0) | prompt_mask).repeat(width, 1)
+            if k > 0:
+                seen[pair_rows, drafts[req_row].long()[pair_drafts]] = True
+            penalized = torch.where(block > 0, block / penalty, block * penalty)
+            block.copy_(torch.where(seen, penalized, block))
         for req_row, counts, presence, frequency in args.penalties:
             block = logits[req_row * width : (req_row + 1) * width]
             block -= frequency * counts + presence * (counts > 0)
