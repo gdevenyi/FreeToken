@@ -398,6 +398,40 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     assert captured["max_slots"] == 5
 
 
+def test_rebuild_without_a_moe_resize_reaches_the_pool_resize(monkeypatch):
+    """A KV-only rebuild (no moe_cache_size) passes the fit-check, tears down the graphs and
+    resizes the pools with no MoE pool split, instead of failing past the point of no return."""
+    from freetoken.engine.engine import Engine
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(linear_attention_group=lambda: None),
+        dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        max_extend_tokens=1024, max_seq_len=4096,
+    )
+    resized = {}
+
+    class Reached(Exception):
+        pass
+
+    def resize_pools(config, moe_cache_size, num_pages, num_mamba_slots, num_swa_pages, moe_pool_sizes=None):
+        resized.update(moe_cache_size=moe_cache_size, num_pages=num_pages, moe_pool_sizes=moe_pool_sizes)
+        raise Reached
+
+    engine = SimpleNamespace(
+        config=config, moe_offload_cache=None, linear_state_pool=None, linear_backend=None, spec=None,
+        _spec_budget=lambda config: (0, 0),
+        kv_cache=SimpleNamespace(validate_rebuild=lambda config, **kwargs: None),
+        _baseline_free=1 << 30, _weights_bytes=0, num_pages=64, device=torch.device("cpu"),
+        graph_runner=SimpleNamespace(graph_bs_list=[1], destroy_cuda_graphs=lambda: None),
+        attn_backend=SimpleNamespace(reset_capture=lambda: None), _resize_pools=resize_pools,
+    )
+    engine._target_moe_and_expert_bytes = lambda size, sizes=None: (0, 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    with pytest.raises(Reached):
+        Engine.rebuild_runtime_cache(engine, num_pages=32)
+    assert resized == {"moe_cache_size": None, "num_pages": 32, "moe_pool_sizes": None}
+
+
 # ---------------------------------------------------------------------------
 # offload-cache sizing guard + auto-resolution (_require_offload_cache_size / _adjust_config),
 # the floor rule compute_cache_floors documents above.
