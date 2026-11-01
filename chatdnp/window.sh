@@ -111,7 +111,7 @@ for t in $TESTS; do
       $PYC bench_client.py --base-url $FT_BASE --repeats 1 --concurrent 4 --seed 100 --out "$OUT/${LABEL}_warm.json"
       for r in 1 2 3; do
         say "--- bench_client run $r (concurrent 8)"
-        $PYC bench_client.py --base-url $FT_BASE --repeats 1 --concurrent 8 --seed $((100 + r)) --out "$OUT/${LABEL}_reb$r.json"
+        $PYC bench_client.py --base-url $FT_BASE --repeats ${BENCH_REPEATS:-3} --concurrent 8 --seed $((100 + r)) --out "$OUT/${LABEL}_reb$r.json"
       done ;;
     settle) say "--- settle: idle ${SETTLE_S:-480} s (a new server benches lower for its first minutes)"; sleep "${SETTLE_S:-480}"; say "settle done" ;;
     gsm8k)  say "--- GSM8K-300 @1536"; $PYC gsm8k_probe.py --n 300 --concurrency 8 --max-tokens 1536 --label "${LABEL}-1536" --out "$OUT/${LABEL}_gsm8k_1536.json" ;;
