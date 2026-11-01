@@ -116,6 +116,7 @@ class EngineConfig:
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
     distributed_timeout: float = 1800.0  # ranks reach the first collective minutes apart on a 100+ GiB offload load
+    distributed_port: int = 2333
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     # speculative decoding
@@ -200,4 +201,4 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        return f"tcp://127.0.0.1:{self.distributed_port}"
