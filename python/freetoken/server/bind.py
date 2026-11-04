@@ -52,11 +52,11 @@ def bind_sockets(hosts: List[str], port: int) -> List[socket.socket]:
     return socks
 
 
-def serve(app: Any, host: str, port: int) -> None:
-    """``uvicorn.run(app, host=host, port=port)``, generalised to a comma-separated host list."""
+def serve(app: Any, host: str, port: int, **uvicorn_kwargs: Any) -> None:
+    """``uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)``, generalised to a comma-separated host list."""
     hosts = split_hosts(host)
     if len(hosts) == 1:
-        uvicorn.run(app, host=hosts[0], port=port)
+        uvicorn.run(app, host=hosts[0], port=port, **uvicorn_kwargs)
         return
-    server = uvicorn.Server(uvicorn.Config(app, host=hosts[0], port=port))
+    server = uvicorn.Server(uvicorn.Config(app, host=hosts[0], port=port, **uvicorn_kwargs))
     server.run(sockets=bind_sockets(hosts, port))
