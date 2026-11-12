@@ -1082,3 +1082,73 @@ def test_convert_function_call_output_text_list_stays_a_plain_tool_message():
     spec = RP.convert_responses_to_genspec(req, {})
     assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool"]
     assert spec.messages[2]["content"] == "ab"
+
+
+# --------------------------------------------------------------------------- #
+# /v1/responses/input_tokens
+# --------------------------------------------------------------------------- #
+class _FakeTokenizeManager:
+    def __init__(self):
+        self.msgs = []
+
+    def tokenize(self, msgs):
+        import torch
+        from freetoken.message import UserMsg
+
+        self.msgs.extend(msgs)
+        return [
+            UserMsg(
+                uid=m.uid,
+                input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32),
+                sampling_params=m.sampling_params,
+            )
+            for m in msgs
+        ]
+
+
+def test_responses_input_tokens_route():
+    manager = _FakeTokenizeManager()
+    fake = FakeState([])
+    fake.frontend_tokenizer = lambda: manager
+    client = _client(fake)
+    body = {
+        "model": "gpt-x",
+        "instructions": "be concise",
+        "input": [{"type": "message", "role": "user", "content": "hello"}],
+        "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
+        "reasoning": {"effort": "medium"},
+    }
+    r = client.post("/v1/responses/input_tokens", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "object": "response.input_tokens",
+        "input_tokens": r.json()["input_tokens"],
+    }
+    assert r.json()["input_tokens"] > 0
+
+    [msg] = manager.msgs
+    spec = RP.convert_responses_to_genspec(ResponsesRequest.model_validate(body), {})
+    assert msg.text == spec.messages
+    assert msg.tools == spec.template_tools
+    assert msg.chat_template_kwargs == spec.chat_template_kwargs
+
+
+def test_responses_input_tokens_errors_and_get_route_coexistence():
+    manager = _FakeTokenizeManager()
+    fake = FakeState([])
+    fake.frontend_tokenizer = lambda: manager
+    client = _client(fake)
+
+    empty = client.post("/v1/responses/input_tokens", json={"model": "gpt-x"})
+    assert empty.status_code == 400
+    assert "no tokenizable content" in empty.json()["error"]["message"]
+
+    prev = client.post(
+        "/v1/responses/input_tokens",
+        json={"model": "gpt-x", "input": "hi", "previous_response_id": "resp_1"},
+    )
+    assert prev.status_code == 400
+    assert "previous_response_id" in prev.json()["error"]["message"]
+
+    get_resp = client.get("/v1/responses/resp_abc")
+    assert get_resp.status_code == 404

@@ -70,6 +70,7 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    count_prompt_tokens,
     generate_events,
     generate_full,
     render_messages,
@@ -114,6 +115,21 @@ class ResponsesRequest(BaseModel):
     parallel_tool_calls: bool | None = None
 
 
+class ResponsesInputTokensRequest(BaseModel):
+    """Request body for ``POST /v1/responses/input_tokens``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    input: str | list[dict[str, Any]] | None = None
+    instructions: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    reasoning: dict[str, Any] | None = None
+    previous_response_id: str | None = None
+    parallel_tool_calls: bool | None = None
+
+
 def register_responses_routes(
     app: FastAPI,
     get_state: Callable[[], Any],
@@ -136,6 +152,11 @@ def register_responses_routes(
                 "resend full context in 'input'",
             )
         return await handle_responses(req, request, state, get_model_sampling())
+
+    @app.post("/v1/responses/input_tokens")
+    async def v1_responses_input_tokens(req: ResponsesInputTokensRequest, request: Request):
+        log_request("/v1/responses/input_tokens", req, request)
+        return await handle_responses_input_tokens(req, get_state())
 
     @app.get("/v1/responses/{response_id}")
     async def v1_responses_get(response_id: str):
@@ -210,14 +231,14 @@ async def handle_responses(
 # directly with the Responses' OWN max-tokens default — so the OpenAI-chat 16-token
 # floor can never leak in, exactly as vLLM keeps a per-protocol to_sampling_params).
 # --------------------------------------------------------------------------- #
-def convert_responses_to_genspec(
-    req: ResponsesRequest,
-    model_sampling: dict[str, Any],
-    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+def convert_responses_prompt(
+    req: ResponsesRequest | ResponsesInputTokensRequest,
     reasoning_parser: str | None = None,
-    timings_per_token: bool = False,
     thinking: str | None = None,
-) -> GenSpec:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
+    """(messages, template_tools, parser_tools, chat_template_kwargs) shared by
+    ``/v1/responses`` and ``/v1/responses/input_tokens``."""
+    del reasoning_parser
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
     # and a `developer` permissions message) — into ONE leading system message. Strict chat
@@ -229,7 +250,9 @@ def convert_responses_to_genspec(
         system_texts.append(req.instructions)
 
     other: list[dict[str, Any]] = []
-    if isinstance(req.input, str):
+    if req.input is None:
+        pass
+    elif isinstance(req.input, str):
         other.append({"role": "user", "content": req.input})
     else:
         for item in req.input:
@@ -265,9 +288,48 @@ def convert_responses_to_genspec(
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
     ctk = thinking_override_kwargs(thinking, ctk)
+    return render_messages(messages), template_tools, parser_tools, ctk
 
+
+async def handle_responses_input_tokens(req: ResponsesInputTokensRequest, state: Any):
+    if req.previous_response_id:
+        return _error_response(
+            400,
+            "previous_response_id is not supported (stateless server); "
+            "resend full context in 'input'",
+        )
+    try:
+        messages, template_tools, _, ctk = convert_responses_prompt(
+            req,
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            thinking=getattr(state.config, "thinking", None),
+        )
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+    if not messages:
+        return _error_response(400, "input: no tokenizable content")
+    try:
+        n_tokens = await count_prompt_tokens(messages, template_tools, ctk, state)
+    except GenerationError as exc:
+        return _error_response(400, str(exc), exc.code)
+    except Exception as exc:  # noqa: BLE001 — tokenizer init / other failure -> server error
+        return _error_response(500, f"token counting failed: {exc}", err_type="server_error")
+    return JSONResponse(content={"object": "response.input_tokens", "input_tokens": n_tokens})
+
+
+def convert_responses_to_genspec(
+    req: ResponsesRequest,
+    model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    reasoning_parser: str | None = None,
+    timings_per_token: bool = False,
+    thinking: str | None = None,
+) -> GenSpec:
+    messages, template_tools, parser_tools, ctk = convert_responses_prompt(
+        req, reasoning_parser=reasoning_parser, thinking=thinking
+    )
     return GenSpec(
-        messages=render_messages(messages),
+        messages=messages,
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -826,8 +888,14 @@ def _sse(event) -> str:
     return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
 
-def _error_response(status_code: int, message: str, code: str | None = None) -> JSONResponse:
+def _error_response(
+    status_code: int,
+    message: str,
+    code: str | None = None,
+    *,
+    err_type: str = "invalid_request_error",
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"message": message, "type": "invalid_request_error", "code": code}},
+        content={"error": {"message": message, "type": err_type, "code": code}},
     )
