@@ -12,6 +12,7 @@ Draft row c reads the target's residual streams before the final mix, ``R_c [hc_
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
 import re
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info, try_get_tp_info
 from freetoken.layers import GemmaPlusOneRMSNorm, LinearReplicated, OPList
 from freetoken.layers.base import BaseOP
 from freetoken.layers.quantization import finalize_quant
@@ -103,8 +105,22 @@ def _pack_quant(model_path: str):
     return GGUFConfig(types, _pack_tensors, name_map=NameMap(packed=packed))
 
 
-def draft_config(config: ModelConfig) -> ModelConfig:
+def _unquantized_mtp(quant):
+    if quant is None:
+        return None
+    q = copy.copy(quant)
+    prev = q.unquantized
+    q.unquantized = lambda name, _prev=prev: _prev(name) or name.startswith("mtp.")
+    q._schemes = {}
+    return q
+
+
+def draft_config(config: ModelConfig, *, tp_size: int | None = None) -> ModelConfig:
     """The target config cut to one QSA layer (layer id 0) without PLE."""
+    if tp_size is None:
+        tp = try_get_tp_info()
+        tp_size = tp.size if tp is not None else 1
+    quant = _unquantized_mtp(config.quant) if tp_size > 1 else config.quant
     group = next(g for g in config.attention_groups if isinstance(g, FullAttentionGroupConfig) and g.index_ratio > 1)
     return dataclasses.replace(
         config,
@@ -113,11 +129,13 @@ def draft_config(config: ModelConfig) -> ModelConfig:
         qwen4_args=dataclasses.replace(config.qwen4_args, ple_layer_ids=()),
         slot_states=(),
         vision_config=None,
+        quant=quant,
     )
 
 
 class Qwen4ExpMTPDraft(BaseOP):
     attention_backend = "qsa_sparse"
+    supports_tp = True
     draft_config = staticmethod(draft_config)
 
     @staticmethod
@@ -125,11 +143,13 @@ class Qwen4ExpMTPDraft(BaseOP):
         return config.qwen4_args.hc_count * config.hidden_size
 
     @staticmethod
-    def check_source(path: str, target_path: str) -> None:
+    def check_source(path: str, target_path: str, *, tp_size: int = 1) -> None:
         from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
         from freetoken.models.loader import safetensors_weight_map
 
         if is_gguf_path(path):
+            if tp_size > 1:
+                raise ValueError("Strata GGUF MTP packs require --tp 1")
             if not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
                 raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
         elif is_gguf_path(target_path):
@@ -159,6 +179,8 @@ class Qwen4ExpMTPDraft(BaseOP):
         from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
 
         pack = is_gguf_path(model_path)
+        if pack and get_tp_info().size > 1:
+            raise ValueError("Strata GGUF MTP packs require --tp 1")
         with torch.device("meta"), torch_dtype(dtype):
             draft = cls(config, target_model, _pack_quant(model_path) if pack else None)
         expected = draft.state_dict()

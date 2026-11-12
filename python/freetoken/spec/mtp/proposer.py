@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from freetoken.core import Batch, get_global_ctx
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.engine.sample import make_device_tensor
 from freetoken.kvcache.format import NONE
 from freetoken.models.blocks import embed_input_ids
@@ -31,6 +32,7 @@ class MTPDraft(Protocol):
 
     # None: the proposer picks from the target's backends
     attention_backend: ClassVar[str | None]
+    supports_tp: ClassVar[bool]
 
     @staticmethod
     def draft_config(config: ModelConfig) -> ModelConfig: ...
@@ -131,10 +133,12 @@ class MTPProposer(Proposer):
     def adjust_config(cls, config, override) -> None:
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
-        super().adjust_config(config, override)
         arch = config.hf_config.architectures[0]
         if "mtp" not in dict(config.model_spec.spec_drafts):
             raise ValueError(f"MTP is not supported for {arch} yet")
+        draft_cls = cls._draft_class(config)
+        if not getattr(draft_cls, "supports_tp", False):
+            super().adjust_config(config, override)
         if config.use_dummy_weight:
             raise ValueError("MTP reads its draft from the checkpoint, so it cannot run with --dummy-weight")
         path = config.speculative_draft_model_path or config.model_path
@@ -144,7 +148,10 @@ class MTPProposer(Proposer):
         # FTW keeps only what the target's iter_weights yields, which drops mtp.*
         if is_ftw_checkpoint(path):
             raise ValueError("MTP cannot load its draft from an FTW checkpoint yet")
-        cls._draft_class(config).check_source(path, config.model_path)
+        if getattr(draft_cls, "supports_tp", False):
+            draft_cls.check_source(path, config.model_path, tp_size=config.tp_info.size)
+        else:
+            draft_cls.check_source(path, config.model_path)
         if config.speculative_token_map:
             if config.model_config.tie_word_embeddings:
                 raise ValueError("--speculative-token-map needs an LM head with its own weights, but this one is tied to the embedding")
@@ -175,7 +182,12 @@ class MTPProposer(Proposer):
         rows = config.max_running_req + 1
         # relay hidden and carry, and the verify hiddens
         fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
-        groups = draft_cls.draft_config(with_resident_moe(config.model_config)).kv_cache_group_specs()
+        draft_cfg = (
+            draft_cls.draft_config(with_resident_moe(config.model_config), tp_size=config.tp_info.size)
+            if getattr(draft_cls, "supports_tp", False)
+            else draft_cls.draft_config(with_resident_moe(config.model_config))
+        )
+        groups = draft_cfg.kv_cache_group_specs()
         fmt = getattr(config, "kv_format", NONE)
         return fixed, sum(spec_kv_bytes_per_token(group, config, fmt) for group in groups)
 
@@ -183,6 +195,8 @@ class MTPProposer(Proposer):
         super().__init__(config, target_model)
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.dtype = config.dtype
+        self._tp_info = get_tp_info()
+        self._comm = DistributedCommunicator() if self._tp_info.size > 1 else None
         path = config.speculative_draft_model_path or config.model_path
         from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
 
@@ -278,7 +292,11 @@ class MTPProposer(Proposer):
 
     def _draft_token(self, hidden: torch.Tensor) -> torch.Tensor:
         token = self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
-        return token if self.hot_ids is None else self.hot_ids[token]
+        token = token if self.hot_ids is None else self.hot_ids[token]
+        if self._comm is not None:
+            token = token.contiguous() if self._tp_info.is_primary() else torch.zeros_like(token)
+            token = self._comm.all_reduce(token)
+        return token
 
     def _view(self, req, cached_len: int, device_len: int) -> _DraftReq:
         return _DraftReq(cached_len, device_len, req.table_idx, getattr(req, "mrope_delta", 0), getattr(req, "mrope_positions_full", None))

@@ -14,7 +14,12 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.attention.linear import LinearAttnBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import (
+    DistributedCommunicator,
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_tp_info,
+)
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
@@ -535,6 +540,7 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
+        self._comm = DistributedCommunicator() if config.tp_info.size > 1 else None
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
@@ -1521,6 +1527,13 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if spec_prefill and self._comm is not None:
+            next_tokens_gpu = (
+                next_tokens_gpu.contiguous()
+                if self.config.tp_info.is_primary()
+                else torch.zeros_like(next_tokens_gpu)
+            )
+            next_tokens_gpu = self._comm.all_reduce(next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

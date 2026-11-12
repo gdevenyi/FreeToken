@@ -58,8 +58,16 @@ auto operator==(const DLDataType &a, const DLDataType &b) -> bool {
 
 const auto kNCCLDtypeMap =
     std::unordered_map<DLDataType, ncclDataType_t, DLDataTypeHash>{
+        {{DLDataTypeCode::kDLInt, 8, 1}, ncclInt8},
+        {{DLDataTypeCode::kDLUInt, 8, 1}, ncclUint8},
+        {{DLDataTypeCode::kDLInt, 32, 1}, ncclInt32},
+        {{DLDataTypeCode::kDLUInt, 32, 1}, ncclUint32},
+        {{DLDataTypeCode::kDLInt, 64, 1}, ncclInt64},
+        {{DLDataTypeCode::kDLUInt, 64, 1}, ncclUint64},
         {{DLDataTypeCode::kDLFloat, 16, 1}, ncclFloat16},
         {{DLDataTypeCode::kDLBfloat, 16, 1}, ncclBfloat16},
+        {{DLDataTypeCode::kDLFloat, 32, 1}, ncclFloat32},
+        {{DLDataTypeCode::kDLFloat, 64, 1}, ncclFloat64},
     };
 
 using std::shared_ptr;

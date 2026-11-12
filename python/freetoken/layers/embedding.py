@@ -26,11 +26,17 @@ class VocabParallelEmbedding(BaseOP):
         *,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
+        tp_size: int | None = None,
+        tp_rank: int | None = None,
     ):
         super().__init__()
-        tp_info = get_tp_info()
-        tp_rank = tp_info.rank
-        self.tp_size = tp_info.size
+        if tp_size is None:
+            tp_info = get_tp_info()
+            tp_rank = tp_info.rank
+            self.tp_size = tp_info.size
+        else:
+            self.tp_size = tp_size
+            tp_rank = 0 if tp_rank is None else tp_rank
         self.num_embeddings = num_embeddings
         self.num_embeddings_tp = div_ceil(num_embeddings, self.tp_size)
         start_idx = self.num_embeddings_tp * tp_rank
@@ -81,8 +87,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         *,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
+        tp_size: int | None = None,
+        tp_rank: int | None = None,
     ):
-        super().__init__(num_embeddings, embedding_dim)
+        super().__init__(num_embeddings, embedding_dim, tp_size=tp_size, tp_rank=tp_rank)
         self.has_bias = bias
         self.prefix = prefix
         self.tied_embedding = tied_embedding
@@ -115,15 +123,43 @@ class ParallelLMHead(VocabParallelEmbedding):
         ids = ids[torch.arange(div_ceil(ids.numel(), 128) * 128) % ids.numel()]
         rows = ids.numel()
         with torch.device("meta"):
-            head = ParallelLMHead(rows, self.embedding_dim, self.has_bias, quant_config=quant_config, prefix=self.prefix)
+            head = ParallelLMHead(
+                rows,
+                self.embedding_dim,
+                self.has_bias,
+                quant_config=quant_config,
+                prefix=self.prefix,
+                tp_size=1,
+                tp_rank=0,
+            )
         full = self.state_dict()
         ids = ids.to(next(iter(full.values())).device)
+        start, count = self.vocab_range
         for name, want in head.state_dict().items():
             have = full[name]
             if want.dim() == 0:
+                if self.tp_size > 1:
+                    raise NotImplementedError(
+                        f"{self.prefix}.{name} is a per-shard scalar under TP={self.tp_size}, so the head cannot keep a subset of its rows"
+                    )
                 kept = have.clone()
-            elif want.shape[0] >= rows and have.shape[1:] == want.shape[1:] and have.shape[0] - self.num_embeddings == want.shape[0] - rows:
-                kept = have.index_select(0, ids)
+            elif (
+                want.shape[0] >= rows
+                and have.shape[1:] == want.shape[1:]
+                and have.shape[0] - want.shape[0] in (count - rows, self.num_embeddings_tp - rows)
+            ):
+                if self.tp_size == 1:
+                    kept = have.index_select(0, ids)
+                else:
+                    in_shard = (ids >= start) & (ids < start + count)
+                    local_ids = ids[in_shard] - start
+                    kept = have.new_zeros(rows, *have.shape[1:])
+                    if local_ids.numel():
+                        kept[in_shard] = have.index_select(0, local_ids)
+                    if kept.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                        self._comm.all_reduce(kept.view(torch.uint8))
+                    else:
+                        kept = self._comm.all_reduce(kept)
                 if want.shape[0] > rows:
                     # ggml's kernels read past the last row and need zeros there
                     kept = torch.cat([kept, kept.new_zeros(want.shape[0] - rows, *kept.shape[1:])])

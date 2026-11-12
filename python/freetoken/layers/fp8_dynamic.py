@@ -228,10 +228,45 @@ class Fp8ParallelLMHead(ParallelLMHead):
     Only the GEMM changes; the all_gather in ``logits`` is untouched. Untied embeddings only: a tied head shares the bf16 embedding table.
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        super().__init__(num_embeddings, embedding_dim)
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        tp_size: int | None = None,
+        tp_rank: int | None = None,
+    ):
+        super().__init__(num_embeddings, embedding_dim, tp_size=tp_size, tp_rank=tp_rank)
         self.weight = torch.empty(self.num_embeddings_tp, embedding_dim, dtype=FP8)
         self.weight_scale = torch.empty((), dtype=torch.float32)
+
+    def keep_rows(self, ids: torch.Tensor, quant_config=None) -> None:
+        from freetoken.utils import div_ceil
+
+        ids = ids[torch.arange(div_ceil(ids.numel(), 128) * 128) % ids.numel()]
+        rows = ids.numel()
+        with torch.device("meta"):
+            head = Fp8ParallelLMHead(rows, self.embedding_dim, tp_size=1, tp_rank=0)
+        device = self.weight.device
+        ids = ids.to(device)
+        if self.tp_size == 1:
+            head.weight = self.weight.index_select(0, ids)
+            head.weight_scale = self.weight_scale.clone()
+        else:
+            start, count = self.vocab_range
+            in_shard = (ids >= start) & (ids < start + count)
+            local_ids = ids[in_shard] - start
+            kept_bf16 = torch.zeros(rows, self.embedding_dim, dtype=torch.bfloat16, device=device)
+            if local_ids.numel():
+                kept_bf16[in_shard] = (
+                    self.weight.index_select(0, local_ids).to(torch.float32) * self.weight_scale
+                ).to(torch.bfloat16)
+            kept_bf16 = self._comm.all_reduce(kept_bf16)
+            w_f32 = kept_bf16.to(torch.float32)
+            scale = (w_f32.abs().amax() / E4M3_MAX).clamp_min(1e-12)
+            head.weight = (w_f32 / scale).clamp_(-E4M3_MAX, E4M3_MAX).to(FP8)
+            head.weight_scale = scale.reshape(())
+        self.kept_rows = head, ids
 
     def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
         y = fp8_dynamic_linear(x, self.weight, self.weight_scale)
