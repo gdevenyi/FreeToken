@@ -77,6 +77,11 @@ INT8_PER_TOKEN_HEAD = KVFormat(
 )
 
 KV_FORMATS: dict[str, KVFormat] = {fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD)}
+KV_FORMAT_ALIASES: dict[str, KVFormat] = {
+    "fp8": FP8_PER_TOKEN_HEAD,
+    "fp8_e4m3": FP8_PER_TOKEN_HEAD,
+    "int8": INT8_PER_TOKEN_HEAD,
+}
 # what a pool with per-row scale tensors and a reader built on kv_rows.py can declare
 ROW_SCALE_FORMATS = frozenset({NONE.name, FP8_PER_TOKEN_HEAD.name, INT8_PER_TOKEN_HEAD.name})
 
@@ -85,7 +90,10 @@ def resolve_kv_format(kv_cache_dtype: str) -> KVFormat:
     """The format of a --kv-cache-dtype value; "auto" never quantizes."""
     if kv_cache_dtype == "auto":
         return NONE
+    if (alias := KV_FORMAT_ALIASES.get(kv_cache_dtype)) is not None:
+        return alias
     try:
         return KV_FORMATS[kv_cache_dtype]
     except KeyError:
-        raise ValueError(f"unknown --kv-cache-dtype {kv_cache_dtype!r}; one of auto, {', '.join(KV_FORMATS)}") from None
+        known = ", ".join(["auto", *(n for n in KV_FORMATS if n != NONE.name), *KV_FORMAT_ALIASES])
+        raise ValueError(f"unknown --kv-cache-dtype {kv_cache_dtype!r}; one of {known}") from None

@@ -320,3 +320,50 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
         baseline_free=10 * per_page, weights_bytes=0, current_num_pages=10,
         num_swa_pages=None, future_family_key=None,
     )
+
+
+def test_kv_format_aliases_and_tp_sharding(monkeypatch):
+    """'fp8'/'fp8_e4m3'/'int8' alias per-token-head formats, and TP=2 shards local heads and scales."""
+    import torch
+    from freetoken.distributed import DistributedInfo, info as dist_info
+    from freetoken.engine.engine import _validate_kv_format
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, resolve_kv_format
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    assert resolve_kv_format("fp8") is FP8_PER_TOKEN_HEAD
+    assert resolve_kv_format("fp8_e4m3") is FP8_PER_TOKEN_HEAD
+    assert resolve_kv_format("int8") is INT8_PER_TOKEN_HEAD
+
+    tp2 = DistributedInfo(0, 2)
+    monkeypatch.setattr(dist_info, "_TP_INFO", tp2)
+    config = _generic_config()
+    config.dtype = torch.bfloat16
+    config.model_config.model_is_mrope = False
+    config.tp_info = tp2
+    config.kv_format = FP8_PER_TOKEN_HEAD
+    qsa_spec = KVCacheGroupSpec(
+        name="full", layer_ids=tuple(range(12)), num_kv_heads=4, head_dim=256,
+        sliding_window=None, index_head_dim=64, num_index_layers=12, index_ratio=4, attn_type=AttnType.QSA,
+    )
+    config.model_config.kv_cache_group_specs = lambda: (qsa_spec,)
+    _validate_kv_format(config, config.model_config)
+
+    pool = QSAKVCache(
+        num_kv_heads=4,
+        num_layers=12,
+        head_dim=256,
+        num_pages=4,
+        page_size=16,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        index_head_dim=64,
+        num_index_layers=12,
+        index_ratio=4,
+        num_req_slots=3,
+        kv_format=FP8_PER_TOKEN_HEAD,
+    )
+    # TP=2 halves num_kv_heads (4 -> 2) on both codes and per-(token, local_head) fp32 scales
+    assert pool.k_cache(0).shape == (4, 16, 2, 256)
+    assert pool.k_scale(0).shape == (64, 2, 1)
+    per_page, _, page_tokens, _ = QSAKVCache.kv_cost(config)
+    assert pool.unit_bytes() == (per_page // page_tokens, 0)
