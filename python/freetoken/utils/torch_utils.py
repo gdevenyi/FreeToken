@@ -21,7 +21,11 @@ def torch_dtype(dtype: torch.dtype):
 
 
 def nvtx_annotate(name: str, layer_id_field: str | None = None):
+    import torch
     import torch.cuda.nvtx as nvtx
+
+    if torch.version.cuda is None:
+        return lambda fn: fn
 
     def decorator(fn):
         @functools.wraps(fn)

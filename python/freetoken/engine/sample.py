@@ -303,28 +303,27 @@ class Sampler:
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
-        with torch.cuda.nvtx.range("Sampler"):
-            if args.penalties:
-                logits = apply_penalties(logits, args)
-            # after the penalties: min_p must see the final distribution
-            if args.plan is not None:
-                logits = apply_logits_processors(logits, args.plan, self.vocab_size)
-            if args.temperatures is None:  # greedy sampling
-                tokens = torch.argmax(logits, dim=-1)
-            else:
-                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
-                if args.greedy_mask is not None:
-                    # Mixed batches still run probability sampling for all rows, but
-                    # greedy rows must follow argmax's deterministic tie-breaking.
-                    greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
-                    tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
-            # Update on the sampling stream: overlapped scheduling can prepare the next
-            # batch before the previous token reaches Req.input_ids on the CPU.
-            for row, counts, _, _ in args.penalties:
-                counts.scatter_add_(
-                    0, tokens[row : row + 1].long(), counts.new_ones(1)
-                )
-            return tokens
+        if args.penalties:
+            logits = apply_penalties(logits, args)
+        # after the penalties: min_p must see the final distribution
+        if args.plan is not None:
+            logits = apply_logits_processors(logits, args.plan, self.vocab_size)
+        if args.temperatures is None:  # greedy sampling
+            tokens = torch.argmax(logits, dim=-1)
+        else:
+            tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+            if args.greedy_mask is not None:
+                # Mixed batches still run probability sampling for all rows, but
+                # greedy rows must follow argmax's deterministic tie-breaking.
+                greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
+                tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+        # Update on the sampling stream: overlapped scheduling can prepare the next
+        # batch before the previous token reaches Req.input_ids on the CPU.
+        for row, counts, _, _ in args.penalties:
+            counts.scatter_add_(
+                0, tokens[row : row + 1].long(), counts.new_ones(1)
+            )
+        return tokens
 
     def sample_verify(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor:
         """One token per verify row as decode would sample it, ``drafts`` [bs, k] giving k+1 rows per request.

@@ -323,13 +323,14 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
 
 
 def test_kv_format_aliases_and_tp_sharding(monkeypatch):
-    """'fp8'/'fp8_e4m3'/'int8' alias per-token-head formats, and TP=2 shards local heads and scales."""
+    """'bf16'/'fp8'/'fp8_e4m3'/'int8' alias KV formats, and TP=2 shards local heads and scales."""
     import torch
     from freetoken.distributed import DistributedInfo, info as dist_info
     from freetoken.engine.engine import _validate_kv_format
-    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, resolve_kv_format
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, NONE, resolve_kv_format
     from freetoken.kvcache.qsa_pool import QSAKVCache
 
+    assert resolve_kv_format("bf16") is NONE
     assert resolve_kv_format("fp8") is FP8_PER_TOKEN_HEAD
     assert resolve_kv_format("fp8_e4m3") is FP8_PER_TOKEN_HEAD
     assert resolve_kv_format("int8") is INT8_PER_TOKEN_HEAD
