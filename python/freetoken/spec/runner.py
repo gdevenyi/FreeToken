@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from freetoken.distributed import DistributedCommunicator
 from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecForwardOutput
 
@@ -34,6 +35,8 @@ class SpecRunner:
         self.config = config
         self.device = engine.device
         self.k = config.speculative_num_steps
+        self._tp_info = config.tp_info
+        self._comm = DistributedCommunicator() if self._tp_info.size > 1 else None
         self.proposer = proposer_class(config)(config, engine.model)
         self.radix_lookahead = self.proposer.radix_lookahead
         self.engine = None
@@ -110,8 +113,14 @@ class SpecRunner:
             )
         else:
             out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+        packed = torch.cat([out, emitted.unsqueeze(1)], dim=1)
+        if self._comm is not None:
+            if not self._tp_info.is_primary():
+                packed.zero_()
+            packed = self._comm.all_reduce(packed)
+            out, emitted = packed[:, :width], packed[:, width]
         host = self._host[:bs]
-        host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
+        host.copy_(packed, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(engine.stream)
         # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it

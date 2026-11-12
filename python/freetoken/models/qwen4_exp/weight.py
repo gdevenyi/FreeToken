@@ -456,10 +456,88 @@ _MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
 _MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)|(?P<stacked>gate_up|down)_proj)$")
 
 
+def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize a 2D block-fp8 weight ``[rows, cols]`` with ``scale [sr, sc]`` to bf16."""
+    rows, cols = weight.shape
+    sr, sc = scale.shape
+    br = (rows + sr - 1) // sr
+    bc = (cols + sc - 1) // sc
+    s = (
+        scale.to(torch.float32)
+        .repeat_interleave(br, dim=0)[:rows]
+        .repeat_interleave(bc, dim=1)[:, :cols]
+    )
+    return (weight.to(torch.float32) * s).to(torch.bfloat16)
+
+
+def _dequant_emitted(emitted: list[tuple[str, torch.Tensor]]) -> list[tuple[str, torch.Tensor]]:
+    by_name = dict(emitted)
+    weight_key = next((k for k in by_name if k.endswith(".weight")), None)
+    if weight_key is None:
+        return emitted
+    base = weight_key[: -len(".weight")]
+    w = by_name[weight_key]
+    if f"{base}.weight_scale_inv" in by_name:
+        return [(weight_key, _dequant_fp8_block(w, by_name[f"{base}.weight_scale_inv"]))]
+    if f"{base}.weight_scale" in by_name:
+        if f"{base}.weight_global" in by_name:
+            raise ValueError(f"{weight_key}: NVFP4 MTP dense projection cannot be TP-dequantized on the fly")
+        s = by_name[f"{base}.weight_scale"].to(torch.float32)
+        if s.ndim == 1:
+            s = s.unsqueeze(1)
+        return [(weight_key, (w.to(torch.float32) * s).to(torch.bfloat16))]
+    return emitted
+
+
+def _shard_mtp_expert_pieces(pieces, rank: int, world: int):
+    for bank_layer, e0, e1, piece in pieces:
+        if "gate_up" in piece:
+            gate, up = piece["gate_up"].chunk(2, dim=1)
+            down = piece["down"]
+        else:
+            gate, up, down = piece["gate"], piece["up"], piece["down"]
+            if "gate_scale" in piece:
+                gate = torch.stack([_dequant_fp8_block(w, s) for w, s in zip(gate, piece["gate_scale"])])
+                up = torch.stack([_dequant_fp8_block(w, s) for w, s in zip(up, piece["up_scale"])])
+                down = torch.stack([_dequant_fp8_block(w, s) for w, s in zip(down, piece["down_scale"])])
+        local_i = div_even(gate.shape[1], world)
+        sl = slice(rank * local_i, (rank + 1) * local_i)
+        yield (
+            bank_layer,
+            e0,
+            e1,
+            {
+                "gate_up": torch.cat([gate[:, sl, :], up[:, sl, :]], dim=1).contiguous(),
+                "down": down[:, :, sl].contiguous(),
+            },
+        )
+
+
 def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The ``mtp.*`` head but its routed experts, named as Qwen4ExpMTPDraft names it and fused like the target's dense weights."""
+    from .mtp import draft_config
+
+    tp = get_tp_info()
     hf_config = cached_load_hf_config(model_path)
-    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]).packed_modules_mapping)
+    quant = get_quant_config()
+    reader = _DenseReader(quant, get_model_spec(hf_config.architectures[0]).packed_modules_mapping)
+    needs_config = tp.size > 1 or fp8_dense_enabled()
+    draft_cfg = (
+        draft_config(replace(parse_config(hf_config), quant=quant), tp_size=tp.size)
+        if needs_config
+        else None
+    )
+    fp8 = draft_cfg is not None and draft_cfg.attn_quant == "fp8_dynamic"
+
+    def emit(raw_out_name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+        name = raw_out_name.removeprefix("mtp.")
+        if draft_cfg is not None:
+            tensor = _shard(name, tensor, draft_cfg, tp.rank, tp.size)
+        if fp8 and _fp8_dense_applies(raw_out_name, draft_cfg):
+            yield from _fp8_dense(name, tensor, draft_cfg, tp.size, dense=True, lm_head=False)
+        else:
+            yield name, tensor
+
     seen = False
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -472,9 +550,12 @@ def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[st
                 tensor = f.get_tensor(raw_name)
                 emitted = reader.add(raw_name, tensor)
                 if emitted is None:
-                    yield raw_name[len("mtp."):], tensor
+                    yield from emit(raw_name, tensor)
                 else:
-                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+                    if tp.size > 1 and emitted:
+                        emitted = _dequant_emitted(emitted)
+                    for fused_name, fused_tensor in emitted:
+                        yield from emit(fused_name, fused_tensor)
     if not seen:
         raise ValueError(f"{model_path} has no mtp.* weights")
     if reader.pending:
@@ -493,7 +574,11 @@ def iter_mtp_expert_pieces(model_path: str):
             return None, m["stacked"]
         return int(m["expert"]), m["proj"] + ("_scale" if m["kind"] == "weight_scale_inv" else "")
 
-    return iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
+    pieces = iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
+    tp = get_tp_info()
+    if tp.size > 1:
+        return _shard_mtp_expert_pieces(pieces, tp.rank, tp.size)
+    return pieces
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
