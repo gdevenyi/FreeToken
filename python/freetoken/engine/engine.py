@@ -250,8 +250,6 @@ def _validate_kv_format(config, model_config) -> None:
         raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
     if config.dtype != torch.bfloat16:
         raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
-    if config.tp_info.size != 1:
-        raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism yet")
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
