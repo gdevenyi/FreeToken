@@ -322,6 +322,7 @@ def test_non_finite_argument_text_stays_a_string(parser_name, param_schema, raw,
         {
             "qwen25": "<tool_call>" + json_call + "</tool_call>",
             "qwen": "<tool_call>" + json_call + "</tool_call>",
+            "ricursive": "<tool_call>" + json_call + "</tool_call>",
             "mistral": "[TOOL_CALLS] [" + json_call + "]",
             "llama3": "<|python_tag|>" + json_call,
             "gpt_oss": (
@@ -726,6 +727,12 @@ class TestMuseGlimmerDetector(_DetectorContract):
     parser_name = 'muse_glimmer'
     block = '<|start|>assistant to=read<|message|><atem:function_calls>\n<atem:invoke name="read">\n<atem:parameter name="filePath">/tmp/test_calc.py</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>'
     truncate_before = '</atem:invoke>'
+
+
+class TestRippleDetector(_DetectorContract):
+    parser_name = 'ricursive'
+    block = '<tool_call>{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}</tool_call>'
+    truncate_before = '</tool_call>'
 
 
 def test_contract_classes_cover_every_concrete_detector():

@@ -236,6 +236,13 @@ class TestMuseGlimmerReasoningParser(_ReasoningContract):
     content_opener = "<|start|>assistant to=user<|message|>"
 
 
+class TestRippleReasoningParser(_ReasoningContract):
+    name = "ricursive"
+    opener = "<think>\n"
+    closer = "\n</think>"
+    content_opener = "\n"
+
+
 def test_contract_classes_cover_every_reasoning_detector():
     covered = {type(cls().parser().detector) for cls in _ReasoningContract.__subclasses__()}
     detectors = set()
