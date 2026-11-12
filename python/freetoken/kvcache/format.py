@@ -78,6 +78,7 @@ INT8_PER_TOKEN_HEAD = KVFormat(
 
 KV_FORMATS: dict[str, KVFormat] = {fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD)}
 KV_FORMAT_ALIASES: dict[str, KVFormat] = {
+    "bf16": NONE,
     "fp8": FP8_PER_TOKEN_HEAD,
     "fp8_e4m3": FP8_PER_TOKEN_HEAD,
     "int8": INT8_PER_TOKEN_HEAD,
