@@ -7,7 +7,9 @@ Draft row c reads the target's residual streams before the final mix, ``R_c [hc_
     R_out = layer(R_in)                                # QSA attention + routed MoE, no PLE
     logits = lm_head(mixer(R_out))
 
-``R_out`` relays to the next draft step. The weights come from the checkpoint's ``mtp.*`` tensors, or from a Strata MTP pack (a GGUF with the same names, stacked ggml experts).
+``R_out`` relays to the next draft step. The weights come from the checkpoint's ``mtp.*`` tensors, from a Strata MTP pack
+(a GGUF with the same names, stacked ggml experts, TP=1), or from a llama.cpp nextn sidecar (Unsloth ``mtp-*.gguf``, any TP:
+dense float or load-time FP8, routed experts packed and sliced per rank like the trunk's).
 """
 
 from __future__ import annotations
@@ -115,6 +117,46 @@ def _unquantized_mtp(quant):
     return q
 
 
+def _is_sidecar(path: str) -> bool:
+    """A GGUF carrying a nextn block; a file the reader cannot parse is left to the pack checks and their errors."""
+    from .gguf import sidecar_block
+
+    try:
+        return sidecar_block(path) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _check_sidecar(path: str, target_path: str) -> None:
+    """An mtp-*.gguf sidecar: one nextn block of this model (same arch and width), and nothing else of a trunk."""
+    from freetoken.models.gguf.reader import gguf_architecture, gguf_tensor_index, is_gguf_path, load_gguf_metadata
+
+    blocks = {name.split(".")[1] for name in gguf_tensor_index(path) if name.startswith("blk.")}
+    if len(blocks) != 1 or gguf_architecture(path) != "qwen4exp":
+        raise ValueError(f"{path}: an MTP sidecar holds one qwen4exp nextn block, found blocks {sorted(blocks)[:4]}")
+    width = load_gguf_metadata(path).get("qwen4exp.embedding_length")
+    if is_gguf_path(target_path):
+        target_width = load_gguf_metadata(target_path).get("qwen4exp.embedding_length")
+    else:
+        from freetoken.utils import cached_load_hf_config
+
+        hf = cached_load_hf_config(target_path)
+        target_width = getattr(getattr(hf, "text_config", hf), "hidden_size", None)
+    if width is not None and target_width is not None and int(width) != int(target_width):
+        raise ValueError(f"{path}: an MTP sidecar of width {int(width)} for a target of width {int(target_width)}")
+
+
+def _iter_sidecar_emitted(model_path: str, config: ModelConfig, rank: int, world: int) -> Iterator[tuple[str, torch.Tensor]]:
+    """The sidecar's dense tensors as this rank loads them: TP-sharded and load-time FP8 by the trunk's emitter, named as this module names them."""
+    from .gguf import iter_sidecar_weights
+    from .weight import dense_emitter
+
+    emit, _, _ = dense_emitter(config, rank, world)
+    for raw, tensor in iter_sidecar_weights(model_path, config):
+        for name, out in emit(raw, tensor):
+            yield name.removeprefix("mtp."), out
+
+
 def draft_config(config: ModelConfig, *, tp_size: int | None = None) -> ModelConfig:
     """The target config cut to one QSA layer (layer id 0) without PLE."""
     if tp_size is None:
@@ -148,13 +190,17 @@ class Qwen4ExpMTPDraft(BaseOP):
         from freetoken.models.loader import safetensors_weight_map
 
         if is_gguf_path(path):
+            if _is_sidecar(path):
+                _check_sidecar(path, target_path)
+                return
             if tp_size > 1:
                 raise ValueError("Strata GGUF MTP packs require --tp 1")
             if not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
-                raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
+                raise ValueError(f"{path} has no mtp.* tensors or nextn block; pass a Strata MTP pack or an mtp-*.gguf "
+                                 "sidecar with --speculative-draft-model-path")
         elif is_gguf_path(target_path):
             # a draft read from a folder takes the target's quant config, which for a GGUF target describes GGUF tensors
-            raise ValueError(f"a GGUF target needs a GGUF draft that carries mtp.* tensors (a Strata MTP pack), not {path}")
+            raise ValueError(f"a GGUF target needs a GGUF draft (an mtp-*.gguf sidecar or a Strata MTP pack), not {path}")
         elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
             raise ValueError(f"{path} has no mtp.* tensors")
 
@@ -178,14 +224,22 @@ class Qwen4ExpMTPDraft(BaseOP):
         from freetoken.models.gguf.reader import is_gguf_path
         from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
 
-        pack = is_gguf_path(model_path)
-        if pack and get_tp_info().size > 1:
+        from .gguf import sidecar_block, sidecar_quant
+
+        tp = get_tp_info()
+        sidecar = is_gguf_path(model_path) and _is_sidecar(model_path)
+        pack = is_gguf_path(model_path) and not sidecar
+        if pack and tp.size > 1:
             raise ValueError("Strata GGUF MTP packs require --tp 1")
+        quant = sidecar_quant(model_path) if sidecar else _pack_quant(model_path) if pack else None
         with torch.device("meta"), torch_dtype(dtype):
-            draft = cls(config, target_model, _pack_quant(model_path) if pack else None)
+            draft = cls(config, target_model, quant)
         expected = draft.state_dict()
         loaded = {}
-        weights = _iter_pack_weights(model_path, draft.config) if pack else iter_mtp_weights(model_path, device)
+        if sidecar:
+            weights = _iter_sidecar_emitted(model_path, draft.config, tp.rank, tp.size)
+        else:
+            weights = _iter_pack_weights(model_path, draft.config) if pack else iter_mtp_weights(model_path, device)
         for name, tensor in weights:
             if name not in expected:
                 raise ValueError(f"{model_path}: unexpected MTP tensor {name!r}")
@@ -195,7 +249,12 @@ class Qwen4ExpMTPDraft(BaseOP):
         draft.load_state_dict(loaded)
         # packed by the layer's own expert method, as the target's resident layers are
         moe = draft.layers.op_list[0].mlp.experts
-        if pack:
+        if sidecar:
+            from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+            # one bank layer, sliced along I per rank as the trunk's GGUF experts are
+            banks = load_gguf_expert_banks(model_path, 1, first_layer=sidecar_block(model_path), device=device)
+        elif pack:
             banks = _pack_expert_banks(model_path, device)
         else:
             pieces = iter_mtp_expert_pieces(model_path)

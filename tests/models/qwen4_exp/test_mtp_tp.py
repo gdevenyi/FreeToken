@@ -534,3 +534,16 @@ def test_cross_rank_lockstep_in_draft_token_and_verify_step(monkeypatch):
     assert out0.emitted_cpu.tolist() == [2]
     assert out1.emitted_cpu.tolist() == [2]
     assert post_seen == [(0, [[101, 102, 103]], [2]), (1, [[101, 102, 103]], [2])]
+
+
+def test_sidecar_names_map_to_the_nextn_block():
+    # llama.cpp stores fc_embedding | fc_hidden as one eh_proj and the draft's final mixer as hc_head_*
+    from freetoken.models.qwen4_exp.gguf import sidecar_to_gguf
+
+    tensors = {"blk.48.nextn.eh_proj.weight": 8, "blk.48.attn_q.weight": 8}
+    assert sidecar_to_gguf("mtp.fc_embedding", tensors) == ("blk.48.nextn.eh_proj",)
+    assert sidecar_to_gguf("mtp.fc_hidden", tensors) == ("blk.48.nextn.eh_proj",)
+    assert sidecar_to_gguf("mtp.hyper_connection_mixer.input_mix_weight_down", tensors) == ("blk.48.nextn.hc_head_down",)
+    assert sidecar_to_gguf("mtp.hyper_connection_mixer.input_mix_weight_up", tensors) == ("blk.48.nextn.hc_head_up",)
+    assert sidecar_to_gguf("mtp.layers.0.self_attn.q_proj", tensors) == ("blk.48.attn_q",)
+    assert sidecar_to_gguf("mtp.layers.0.mlp.experts.0.down_proj", tensors) == ("blk.48.ffn_down_exps",)
