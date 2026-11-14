@@ -173,6 +173,23 @@ def _dummy_target():
     return SimpleNamespace(model=SimpleNamespace(embed_tokens=object()))
 
 
+def _write_gguf(path, tensors: dict[str, torch.Tensor]) -> None:
+    """A minimal valid GGUF v3 file of F32 tensors (general.architecture qwen4exp)."""
+    import struct
+
+    def s(x: str) -> bytes:
+        return struct.pack("<Q", len(x.encode())) + x.encode()
+
+    head = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), 1) + s("general.architecture") + struct.pack("<I", 8) + s("qwen4exp")
+    data, off = b"", 0
+    for name, t in tensors.items():
+        raw = t.float().contiguous().numpy().tobytes()
+        head += s(name) + struct.pack("<I", t.dim()) + b"".join(struct.pack("<Q", n) for n in reversed(t.shape)) + struct.pack("<IQ", 0, off)
+        data += raw + b"\0" * (-len(raw) % 32)
+        off = len(data)
+    path.write_bytes(head + b"\0" * (-len(head) % 32) + data)
+
+
 def test_mtp_adjust_config_and_budget_tp_gating(tmp_path):
     ckpt = tmp_path / "qwen4_mtp"
     hf = _hf_dict()
@@ -202,7 +219,7 @@ def test_mtp_adjust_config_and_budget_tp_gating(tmp_path):
 
     # GGUF Strata MTP pack must still reject TP > 1 at config validation time
     gguf_pack = tmp_path / "draft.gguf"
-    gguf_pack.write_bytes(b"GGUF")
+    _write_gguf(gguf_pack, {"mtp.fc_embedding.weight": torch.zeros(4, 4)})
     cfg_gguf = replace_ns(cfg, speculative_draft_model_path=str(gguf_pack))
     with pytest.raises(ValueError, match="Strata GGUF MTP packs require --tp 1"):
         MTPProposer.adjust_config(cfg_gguf, lambda k, v: None)
@@ -547,3 +564,56 @@ def test_sidecar_names_map_to_the_nextn_block():
     assert sidecar_to_gguf("mtp.hyper_connection_mixer.input_mix_weight_up", tensors) == ("blk.48.nextn.hc_head_up",)
     assert sidecar_to_gguf("mtp.layers.0.self_attn.q_proj", tensors) == ("blk.48.attn_q",)
     assert sidecar_to_gguf("mtp.layers.0.mlp.experts.0.down_proj", tensors) == ("blk.48.ffn_down_exps",)
+
+
+def test_sidecar_weights_split_eh_proj_embedding_first_and_unshift_norms(monkeypatch):
+    # every tensor holds a distinct constant, so a swapped split or a missed "- 1" shows as a wrong value
+    from types import SimpleNamespace as NS
+
+    from freetoken.models.gguf.reader import GgufTensorInfo
+    from freetoken.models.qwen4_exp import gguf as g
+
+    hidden, hc, low, inter = 4, 2, 2, 4
+    shapes = {
+        "nextn.eh_proj": (hidden, 2 * hidden), "nextn.enorm": (hidden,), "nextn.hnorm": (hc * hidden,),
+        "nextn.hc_head_down": (hc * hidden, low), "nextn.hc_head_up": (low, hc * hidden), "nextn.hc_head_norm": (hc * hidden,),
+        "attn_q": (2 * hidden, hidden), "attn_k": (hidden, hidden), "attn_v": (hidden, hidden), "attn_output": (hidden, 2 * hidden),
+        "attn_q_norm": (hidden,), "attn_k_norm": (hidden,), "indexer.q_proj": (hidden, hidden), "indexer.k_proj": (hidden, hidden),
+        "indexer.q_norm": (hidden,), "indexer.k_norm": (hidden,), "ffn_gate_inp": (8, hidden), "ffn_gate_inp_shexp": (hidden,),
+        "ffn_gate_shexp": (inter, hidden), "ffn_up_shexp": (inter, hidden), "ffn_down_shexp": (hidden, inter),
+        "hc_attn_down": (hc * hidden, low), "hc_attn_inject": (hc * hidden, hc), "hc_attn_up": (low, hc * hidden), "hc_attn_norm": (hc * hidden,),
+        "hc_ffn_down": (hc * hidden, low), "hc_ffn_inject": (hc * hidden, hc), "hc_ffn_up": (low, hc * hidden), "hc_ffn_norm": (hc * hidden,),
+    }
+    data = {}
+    for i, (leaf, shape) in enumerate(shapes.items()):
+        t = torch.full(shape, float(i + 2))
+        if leaf == "nextn.eh_proj":
+            t[:, hidden:] = -1.0  # the hidden half
+        data[f"blk.48.{leaf}.weight"] = t
+    index = {
+        n: GgufTensorInfo(n, "x", 0, t.numel() * 4, 0, tuple(reversed(t.shape))) for n, t in data.items()
+    }
+    monkeypatch.setattr(g, "gguf_tensor_index", lambda path: index)
+    monkeypatch.setattr(g, "float_tensor", lambda info: data[info.name])
+    monkeypatch.setattr(g, "matrix", lambda info: data[info.name])
+    cfg = NS(hidden_size=hidden, shared_expert_intermediate_size=inter, qwen4_args=NS(hc_count=hc, hc_lowrank=low))
+    out = dict(g.iter_sidecar_weights("x", cfg))
+    eh = data["blk.48.nextn.eh_proj.weight"]
+    assert torch.equal(out["mtp.fc_embedding.weight"], eh[:, :hidden]) and torch.equal(out["mtp.fc_hidden.weight"], eh[:, hidden:])
+    assert torch.equal(out["mtp.pre_fc_norm_embedding.weight"], data["blk.48.nextn.enorm.weight"] - 1)
+    assert torch.equal(out["mtp.pre_fc_norm_hidden.weight"], data["blk.48.nextn.hnorm.weight"] - 1)
+    assert torch.equal(out["mtp.hyper_connection_mixer.hc_norm.weight"], data["blk.48.nextn.hc_head_norm.weight"] - 1)
+    assert torch.equal(out["mtp.hyper_connection_mixer.input_mix_weight_down.weight"], data["blk.48.nextn.hc_head_down.weight"])
+    assert torch.equal(out["mtp.layers.0.self_attn.q_norm.weight"], data["blk.48.attn_q_norm.weight"] - 1)
+
+
+def test_sidecar_float_globs_cover_the_dense_draft_but_not_its_experts():
+    # a dense module left out of the globs would build as ggml while the reader hands it floats
+    from freetoken.layers.quantization.names import name_set
+    from freetoken.models.qwen4_exp.gguf import _LAYER_LEAVES, _SIDECAR_FLOAT_MODULES
+
+    hit = name_set(_SIDECAR_FLOAT_MODULES)
+    dense = [f"mtp.layers.0.{leaf}" for leaf in _LAYER_LEAVES if not leaf.startswith(("linear_attn.", "ple.", "mlp.experts."))]
+    dense += ["mtp.fc_embedding", "mtp.fc_hidden", "mtp.hyper_connection_mixer.input_mix_weight_down"]
+    assert [n for n in dense if not hit(n)] == []
+    assert not any(hit(f"mtp.layers.0.mlp.experts.0.{p}_proj") for p in ("gate", "up", "down"))

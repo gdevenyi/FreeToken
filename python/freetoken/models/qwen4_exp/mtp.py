@@ -117,19 +117,10 @@ def _unquantized_mtp(quant):
     return q
 
 
-def _is_sidecar(path: str) -> bool:
-    """A GGUF carrying a nextn block; a file the reader cannot parse is left to the pack checks and their errors."""
-    from .gguf import sidecar_block
-
-    try:
-        return sidecar_block(path) is not None
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _check_sidecar(path: str, target_path: str) -> None:
     """An mtp-*.gguf sidecar: one nextn block of this model (same arch and width), and nothing else of a trunk."""
     from freetoken.models.gguf.reader import gguf_architecture, gguf_tensor_index, is_gguf_path, load_gguf_metadata
+    from freetoken.models.gguf.tensors import check_scales
 
     blocks = {name.split(".")[1] for name in gguf_tensor_index(path) if name.startswith("blk.")}
     if len(blocks) != 1 or gguf_architecture(path) != "qwen4exp":
@@ -144,6 +135,8 @@ def _check_sidecar(path: str, target_path: str) -> None:
         target_width = getattr(getattr(hf, "text_config", hf), "hidden_size", None)
     if width is not None and target_width is not None and int(width) != int(target_width):
         raise ValueError(f"{path}: an MTP sidecar of width {int(width)} for a target of width {int(target_width)}")
+    # the sidecar loader reads no weight scales, so refuse any rather than serve unscaled weights
+    check_scales(path, nvfp4=False)
 
 
 def _iter_sidecar_emitted(model_path: str, config: ModelConfig, rank: int, world: int) -> Iterator[tuple[str, torch.Tensor]]:
@@ -190,7 +183,13 @@ class Qwen4ExpMTPDraft(BaseOP):
         from freetoken.models.loader import safetensors_weight_map
 
         if is_gguf_path(path):
-            if _is_sidecar(path):
+            from .gguf import sidecar_block
+
+            try:
+                block = sidecar_block(path)
+            except Exception as exc:  # a partial download or a non-GGUF file: say which file, keep the cause
+                raise ValueError(f"cannot read the GGUF draft {path}: {exc}") from exc
+            if block is not None:
                 _check_sidecar(path, target_path)
                 return
             if tp_size > 1:
@@ -227,7 +226,7 @@ class Qwen4ExpMTPDraft(BaseOP):
         from .gguf import sidecar_block, sidecar_quant
 
         tp = get_tp_info()
-        sidecar = is_gguf_path(model_path) and _is_sidecar(model_path)
+        sidecar = is_gguf_path(model_path) and sidecar_block(model_path) is not None
         pack = is_gguf_path(model_path) and not sidecar
         if pack and tp.size > 1:
             raise ValueError("Strata GGUF MTP packs require --tp 1")
