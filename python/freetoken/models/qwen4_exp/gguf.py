@@ -18,8 +18,7 @@ import torch
 from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.mmproj import find_mmproj, log_mmproj
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.config import fp8_dense_enabled, fp8_lmhead_enabled
-from freetoken.models.gguf.tensors import check_scales, dequantized_tensor, float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, dequantized_tensor, float_tensor, fused, matrix, weight_scale
 from freetoken.models.qwen3_vl.gguf import gguf_mm_config, iter_mmproj_weights
 
 from .config import parse_config
@@ -97,11 +96,11 @@ _FLOAT_DENSE_MODULES = (
 
 
 def gguf_float_dense() -> bool:
-    """Whether the dense projections load as bf16 instead of packed ggml rows: the TP shard and load-time FP8 run on
-    float rows. On with FREETOKEN_FP8_DENSE / FREETOKEN_FP8_LMHEAD, or FREETOKEN_GGUF_FLOAT_DENSE=1. An env switch, not
-    the TP size, so the builder (QuantConfig, parsed before TP is set) and the reader always get one answer."""
-    forced = os.getenv("FREETOKEN_GGUF_FLOAT_DENSE", "0").strip().lower() in ("1", "true", "yes", "on")
-    return forced or fp8_dense_enabled() or fp8_lmhead_enabled()
+    """Whether the dense projections load dequantized to bf16 instead of as packed ggml rows (FREETOKEN_GGUF_FLOAT_DENSE=1):
+    the TP shard runs on float rows, so TP > 1 needs it, and FREETOKEN_FP8_DENSE / _LMHEAD then requantize on top as for a
+    bf16 checkpoint. Without it the file's own ggml types win, FP8 switches included. An env switch, not the TP size, so the
+    builder (QuantConfig, parsed before TP is set) and the reader always get one answer."""
+    return os.getenv("FREETOKEN_GGUF_FLOAT_DENSE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def gguf_float_modules() -> tuple[str, ...]:
@@ -219,8 +218,8 @@ def iter_gguf_weights(
     float_dense = gguf_float_dense()
     if world > 1 and not float_dense:
         raise ValueError(
-            "a qwen4exp GGUF at --tp-size > 1 shards its dense projections as floats: "
-            "set FREETOKEN_FP8_DENSE=1 (load-time FP8, as the safetensors path) or FREETOKEN_GGUF_FLOAT_DENSE=1 (bf16)"
+            "a qwen4exp GGUF at --tp-size > 1 shards its dense projections as floats: set FREETOKEN_GGUF_FLOAT_DENSE=1 "
+            "(bf16; add FREETOKEN_FP8_DENSE=1 / FREETOKEN_FP8_LMHEAD=1 for load-time FP8, as the safetensors path)"
         )
     if float_dense:
         from .weight import dense_emitter
@@ -249,7 +248,18 @@ class _DenseReader:
         return float_tensor(self.t(name)).float() - 1.0
 
     def mat(self, info: GgufTensorInfo) -> torch.Tensor:
-        return dequantized_tensor(info).to(torch.bfloat16) if self.float_dense and is_quantized(info.ggml_type) else matrix(info)
+        if not (self.float_dense and is_quantized(info.ggml_type)):
+            return matrix(info)
+        w = dequantized_tensor(info)
+        # an NVFP4 tensor's weight_scale_2 (``.scale``), which the packed path applies per output row in the GEMM
+        if (s := weight_scale(info)) is not None:
+            if s.numel() == 1:
+                w = w * s
+            elif s.numel() == w.shape[0]:
+                w = w * s.unsqueeze(1)
+            else:
+                raise NotImplementedError(f"{info.name}: {s.numel()} weight scales for {w.shape[0]} rows")
+        return w.to(torch.bfloat16)
 
     def fz(self, prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k: int, pad_to: int = 0):
         # no infos: fused takes every part as a float row block
@@ -419,10 +429,28 @@ def iter_sidecar_weights(model_path: str, draft_config: ModelConfig) -> Iterator
 
 
 def ple_table_info(model_path: str) -> GgufTensorInfo:
-    return gguf_tensor_index(model_path)["per_layer_token_embd.weight"]
+    info = gguf_tensor_index(model_path).get("per_layer_token_embd.weight")
+    if info is None:
+        raise ValueError(f"{model_path} has no per_layer_token_embd.weight tensor")
+    return info
+
+
+def check_ple_table(path: str, *, head_dim: int | None = None, rows_needed: int | None = None) -> GgufTensorInfo:
+    """A --ple-table file: one 2-D ``per_layer_token_embd`` of ``head_dim``-wide rows, no weight scale (no PLE reader applies
+    one), at least ``rows_needed`` rows (the checkpoint pads its table to whole shards: 320,001,536 rows for 320,001,446 hashed)."""
+    info = ple_table_info(path)
+    if "per_layer_token_embd.scale" in gguf_tensor_index(path):
+        raise NotImplementedError(f"--ple-table {path}: a PLE table with a weight scale (per_layer_token_embd.scale) is not supported")
+    if len(info.ne) != 2:
+        raise ValueError(f"--ple-table {path}: per_layer_token_embd has shape {info.ne}, expected [row width, rows]")
+    if head_dim is not None and info.ne[0] != head_dim:
+        raise ValueError(f"--ple-table {path}: rows are {info.ne[0]} wide, this model's are {head_dim}")
+    if rows_needed is not None and info.ne[1] < rows_needed:
+        raise ValueError(f"--ple-table {path} has {info.ne[1]} rows; this model's n-gram hash addresses {rows_needed}")
+    return info
 
 
 __all__ = [
     "gguf_float_dense", "gguf_float_modules", "gguf_mm_config", "iter_gguf_weights", "iter_sidecar_weights", "parse_gguf_config",
-    "ple_table_info", "sidecar_block", "sidecar_quant", "sidecar_to_gguf", "to_gguf",
+    "check_ple_table", "ple_table_info", "sidecar_block", "sidecar_quant", "sidecar_to_gguf", "to_gguf",
 ]

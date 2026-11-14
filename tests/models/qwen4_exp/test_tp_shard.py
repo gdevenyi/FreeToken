@@ -210,3 +210,53 @@ def test_gguf_expert_slice_refuses_a_k_quant_down_that_splits_a_block():
     with pytest.raises(NotImplementedError, match="cannot split"):
         _shard_intermediate([torch.zeros(1, 640, 1, dtype=torch.uint8)] * 2, down, int(QT.Q4_K), 640, 0, 2)
 
+
+
+def test_gguf_float_dense_is_its_own_switch(monkeypatch):
+    # the FP8 switches alone must leave a GGUF's own ggml types in charge (the checkpoint's scheme wins at TP=1)
+    from freetoken.models.qwen4_exp.gguf import gguf_float_dense, gguf_float_modules
+
+    monkeypatch.delenv("FREETOKEN_GGUF_FLOAT_DENSE", raising=False)
+    monkeypatch.setenv("FREETOKEN_FP8_DENSE", "1")
+    monkeypatch.setenv("FREETOKEN_FP8_LMHEAD", "1")
+    assert not gguf_float_dense() and gguf_float_modules() == ()
+    monkeypatch.setenv("FREETOKEN_GGUF_FLOAT_DENSE", "1")
+    assert gguf_float_dense() and gguf_float_modules()
+
+
+def test_gguf_float_globs_cover_every_dense_checkpoint_name_but_no_expert():
+    from freetoken.layers.quantization.names import name_set
+    from freetoken.models.qwen4_exp.gguf import _FLOAT_DENSE_MODULES, _LAYER_LEAVES, _TOP_LEAVES
+
+    hit = name_set(_FLOAT_DENSE_MODULES)
+    dense = [f"model.language_model.layers.3.{leaf}" for leaf in _LAYER_LEAVES if not leaf.startswith("mlp.experts.")]
+    dense += list(_TOP_LEAVES)
+    assert [n for n in dense if not hit(n)] == []
+    assert not any(hit(f"model.language_model.layers.3.mlp.experts.0.{p}_proj") for p in ("gate", "up", "down"))
+
+
+def test_packed_gguf_refuses_tp_without_float_dense(monkeypatch):
+    import freetoken.distributed as dist
+    import pytest
+    from freetoken.models.qwen4_exp import gguf as g
+
+    monkeypatch.delenv("FREETOKEN_GGUF_FLOAT_DENSE", raising=False)
+    monkeypatch.setattr(g, "parse_gguf_config", lambda shim: SimpleNamespace())
+    monkeypatch.setattr("freetoken.utils.cached_load_hf_config", lambda path: None)
+    monkeypatch.setattr(dist, "try_get_tp_info", lambda: SimpleNamespace(rank=0, size=2))
+    with pytest.raises(ValueError, match="FREETOKEN_GGUF_FLOAT_DENSE=1"):
+        next(g.iter_gguf_weights("x.gguf", torch.device("cpu"), include_moe_experts=False, include_non_moe=True))
+
+
+def test_float_reader_applies_an_nvfp4_weight_scale_per_row(monkeypatch):
+    # the packed path scales an NVFP4 tensor's rows by its weight_scale_2; the float path must not drop it
+    from freetoken.layers.quantization.ggml_types import NVFP4
+    from freetoken.models.qwen4_exp import gguf as g
+
+    w = torch.ones(3, 32)
+    monkeypatch.setattr(g, "dequantized_tensor", lambda info: w)
+    for scale, expect in ((torch.tensor([0.5]), w * 0.5), (torch.tensor([1.0, 2.0, 3.0]), w * torch.tensor([[1.0], [2.0], [3.0]]))):
+        monkeypatch.setattr(g, "weight_scale", lambda info, s=scale: s)
+        info = SimpleNamespace(ggml_type=NVFP4, name="t")
+        got = g._DenseReader({}, SimpleNamespace(hidden_size=32), float_dense=True).mat(info)
+        assert torch.allclose(got.float(), expect)
