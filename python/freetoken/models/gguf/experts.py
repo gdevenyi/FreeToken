@@ -13,7 +13,7 @@ import os
 import torch
 
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, type_name
+from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, row_bytes, type_name
 from freetoken.utils import init_logger
 
 from .reader import GgufTensorInfo, gguf_tensor_index
@@ -29,6 +29,38 @@ def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
     raw = torch.from_numpy(info.data()).view(experts, rows, info.nbytes // (experts * rows))
     dtype = float_dtype(info.ggml_type)
     return raw if dtype is None else raw.view(dtype)
+
+
+def _tp_slice() -> tuple[int, int]:
+    """``(rank, world)`` of this process; ``(0, 1)`` without TP."""
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    return (0, 1) if tp is None else (tp.rank, tp.size)
+
+
+def _shard_intermediate(gate_up: list[torch.Tensor], down: torch.Tensor, down_type: int, inter: int, rank: int, world: int):
+    """This rank's slice of the expert intermediate axis I, as nvfp4_banks._tp_shard cuts the safetensors experts.
+
+    gate and up keep rows ``[rank * I/world, (rank + 1) * I/world)`` of each; down keeps the same span of every packed
+    row, which is whole ggml blocks when the block size divides I/world (Q5_1 / Q8_0 / IQ4_NL / Q5_0 blocks of 32, not
+    a 256-value K-quant at I/world = 320)."""
+    if world == 1:
+        return gate_up, down
+    if inter % world:
+        raise NotImplementedError(f"expert intermediate {inter} does not split over {world} ranks")
+    n = inter // world
+    lo = rank * n
+    if len(gate_up) == 1:  # stored gate_up: [gate(I) | up(I)] rows
+        gate_up = [gate_up[0][:, :inter], gate_up[0][:, inter:]]
+    gate_up = [r[:, lo : lo + n] for r in gate_up]
+    if float_dtype(down_type) is not None:
+        return gate_up, down[:, :, lo : lo + n]
+    try:
+        b_lo, b_n = row_bytes(down_type, lo) if lo else 0, row_bytes(down_type, n)
+    except ValueError as exc:
+        raise NotImplementedError(f"{type_name(down_type)} down experts cannot split I={inter} over {world} ranks: {exc}") from None
+    return gate_up, down[:, :, b_lo : b_lo + b_n]
 
 
 def _drop_page_cache(info: GgufTensorInfo) -> None:
@@ -86,6 +118,9 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
+    rank, world = _tp_slice()
+    if world > 1 and biased:
+        raise NotImplementedError(f"{model_path}: per-expert biases (gpt-oss) have no tensor-parallel split")
     with PinPipeline() if device is None else contextlib.nullcontext() as pins:
         for layer in range(num_layers):
             blk = f"blk.{first_layer + layer}"
@@ -99,8 +134,9 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     raise NotImplementedError(f"{blk}: gate and up experts have different ggml types")
                 parts = [gate, up]
             tags.append(("ggml", type_name(gate.ggml_type), type_name(down.ggml_type)))
+            down_k = down.ne[0] // world  # down's K is the (sharded) intermediate axis
             tails["gate_up"].append(mmq_tail_bytes(gate.ggml_type, gate.ne[0]))
-            tails["down"].append(mmq_tail_bytes(down.ggml_type, down.ne[0]))
+            tails["down"].append(mmq_tail_bytes(down.ggml_type, down_k))
             if scaled:
                 tails["global"].append(0)
             if biased:
@@ -108,8 +144,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 tails["down_bias"].append(0)
             # a whole-layer float layer runs the bf16 fused MoE; a mixed float/quant layer keeps the float half's own dtype
             pure_float = float_dtype(gate.ggml_type) is not None and float_dtype(down.ggml_type) is not None
-            rows = [_expert_rows(info) for info in parts]
-            d = _expert_rows(down)
+            rows, d = _shard_intermediate([_expert_rows(info) for info in parts], _expert_rows(down), down.ggml_type, down.ne[0], rank, world)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
             gu_dtype, down_dtype = (torch.bfloat16, torch.bfloat16) if pure_float else (rows[0].dtype, d.dtype)
@@ -121,7 +156,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             else:
                 banks = {
                     "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], gu_dtype, device),
-                    "down": _device_bank(tuple(d.shape), down.ggml_type, down.ne[0], down_dtype, device),
+                    "down": _device_bank(tuple(d.shape), down.ggml_type, down_k, down_dtype, device),
                 }
                 if scaled:
                     banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)

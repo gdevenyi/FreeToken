@@ -158,3 +158,55 @@ def test_vision_merger_and_replicated_tower_tensors():
     ):
         t = torch.randn(4, 6)
         assert _shard(name, t, cfg, 1, world).equal(t)
+
+
+def _q8_0_rows(rows: int, k: int, seed: int):
+    """Packed Q8_0 rows [rows, k // 32 * 34]: an f16 scale (some negative) then 32 int8 codes per block."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    nb = rows * k // 32
+    d = rng.uniform(-0.02, 0.02, nb).astype(np.float16).view(np.uint8).reshape(nb, 2)
+    q = rng.integers(-127, 128, (nb, 32), dtype=np.int8).view(np.uint8)
+    return np.concatenate([d, q], axis=1).reshape(rows, k // 32 * 34)
+
+
+def test_gguf_expert_slice_keeps_whole_blocks_and_partial_sums():
+    # TP slices a packed down row by bytes at block boundaries; an element-wise cut would decode garbage
+    import numpy as np
+    from freetoken.models.gguf.experts import _shard_intermediate
+    from freetoken.third_party.gguf import quants
+    from freetoken.third_party.gguf.constants import GGMLQuantizationType as QT
+
+    E, inter, hidden, world = 2, 64, 32, 2
+    gate, up = (torch.from_numpy(_q8_0_rows(E * inter, hidden, s)).view(E, inter, -1) for s in (0, 1))
+    down = torch.from_numpy(_q8_0_rows(E * hidden, inter, 2)).view(E, hidden, -1)
+    dq = lambda t, k: quants.dequantize(t.reshape(-1, t.shape[-1]).numpy(), QT.Q8_0).reshape(*t.shape[:-1], k)  # noqa: E731
+    full = [dq(gate, hidden), dq(up, hidden), dq(down, inter)]
+    x = np.random.default_rng(3).standard_normal(hidden).astype(np.float32)
+
+    def mlp(g, u, d):
+        a = g @ x
+        return d @ (a / (1 + np.exp(-a)) * (u @ x))
+
+    total = 0
+    for rank in range(world):
+        (g, u), d = _shard_intermediate([gate, up], down, int(QT.Q8_0), inter, rank, world)
+        lo, n = rank * inter // world, inter // world
+        assert np.array_equal(dq(g, hidden), full[0][:, lo : lo + n])
+        assert np.array_equal(dq(u, hidden), full[1][:, lo : lo + n])
+        assert np.array_equal(dq(d, n), full[2][:, :, lo : lo + n])
+        total = total + mlp(dq(g, hidden)[0], dq(u, hidden)[0], dq(d, n)[0])
+    np.testing.assert_allclose(total, mlp(full[0][0], full[1][0], full[2][0]), rtol=1e-5, atol=1e-6)
+
+
+def test_gguf_expert_slice_refuses_a_k_quant_down_that_splits_a_block():
+    # a 256-value K-quant down row at I=640 cannot split into two 320-value halves
+    import pytest
+    from freetoken.models.gguf.experts import _shard_intermediate
+    from freetoken.third_party.gguf.constants import GGMLQuantizationType as QT
+
+    down = torch.zeros(1, 4, 640 // 256 * 144 + 144, dtype=torch.uint8)
+    with pytest.raises(NotImplementedError, match="cannot split"):
+        _shard_intermediate([torch.zeros(1, 640, 1, dtype=torch.uint8)] * 2, down, int(QT.Q4_K), 640, 0, 2)
+

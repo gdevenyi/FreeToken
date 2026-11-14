@@ -69,6 +69,22 @@ def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_w
 
 
 
+def _tp_splits(cfg: MoEConfig) -> bool:
+    """A rank's I-slice (models/gguf/experts._shard_intermediate) is whole ggml blocks: gate/up split by row, and down's
+    K = local_intermediate must be a multiple of its block (32 for Q5_1 / Q8_0, not 256 for a K-quant at 320).
+    Per-expert biases (gpt-oss) have no split."""
+    if cfg.tp_size == 1:
+        return True
+    if cfg.has_bias:
+        return False
+    _, down = expert_types(cfg)
+    try:
+        row_bytes(down, cfg.local_intermediate)
+    except ValueError:
+        return False
+    return True
+
+
 class GgmlMoEKernel(MoEKernel):
     name = "ggml"
     cpu_format = "gguf"
@@ -81,7 +97,7 @@ class GgmlMoEKernel(MoEKernel):
                 return f"float GGUF experts run on the bf16 fused MoE: {reason}"
         if cfg.has_bias and cfg.decode_target != "gpu":
             return "gpt-oss per-expert biases have no CPU executor format; decode must run on the GPU"
-        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False, bias_ok=True)
+        return self._common_reject(cfg, tp_ok=_tp_splits(cfg), cpu_ok=True, plain_silu_only=False, bias_ok=True)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
