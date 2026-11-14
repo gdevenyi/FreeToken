@@ -211,3 +211,29 @@ def test_drain_of_a_no_draft_step_commits_one_token_and_counts_no_draft():
     for req in reqs:
         stub._free_req_resources(req)
     cm.check_integrity()
+
+
+def test_a_padded_one_row_batch_gets_one_row_per_padding_request(monkeypatch):
+    # past --speculative-max-batch-size a batch of 3 replays the bs=4 one-row graph: _make_positions gives every padded
+    # request its own extend_len rows, so the padding must be the engine's one-token twin, not the k+1-token dummy
+    from freetoken.scheduler.scheduler import _make_input_tuple, _make_positions
+
+    real_empty = torch.empty  # the helpers pin their host buffers, which needs a CUDA driver
+    monkeypatch.setattr(torch, "empty", lambda *a, pin_memory=False, **kw: real_empty(*a, **kw))
+    pool, cm, tm, dm, stub, events = _setup()
+    reqs = [_decoding_req(pool, cm, tm, uid, 16) for uid in (1, 2, 3)]
+
+    def pad(n):
+        return Req(input_ids=torch.zeros(n, dtype=torch.int32), table_idx=3, cached_len=0, output_len=1, uid=-1,
+                   sampling_params=None, cache_handle=None)
+
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=1)
+    batch.padded_reqs = reqs + [pad(1)]
+    batch.positions = _make_positions(batch, torch.device("cpu"))
+    rows, pos = _make_input_tuple(batch, torch.device("cpu"))
+    assert batch.positions.numel() == rows.numel() == batch.padded_size * batch.rows_per_req == 4
+    assert batch.positions.tolist() == [PROMPT, PROMPT, PROMPT, 0]
+    batch.padded_reqs = reqs + [pad(K + 1)]  # the decode / verify dummy overflows a one-row batch
+    assert _make_positions(batch, torch.device("cpu")).numel() == 3 + K + 1
+    for req in reqs:
+        stub._free_req_resources(req)

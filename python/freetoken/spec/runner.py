@@ -97,6 +97,7 @@ class SpecRunner:
         self.proposer.attach(DraftContext(
             page_table=engine.page_table, num_pages=engine.num_pages, device=engine.device,
             stream=engine.stream, dummy_req=engine.dummy_req, slot_states=states, kv_cache=engine.kv_cache,
+            dummy_req_narrow=getattr(engine, "dummy_req_narrow", None),
         ))
 
     def detach(self, *, keep_kv: bool) -> None:

@@ -693,6 +693,18 @@ class Engine:
         if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # the one-row (no-draft) graphs pad with a one-token twin: _make_positions gives each padded request its own
+        # extend_len rows, and a k+1-token pad would overflow a one-row batch
+        self.dummy_req_narrow = None
+        if self.attn_backend_narrow is not None:
+            self.dummy_req_narrow = Req(
+                input_ids=torch.zeros(1, dtype=torch.int32, device="cpu"),
+                table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+                sampling_params=None,  # type: ignore
+                cache_handle=None,  # type: ignore
+            )
+            if hasattr(self.dummy_req, "linear_slot_idx"):
+                self.dummy_req_narrow.linear_slot_idx = self.dummy_req.linear_slot_idx
 
         # ======================= Verify state initialization ========================
         if config.decode_rows_per_req > 1 and self.linear_state_pool is not None:
@@ -1499,7 +1511,7 @@ class Engine:
             cuda_graph_max_bs=max(narrow_bs),
             free_memory=free_memory,
             max_seq_len=max_seq_len,
-            dummy_req=self.dummy_req,
+            dummy_req=self.dummy_req_narrow,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             out_dtype=torch.float32,

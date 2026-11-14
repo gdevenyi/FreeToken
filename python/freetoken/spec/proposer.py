@@ -42,6 +42,8 @@ class DraftContext(NamedTuple):
     slot_states: dict[str, torch.Tensor]
     # the engine's target KV pool, always populated by SpecRunner.attach; a read-only draft reads through it
     kv_cache: BaseKVCachePool
+    # --speculative-max-batch-size: the one-token padding request of the one-row (no-draft) graphs; dummy_req has k+1
+    dummy_req_narrow: Req | None = None
 
 
 class Proposer:

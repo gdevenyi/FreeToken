@@ -329,7 +329,7 @@ class MTPProposer(Proposer):
                 cuda_graph_max_bs=max(bs_list),
                 free_memory=0,
                 max_seq_len=ctx.page_table.shape[1],
-                dummy_req=ctx.dummy_req,
+                dummy_req=ctx.dummy_req_narrow or ctx.dummy_req,
                 mrope=self.mrope,
                 rows_per_req=1,
                 phase="verify",
