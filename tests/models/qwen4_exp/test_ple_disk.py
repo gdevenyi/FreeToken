@@ -294,7 +294,7 @@ def test_disk_table_matches_oracle(tmp_path, dtype):
     prompt = [3, 4, EOS, 5, 6, 8]
     fresh = SimpleNamespace(input_ids=torch.tensor(prompt[:4], dtype=torch.int32), device_len=4, cached_len=0)
     cont = SimpleNamespace(input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=6, cached_len=4)
-    disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False)
+    disk.host_fill_batch(SimpleNamespace(is_decode=False, phase="prefill", padded_reqs=[fresh, cont]), use_graph=False)
     ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill"
 

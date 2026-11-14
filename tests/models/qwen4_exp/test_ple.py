@@ -810,3 +810,23 @@ def test_decode_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(static_out, replayed)
+
+
+def test_disk_table_stages_a_one_row_verify_batch_like_a_decode_step():
+    # --speculative-max-batch-size: a no-draft verify step has one row per request, its token on the device as on decode.
+    # Red if it takes the prefill branch: that stages host tokens into the eager buffer while a captured graph reads
+    # its own buffer (and waits forever on the flag under wait-sync).
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    disk = object.__new__(DiskRowTable)
+    disk.image_token_id, disk.eos_token_id, disk._wait_sync, disk._worker = None, EOS, False, None
+    staged = []
+    disk.fill = lambda runs, *, graph: staged.append(([r.tolist() for r in runs], graph))
+    req = SimpleNamespace(input_ids=torch.tensor([3, 4, EOS, 5], dtype=torch.int32), device_len=5, cached_len=4)
+    batch = SimpleNamespace(
+        is_decode=False, phase="verify", rows_per_req=1, input_ids=torch.tensor([9], dtype=torch.int32),
+        reqs=[req], padded_reqs=[req], size=1, padded_size=1,
+    )
+
+    assert disk.host_fill_batch(batch, use_graph=True) is None
+    assert staged == [([[EOS, 5, 9]], True)]

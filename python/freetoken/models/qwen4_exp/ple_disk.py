@@ -292,7 +292,8 @@ class DiskRowTable:
         eos = self.eos_token_id
         # decode and verify: rows_per_req tokens per request on the device, the first at device_len - rows_per_req
         rows = getattr(batch, "rows_per_req", None) or 1
-        if batch.is_decode or rows > 1:
+        # a verify step of one row per request (no drafts, --speculative-max-batch-size) is decode-shaped, not a prefill
+        if batch.is_decode or batch.phase == "verify":
             reqs = list(batch.reqs)
             histories = [self._ple_context(r.input_ids, r.device_len - rows) for r in reqs]
             if use_graph and self._wait_sync:
