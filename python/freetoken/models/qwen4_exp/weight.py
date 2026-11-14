@@ -381,6 +381,28 @@ def _fp8_dense_applies(name: str, config) -> bool:
     return False
 
 
+def dense_emitter(config, rank: int, world: int):
+    """``(emit, fp8, lmhead)``: ``emit(name, tensor)`` yields one dense state-dict tensor as this rank loads it,
+    TP-sharded and then load-time FP8 where the builder made Fp8DynamicLinear. ``config`` (the parsed config under
+    the builder's QuantConfig) may be None only for a plain TP=1 bf16 read. The safetensors and GGUF readers share it."""
+    lmhead = config is not None and use_fp8_lmhead(config)
+    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+    if fp8:
+        logger.info("qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), FREETOKEN_FP8_DENSE=1")
+    if lmhead:
+        logger.info("qwen4_exp lm_head: load-time per-tensor FP8, FREETOKEN_FP8_LMHEAD=1")
+
+    def emit(name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+        tensor = _shard(name, tensor, config, rank, world)
+        dense = fp8 and _fp8_dense_applies(name, config)
+        if dense or lmhead:
+            yield from _fp8_dense(name, tensor, config, world, dense=dense, lm_head=lmhead)
+        else:
+            yield name, tensor
+
+    return emit, fp8, lmhead
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -407,20 +429,7 @@ def iter_weights(
     # the sharding geometry and the fp8 split need the parsed config, under the QuantConfig the builder saw; a plain TP=1 read never touches it
     needs_config = tp.size > 1 or fp8_dense_enabled() or fp8_lmhead_enabled()
     config = replace(parse_config(hf_config), quant=quant) if needs_config else None
-    lmhead = config is not None and use_fp8_lmhead(config)
-    fp8 = config is not None and config.attn_quant == "fp8_dynamic"
-    if fp8:
-        logger.info("qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), FREETOKEN_FP8_DENSE=1")
-    if lmhead:
-        logger.info("qwen4_exp lm_head: load-time per-tensor FP8, FREETOKEN_FP8_LMHEAD=1")
-
-    def emit(name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
-        tensor = _shard(name, tensor, config, tp.rank, tp.size)
-        dense = fp8 and _fp8_dense_applies(name, config)
-        if dense or lmhead:
-            yield from _fp8_dense(name, tensor, config, tp.size, dense=dense, lm_head=lmhead)
-        else:
-            yield name, tensor
+    emit, fp8, lmhead = dense_emitter(config, tp.rank, tp.size)
 
     for file in tqdm(
         iter_weight_files(model_path),
