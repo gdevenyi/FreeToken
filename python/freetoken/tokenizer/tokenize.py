@@ -67,7 +67,7 @@ def _map_developer_role(
     """OpenAI's ``developer`` role is the current spelling of ``system`` (clients such as pi
     send the system prompt that way by default). Most chat templates do not know it and raise
     ("Unexpected message role"), so map it to ``system`` unless the template handles it."""
-    if "developer" in (chat_template or "") or not any(
+    if "developer" in str(chat_template or "") or not any(
         m.get("role") == "developer" for m in messages
     ):
         return messages
@@ -175,11 +175,6 @@ class TokenizeManager:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs, images=images
             )
-        if any(m.get("role") == "developer" for m in messages):
-            # OpenAI's "developer" is the newer spelling of "system". Templates that do not
-            # name it drop it, raise on it, or render it as a role the model never saw.
-            if "developer" not in str(self.tokenizer.chat_template):
-                messages = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
         # Broadcast the effort in every spelling the ecosystem's templates read
         # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
         # variables) -- the same rule the thinking toggles use. An explicit

@@ -407,6 +407,24 @@ def test_developer_role_renders_as_system_unless_the_template_names_it(template,
     ]
 
 
+def test_system_then_developer_merge_into_one_leading_system_message():
+    # codex sends instructions as system plus a developer message; Qwen templates raise on a
+    # system message that is not first
+    tokenizer = FakeTokenizer()
+    tokenizer.chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}"
+    manager = TokenizeManager(tokenizer)
+    messages = [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "hi"},
+        {"role": "developer", "content": "Answer in French."},
+    ]
+    manager.tokenize([TokenizeMsg(uid=1, text=messages, sampling_params=SamplingParams())])
+    assert tokenizer.chat_template_messages == [
+        {"role": "system", "content": "You are terse.\n\nAnswer in French."},
+        {"role": "user", "content": "hi"},
+    ]
+
+
 class FakeDsv4Tokenizer:
     chat_template = None
 
