@@ -159,15 +159,13 @@ class Qwen4ExpModel(BaseOP):
         return self.hyper_connection_mixer.mix(hidden, rn=rn)[0]
 
 
-def _check_ple_override(path: str, emb) -> None:
-    """A --ple-table must cover every row the n-gram hash can address with this model's constants
-    (the checkpoint pads its table to whole shards: 320,001,536 rows for 320,001,446 hashed)."""
-    from .gguf import ple_table_info
+def _check_ple_override(path: str, layer) -> None:
+    """A --ple-table must have this model's row width and cover every row its n-gram hash can address."""
+    from .gguf import check_ple_table
 
-    info = ple_table_info(path)
+    emb = layer.ple_embedding
     need = int(emb.ngram_heads_offsets[-1]) + int(emb.ngram_heads_vocab_sizes[-1])
-    if info.ne[1] < need:
-        raise ValueError(f"--ple-table {path} has {info.ne[1]} rows; this model's n-gram hash addresses {need}")
+    check_ple_table(path, head_dim=layer.args.ngram_head_dim, rows_needed=need)
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -215,7 +213,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         override = getattr(engine_config, "ple_table", None)
         if override:
-            _check_ple_override(override, ple_layers[0].ple_embedding)
+            _check_ple_override(override, ple_layers[0])
         if engine_config.ple_backend == "disk":
             from .ple_disk import DiskRowTable, resolve_row_source, source_from_gguf
 

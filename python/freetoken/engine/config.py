@@ -156,6 +156,11 @@ class EngineConfig:
             raise ValueError(f"online_quant {self.online_quant!r} has no online method; known: {known}")
         if isinstance(self.online_quant_modules, str):
             raise TypeError("online_quant_modules takes a tuple of module names or globs, not a string")
+        if self.ple_table:
+            # the header checks here, before the weights load; width and rows once the model's PLE constants exist
+            from freetoken.models.qwen4_exp.gguf import check_ple_table
+
+            check_ple_table(self.ple_table)
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

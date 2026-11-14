@@ -426,17 +426,22 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
         load_ple_table(folder, args, pin=False)
 
 
-def _one_tensor_gguf(path, name: str, ggml_type: int, ne: tuple[int, ...], data: bytes) -> None:
-    """A minimal GGUF v3 file holding one tensor, as Unsloth's engram/*.gguf_file tables are."""
+def _one_tensor_gguf(path, name: str, ggml_type: int, ne: tuple[int, ...], data: bytes, extra=None) -> None:
+    """A minimal GGUF v3 file holding one tensor, as Unsloth's engram/*.gguf_file tables are (``extra``: one more
+    ``(name, type, ne, bytes)`` tensor)."""
     import struct
 
     def s(x: str) -> bytes:
         return struct.pack("<Q", len(x.encode())) + x.encode()
 
+    tensors = [(name, ggml_type, ne, data)] + ([extra] if extra else [])
+    infos, blob = b"", b""
+    for n, t, shape, raw in tensors:
+        infos += s(n) + struct.pack("<I", len(shape)) + b"".join(struct.pack("<Q", x) for x in shape) + struct.pack("<IQ", t, len(blob))
+        blob += raw + b"\0" * (-len(raw) % 32)
     kv = s("general.architecture") + struct.pack("<I", 8) + s("qwen4exp")
-    info = s(name) + struct.pack("<I", len(ne)) + b"".join(struct.pack("<Q", n) for n in ne) + struct.pack("<IQ", ggml_type, 0)
-    head = struct.pack("<IIQQ", 0x46554747, 3, 1, 1) + kv + info
-    path.write_bytes(head + b"\0" * (-len(head) % 32) + data)
+    head = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), 1) + kv + infos
+    path.write_bytes(head + b"\0" * (-len(head) % 32) + blob)
 
 
 def test_load_ple_table_gguf_reads_every_bf16_row(tmp_path):
@@ -456,6 +461,32 @@ def test_load_ple_table_gguf_reads_every_bf16_row(tmp_path):
     _one_tensor_gguf(q8, "per_layer_token_embd.weight", int(GGMLQuantizationType.Q8_0), (32, 4), bytes(4 * 34))
     with pytest.raises(ValueError, match="disk"):
         load_ple_table_gguf(str(q8), SimpleNamespace(ngram_head_dim=32), pin=False)
+
+
+def test_check_ple_table_refuses_what_no_reader_serves(tmp_path):
+    # a missing tensor, a weight scale, a wrong row width or too few rows must stop the load, not mis-serve rows
+    import struct
+
+    from freetoken.models.qwen4_exp.gguf import check_ple_table
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    bf16 = int(GGMLQuantizationType.BF16)
+    ok = tmp_path / "ok.gguf_file"
+    _one_tensor_gguf(ok, "per_layer_token_embd.weight", bf16, (NGRAM_DIM, 10), bytes(10 * NGRAM_DIM * 2))
+    assert check_ple_table(str(ok), head_dim=NGRAM_DIM, rows_needed=10).ne == (NGRAM_DIM, 10)
+    with pytest.raises(ValueError, match="wide"):
+        check_ple_table(str(ok), head_dim=NGRAM_DIM + 1)
+    with pytest.raises(ValueError, match="rows"):
+        check_ple_table(str(ok), rows_needed=11)
+    other = tmp_path / "other.gguf_file"
+    _one_tensor_gguf(other, "token_embd.weight", bf16, (NGRAM_DIM, 10), bytes(10 * NGRAM_DIM * 2))
+    with pytest.raises(ValueError, match="no per_layer_token_embd"):
+        check_ple_table(str(other))
+    scaled = tmp_path / "scaled.gguf_file"
+    _one_tensor_gguf(scaled, "per_layer_token_embd.weight", bf16, (NGRAM_DIM, 10), bytes(10 * NGRAM_DIM * 2),
+                     extra=("per_layer_token_embd.scale", int(GGMLQuantizationType.F32), (1,), struct.pack("<f", 0.25)))
+    with pytest.raises(NotImplementedError, match="weight scale"):
+        check_ple_table(str(scaled))
 
 
 # ======================================================================================

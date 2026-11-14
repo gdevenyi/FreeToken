@@ -746,18 +746,15 @@ def load_ple_table_gguf(path: str, qwen4_args, *, pin: bool = True,
 
     BF16 only: the UVA gather reads fp8 or bf16 rows; a packed ggml table is served by ``--ple-backend disk``."""
     from freetoken.layers.quantization.ggml_types import type_name
-    from freetoken.models.gguf.reader import gguf_tensor_index
     from freetoken.third_party.gguf import GGMLQuantizationType
 
-    info = gguf_tensor_index(path).get("per_layer_token_embd.weight")
-    if info is None:
-        raise ValueError(f"{path} has no per_layer_token_embd.weight tensor")
+    from .gguf import check_ple_table
+
+    info = check_ple_table(path, head_dim=qwen4_args.ngram_head_dim)
     if info.ggml_type != GGMLQuantizationType.BF16:
         raise ValueError(f"--ple-backend pinned reads a BF16 PLE table; {path} stores {type_name(info.ggml_type)}, "
                          "which --ple-backend disk serves")
     cols, rows = info.ne
-    if cols != qwen4_args.ngram_head_dim:
-        raise ValueError(f"{path}: PLE row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
     assert info.nbytes == rows * cols * 2, (info.nbytes, rows, cols)
     bank = HostBank((rows, cols), torch.bfloat16)
     bar = byte_bar(info.nbytes, "Loading PLE table")

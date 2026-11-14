@@ -796,7 +796,8 @@ def parse_args(
         help=(
             "Qwen3.8-Flash-Next: read the PLE n-gram table from this one-tensor GGUF (per_layer_token_embd, "
             "e.g. Unsloth's engram/*.gguf_file) instead of the checkpoint's own, for a safetensors or GGUF model. "
-            "'disk' reads any ggml type; 'pinned' needs a BF16 table."
+            "'disk' reads the ggml types ggml.dequantize decodes (BF16, Q8_0, Q5_1, IQ4_NL, ...); 'pinned' needs a BF16 "
+            "table. A table with a weight scale is refused."
         ),
     )
 
