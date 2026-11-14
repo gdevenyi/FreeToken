@@ -159,6 +159,17 @@ class Qwen4ExpModel(BaseOP):
         return self.hyper_connection_mixer.mix(hidden, rn=rn)[0]
 
 
+def _check_ple_override(path: str, emb) -> None:
+    """A --ple-table must cover every row the n-gram hash can address with this model's constants
+    (the checkpoint pads its table to whole shards: 320,001,536 rows for 320,001,446 hashed)."""
+    from .gguf import ple_table_info
+
+    info = ple_table_info(path)
+    need = int(emb.ngram_heads_offsets[-1]) + int(emb.ngram_heads_vocab_sizes[-1])
+    if info.ne[1] < need:
+        raise ValueError(f"--ple-table {path} has {info.ne[1]} rows; this model's n-gram hash addresses {need}")
+
+
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
@@ -202,8 +213,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        override = getattr(engine_config, "ple_table", None)
+        if override:
+            _check_ple_override(override, ple_layers[0].ple_embedding)
         if engine_config.ple_backend == "disk":
-            from .ple_disk import DiskRowTable, resolve_row_source
+            from .ple_disk import DiskRowTable, resolve_row_source, source_from_gguf
 
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
@@ -219,7 +233,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             }
             rows = engine_config.decode_rows_per_req
             disk_table = DiskRowTable(
-                resolve_row_source(engine_config.model_path),
+                source_from_gguf(override) if override else resolve_row_source(engine_config.model_path),
                 constants,
                 # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
                 max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
@@ -235,11 +249,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         from freetoken.models.gguf.reader import is_gguf_path
 
-        from .weight import load_ple_table
+        from .weight import load_ple_table, load_ple_table_gguf
 
-        if is_gguf_path(engine_config.model_path):
-            raise ValueError("--ple-backend pinned preloads safetensors PLE shards; a GGUF serves its packed table with --ple-backend disk")
-        table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
+        if override:
+            table = load_ple_table_gguf(override, self._config.qwen4_args)
+        elif is_gguf_path(engine_config.model_path):
+            raise ValueError("--ple-backend pinned preloads safetensors PLE shards or a BF16 --ple-table; "
+                             "a GGUF serves its own packed table with --ple-backend disk")
+        else:
+            table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
             ple.ple_embedding.attach_table(

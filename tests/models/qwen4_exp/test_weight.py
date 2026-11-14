@@ -426,6 +426,38 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
         load_ple_table(folder, args, pin=False)
 
 
+def _one_tensor_gguf(path, name: str, ggml_type: int, ne: tuple[int, ...], data: bytes) -> None:
+    """A minimal GGUF v3 file holding one tensor, as Unsloth's engram/*.gguf_file tables are."""
+    import struct
+
+    def s(x: str) -> bytes:
+        return struct.pack("<Q", len(x.encode())) + x.encode()
+
+    kv = s("general.architecture") + struct.pack("<I", 8) + s("qwen4exp")
+    info = s(name) + struct.pack("<I", len(ne)) + b"".join(struct.pack("<Q", n) for n in ne) + struct.pack("<IQ", ggml_type, 0)
+    head = struct.pack("<IIQQ", 0x46554747, 3, 1, 1) + kv + info
+    path.write_bytes(head + b"\0" * (-len(head) % 32) + data)
+
+
+def test_load_ple_table_gguf_reads_every_bf16_row(tmp_path):
+    # small pieces: a wrong file or bank offset at a piece boundary shifts every later row
+    from freetoken.models.qwen4_exp.weight import load_ple_table_gguf
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    table = torch.randn(1037, NGRAM_DIM).to(torch.bfloat16)
+    path = tmp_path / "engram-BF16.gguf_file"
+    _one_tensor_gguf(path, "per_layer_token_embd.weight", int(GGMLQuantizationType.BF16), (NGRAM_DIM, 1037),
+                     table.view(torch.uint8).numpy().tobytes())
+    got = load_ple_table_gguf(str(path), SimpleNamespace(ngram_head_dim=NGRAM_DIM), pin=False, piece=12_288)
+    assert got.bank.tensor.dtype == torch.bfloat16 and float(got.weight_scale) == 1.0
+    assert torch.equal(got.bank.tensor, table)
+
+    q8 = tmp_path / "engram-Q8_0.gguf_file"
+    _one_tensor_gguf(q8, "per_layer_token_embd.weight", int(GGMLQuantizationType.Q8_0), (32, 4), bytes(4 * 34))
+    with pytest.raises(ValueError, match="disk"):
+        load_ple_table_gguf(str(q8), SimpleNamespace(ngram_head_dim=32), pin=False)
+
+
 # ======================================================================================
 # read_range_into: the O_DIRECT byte-range read the PLE table load is built on
 # ======================================================================================

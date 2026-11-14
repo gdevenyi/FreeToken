@@ -739,6 +739,42 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     return PleTable(bank=bank, weight_scale=scale)
 
 
+def load_ple_table_gguf(path: str, qwen4_args, *, pin: bool = True,
+                        workers: int = 8, chunk: int = 8 << 20, piece: int = 4 << 30) -> PleTable:
+    """The ``per_layer_token_embd`` table of a one-tensor GGUF (``--ple-table``, e.g. Unsloth's lossless
+    engram BF16 file) as one pinned host bank, read O_DIRECT like :func:`load_ple_table`.
+
+    BF16 only: the UVA gather reads fp8 or bf16 rows; a packed ggml table is served by ``--ple-backend disk``."""
+    from freetoken.layers.quantization.ggml_types import type_name
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    info = gguf_tensor_index(path).get("per_layer_token_embd.weight")
+    if info is None:
+        raise ValueError(f"{path} has no per_layer_token_embd.weight tensor")
+    if info.ggml_type != GGMLQuantizationType.BF16:
+        raise ValueError(f"--ple-backend pinned reads a BF16 PLE table; {path} stores {type_name(info.ggml_type)}, "
+                         "which --ple-backend disk serves")
+    cols, rows = info.ne
+    if cols != qwen4_args.ngram_head_dim:
+        raise ValueError(f"{path}: PLE row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
+    assert info.nbytes == rows * cols * 2, (info.nbytes, rows, cols)
+    bank = HostBank((rows, cols), torch.bfloat16)
+    bar = byte_bar(info.nbytes, "Loading PLE table")
+    try:
+        buf = bank.memoryview()
+        for start in range(0, info.nbytes, piece):
+            n = min(piece, info.nbytes - start)
+            read_range_into(buf, info.path, file_offset=info.offset + start, nbytes=n,
+                            dest_offset=start, workers=workers, chunk=chunk)
+            bar.update(n)
+    finally:
+        bar.close()
+    if pin and torch.cuda.is_available():
+        bank.pin()
+    return PleTable(bank=bank, weight_scale=torch.tensor(1.0, dtype=torch.bfloat16))
+
+
 # ======================================================================================
 # Routed NVFP4 experts
 # ======================================================================================

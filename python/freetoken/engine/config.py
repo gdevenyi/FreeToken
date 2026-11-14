@@ -38,6 +38,8 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # --ple-table: a one-tensor GGUF (per_layer_token_embd, e.g. Unsloth's engram files) read instead of the checkpoint's own table
+    ple_table: str | None = None
     # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
     embed_weights: str = "gpu"
     # --online-quant: a QuantKind the layers this checkpoint stores bf16 are converted to at load (df11)

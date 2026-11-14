@@ -790,6 +790,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-table",
+        default=ServerArgs.ple_table,
+        metavar="FILE",
+        help=(
+            "Qwen3.8-Flash-Next: read the PLE n-gram table from this one-tensor GGUF (per_layer_token_embd, "
+            "e.g. Unsloth's engram/*.gguf_file) instead of the checkpoint's own, for a safetensors or GGUF model. "
+            "'disk' reads any ggml type; 'pinned' needs a BF16 table."
+        ),
+    )
+
+    parser.add_argument(
         "--embed-weights",
         default=ServerArgs.embed_weights,
         choices=["gpu", "host"],
