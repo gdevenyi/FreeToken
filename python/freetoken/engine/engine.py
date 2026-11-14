@@ -667,6 +667,13 @@ class Engine:
             config.attention_backend, config.model_config
         )
         self.linear_backend = LinearAttnBackend(self.device, self.linear_state_pool) if self.linear_state_pool is not None else None
+        # --speculative-max-batch-size: one-row verify steps get their own backends, because a backend's capture state
+        # (and the buffers its prepare_metadata stages for a replay) belongs to one rows-per-request width
+        self.attn_backend_narrow = self.linear_backend_narrow = self.narrow_graph_runner = None
+        if self.spec is not None and config.speculative_max_batch_size is not None:
+            self.attn_backend_narrow = create_attention_backend(config.attention_backend, config.model_config)
+            if self.linear_state_pool is not None:
+                self.linear_backend_narrow = LinearAttnBackend(self.device, self.linear_state_pool)
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -697,7 +704,7 @@ class Engine:
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================
-        self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
+        self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
         if config.prefill_warmup:
             self._warmup_prefill()
 
@@ -1419,16 +1426,20 @@ class Engine:
         # free << startup pre-load free), so re-deriving it here would silently drop large
         # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
         # captured coverage identical (the fit-check above guarantees the graph headroom fits).
-        prior_graph_bs = self.graph_runner.graph_bs_list
+        narrow = getattr(self, "narrow_graph_runner", None)
+        prior_graph_bs = self.graph_runner.graph_bs_list + (narrow.graph_bs_list if narrow is not None else [])
         # Point of no return for the scheduler's rollback logic: from here the live graphs and
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
-        self.attn_backend.reset_capture()
-        if self.linear_backend is not None:
-            self.linear_backend.reset_capture()
+        narrow_backends = (getattr(self, "attn_backend_narrow", None), getattr(self, "linear_backend_narrow", None))
+        for backend in (self.attn_backend, self.linear_backend, *narrow_backends):
+            if backend is not None:
+                backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if narrow is not None:
+            narrow.destroy_cuda_graphs()
         if self.spec is not None:
             # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
             self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
@@ -1450,7 +1461,57 @@ class Engine:
         if self.spec is not None:
             self.spec.attach(self)
         # reuse the startup-resolved bs set (see above)
-        self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+        self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(prior_graph_bs, free_min, aligned_max_seq_len)
+
+    def graph_runner_for(self, batch: Batch) -> GraphRunner:
+        """The runner whose graphs serve this batch: the one-row verify family past --speculative-max-batch-size."""
+        if self.narrow_graph_runner is not None and batch.phase == "verify" and batch.rows_per_req == 1:
+            return self.narrow_graph_runner
+        return self.graph_runner
+
+    def backends_for(self, batch: Batch) -> tuple:
+        """(attention, linear) backends that stage this batch's metadata and run its forward."""
+        if self.attn_backend_narrow is not None and batch.phase == "verify" and batch.rows_per_req == 1:
+            return self.attn_backend_narrow, self.linear_backend_narrow
+        return self.attn_backend, self.linear_backend
+
+    def _make_graph_runners(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> tuple:
+        """(main runner, one-row verify runner or None). With --speculative-max-batch-size the verify family splits by
+        batch size: decode_rows_per_req rows up to the limit, one row (no drafts) above it, each on its own backends."""
+        config = self.config
+        gate = getattr(config, "speculative_max_batch_size", None)
+        if getattr(self, "spec", None) is None or gate is None:
+            return self._make_graph_runner(cuda_graph_bs, free_memory, max_seq_len), None
+        all_bs = [
+            bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
+            if bs <= config.max_running_req
+        ]
+        main = self._make_graph_runner([bs for bs in all_bs if bs <= gate] or [1], free_memory, max_seq_len)
+        narrow_bs = [bs for bs in all_bs if bs > gate]
+        if not narrow_bs:
+            return main, None
+        narrow = GraphRunner(
+            stream=self.stream,
+            device=self.device,
+            forward=self.model.forward,
+            attn_backend=self.attn_backend_narrow,
+            cuda_graph_bs=narrow_bs,
+            cuda_graph_max_bs=max(narrow_bs),
+            free_memory=free_memory,
+            max_seq_len=max_seq_len,
+            dummy_req=self.dummy_req,
+            moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
+            out_dtype=torch.float32,
+            linear_backend=self.linear_backend_narrow,
+            rows_per_req=1,
+            phase="verify",
+            batch_hook=self._prepare_verify_batch,
+            ctx_override=dict(attn_backend=self.attn_backend_narrow),
+            pool=main.graph_pool,
+        )
+        self.spec.capture_graphs(narrow.graph_bs_list, narrow.graph_pool, rows_per_req=1)
+        return main, narrow
 
     def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
         """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
@@ -1504,9 +1565,12 @@ class Engine:
 
     def forward_logits(self, batch: Batch) -> torch.Tensor:
         """The batch's logits from its captured graph, or eagerly when none fits."""
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        runner = self.graph_runner_for(batch)
+        use_graph = runner.can_use_cuda_graph(batch)
+        attn_backend, _ = self.backends_for(batch)
+        override = {} if attn_backend is self.attn_backend else dict(attn_backend=attn_backend)
+        with self.ctx.forward_batch(batch, **override), self.model.forward_host_ctx(batch, use_graph):
+            logits = runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1660,6 +1724,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.narrow_graph_runner is not None:
+            self.narrow_graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

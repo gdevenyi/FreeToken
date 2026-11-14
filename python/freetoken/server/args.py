@@ -1101,6 +1101,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-max-batch-size",
+        "--spec-max-bs",
+        type=int,
+        default=ServerArgs.speculative_max_batch_size,
+        help="mtp only: decode steps with more running requests than this draft nothing and verify just the pending "
+        "token (one row per request; a second set of CUDA graphs covers those batch sizes); the draft still runs over "
+        "each emitted token, so drafting resumes without a catch-up. Off by default (draft on every step).",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

@@ -181,3 +181,33 @@ def test_drain_stamps_intermediate_timings_when_requested():
     assert reply[0].timings["draft_n"] == K and reply[0].timings["draft_n_accepted"] == 3
     # the terminal reply of the same drain keeps the unchanged terminal snapshot
     assert reply[1].finished and reply[1].timings["predicted_n"] == 3
+
+
+def test_drain_of_a_no_draft_step_commits_one_token_and_counts_no_draft():
+    # past --speculative-max-batch-size a step verifies only the pending token: rows_per_req 1, nothing widened.
+    # The drain must take the width from the batch, not from decode_rows_per_req (which still says k + 1).
+    pool, cm, tm, dm, stub, events = _setup()
+    reqs = [_decoding_req(pool, cm, tm, 1, 16), _decoding_req(pool, cm, tm, 2, 16)]
+    dm.filter_reqs(reqs)
+    cm.allocate_paged(reqs)
+    free_before = cm.available_size
+    out = torch.tensor([[11], [21]])
+    output = SimpleNamespace(next_tokens_gpu=out, next_tokens_cpu=out, emitted_cpu=torch.tensor([0, 0]))
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=1)
+    reply, finished = [], set()
+    tables = [r.table_idx for r in reqs]
+
+    committed = Scheduler._drain_verify(stub, batch, output, reply, finished)
+
+    assert committed == 2
+    assert [m.next_tokens for m in reply] == [[11], [21]]
+    assert events == [("commit", [1, 2], [1, 1])]
+    for req, table, tok in zip(reqs, tables, (11, 21)):
+        assert (req.cached_len, req.device_len) == (PROMPT + 1, PROMPT + 2)
+        assert req.stats.draft_n == 0 and req.stats.draft_n_accepted == 0
+        assert int(stub.token_pool[table, PROMPT + 1]) == tok
+    # nothing was widened, so nothing comes back
+    assert cm.available_size == free_before
+    for req in reqs:
+        stub._free_req_resources(req)
+    cm.check_integrity()

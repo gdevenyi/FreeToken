@@ -434,7 +434,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
         """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
-        k = self.config.decode_rows_per_req - 1
+        k = batch.rows_per_req - 1  # 0 on a step past --speculative-max-batch-size
         counts, finished = [], []
         now = time.perf_counter()
         for i, req in enumerate(batch.reqs):
@@ -915,8 +915,8 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         if self.spec is not None and batch.is_decode:
-            batch.phase, batch.rows_per_req = "verify", self.config.decode_rows_per_req
-        self.engine.graph_runner.pad_batch(batch)
+            batch.phase, batch.rows_per_req = "verify", self.config.verify_rows_for(batch.size)
+        self.engine.graph_runner_for(batch).pad_batch(batch)
         if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
@@ -938,7 +938,7 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
-        if batch.phase == "verify":
+        if batch.phase == "verify" and batch.rows_per_req > 1:
             # the drafts run on the GPU while the host builds this batch's metadata below
             self.spec.propose_into(batch.reqs, self.token_pool)
         if batch.is_prefill:
@@ -949,13 +949,15 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_backend is not None:
-            self.engine.linear_backend.prepare_metadata(batch)
+        # the backends whose captured graphs serve this batch's width stage its metadata
+        attn_backend, linear_backend = self.engine.backends_for(batch)
+        if linear_backend is not None:
+            linear_backend.prepare_metadata(batch)
         if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0][:: batch.rows_per_req].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=sample_args,

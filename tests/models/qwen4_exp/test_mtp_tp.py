@@ -533,7 +533,7 @@ def test_cross_rank_lockstep_in_draft_token_and_verify_step(monkeypatch):
             sampler=object(),
             stream=None,
         )
-        batch = SimpleNamespace(size=1, input_ids=torch.tensor([50, 101, 102], dtype=torch.int64), features=None)
+        batch = SimpleNamespace(size=1, rows_per_req=3, input_ids=torch.tensor([50, 101, 102], dtype=torch.int64), features=None)
         return sr.verify_step(batch, None)
 
     rec_v = SimpleNamespace(all_reduce=lambda t: (sent_verify.append(t.clone()), t)[1])
@@ -617,3 +617,80 @@ def test_sidecar_float_globs_cover_the_dense_draft_but_not_its_experts():
     dense += ["mtp.fc_embedding", "mtp.fc_hidden", "mtp.hyper_connection_mixer.input_mix_weight_down"]
     assert [n for n in dense if not hit(n)] == []
     assert not any(hit(f"mtp.layers.0.mlp.experts.0.{p}_proj") for p in ("gate", "up", "down"))
+
+
+def test_speculative_max_batch_size_picks_the_width_and_validates():
+    from freetoken.engine.config import EngineConfig
+    from freetoken.spec.runner import SpecRunner
+
+    # one rule for every rank's scheduler: k + 1 rows up to the limit, one row (no drafts) above it
+    cfg = SimpleNamespace(speculative_max_batch_size=2, decode_rows_per_req=4)
+    assert [EngineConfig.verify_rows_for(cfg, bs) for bs in (1, 2, 3, 8)] == [4, 4, 1, 1]
+    cfg.speculative_max_batch_size = None
+    assert EngineConfig.verify_rows_for(cfg, 8) == 4
+
+    import freetoken.spec.runner as runner_mod
+
+    stub = SimpleNamespace(adjust_config=lambda c, o: None, num_steps=lambda c: (3, 8))
+    orig = runner_mod.proposer_class
+    runner_mod.proposer_class = lambda c: stub
+    try:
+        def make(gate, algo="mtp"):
+            return SimpleNamespace(speculative_algorithm=algo, speculative_num_steps=2, max_running_req=8,
+                                   speculative_max_batch_size=gate)
+
+        c = make(2)
+        SpecRunner.adjust_config(c, lambda k, v: setattr(c, k, v))
+        assert c.speculative_max_batch_size == 2
+        c = make(8)  # >= max_running_req: never fires, so it is switched off
+        SpecRunner.adjust_config(c, lambda k, v: setattr(c, k, v))
+        assert c.speculative_max_batch_size is None
+        with pytest.raises(ValueError, match=">= 1"):
+            c = make(0)
+            SpecRunner.adjust_config(c, lambda k, v: setattr(c, k, v))
+        with pytest.raises(ValueError, match="mtp only"):
+            c = make(2, algo="dflash")
+            SpecRunner.adjust_config(c, lambda k, v: setattr(c, k, v))
+    finally:
+        runner_mod.proposer_class = orig
+
+
+def test_verify_step_of_a_no_draft_step(monkeypatch):
+    # past --speculative-max-batch-size: one row per request, no proposal, a [bs, 1] result through the narrower host
+    # slice, and post_verify still runs so the draft extends over the emitted token
+    import freetoken.spec.runner as runner_mod
+    from freetoken.spec.runner import SpecRunner
+
+    monkeypatch.setattr(runner_mod.torch.cuda, "Event", lambda: SimpleNamespace(record=lambda _s: None))
+    seen = {}
+
+    def fake_reject(logits, drafts, args, sampler):
+        seen["drafts"] = tuple(drafts.shape)
+        return torch.tensor([[7], [9]], dtype=torch.int64), torch.zeros(2, dtype=torch.int64)
+
+    monkeypatch.setattr(runner_mod, "reject", fake_reject)
+    sr = object.__new__(SpecRunner)
+    sr.k, sr._comm, sr._proposal = 3, None, None
+    sr._tp_info = DistributedInfo(0, 1)
+    sr._host = torch.zeros(4, sr.k + 2, dtype=torch.int64)
+    sr.feature_sink = lambda _b: None
+    posted = []
+    sr.proposer = SimpleNamespace(post_verify=lambda b, out, em: posted.append((b.rows_per_req, out.tolist(), em.tolist())))
+    sr.engine = SimpleNamespace(forward_logits=lambda _b: torch.zeros(2, 16), sampler=object(), stream=None)
+    batch = SimpleNamespace(size=2, rows_per_req=1, input_ids=torch.tensor([5, 6], dtype=torch.int64), features=None)
+
+    out = sr.verify_step(batch, None)
+
+    assert seen["drafts"] == (2, 0)
+    assert out.next_tokens_cpu.tolist() == [[7], [9]] and out.emitted_cpu.tolist() == [0, 0]
+    assert posted == [(1, [[7], [9]], [0, 0])]
+
+
+def test_reject_with_no_drafts_takes_the_target_token():
+    from freetoken.engine.sample import BatchSamplingArgs, Sampler
+    from freetoken.spec.rejection import reject
+
+    logits = torch.zeros(2, 16)
+    logits[0, 7] = logits[1, 9] = 5.0
+    out, emitted = reject(logits, torch.zeros(2, 0, dtype=torch.int64), BatchSamplingArgs(temperatures=None), Sampler(torch.device("cpu"), 16))
+    assert out.tolist() == [[7], [9]] and emitted.tolist() == [0, 0]

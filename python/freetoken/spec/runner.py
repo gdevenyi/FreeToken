@@ -63,6 +63,14 @@ class SpecRunner:
                 f"--speculative-num-steps must be in [1, {max_k}] for "
                 f"{config.speculative_algorithm}, got {config.speculative_num_steps}"
             )
+        gate = getattr(config, "speculative_max_batch_size", None)
+        if gate is not None:
+            if config.speculative_algorithm != "mtp":
+                raise ValueError("--speculative-max-batch-size is implemented for --speculative-algorithm mtp only")
+            if gate < 1:
+                raise ValueError(f"--speculative-max-batch-size must be >= 1, got {gate}")
+            if gate >= config.max_running_req:
+                override("speculative_max_batch_size", None)  # every batch drafts: the gate never fires
 
     @classmethod
     def prepare_target(cls, config, model) -> None:
@@ -94,8 +102,12 @@ class SpecRunner:
     def detach(self, *, keep_kv: bool) -> None:
         self.proposer.detach(keep_kv=keep_kv)
 
-    def capture_graphs(self, bs_list: List[int], pool) -> None:
-        self.proposer.capture_graphs(bs_list, pool)
+    def capture_graphs(self, bs_list: List[int], pool, rows_per_req: int | None = None) -> None:
+        """The draft's graphs next to the target's; ``rows_per_req`` 1 is the no-draft family of --speculative-max-batch-size."""
+        if rows_per_req is None:
+            self.proposer.capture_graphs(bs_list, pool)
+        else:
+            self.proposer.capture_graphs(bs_list, pool, rows_per_req=rows_per_req)
 
     def feature_sink(self, batch: Batch) -> FeatureSink | None:
         return self.proposer.feature_sink(batch)
@@ -113,13 +125,14 @@ class SpecRunner:
 
     def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput:
         engine = self.engine
-        bs, width = batch.size, self.k + 1
+        # k + 1, or 1 on a step past --speculative-max-batch-size (no drafts, no proposal)
+        bs, width = batch.size, batch.rows_per_req
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
         proposal, self._proposal = self._proposal, None
-        if proposal.draft_support_probs is not None:
+        if proposal is not None and proposal.draft_support_probs is not None:
             out, emitted = reject_with_draft_probs(
                 logits, drafts, proposal.draft_support_ids, proposal.draft_support_probs, sample_args, engine.sampler,
             )
@@ -131,7 +144,7 @@ class SpecRunner:
                 packed.zero_()
             packed = self._comm.all_reduce(packed)
             out, emitted = packed[:, :width], packed[:, width]
-        host = self._host[:bs]
+        host = self._host[:bs, : width + 1]
         host.copy_(packed, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(engine.stream)

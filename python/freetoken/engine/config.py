@@ -128,6 +128,9 @@ class EngineConfig:
     speculative_num_steps: int = 0
     speculative_draft_model_path: str | None = None
     speculative_token_map: str | None = None
+    # --speculative-max-batch-size: decode steps of more requests verify only the pending token (no drafts); the draft still
+    # runs over that token, so its KV and relay stay current. None drafts on every step.
+    speculative_max_batch_size: int | None = None
     # the proposer's states on the target's linear-state slots, resolved by _adjust_config
     spec_slot_states: tuple[SlotStateSpec, ...] = ()
     max_seq_len_override: int | None = None
@@ -242,6 +245,13 @@ class EngineConfig:
     def decode_rows_per_req(self) -> int:
         """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
         return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
+
+    def verify_rows_for(self, batch_size: int) -> int:
+        """Rows per request of a speculative decode step of ``batch_size`` requests: ``decode_rows_per_req``, or 1 (the
+        pending token alone, no drafts) past --speculative-max-batch-size. A function of the batch size only, so every TP
+        rank's scheduler, which sees the same batches, picks the same width."""
+        gate = self.speculative_max_batch_size
+        return 1 if gate is not None and batch_size > gate else self.decode_rows_per_req
 
     @property
     def slot_states(self) -> tuple[SlotStateSpec, ...]:

@@ -682,7 +682,9 @@ class PLELayer(BaseOP):
         bs = meta.state_slots.numel()
         rows = x.shape[0] // bs
         handler = get_global_ctx().linear_state_pool.verify_handler(PLE_CONV_STATE)
-        history = handler.history[self.layer_id][:bs]
+        # this step's rows only: a no-draft step (--speculative-max-batch-size) has fewer than the scratch holds, and the
+        # unfold below must yield one window per row
+        history = handler.history[self.layer_id][:bs, :, : self.state_len + rows]
         history[..., : self.state_len].copy_(self._read_state(meta, states, x.dtype))
         history[..., self.state_len :].copy_(x.view(bs, rows, -1).transpose(1, 2))
         # contiguous taps reduce in the order the decode taps do
@@ -780,7 +782,8 @@ class PLENgramVerify:
         """Stage a verify forward's context and input tokens; the forward itself leaves the live context as it was."""
         bs = meta.state_slots.numel()
         self.ids[:bs, : self.ctx_len].copy_(meta.ngram_context)
-        self.ids[:bs, self.ctx_len :].copy_(meta.input_ids.view(bs, -1))
+        rows = meta.input_ids.numel() // bs  # fewer than the scratch holds on a no-draft step
+        self.ids[:bs, self.ctx_len : self.ctx_len + rows].copy_(meta.input_ids.view(bs, rows))
 
     def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
         context = pool.slot_state(self.name)

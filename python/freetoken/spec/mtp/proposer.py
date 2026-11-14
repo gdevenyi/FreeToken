@@ -242,15 +242,22 @@ class MTPProposer(Proposer):
         with get_global_ctx().override(kv_cache=self.kv):
             self.extend_backend = create_attention_backend(fixed or ("fa" if "fa" in parts else "triton"), cfg)
             self.chain_backend = create_attention_backend(fixed or "triton", cfg)
+            # --speculative-max-batch-size: the one-row extend of a no-draft step has its own capture state
+            self.extend_backend_narrow = (
+                create_attention_backend(fixed or ("fa" if "fa" in parts else "triton"), cfg)
+                if getattr(self.config, "speculative_max_batch_size", None) is not None else None
+            )
+        self.extend_graphs_narrow = None
 
     def detach(self, *, keep_kv: bool) -> None:
-        if self.extend_graphs is not None:
-            self.extend_graphs.destroy_cuda_graphs()
-        self.extend_graphs = self.chain_graphs = None
+        for graphs in (self.extend_graphs, self.extend_graphs_narrow):
+            if graphs is not None:
+                graphs.destroy_cuda_graphs()
+        self.extend_graphs = self.chain_graphs = self.extend_graphs_narrow = None
         if not keep_kv:
             self.kv = None
         self.relay = self.verify_hidden = self.picked_rows = None
-        self.extend_backend = self.chain_backend = None
+        self.extend_backend = self.chain_backend = self.extend_backend_narrow = None
         self._prefill_state.clear()
         super().detach(keep_kv=keep_kv)
 
@@ -303,7 +310,7 @@ class MTPProposer(Proposer):
 
     # ------------------------------------------------------------------ one step
 
-    def capture_graphs(self, bs_list: List[int], pool) -> None:
+    def capture_graphs(self, bs_list: List[int], pool, rows_per_req: int | None = None) -> None:
         from freetoken.engine.graph import GraphRunner
 
         from .chain_graph import ChainGraphs
@@ -311,6 +318,25 @@ class MTPProposer(Proposer):
         if not bs_list:
             return
         ctx = self.ctx
+        if rows_per_req == 1:
+            # the one-row extend of the no-draft steps past --speculative-max-batch-size: no chain, nothing to propose
+            self.extend_graphs_narrow = GraphRunner(
+                stream=ctx.stream,
+                device=ctx.device,
+                forward=lambda: self._extend_forward(1),
+                attn_backend=self.extend_backend_narrow,
+                cuda_graph_bs=bs_list,
+                cuda_graph_max_bs=max(bs_list),
+                free_memory=0,
+                max_seq_len=ctx.page_table.shape[1],
+                dummy_req=ctx.dummy_req,
+                mrope=self.mrope,
+                rows_per_req=1,
+                phase="verify",
+                ctx_override=dict(kv_cache=self.kv, attn_backend=self.extend_backend_narrow, hide_target_state=True),
+                pool=pool,
+            )
+            return
         self.extend_graphs = GraphRunner(
             stream=ctx.stream,
             device=ctx.device,
@@ -353,17 +379,21 @@ class MTPProposer(Proposer):
         self._prefill_sink = _PrefillSink([(r.cached_len, r.device_len) for r in batch.reqs])
         return self._prefill_sink
 
-    def _extend_forward(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Draft hiddens of a verify-shaped batch; returns each request's row at its last accepted position and that row's argmax."""
+    def _extend_forward(self, width: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft hiddens of a verify-shaped batch of ``width`` rows per request (k + 1 by default); returns each request's row at its last accepted position and that row's argmax."""
         input_ids = get_global_ctx().batch.input_ids
         n = input_ids.shape[0]
         hidden = self.draft.forward_hidden(self.draft.embed_tokens.forward(input_ids), self.verify_hidden[:n])
-        picked = hidden[self.picked_rows[: n // (self.k + 1)]]
+        picked = hidden[self.picked_rows[: n // (width or self.k + 1)]]
         return picked, self._draft_token(picked)
 
     def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:
-        """Redraft positions C..C+k from the target's verify hiddens, then relay each request's row at its last accepted position."""
-        k1 = self.k + 1
+        """Redraft positions C..C+k from the target's verify hiddens, then relay each request's row at its last accepted position.
+        A no-draft step (one row per request) runs the draft over its one emitted token, so the draft stays current."""
+        k1 = batch.rows_per_req
+        narrow = k1 == 1 and self.k > 0
+        backend = self.extend_backend_narrow if narrow and self.extend_backend_narrow is not None else self.extend_backend
+        graphs = self.extend_graphs_narrow if narrow else self.extend_graphs
         bs, padded = batch.size, batch.padded_size
         tokens = torch.zeros(padded, k1, dtype=torch.int64, device=self.device)
         tokens[:bs] = out
@@ -376,13 +406,12 @@ class MTPProposer(Proposer):
         draft.out_loc = batch.out_loc
         draft.active_table_idx = batch.active_table_idx
         self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
-        self.extend_backend.prepare_metadata(draft)
-        graphs = self.extend_graphs
+        backend.prepare_metadata(draft)
         if graphs is not None and graphs.can_use_cuda_graph(draft) and padded in graphs.graph_map:
             picked, d1 = graphs.replay(draft)
         else:
-            with get_global_ctx().forward_batch(draft, kv_cache=self.kv, attn_backend=self.extend_backend, hide_target_state=True):
-                picked, d1 = self._extend_forward()
+            with get_global_ctx().forward_batch(draft, kv_cache=self.kv, attn_backend=backend, hide_target_state=True):
+                picked, d1 = self._extend_forward(k1)
             picked, d1 = picked[:bs], d1[:bs]
         table = make_device_tensor([r.table_idx for r in batch.reqs], torch.int64, self.device)
         self.relay.hidden[table] = picked

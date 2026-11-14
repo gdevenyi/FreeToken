@@ -685,6 +685,60 @@ def test_verify_commit_matches_stepwise_decode(accepted):
     assert torch.equal(conv[others], conv0[others]) and torch.equal(context[others], context0[others])
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+def test_one_row_verify_on_a_wider_scratch_matches_a_decode_step(device):
+    """A no-draft verify step (--speculative-max-batch-size) writes one row per request into a scratch sized for k+1:
+    its conv output, and the PLE state its commit leaves, are one decode step's."""
+    from freetoken.attention.linear import FLAMetadata
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.qwen4_exp.config import PLE_CONV_STATE, PLE_NGRAM_STATE
+
+    torch.manual_seed(23)
+    config = _config()
+    args = config.qwen4_args
+    device = torch.device(device)
+    layer = _make_layer(config, device=device.type)
+    pool = LinearStatePool(config.linear_attention_group(), 6, torch.float32, device, tp_size=1, slot_states=config.slot_states)
+    fresh_ctx(linear_state_pool=pool)
+    slots = [3, 1]
+    bs = len(slots)
+    conv = pool.slot_state(PLE_CONV_STATE, layer.layer_id)
+    context = pool.slot_state(PLE_NGRAM_STATE)
+    conv.copy_(torch.randn_like(conv))
+    context.copy_(torch.randint(8, VOCAB, context.shape, device=device, dtype=context.dtype))
+    conv0, context0 = conv.clone(), context.clone()
+    tokens = torch.tensor([11, 14], dtype=torch.int32, device=device)
+    x = torch.randn(bs, args.ple_state_width, device=device)
+    slot_ids = torch.tensor(slots, dtype=torch.int32, device=device)
+
+    def batch(phase):
+        reqs = [Req(input_ids=torch.zeros(9, dtype=torch.int32), table_idx=slot, cached_len=8, output_len=8,
+                    uid=i, sampling_params=SamplingParams(), cache_handle=None) for i, slot in enumerate(slots)]
+        b = Batch(reqs=reqs, phase=phase, rows_per_req=1)
+        b.padded_reqs, b.input_ids = reqs, tokens
+        b.fla_metadata = FLAMetadata(cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device), cache_indices=slot_ids)
+        return b
+
+    meta = build_ple_metadata(batch("decode"), args, device)
+    want = layer._short_conv(x, meta, conv)
+    commit_ngram_context(meta, None)
+    conv1, context1 = conv.clone(), context.clone()
+    conv.copy_(conv0)
+    context.copy_(context0)
+
+    pool.attach_verify_scratch(bs, 4)  # sized for k+1 = 4 rows, this step fills one
+    meta = build_ple_metadata(batch("verify"), args, device)
+    got = layer._short_conv(x, meta, conv)
+    pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+    assert torch.equal(conv, conv0) and torch.equal(context, context0)
+    assert torch.equal(got, want)
+    counts = torch.ones(bs, dtype=torch.int64, device=device)
+    for name in (PLE_CONV_STATE, PLE_NGRAM_STATE):
+        pool.verify_handler(name).commit(pool, slot_ids.long(), counts)
+    assert torch.equal(conv[slots], conv1[slots]) and torch.equal(context[slots], context1[slots])
+
+
 # --------------------------------------------------------------------------------------
 # CUDA graph + prefetch overlap
 # --------------------------------------------------------------------------------------
