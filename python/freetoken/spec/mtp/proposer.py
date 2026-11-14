@@ -124,6 +124,8 @@ def read_token_map(path: str, vocab_size: int) -> torch.Tensor:
 
 class MTPProposer(Proposer):
     radix_lookahead = True
+    # --speculative-max-batch-size: post_verify and capture_graphs take one-row (no-draft) verify steps
+    one_row_verify = True
 
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
@@ -384,6 +386,10 @@ class MTPProposer(Proposer):
         input_ids = get_global_ctx().batch.input_ids
         n = input_ids.shape[0]
         hidden = self.draft.forward_hidden(self.draft.embed_tokens.forward(input_ids), self.verify_hidden[:n])
+        if width == 1:
+            # no drafts: each request's only row is its last accepted one. picked_rows holds k + 1 strides (attach(),
+            # earlier steps) that index past these n rows, at capture and in a padded replay's tail.
+            return hidden, self._draft_token(hidden)
         picked = hidden[self.picked_rows[: n // (width or self.k + 1)]]
         return picked, self._draft_token(picked)
 
@@ -405,7 +411,8 @@ class MTPProposer(Proposer):
         draft.mrope_positions = batch.mrope_positions
         draft.out_loc = batch.out_loc
         draft.active_table_idx = batch.active_table_idx
-        self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
+        if not narrow:
+            self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
         backend.prepare_metadata(draft)
         if graphs is not None and graphs.can_use_cuda_graph(draft) and padded in graphs.graph_map:
             picked, d1 = graphs.replay(draft)

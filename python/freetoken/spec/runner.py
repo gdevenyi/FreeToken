@@ -65,8 +65,12 @@ class SpecRunner:
             )
         gate = getattr(config, "speculative_max_batch_size", None)
         if gate is not None:
-            if config.speculative_algorithm != "mtp":
-                raise ValueError("--speculative-max-batch-size is implemented for --speculative-algorithm mtp only")
+            if not getattr(proposer_cls, "one_row_verify", False):
+                # the mtp name can resolve to another proposer (a family's spec_drafts), e.g. SharedKVMTPProposer
+                raise ValueError(
+                    "--speculative-max-batch-size needs a draft that extends one row per request (MTPProposer); "
+                    f"{proposer_cls.__name__} does not"
+                )
             if gate < 1:
                 raise ValueError(f"--speculative-max-batch-size must be >= 1, got {gate}")
             if gate >= config.max_running_req:
@@ -145,7 +149,9 @@ class SpecRunner:
                 packed.zero_()
             packed = self._comm.all_reduce(packed)
             out, emitted = packed[:, :width], packed[:, width]
-        host = self._host[:bs, : width + 1]
+        # one contiguous block of the pinned buffer: a strided slice (width < k + 1) would make the non-blocking copy go
+        # through a pageable temporary and block the host
+        host = self._host.view(-1)[: bs * (width + 1)].view(bs, width + 1)
         host.copy_(packed, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(engine.stream)

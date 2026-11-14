@@ -1498,8 +1498,12 @@ class Engine:
             bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
             if bs <= config.max_running_req
         ]
-        main = self._make_graph_runner([bs for bs in all_bs if bs <= gate] or [1], free_memory, max_seq_len)
-        narrow_bs = [bs for bs in all_bs if bs > gate]
+        main_bs, narrow_bs = [bs for bs in all_bs if bs <= gate], [bs for bs in all_bs if bs > gate]
+        if narrow_bs and gate not in main_bs:
+            # the limit keeps a graph: under a limit of 3, a batch of 3 still verifies k + 1 rows and would run eagerly
+            main_bs.append(gate)
+        # empty only when graphs are off (all_bs empty): an empty list keeps them off
+        main = self._make_graph_runner(main_bs, free_memory, max_seq_len)
         if not narrow_bs:
             return main, None
         narrow = GraphRunner(

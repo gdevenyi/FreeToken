@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
-import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
 
 import freetoken.distributed.info as dist_info
+from freetoken.core import Batch
 from freetoken.distributed import DistributedInfo
 from freetoken.kvcache.format import NONE
 from freetoken.layers import ParallelLMHead, rotary, set_rope_device
@@ -21,7 +21,7 @@ from freetoken.layers.fp8_dynamic import E4M3_MAX, FP8, Fp8ParallelLMHead
 from freetoken.layers.quantization import NameMap, QuantConfig, set_quant_config
 from freetoken.models.loader import shard_tensor
 from freetoken.models.qwen4_exp.config import parse_config
-from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPDraft, draft_config
+from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPDraft
 from freetoken.models.register import get_model_spec
 from freetoken.spec.mtp.proposer import MTPProposer, with_resident_moe
 from freetoken.spec.proposer import SpecProposal
@@ -631,7 +631,11 @@ def test_speculative_max_batch_size_picks_the_width_and_validates():
 
     import freetoken.spec.runner as runner_mod
 
-    stub = SimpleNamespace(adjust_config=lambda c, o: None, num_steps=lambda c: (3, 8))
+    from freetoken.spec.mtp.shared_proposer import SharedKVMTPProposer
+
+    # the mtp name can resolve to SharedKVMTPProposer, whose post_verify and capture_graphs assume k + 1 rows
+    assert MTPProposer.one_row_verify and not getattr(SharedKVMTPProposer, "one_row_verify", False)
+    stub = SimpleNamespace(adjust_config=lambda c, o: None, num_steps=lambda c: (3, 8), one_row_verify=True)
     orig = runner_mod.proposer_class
     runner_mod.proposer_class = lambda c: stub
     try:
@@ -648,8 +652,9 @@ def test_speculative_max_batch_size_picks_the_width_and_validates():
         with pytest.raises(ValueError, match=">= 1"):
             c = make(0)
             SpecRunner.adjust_config(c, lambda k, v: setattr(c, k, v))
-        with pytest.raises(ValueError, match="mtp only"):
-            c = make(2, algo="dflash")
+        stub.one_row_verify, stub.__name__ = False, "SharedKVMTPProposer"
+        with pytest.raises(ValueError, match="one row per request"):
+            c = make(2)
             SpecRunner.adjust_config(c, lambda k, v: setattr(c, k, v))
     finally:
         runner_mod.proposer_class = orig
@@ -684,6 +689,10 @@ def test_verify_step_of_a_no_draft_step(monkeypatch):
     assert seen["drafts"] == (2, 0)
     assert out.next_tokens_cpu.tolist() == [[7], [9]] and out.emitted_cpu.tolist() == [0, 0]
     assert posted == [(1, [[7], [9]], [0, 0])]
+    # the D2H destination is one contiguous block of the pinned buffer: a strided slice of it would make the
+    # non-blocking copy go through a pageable temporary, which blocks the host until the step is done
+    assert out.emitted_cpu.stride() == (2,)
+    assert out.emitted_cpu.untyped_storage().data_ptr() == sr._host.untyped_storage().data_ptr()
 
 
 def test_reject_with_no_drafts_takes_the_target_token():
@@ -694,3 +703,110 @@ def test_reject_with_no_drafts_takes_the_target_token():
     logits[0, 7] = logits[1, 9] = 5.0
     out, emitted = reject(logits, torch.zeros(2, 0, dtype=torch.int64), BatchSamplingArgs(temperatures=None), Sampler(torch.device("cpu"), 16))
     assert out.tolist() == [[7], [9]] and emitted.tolist() == [0, 0]
+
+
+class _FakeForwardCtx:
+    batch = None
+
+    @contextlib.contextmanager
+    def forward_batch(self, batch, **_):
+        self.batch = batch
+        yield
+
+
+def _one_row_proposer(monkeypatch, k=3, rows=9, width=4):
+    # an MTPProposer as attach() leaves it, with a draft whose hidden row is its input token: picked rows read back as tokens
+    import freetoken.spec.mtp.proposer as prop
+
+    fctx = _FakeForwardCtx()
+    monkeypatch.setattr(prop, "get_global_ctx", lambda: fctx)
+    p = object.__new__(MTPProposer)
+    p.k, p.device, p.kv, p.mrope = k, torch.device("cpu"), None, False
+    p.extend_backend = p.extend_backend_narrow = SimpleNamespace(prepare_metadata=lambda _b: None)
+    p.extend_graphs = p.extend_graphs_narrow = None
+    p.picked_rows = torch.arange(rows, dtype=torch.int64) * (k + 1)
+    p.verify_hidden = torch.zeros(rows * (k + 1), width)
+    p.relay = SimpleNamespace(hidden=torch.zeros(rows, width), d1=torch.zeros(rows, dtype=torch.int64))
+    p.draft = SimpleNamespace(
+        embed_tokens=SimpleNamespace(forward=lambda ids: ids.float().unsqueeze(1).expand(-1, width)),
+        forward_hidden=lambda embeds, _hidden: embeds,
+    )
+    p._draft_token = lambda picked: picked[:, 0].long()
+    return p, fctx
+
+
+def test_one_row_post_verify_gathers_inside_a_padded_batch(monkeypatch):
+    # a no-draft step of 3 requests padded to 4 has 4 draft hidden rows, while attach() (and any k + 1-row step) leaves
+    # k + 1 strides in picked_rows, which index past them. Red if the one-row extend gathers through picked_rows.
+    p, _ = _one_row_proposer(monkeypatch)
+    reqs = [SimpleNamespace(cached_len=10 + i, device_len=11 + i, table_idx=t) for i, t in enumerate([5, 2, 7])]
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=1)
+    batch.padded_reqs = reqs + [SimpleNamespace(cached_len=0, device_len=1, table_idx=8)]
+    batch.positions, batch.out_loc = torch.zeros(4, dtype=torch.int64), None
+
+    p.post_verify(batch, torch.tensor([[21], [22], [23]]), torch.zeros(3, dtype=torch.int64))
+
+    assert p.relay.d1[[5, 2, 7]].tolist() == [21, 22, 23]
+    assert p.relay.hidden[[5, 2, 7], 0].tolist() == [21.0, 22.0, 23.0]
+
+
+def test_one_row_draft_graph_capture_gathers_inside_its_batch(monkeypatch):
+    # capturing the one-row extend graph of bs requests forwards bs rows; attach() left picked_rows at arange * (k + 1),
+    # which indexes past them. Red if the one-row extend gathers through picked_rows.
+    import freetoken.engine.graph as graph_mod
+
+    p, fctx = _one_row_proposer(monkeypatch)
+    p.ctx = SimpleNamespace(stream=None, device=p.device, page_table=torch.zeros(9, 64), dummy_req=None, dummy_req_narrow=None)
+    captured = []
+
+    class _CapturingRunner:
+        def __init__(self, *, forward, cuda_graph_bs, rows_per_req, **_):
+            for bs in cuda_graph_bs:
+                fctx.batch = SimpleNamespace(input_ids=torch.arange(bs * rows_per_req, dtype=torch.int64))
+                captured.append((bs, forward()[1].tolist()))
+
+    monkeypatch.setattr(graph_mod, "GraphRunner", _CapturingRunner)
+    p.capture_graphs([4, 8], pool=None, rows_per_req=1)
+
+    assert captured == [(4, [0, 1, 2, 3]), (8, list(range(8)))]
+
+
+@pytest.mark.parametrize(
+    ("max_bs", "gate", "main", "narrow"),
+    [
+        (8, 1, [1], [2, 4, 8]), (8, 3, [1, 2, 3], [4, 8]), (8, 4, [1, 2, 4], [8]), (8, 6, [1, 2, 4, 6], [8]),
+        (8, 8, [1, 2, 4, 8], None), (0, 2, [], None),
+    ],
+)
+def test_verify_graph_sizes_split_at_the_limit_and_keep_a_graph_for_it(monkeypatch, max_bs, gate, main, narrow):
+    # --cuda-graph-max-bs 8 captures 1, 2, 4, 8. Under a limit of 3 a batch of 3 still verifies k + 1 rows; without a
+    # size-3 graph it would run eagerly (max_graph_bs 2). Red if the limit is not added to the k + 1-row sizes.
+    # With graphs off (max 0, or the CPU-MoE safety switch) the limit must not capture any graph.
+    import freetoken.engine.engine as engine_mod
+
+    made = {}
+
+    class _Runner:
+        def __init__(self, *, cuda_graph_bs, rows_per_req, **_):
+            made["narrow"], made["narrow_rows"] = list(cuda_graph_bs), rows_per_req
+            self.graph_bs_list, self.graph_pool = sorted(cuda_graph_bs), None
+
+    monkeypatch.setattr(engine_mod, "GraphRunner", _Runner)
+    eng = object.__new__(engine_mod.Engine)
+    eng.config = SimpleNamespace(
+        speculative_max_batch_size=gate, cuda_graph_max_bs=max_bs, max_running_req=16,
+        model_config=SimpleNamespace(model_is_mrope=False),
+    )
+    eng.spec = SimpleNamespace(capture_graphs=lambda bs, pool, rows_per_req=None: made.setdefault("draft", (bs, rows_per_req)))
+    eng.stream = eng.device = eng.model = eng.attn_backend_narrow = eng.linear_backend_narrow = None
+    eng.dummy_req_narrow = eng.moe_offload_cache = eng._prepare_verify_batch = None
+    eng.model = SimpleNamespace(forward=None)
+    eng._make_graph_runner = lambda bs, _free, _len: made.setdefault("main", list(bs)) and SimpleNamespace(graph_pool=None)
+
+    _, narrow_runner = eng._make_graph_runners(None, 0, 4096)
+
+    assert made["main"] == main
+    if narrow is None:
+        assert narrow_runner is None and "narrow" not in made
+    else:
+        assert made["narrow"] == narrow and made["narrow_rows"] == 1 and made["draft"] == (narrow, 1)
