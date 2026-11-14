@@ -1,10 +1,13 @@
 """Qwen3.8-Flash-Next from a llama.cpp ``qwen4exp`` GGUF: config from the GGUF metadata, tensor names, and the converter's transforms undone.
 
 The llama.cpp converter (conversion/qwen.py, conversion/qwen4exp.py) stores every zero-centred norm as ``w + 1``, ``A_log`` as ``-exp(A_log)``, the squeezed conv kernels, the indexer projection split into q and k, and the GDN value heads in tiled order (k-head minor). Row reorders are undone on the packed bytes; ``ssm_out`` keeps its tiled columns and the GDN layer permutes its input instead (``Qwen4ExpArgs.gdn_out_heads_tiled``).
+
+With :func:`gguf_float_dense` the dense projections load dequantized to bf16 in the safetensors reader's layout (``ssm_out`` columns untiled too) and go through its TP shard and load-time FP8 (``weight.dense_emitter``); only the routed experts and the PLE table stay packed ggml. TP > 1 needs it.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from types import SimpleNamespace
@@ -15,7 +18,8 @@ import torch
 from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.mmproj import find_mmproj, log_mmproj
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
+from freetoken.models.config import fp8_dense_enabled, fp8_lmhead_enabled
+from freetoken.models.gguf.tensors import check_scales, dequantized_tensor, float_tensor, fused, matrix
 from freetoken.models.qwen3_vl.gguf import gguf_mm_config, iter_mmproj_weights
 
 from .config import parse_config
@@ -83,6 +87,26 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     if m is None:
         return ()
     return tuple(f"blk.{m.group(1)}.{leaf}" for leaf in _LAYER_LEAVES.get(m.group(2), ()))
+
+
+# checkpoint-name globs of every dense module: all but the routed experts and the PLE table (ple_embedding)
+_FLOAT_DENSE_MODULES = (
+    "*embed_tokens", "lm_head", "*hyper_connection*", "*.self_attn", "*.linear_attn",
+    "*.mlp.gate", "*.shared_expert", "*.shared_expert_gate", "*.ple.key_proj", "*.ple.value_proj",
+)
+
+
+def gguf_float_dense() -> bool:
+    """Whether the dense projections load as bf16 instead of packed ggml rows: the TP shard and load-time FP8 run on
+    float rows. On with FREETOKEN_FP8_DENSE / FREETOKEN_FP8_LMHEAD, or FREETOKEN_GGUF_FLOAT_DENSE=1. An env switch, not
+    the TP size, so the builder (QuantConfig, parsed before TP is set) and the reader always get one answer."""
+    forced = os.getenv("FREETOKEN_GGUF_FLOAT_DENSE", "0").strip().lower() in ("1", "true", "yes", "on")
+    return forced or fp8_dense_enabled() or fp8_lmhead_enabled()
+
+
+def gguf_float_modules() -> tuple[str, ...]:
+    """``ModelSpec.gguf_float_modules``: the modules the builder makes float, so the GGUF QuantConfig gives them no scheme."""
+    return _FLOAT_DENSE_MODULES if gguf_float_dense() else ()
 
 
 def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
@@ -158,7 +182,8 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         vision_config=getattr(shim, "vision_config", None),
     )
     config = parse_config(hf_like)
-    return replace(config, expert_quant="gguf", qwen4_args=replace(config.qwen4_args, gdn_out_heads_tiled=True))
+    tiled = not gguf_float_dense()  # the float reader untiles ssm_out's columns
+    return replace(config, expert_quant="gguf", qwen4_args=replace(config.qwen4_args, gdn_out_heads_tiled=tiled))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -184,9 +209,35 @@ def iter_gguf_weights(
     """The dense state dict from the GGUF; the routed experts load as offload banks (``freetoken.models.gguf.experts``)."""
     if not include_non_moe:
         return
+    from freetoken.distributed import try_get_tp_info
+    from freetoken.layers.quantization import get_quant_config
     from freetoken.utils import cached_load_hf_config
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    tp = try_get_tp_info()
+    rank, world = (0, 1) if tp is None else (tp.rank, tp.size)
+    float_dense = gguf_float_dense()
+    if world > 1 and not float_dense:
+        raise ValueError(
+            "a qwen4exp GGUF at --tp-size > 1 shards its dense projections as floats: "
+            "set FREETOKEN_FP8_DENSE=1 (load-time FP8, as the safetensors path) or FREETOKEN_GGUF_FLOAT_DENSE=1 (bf16)"
+        )
+    if float_dense:
+        from .weight import dense_emitter
+
+        emit, _, _ = dense_emitter(replace(config, quant=get_quant_config()), rank, world)
+    else:
+        def emit(name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+            yield name, tensor
+
+    for name, tensor in _iter_gguf_dense(model_path, config, float_dense, include_vision):
+        yield from emit(name, tensor)
+
+
+def _iter_gguf_dense(model_path: str, config: ModelConfig, float_dense: bool, include_vision: bool) -> Iterator[tuple[str, torch.Tensor]]:
+    """Unsharded dense tensors: packed ggml rows per ggml-type run, or with ``float_dense`` bf16 in the safetensors layout."""
+    from freetoken.utils import cached_load_hf_config
+
     vision = include_vision and config.is_multimodal
     log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)
@@ -200,18 +251,25 @@ def iter_gguf_weights(
     def norm(name: str) -> torch.Tensor:
         return float_tensor(t(name)).float() - 1.0
 
+    def mat(info: GgufTensorInfo) -> torch.Tensor:
+        return dequantized_tensor(info).to(torch.bfloat16) if float_dense and is_quantized(info.ggml_type) else matrix(info)
+
+    def fz(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k: int, pad_to: int = 0):
+        # no infos: fused takes every part as a float row block
+        return fused(prefix, [] if float_dense else infos, parts, k, pad_to=pad_to)
+
     def hc(prefix: str, src: str) -> Iterator[tuple[str, torch.Tensor]]:
         down, inject, up = (t(f"{src}_{p}") for p in ("down", "inject", "up"))
-        yield from fused(f"{prefix}.input_mix_weight_down_block_inject", [down, inject], [matrix(down), matrix(inject)],
-                         hidden * config.qwen4_args.hc_count, pad_to=16)
-        yield from fused(f"{prefix}.input_mix_weight_up", [up], [matrix(up)], config.qwen4_args.hc_lowrank)
+        yield from fz(f"{prefix}.input_mix_weight_down_block_inject", [down, inject], [mat(down), mat(inject)],
+                      hidden * config.qwen4_args.hc_count, pad_to=16)
+        yield from fz(f"{prefix}.input_mix_weight_up", [up], [mat(up)], config.qwen4_args.hc_lowrank)
         yield f"{prefix}.hc_norm.weight", norm(f"{src}_norm")
 
-    yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
-    yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
+    yield from fz("model.embed_tokens", [t("token_embd")], [mat(t("token_embd"))], hidden)
+    yield from fz("lm_head", [t("output")], [mat(t("output"))], hidden)
     for proj, k in (("down", hidden * config.qwen4_args.hc_count), ("up", config.qwen4_args.hc_lowrank)):
         info = t(f"output_hc_{proj}")
-        yield from fused(f"model.hyper_connection_mixer.input_mix_weight_{proj}", [info], [matrix(info)], k)
+        yield from fz(f"model.hyper_connection_mixer.input_mix_weight_{proj}", [info], [mat(info)], k)
     yield "model.hyper_connection_mixer.hc_norm.weight", norm("output_hc_norm")
 
     for layer in range(config.num_layers):
@@ -220,42 +278,47 @@ def iter_gguf_weights(
             la = f"{pre}.linear_attn"
             nk, dk = g.num_key_heads, g.key_head_dim
             qkv, gate = t(f"{blk}.attn_qkv"), t(f"{blk}.attn_gate")
-            qkv_rows = matrix(qkv)
+            qkv_rows = mat(qkv)
             v_start = 2 * nk * dk
             qkv_rows = torch.cat([qkv_rows[:v_start], _untile(qkv_rows[v_start:], nk, g.value_head_dim)])
-            z_rows = _untile(matrix(gate), nk, g.value_head_dim)
+            z_rows = _untile(mat(gate), nk, g.value_head_dim)
             beta_info, alpha_info = t(f"{blk}.ssm_beta"), t(f"{blk}.ssm_alpha")
-            beta, alpha = (_untile(matrix(i), nk, 1) for i in (beta_info, alpha_info))
-            if is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type):
+            beta, alpha = (_untile(mat(i), nk, 1) for i in (beta_info, alpha_info))
+            if not float_dense and (is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type)):
                 yield from fused(f"{la}.in_proj_qkvz", [qkv, gate], [qkv_rows, z_rows], hidden)
                 yield from fused(f"{la}.in_proj_ba", [beta_info, alpha_info], [beta, alpha], hidden)
             else:
-                yield from fused(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
+                yield from fz(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
             conv = float_tensor(t(f"{blk}.ssm_conv1d")).float()
             conv = torch.cat([conv[:v_start], _untile(conv[v_start:], nk, g.value_head_dim)])
             yield f"{la}.conv1d.weight", conv.unsqueeze(1)
             yield f"{la}.dt_bias", _untile(float_tensor(t(f"{blk}.ssm_dt.bias")).float(), nk, 1)
             yield f"{la}.A_log", _untile(torch.log(-float_tensor(t(f"{blk}.ssm_a")).float()), nk, 1)
             yield f"{la}.norm.weight", float_tensor(t(f"{blk}.ssm_norm"))
-            yield from fused(f"{la}.out_proj", [t(f"{blk}.ssm_out")], [matrix(t(f"{blk}.ssm_out"))], g.num_value_heads * g.value_head_dim)
+            out_info = t(f"{blk}.ssm_out")
+            out = mat(out_info)
+            if float_dense:
+                # the row-parallel shard and the untiled GDN forward both want grouped value-head columns
+                out = _untile(out, nk, g.value_head_dim, dim=1)
+            yield from fz(f"{la}.out_proj", [out_info], [out], g.num_value_heads * g.value_head_dim)
         else:
             sa = f"{pre}.self_attn"
             parts = [t(f"{blk}.attn_{p}") for p in ("q", "k", "v")]
-            yield from fused(f"{sa}.qkv_proj", parts, [matrix(p) for p in parts], hidden)
+            yield from fz(f"{sa}.qkv_proj", parts, [mat(p) for p in parts], hidden)
             out = t(f"{blk}.attn_output")
-            yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
+            yield from fz(f"{sa}.o_proj", [out], [mat(out)], int(out.ne[0]))
             yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
             yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
             iq, ik = t(f"{blk}.indexer.q_proj"), t(f"{blk}.indexer.k_proj")
-            yield from fused(f"{sa}.indexer.index_qk_proj", [iq, ik], [matrix(iq), matrix(ik)], hidden)
+            yield from fz(f"{sa}.indexer.index_qk_proj", [iq, ik], [mat(iq), mat(ik)], hidden)
             yield f"{sa}.indexer.q_layernorm.weight", norm(f"{blk}.indexer.q_norm")
             yield f"{sa}.indexer.k_layernorm.weight", norm(f"{blk}.indexer.k_norm")
 
         mlp = f"{pre}.mlp"
         yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
         sg, su, sd = (t(f"{blk}.ffn_{p}_shexp") for p in ("gate", "up", "down"))
-        yield from fused(f"{mlp}.shared_expert.gate_up_proj", [sg, su], [matrix(sg), matrix(su)], hidden)
-        yield from fused(f"{mlp}.shared_expert.down_proj", [sd], [matrix(sd)], config.shared_expert_intermediate_size)
+        yield from fz(f"{mlp}.shared_expert.gate_up_proj", [sg, su], [mat(sg), mat(su)], hidden)
+        yield from fz(f"{mlp}.shared_expert.down_proj", [sd], [mat(sd)], config.shared_expert_intermediate_size)
         yield f"{mlp}.shared_expert_gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp_shexp")).reshape(1, -1)
         yield from hc(f"{pre}.attn_hyper_connection", f"{blk}.hc_attn")
         yield from hc(f"{pre}.mlp_hyper_connection", f"{blk}.hc_ffn")
@@ -264,7 +327,7 @@ def iter_gguf_weights(
             ple = f"{pre}.ple"
             for proj in ("key", "value"):
                 info = t(f"{blk}.ple_{proj}")
-                yield from fused(f"{ple}.{proj}_proj", [info], [matrix(info)], config.qwen4_args.ple_embed_dim)
+                yield from fz(f"{ple}.{proj}_proj", [info], [mat(info)], config.qwen4_args.ple_embed_dim)
             for n in ("key", "query", "conv"):
                 yield f"{ple}.norm_{n}.weight", norm(f"{blk}.ple_norm_{n}")
             yield f"{ple}.conv1d.weight", float_tensor(t(f"{blk}.ple_conv1d")).float().unsqueeze(1)
@@ -280,4 +343,4 @@ def ple_table_info(model_path: str) -> GgufTensorInfo:
     return gguf_tensor_index(model_path)["per_layer_token_embd.weight"]
 
 
-__all__ = ["gguf_mm_config", "iter_gguf_weights", "parse_gguf_config", "ple_table_info", "to_gguf"]
+__all__ = ["gguf_float_dense", "gguf_float_modules", "gguf_mm_config", "iter_gguf_weights", "parse_gguf_config", "ple_table_info", "to_gguf"]

@@ -36,6 +36,8 @@ class ModelSpec:
     encoders: tuple[EncoderSpec, ...] = ()
     # speculative method -> "module:Class" of the family's draft for it
     spec_drafts: tuple[tuple[str, str], ...] = ()
+    # GGUF family: module attribute ``() -> tuple[str, ...]`` naming the checkpoint globs that load as floats, not packed ggml
+    gguf_float_modules: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -389,6 +391,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         spec_drafts=_QWEN4_EXP_DRAFTS,
+        gguf_float_modules="gguf_float_modules",
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
@@ -593,7 +596,10 @@ def checkpoint_quant_config(
         from freetoken.models.gguf.reader import gguf_tensor_index
 
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
-        quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+        unquantized = spec.unquantized_modules
+        if spec.gguf_float_modules is not None:
+            unquantized += _load_attr(spec.module, spec.gguf_float_modules)()
+        quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=unquantized)
     else:
         quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
     return quant.with_online(QuantKind(online), online_modules) if online else quant

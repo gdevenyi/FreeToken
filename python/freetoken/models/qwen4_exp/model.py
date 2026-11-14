@@ -233,8 +233,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.forward_host_ctx = disk_table.forward_host_ctx
             return 0
 
+        from freetoken.models.gguf.reader import is_gguf_path
+
         from .weight import load_ple_table
 
+        if is_gguf_path(engine_config.model_path):
+            raise ValueError("--ple-backend pinned preloads safetensors PLE shards; a GGUF serves its packed table with --ple-backend disk")
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
