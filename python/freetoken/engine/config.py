@@ -142,6 +142,20 @@ class EngineConfig:
     def kv_format(self) -> KVFormat:
         return resolve_kv_format(self.kv_cache_dtype)
 
+    def _check_gguf_tp(self) -> None:
+        """A qwen4exp GGUF shards its dense layers only as floats: refuse TP > 1 without the switch now, not after the model build."""
+        from freetoken.models.gguf.reader import gguf_architecture, is_gguf_path
+
+        if self.tp_info.size <= 1 or not is_gguf_path(self.model_path) or gguf_architecture(self.model_path) != "qwen4exp":
+            return
+        from freetoken.models.qwen4_exp.gguf import gguf_float_dense
+
+        if not gguf_float_dense():
+            raise ValueError(
+                "a qwen4exp GGUF at --tp-size > 1 shards its dense projections as floats: set FREETOKEN_GGUF_FLOAT_DENSE=1 "
+                "(bf16; add FREETOKEN_FP8_DENSE=1 / FREETOKEN_FP8_LMHEAD=1 for load-time FP8)"
+            )
+
     def __post_init__(self):
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
@@ -161,6 +175,7 @@ class EngineConfig:
             from freetoken.models.qwen4_exp.gguf import check_ple_table
 
             check_ple_table(self.ple_table)
+        self._check_gguf_tp()
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

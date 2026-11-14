@@ -135,8 +135,8 @@ def _check_sidecar(path: str, target_path: str) -> None:
         target_width = getattr(getattr(hf, "text_config", hf), "hidden_size", None)
     if width is not None and target_width is not None and int(width) != int(target_width):
         raise ValueError(f"{path}: an MTP sidecar of width {int(width)} for a target of width {int(target_width)}")
-    # the sidecar loader reads no weight scales, so refuse any rather than serve unscaled weights
-    check_scales(path, nvfp4=False)
+    # NVFP4 weight scales are read (the float reader and the expert banks); refuse any other scale rather than ignore it
+    check_scales(path)
 
 
 def _iter_sidecar_emitted(model_path: str, config: ModelConfig, rank: int, world: int) -> Iterator[tuple[str, torch.Tensor]]:
