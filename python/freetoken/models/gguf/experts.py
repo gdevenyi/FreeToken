@@ -192,8 +192,10 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     banks["gate_up"][:, start : start + r.shape[1]].copy_(r)
                     start += r.shape[1]
                 banks["down"].copy_(d)
-                for info in (*parts, down):
-                    _drop_page_cache(info)
+                if world == 1:
+                    # under TP every rank reads every page of these tensors; one rank's drop would evict the other's
+                    for info in (*parts, down):
+                        _drop_page_cache(info)
             if device is None:
                 pins(layer, host)
             for role, bank in banks.items():
