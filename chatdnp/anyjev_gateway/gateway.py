@@ -32,6 +32,7 @@ from anyjev import Decider
 from anyjev.question import MAX_OPTIONS, Question, QuestionError
 
 MAX_BODY = 32 << 20
+MAX_QUESTIONS = 32  # one request holds the single Decider; --max-questions
 DEFAULT_MODEL = "anyjev-qwen3.8-flash-next"
 
 
@@ -142,6 +143,8 @@ def openai_state(value: Any) -> Any:
 def openai_questions(raw: Any) -> tuple[list[Question], list[dict]]:
     if not isinstance(raw, list) or not 1 <= len(raw) <= 400:
         raise RequestError("questions must be an array of 1 to 400 items", "questions")
+    if len(raw) > MAX_QUESTIONS:
+        raise RequestError(f"at most {MAX_QUESTIONS} questions per request are allowed here", "questions")
     questions, metas = [], []
     for i, q in enumerate(raw):
         p = f"questions[{i}]"
@@ -235,6 +238,8 @@ def handle_openai(engine: Engine, req: dict) -> tuple[dict, list[str]]:
 def jev_questions(raw: Any) -> tuple[list[Question], list[dict]]:
     if not isinstance(raw, dict) or not raw:
         raise RequestError("questions must be a non-empty object of named questions", "questions")
+    if len(raw) > MAX_QUESTIONS:
+        raise RequestError(f"at most {MAX_QUESTIONS} questions per request are allowed here", "questions")
     questions, metas = [], []
     for name, q in raw.items():
         p = f"questions.{name}"
@@ -388,6 +393,7 @@ def make_server(engine: Engine, host: str = "127.0.0.1", port: int = 8100, key: 
 
 
 def main() -> None:
+    global MAX_QUESTIONS
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--tokenizer", required=True, help="local checkpoint dir with the served model's tokenizer")
     ap.add_argument("--upstream", default="http://127.0.0.1:8000", help="FreeToken root URL")
@@ -399,8 +405,12 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--prior", default="content_free", choices=("content_free", "batch", "none"))
     ap.add_argument("--price-per-mtok", type=float, default=0.0, help="Jev usage.cost_usd per million input tokens")
+    ap.add_argument(
+        "--max-questions", type=int, default=MAX_QUESTIONS, help="questions per request (OpenAI allows 400)"
+    )
     ap.add_argument("--key-env", default="ANYJEV_GW_KEY", help="env var holding the shared secret (unset: no check)")
     a = ap.parse_args()
+    MAX_QUESTIONS = a.max_questions
     from anyjev.backends.vllm import VLLMBackend
 
     backend = VLLMBackend(

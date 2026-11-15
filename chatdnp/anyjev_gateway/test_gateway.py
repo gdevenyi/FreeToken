@@ -204,3 +204,14 @@ def test_error_replies_keep_a_reused_connection_usable(server):
         r.read()
         assert r.status == want, (path, r.status)
     conn.close()
+
+
+def test_question_cap_protects_the_shared_engine(server, monkeypatch):
+    # red if a request with more questions than the cap reaches the single, locked Decider
+    monkeypatch.setattr(gw, "MAX_QUESTIONS", 2)
+    base = server()
+    s, d, _ = post(base, "/v1/decisions", OPENAI)  # 4 questions
+    assert s == 400 and d["error"]["param"] == "questions" and "2" in d["error"]["message"]
+    qs = {f"q{i}": {"type": "noul", "instructions": "y?"} for i in range(3)}
+    s, d, _ = post(base, "/v1/decide", {"state": "x", "questions": qs})
+    assert s == 400 and d["param"] == "questions"
