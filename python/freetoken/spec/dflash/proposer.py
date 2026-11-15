@@ -12,6 +12,7 @@ import torch
 from freetoken.attention.linear import gdn_slot
 from freetoken.engine.sample import make_device_tensor
 from freetoken.kernel.triton.dflash import ring_attention_workspace
+from freetoken.models.dflash.config import tp_heads
 from freetoken.spec.dflash.window import DFlashWindow
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
@@ -88,7 +89,7 @@ class DFlashProposer(Proposer):
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
-        super().adjust_config(config, override)
+        # not the base TP refusal: rank 0 decides the drafts (see _draft), and the draft shards by head like the target
         if config.speculative_token_map:
             raise ValueError("--speculative-token-map only works with --speculative-algorithm mtp")
         module, name = _draft_entry(config)
@@ -109,6 +110,7 @@ class DFlashProposer(Proposer):
                 f"{path} (hidden {draft.hidden_size}, vocab {draft.vocab_size}, mask token {draft.mask_token_id}) does not fit "
                 f"{arch} (hidden {target.hidden_size}, vocab {target.vocab_size})"
             )
+        tp_heads(draft, config.tp_info.size)
         if target.linear_attention_group() is None and config.cache_type != "naive":
             raise ValueError(
                 "DFlash keeps its context window on the target's GDN slots, which a prefix-cache hit restores; "

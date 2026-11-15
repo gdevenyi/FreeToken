@@ -1,4 +1,6 @@
-"""DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates."""
+"""DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates.
+
+At TP=2, on the CPU with a simulated communicator: the config check."""
 
 from __future__ import annotations
 
@@ -10,9 +12,9 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
-DEV = torch.device("cuda")
+DEV, CPU = torch.device("cuda"), torch.device("cpu")
 H, LAYERS, HEADS, KV_HEADS, HEAD_DIM, INTER = 64, 2, 4, 2, 64, 128
 GROUP_SIZE, TAPS, RANK, TOP_K, WINDOW, VOCAB, MASK = 16, (1, 2), 8, 4, 16, 64, 61
 RING = WINDOW + 64
@@ -65,17 +67,23 @@ def _load_draft(tmp_path, w: dict[str, torch.Tensor], dtype=torch.bfloat16):
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    path = tmp_path / "draft"
-    path.mkdir()
-    (path / "config.json").write_text(json.dumps(CONFIG))
-    save_file({name: t for name, t in w.items() if not name.startswith("target.")}, str(path / "model.safetensors"))
+    path = _checkpoint(tmp_path, w)
     with torch.device("meta"), torch_dtype(dtype):
         embed, head = VocabParallelEmbedding(VOCAB, H), ParallelLMHead(VOCAB, H)
     for op, name in ((embed, "target.embed"), (head, "target.head")):
         op.load_state_dict({"weight": w[name].to(DEV, dtype)})
         finalize_quant(op)
     target = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), lm_head=head)
-    return DFlash2DraftModel.load(parse_config(cached_load_hf_config(str(path))), target, str(path), DEV, dtype)
+    return DFlash2DraftModel.load(parse_config(cached_load_hf_config(path)), target, path, DEV, dtype)
+
+
+def _checkpoint(tmp_path, w: dict[str, torch.Tensor]) -> str:
+    """The draft tensors of ``w`` as a checkpoint directory."""
+    path = tmp_path / "draft"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(CONFIG))
+    save_file({name: t for name, t in w.items() if not name.startswith("target.")}, str(path / "model.safetensors"))
+    return str(path)
 
 
 class _Reference:
@@ -174,6 +182,7 @@ class _Reference:
         return torch.stack(tokens, 1), torch.stack(qs, 1)
 
 
+@cuda
 @pytest.mark.parametrize("dtype, tol", [(torch.float32, 2**-6), (torch.bfloat16, 2**-2)])
 @pytest.mark.parametrize("block", [4, 8])
 def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
@@ -216,6 +225,7 @@ def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
     assert torch.equal(draft.forward_block(bonus, starts, rows_t, dflash_ring), hidden)
 
 
+@cuda
 def test_sample_path_walks_the_selector_lattice(tmp_path):
     """Greedy and sampled requests follow the fp32 walk (same uniforms); a request whose scores all tie takes the first candidate; a NaN hidden yields in-range ids and a q that is no distribution, without disturbing the other requests."""
     w = _weights()
@@ -241,3 +251,36 @@ def test_sample_path_walks_the_selector_lattice(tmp_path):
     assert torch.equal(tokens[2], cand[2, :, 0]) and torch.equal(q[2], F.one_hot(torch.zeros(block - 1, dtype=torch.int64, device=DEV), TOP_K).float())
     assert ((tokens >= 0) & (tokens < VOCAB)).all() and ((cand >= 0) & (cand < VOCAB)).all()
     assert not torch.isclose(q[3].sum(-1), torch.ones(block - 1, device=DEV)).any()
+
+
+# ---------------------------------------------------------------------------------------------- TP=2 on the CPU
+
+K, MAX_REQ = 3, 4
+MAX_POS = CONFIG["max_position_embeddings"]
+
+
+def _config(path: str, tp: int, rank: int = 0) -> SimpleNamespace:
+    """The engine config fields the DFlash proposer reads, for a Qwen3.8-Flash-Next target of the draft's shape."""
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.register import get_model_spec
+
+    arch = "Qwen4ExpForConditionalGeneration"
+    return SimpleNamespace(
+        tp_info=DistributedInfo(rank, tp), model_spec=get_model_spec(arch), hf_config=SimpleNamespace(architectures=[arch]),
+        model_config=SimpleNamespace(num_layers=CONFIG["num_target_layers"], hidden_size=H, vocab_size=VOCAB, linear_attention_group=lambda: None),
+        speculative_draft_model_path=path, speculative_token_map=None, speculative_num_steps=K, cache_type="naive",
+        max_running_req=MAX_REQ, max_seq_len=MAX_POS, dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize("tp, refused", [(2, None), (3, "num_attention_heads"), (4, "num_key_value_heads")])
+def test_adjust_config_accepts_tp2_refuses_uneven_heads(tmp_path, tp, refused):
+    """TP=2 passes the config check; a TP size that does not divide the query heads, or only the KV heads (which the qkv layer would replicate), is refused there, before the target loads."""
+    from freetoken.spec.dflash.proposer import DFlashProposer
+
+    config = _config(_checkpoint(tmp_path, _weights()), tp)
+    if refused is None:
+        DFlashProposer.adjust_config(config, None)
+        return
+    with pytest.raises(ValueError, match=refused):
+        DFlashProposer.adjust_config(config, None)

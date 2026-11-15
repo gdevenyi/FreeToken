@@ -28,6 +28,15 @@ class DFlashDraftConfig:
     num_target_layers: int
 
 
+def tp_heads(config: DFlashDraftConfig, tp_size: int) -> tuple[int, int]:
+    """The query and KV heads of one rank: q/k/v shard by head and gate/up by row, so ``tp_size`` must divide both head counts and the MLP width."""
+    counts = {"num_attention_heads": config.num_heads, "num_key_value_heads": config.num_kv_heads, "intermediate_size": config.intermediate_size}
+    uneven = {key: n for key, n in counts.items() if n % tp_size}
+    if uneven:
+        raise ValueError(f"the DFlash draft shards its attention and MLP over --tp-size {tp_size}, which does not divide its {uneven}")
+    return config.num_heads // tp_size, config.num_kv_heads // tp_size
+
+
 def parse_config(hf_config: Any) -> DFlashDraftConfig:
     """The draft's ``config.json``; only the DFlash 2 shape (non-causal, all sliding, conv + selector, default rope) is served."""
     archs = list(getattr(hf_config, "architectures", None) or [])
