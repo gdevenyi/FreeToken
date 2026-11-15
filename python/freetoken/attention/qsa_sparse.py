@@ -95,6 +95,9 @@ class QSASparseMetadata(BaseAttnMetadata):
     k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     # Prefill scoring: row-tile maps per (start, end) row chunk, built by the first QSA layer.
     score_tiles:      dict | None = None
+    # Row tiles only for prefill: a verify graph captured with a tile map would keep the address of a map freed with the
+    # capture batch (the warmup and the capture share this metadata object), and its replay would read freed memory.
+    is_prefill:       bool = False
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -210,6 +213,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             qo_indptr_cpu=qo_indptr,
             kv_len_cpu=kv_len,
         )
+        md.is_prefill = getattr(batch, "phase", None) == "prefill"
         batch.attn_metadata = md
         if not is_decode:
             table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
@@ -229,6 +233,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Every-``page_size``-th column of the page table: the per-page base slots. A strided
         VIEW, so gathering rows through it materializes only [bs, W/page_size]."""
         return get_global_ctx().page_table[:, :: self.page_size]
+
+    def _scores_in_row_tiles(self, md: QSASparseMetadata) -> bool:
+        """Prefill scores several query rows of a request per program; decode and verify keep the one-row kernel.
+
+        Only prefill: a captured graph (decode or a speculative verify) would bake in the address of the host-built
+        tile map, which lives on the capture batch's metadata and is freed with it."""
+        return md.is_prefill and self.index_heads == 4
 
     def _block_table(self, table_idx: torch.Tensor) -> torch.Tensor:
         return (self._block_base_view().index_select(0, table_idx) // self.page_size).to(
@@ -421,7 +432,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         columns = md.block_table.shape[1] * self.cmp_page_size
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
-        row_tiles = not md.is_decode and self.index_heads == 4
+        row_tiles = self._scores_in_row_tiles(md)
         for start in range(0, rows, rows_per_chunk):
             end = min(start + rows_per_chunk, rows)
             chunk = slice(start, end)

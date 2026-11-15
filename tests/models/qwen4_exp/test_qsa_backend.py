@@ -204,6 +204,11 @@ def test_decode_graph_replay_matches_eager(rows_per_req):
     with torch.cuda.graph(graph):
         captured_out = attn.forward(static["x"], capture_batch)
     torch.cuda.synchronize()
+    # GraphRunner drops the capture batch after capture: nothing the graph reads may live only on its metadata (a
+    # verify graph once baked in a prefill row-tile map built there, and its replay read freed memory)
+    capture_batch.attn_metadata = None
+    scrub = torch.full((1 << 22,), -1, dtype=torch.int32, device=fixture.device)  # take the freed blocks
+    del scrub
 
     for step in range(steps):
         for req in reqs:
@@ -298,3 +303,25 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+def test_only_prefill_scores_in_row_tiles(monkeypatch):
+    """A verify or decode batch never takes the prefill row-tile path, whose host-built tile map a captured graph
+    would keep after the capture batch frees it (MTP verify graphs read freed memory on the first step)."""
+    import freetoken.attention.qsa_sparse as qsa
+
+    monkeypatch.setattr(qsa, "_CPU_PINNED", {"device": "cpu", "dtype": torch.int32})
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self, *a, **k: self)
+    monkeypatch.setattr(qsa, "get_global_ctx", lambda: SimpleNamespace(page_table=torch.zeros(4, 256, dtype=torch.int32)))
+    backend = object.__new__(qsa.QSASparseAttnBackend)
+    backend.device, backend.page_size, backend.index_heads = torch.device("cpu"), 64, 4
+    reqs = [SimpleNamespace(extend_len=3, device_len=40, table_idx=0), SimpleNamespace(extend_len=3, device_len=9, table_idx=1)]
+    for phase in ("prefill", "verify", "decode"):
+        batch = SimpleNamespace(phase=phase, reqs=reqs, padded_reqs=reqs)
+        backend.prepare_metadata(batch)
+        assert batch.attn_metadata.is_prefill is (phase == "prefill"), phase
+        assert backend._scores_in_row_tiles(batch.attn_metadata) is (phase == "prefill"), phase
+    backend.index_heads = 2  # the tiled kernel is written for 4 index heads
+    batch = SimpleNamespace(phase="prefill", reqs=reqs, padded_reqs=reqs)
+    backend.prepare_metadata(batch)
+    assert not backend._scores_in_row_tiles(batch.attn_metadata)
