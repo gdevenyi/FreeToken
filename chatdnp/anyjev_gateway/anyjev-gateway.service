@@ -1,0 +1,16 @@
+# systemd user unit for the AnyJev decision gateway on chatdnp (linger is on for localadmin).
+# Install: cp anyjev-gateway.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#          systemctl --user enable --now anyjev-gateway
+# It listens on the docker0 address so the LiteLLM container reaches it; every request needs the shared key.
+[Unit]
+Description=AnyJev decision gateway (OpenAI Decisions + Jev) for LiteLLM
+After=network-online.target
+
+[Service]
+Environment=HOST=172.17.0.1 PORT=8100
+ExecStart=%h/anyjev-gw/run_gateway.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
