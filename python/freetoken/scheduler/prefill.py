@@ -58,6 +58,8 @@ class PrefillAdder:
     reserved_swa: int = 0
     # slots a decode step may hold past a request's own length; reserved with it
     token_headroom: int = 0
+    # a logprob read (max_tokens=1 + logprobs) neither resumes from nor feeds the prefix cache
+    isolate_logprob_reads: bool = False
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -76,7 +78,11 @@ class PrefillAdder:
 
         # TODO: consider host cache match case (it needs the same replay cap)
         replay = self.cache_manager.prefix_replay_tokens
-        mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
+        if self.isolate_logprob_reads and req.sampling_params.is_logprob_read:
+            max_len = 0  # a resumed prefill differs numerically from a cold one
+        else:
+            max_len = max(0, req.input_len - replay) if replay else None
+        mr = self.cache_manager.match_req(req, max_len=max_len)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
@@ -289,6 +295,8 @@ class PrefillManager:
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
     token_headroom: int = 0
+    # a logprob read prefills in a pass of its own (see PrefillAdder for the cache side)
+    isolate_logprob_reads: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -318,6 +326,7 @@ class PrefillManager:
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
             token_headroom=self.token_headroom,
+            isolate_logprob_reads=self.isolate_logprob_reads,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -329,6 +338,10 @@ class PrefillManager:
         log_cached_tokens = 0
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
+            # break, not continue: the slicing below assumes the admitted requests are a prefix
+            read = self.isolate_logprob_reads and pending_req.sampling_params.is_logprob_read
+            if read and reqs:
+                break  # a read never shares a pass
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
@@ -356,6 +369,8 @@ class PrefillManager:
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
+                if read:
+                    break  # nobody joins a read's pass
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:

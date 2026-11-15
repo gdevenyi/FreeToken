@@ -241,5 +241,147 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def _finish_read(policy: str, sp: SamplingParams, *, warm_prefix: bool = False, num_pages: int = 256,
+                 isolate: bool = False, radix_lookahead: bool = False):
+    """A 130-token prompt finishing on its prefill forward, with a frozen x64 snapshot at 128
+    (the deepest boundary strictly inside it) and its live state at 130. ``warm_prefix`` first
+    donates a 64-token prefix so the read resumes from a locked prefix-cache hit."""
+    pool = _pool()
+    pt = torch.zeros(4, 256, dtype=torch.int32)
+    cm = CacheManager(num_pages, 1, pt, "hybrid_radix", linear_state_pool=pool,
+                      radix_lookahead=radix_lookahead,
+                      logprob_read_snapshot_donate=policy, isolate_logprob_reads=isolate)
+    prompt = list(range(1, 131))
+    if warm_prefix:
+        warm = Req(input_ids=torch.tensor(prompt[:64] + [999], dtype=torch.int32), table_idx=1,
+                   cached_len=64, output_len=1, uid=9, sampling_params=SamplingParams(),
+                   cache_handle=cm.match_req(_pend(prompt[:64])).cuda_handle)
+        pt[1, :64] = cm._allocate(64)
+        warm.linear_slot_idx, warm.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+        cm.lock(warm.cache_handle)
+        cm.cache_req(warm, finished=True)
+    mr = cm.match_req(_pend(prompt))
+    hit = mr.cuda_handle.cached_len
+    pt[0, :hit] = mr.cuda_handle.get_matched_indices()
+    pt[0, hit:130] = cm._allocate(130 - hit)
+    req = Req(input_ids=torch.tensor(prompt + [7], dtype=torch.int32), table_idx=0, cached_len=130,
+              output_len=1, uid=0, sampling_params=sp, cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
+    cm.lock(mr.cuda_handle)
+    cm.cache_req(req, finished=True)
+    _assert_no_leak(cm, num_pages)
+    return cm, prompt
+
+
+def _assert_no_leak(cm, num_pages=256):
+    pc, pool = cm.prefix_cache, cm.linear_state_pool
+    assert len(cm.free_slots) + pc.full_evictable + pc.full_protected == num_pages  # every page is free or tree-owned
+    assert pc.full_protected == 0 and pc.mamba_protected == 0  # nothing left locked
+    assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1  # no GDN slot leak
+    cm.check_integrity()
+
+
+def _resume_len(cm, prompt, n):
+    return cm.match_req(_pend(prompt[:n] + [12345])).cuda_handle.cached_len
+
+
+READ = SamplingParams(max_tokens=1, logprobs=True, top_logprobs=4, allowed_token_ids=[32, 33])
+
+
+@pytest.mark.parametrize("warm_prefix", [False, True])
+@pytest.mark.parametrize(
+    ("policy", "snapshots", "resume_at_128", "resume_at_130"),
+    [("all", 2, 128, 130), ("boundary", 1, 128, 128), ("none", 0, 0, 0)],
+)
+def test_logprob_read_snapshot_donate_policy(policy, snapshots, resume_at_128, resume_at_130, warm_prefix):
+    # A burst of AnyJev reads must not evict chat users' GDN snapshots: "boundary" and "none"
+    # donate less, and a node no snapshot can resume is never inserted.
+    cm, prompt = _finish_read(policy, READ, warm_prefix=warm_prefix)
+    warm = 1 if warm_prefix else 0  # the warm-up request's own 64-token snapshot
+    assert cm.prefix_cache.mamba_evictable_size == snapshots + warm
+    assert _resume_len(cm, prompt, 128) == max(resume_at_128, 64 * warm)
+    assert _resume_len(cm, prompt, 130) == max(resume_at_130, 64 * warm)
+
+
+@pytest.mark.parametrize("policy", ["boundary", "none"])
+@pytest.mark.parametrize(
+    "sp",
+    [
+        SamplingParams(max_tokens=1),  # no logprobs
+        SamplingParams(max_tokens=2, logprobs=True, top_logprobs=4),  # not a single-token read
+    ],
+)
+def test_snapshot_donate_policy_leaves_other_requests_alone(policy, sp):
+    cm, prompt = _finish_read(policy, sp)
+    assert cm.prefix_cache.mamba_evictable_size == 2
+    assert _resume_len(cm, prompt, 130) == 130
+
+
+@pytest.mark.parametrize(
+    ("policy", "isolate", "snapshots"),
+    [("all", False, 2), ("boundary", False, 1), ("none", False, 0), ("all", True, 0)],
+)
+def test_read_donate_keeps_pages_and_slots_whole_with_radix_lookahead(policy, isolate, snapshots):
+    # production runs MTP, whose radix keys are (token, next token) pairs
+    cm, _ = _finish_read(policy, READ, isolate=isolate, radix_lookahead=True)
+    assert cm.prefix_cache.mamba_evictable_size == snapshots
+
+
+@pytest.mark.parametrize("isolate", [False, True])
+def test_isolated_logprob_read_ignores_and_keeps_out_of_the_prefix_cache(isolate):
+    """An identical earlier read donated under "all"; an isolated read still prefills cold and stores nothing."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, prompt = _finish_read("all", READ, num_pages=512)  # room for both reads: no eviction
+    cm.isolate_logprob_reads = isolate
+    tree = (cm.prefix_cache.full_evictable, cm.prefix_cache.mamba_evictable_size)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=2, page_table=cm.page_table),
+                        DecodeManager(page_size=1), isolate_logprob_reads=isolate)
+    pm.pending_list = [PendingReq(1, torch.tensor(prompt, dtype=torch.int32), READ)]
+    batch = pm.schedule_next_batch(4096)
+    (req,) = batch.reqs
+    assert req.cache_handle.cached_len == batch.log_cached_tokens == (0 if isolate else 128)
+
+    cm.allocate_paged(batch.reqs)
+    req.complete_one()
+    if isolate:  # a cold 130-token extend tracks the x64 boundary at 128 (build_fla_metadata)
+        req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
+    cm.cache_req(req, finished=True)
+    if isolate:
+        assert (cm.prefix_cache.full_evictable, cm.prefix_cache.mamba_evictable_size) == tree
+    _assert_no_leak(cm, num_pages=512)
+
+
+@pytest.mark.parametrize(("policy", "isolate"), [("none", False), ("all", True), ("boundary", True)])
+def test_non_donating_read_chunk_commit_leaves_the_tree_alone(policy, isolate):
+    """The prefill-commit branch donated the x64 snapshot whatever the read policy said."""
+    num_pages, pool = 256, _pool()
+    pt = torch.zeros(4, 256, dtype=torch.int32)
+    cm = CacheManager(num_pages, 1, pt, "hybrid_radix", linear_state_pool=pool,
+                      logprob_read_snapshot_donate=policy, isolate_logprob_reads=isolate)
+    prompt = list(range(1, 131))
+    mr = cm.match_req(_pend(prompt))
+    pt[0, :130] = cm._allocate(130)
+    row = pt[0, :130].clone()
+    req = Req(input_ids=torch.tensor(prompt + [7], dtype=torch.int32), table_idx=0, cached_len=130,
+              output_len=1, uid=0, sampling_params=READ, cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
+    cm.lock(mr.cuda_handle)
+
+    cm.cache_req(req, finished=False)
+    assert cm.prefix_cache.full_evictable + cm.prefix_cache.full_protected == 0
+    assert cm.prefix_cache.mamba_evictable_size + cm.prefix_cache.mamba_protected == 0
+    assert torch.equal(pt[0, :130], row)  # the request still owns its pages
+
+    cm.cache_req(req, finished=True)
+    assert len(cm.free_slots) == num_pages
+    _assert_no_leak(cm)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

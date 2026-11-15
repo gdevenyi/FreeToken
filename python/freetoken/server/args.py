@@ -564,6 +564,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--logprob-read-snapshot-donate",
+        type=str,
+        default=ServerArgs.logprob_read_snapshot_donate,
+        choices=["all", "boundary", "none"],
+        help="Hybrid (GDN) models: which state snapshots a finished logprob read (max_tokens=1 "
+        "with logprobs, e.g. AnyJev label scoring) donates to the prefix cache. 'all' (default): "
+        "the x64 prefill boundary and the final state; 'boundary': only the former; 'none': "
+        "neither, so a burst of reads cannot evict other conversations' snapshots.",
+    )
+
+    parser.add_argument(
+        "--logprob-read-isolate",
+        action="store_true",
+        default=ServerArgs.logprob_read_isolate,
+        help="Make a logprob read's (max_tokens=1 with logprobs, e.g. AnyJev label scoring) "
+        "logprobs independent of other traffic: it prefills in a pass of its own and neither "
+        "resumes from nor stores prefix-cache entries. Costs read throughput under concurrency "
+        "and all prefix reuse for reads; other requests are unchanged.",
+    )
+
+    parser.add_argument(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,

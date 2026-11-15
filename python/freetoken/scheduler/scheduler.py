@@ -97,6 +97,8 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
+            logprob_read_snapshot_donate=config.logprob_read_snapshot_donate,
+            isolate_logprob_reads=config.logprob_read_isolate,
         )
         token_headroom = config.decode_rows_per_req - 1
         self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
@@ -113,6 +115,7 @@ class Scheduler(SchedulerIOMixin):
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
             token_headroom=token_headroom,
+            isolate_logprob_reads=config.logprob_read_isolate,
         )
 
         # some alias for easy access

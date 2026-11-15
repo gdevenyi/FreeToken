@@ -29,10 +29,13 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
+LOGPROB_READ_SNAPSHOT_DONATE = ("all", "boundary", "none")
+
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
+                 logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -45,6 +48,13 @@ class CacheManager:
         self.swa_pool = swa_pool
         self.sliding_window_size = sliding_window_size
         self.is_hybrid = type == "hybrid_radix"
+        # GDN snapshots a finished logprob read (max_tokens=1 + logprobs) donates: "all" (the
+        # x64 prefill boundary and the live final state), "boundary" (only the former), "none".
+        # A burst of such reads otherwise evicts long conversations' snapshots.
+        if logprob_read_snapshot_donate not in LOGPROB_READ_SNAPSHOT_DONATE:
+            raise ValueError(f"unknown snapshot donate policy {logprob_read_snapshot_donate!r}")
+        self.logprob_read_snapshot_donate = logprob_read_snapshot_donate
+        self.isolate_logprob_reads = isolate_logprob_reads
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
@@ -335,6 +345,11 @@ class CacheManager:
             req.cache_handle = new_handle
             self.lock(new_handle)
 
+    def _donate_policy(self, req: Req) -> str:
+        if not req.sampling_params.is_logprob_read:
+            return "all"
+        return "none" if self.isolate_logprob_reads else self.logprob_read_snapshot_donate
+
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote
@@ -355,10 +370,12 @@ class CacheManager:
             # is this request's dup to free. The frozen slot is consumed either way (taken by
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
+            donate = self._donate_policy(req)
             free_upto = old_handle.cached_len
             L = req.mamba_last_track_seqlen
             if (
-                L is not None
+                donate != "none"
+                and L is not None
                 and 0 < L <= req.cached_len
                 and align_down(L, self.page_size) == L
                 and req.mamba_ping_pong is not None
@@ -379,7 +396,9 @@ class CacheManager:
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
             keys = self._keys(req.input_ids, insert_len)
-            if insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len:
+            # Without a donated snapshot a node could never be resumed (match_prefix needs
+            # one), so a non-donating read frees its pages instead of inserting them.
+            if donate == "all" and insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len:
                 prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -391,6 +410,10 @@ class CacheManager:
             return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
+        # A non-donating read keeps its own pages and frozen slot until the finish frees them.
+        if self._donate_policy(req) == "none":
+            req.mamba_last_track_seqlen = None
+            return
         L = req.mamba_last_track_seqlen
         if L is None:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
