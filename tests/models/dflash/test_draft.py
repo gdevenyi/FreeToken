@@ -1,6 +1,6 @@
 """DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates.
 
-At TP=2, on the CPU with a simulated communicator: the config check, the sharded load and the budget against the sharded ring."""
+At TP=2, on the CPU with a simulated communicator: the config check, the sharded load, the budget against the sharded ring, and the rank-0 drafts with the same collectives on both ranks."""
 
 from __future__ import annotations
 
@@ -427,3 +427,74 @@ def test_budget_matches_local_ring(tmp_path, monkeypatch):
     assert ring.k.shape[3] == KV_HEADS // 2
     held = sum(t.nbytes for t in (ring.k, ring.v, *ring.workspace, ring.cos_sin, proposer.aux_buf))
     assert DFlashProposer.budget(proposer.config) == (held, 0)
+
+
+def test_drafts_follow_rank0(tmp_path, monkeypatch):
+    """Each rank walks its own path (own uniforms; here own candidates too), but the target verifies one set of drafts: inside ``_draft``, so every graph replay does it too, rank 1 sends zeros and both ranks take rank 0's tokens, on an all-greedy step too; each rank keeps its own candidates and q for its verify, whose result the runner replaces with rank 0's."""
+    path = _checkpoint(tmp_path, _weights())
+    bs, gen = 2, torch.Generator().manual_seed(5)
+    cand = [torch.randint(0, VOCAB, (bs, K, TOP_K), generator=gen) for _ in range(2)]
+    q = [torch.rand(bs, K, TOP_K, generator=gen) for _ in range(2)]
+
+    def stub(rank):
+        selector = SimpleNamespace(sample_path=lambda *_: (cand[rank][..., 0].clone(), q[rank]))
+        return SimpleNamespace(
+            state_dict=dict, forward_block=lambda bonus, *_: torch.zeros(bonus.shape[0] * (K + 1), H),
+            compute_candidates=lambda pred: (cand[rank], q[rank]), candidate_selector=selector,
+        )
+
+    args = (torch.tensor([3, 40]), torch.tensor([5, 100]), torch.tensor([1, 2]), torch.ones(bs), torch.ones(bs, dtype=torch.bool))
+    sent = []
+    for rank in range(2):
+        comm = _use(monkeypatch, _Comm())
+        _proposer(monkeypatch, path, stub(rank), rank)._draft(*args)
+        assert [op for op, _ in comm.calls] == ["all_reduce"], f"rank {rank} sent {comm.signature()}"
+        sent.append(comm.calls[0][1])
+    assert torch.equal(sent[0], cand[0][..., 0]) and not sent[1].any()
+    for rank in range(2):
+        _use(monkeypatch, _Comm(reply=lambda i, x: sent[0] + sent[1]))
+        tokens, got_cand, got_q = _proposer(monkeypatch, path, stub(rank), rank)._draft(*args)
+        assert torch.equal(tokens, cand[0][..., 0]) and got_cand is cand[rank] and got_q is q[rank]
+
+
+def test_collectives_match_across_ranks(tmp_path, monkeypatch):
+    """Both ranks issue the same collectives in the same order from ``_draft`` (block forward, candidates, token broadcast) for a greedy, a sampled and a padded step, or NCCL hangs; the eager verify inject and the prefill issue none."""
+    from freetoken.core import Batch, Req, SamplingParams
+
+    _cpu_kernels(monkeypatch)
+    w = _weights()
+    path = _checkpoint(tmp_path, w)
+    steps = {"greedy": [True, True], "sampled": [False, True], "padded": [False, True, True, True]}
+    bonus, starts, rows = torch.tensor([3, 40, 0, 0]), torch.tensor([5, 100, 0, 0]), torch.tensor([1, 2, MAX_REQ, MAX_REQ])
+
+    def req(table_idx, n, cached):
+        return Req(input_ids=torch.arange(n), table_idx=table_idx, cached_len=cached, output_len=8, uid=table_idx, sampling_params=SamplingParams(), cache_handle=None)
+
+    seen = []
+    for rank in range(2):
+        comm = _use(monkeypatch, _Comm())
+        proposer = _proposer(monkeypatch, path, _load_rank(monkeypatch, path, w, rank), rank)
+        proposer.attach(_context(CPU))
+        # built for cuda:0, where the prefill sink allocates
+        proposer.device = CPU
+        signatures = {}
+        for name, greedy in steps.items():
+            bs = len(greedy)
+            comm.calls.clear()
+            proposer._draft(bonus[:bs], starts[:bs], rows[:bs], torch.ones(bs), torch.tensor(greedy))
+            signatures[name] = comm.signature()
+        seen.append(signatures)
+
+        comm.calls.clear()
+        verify = Batch(reqs=[req(1, 10, 6), req(2, 20, 16)], phase="verify", rows_per_req=K + 1)
+        verify.padded_reqs, verify.active_table_idx = verify.reqs, torch.tensor([1, 2])
+        verify.positions = torch.cat([torch.arange(6, 6 + K + 1), torch.arange(16, 16 + K + 1)]).to(torch.int32)
+        proposer.post_verify(verify, None, None)
+        prefill = Batch(reqs=[req(3, 20, 0)], phase="prefill")
+        sink = proposer.feature_sink(prefill)
+        for layer in TAPS:
+            sink.layer_output(layer, torch.randn(20, H, dtype=torch.bfloat16))
+        proposer.on_prefill(prefill, None)
+        assert comm.calls == [], comm.signature()
+    assert seen[0] == seen[1]
+    assert seen[0]["greedy"] == seen[0]["sampled"] and seen[0]["greedy"][-1] == ("all_reduce", (2, K), torch.int64)

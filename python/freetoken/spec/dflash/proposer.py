@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 
 from freetoken.attention.linear import gdn_slot
+from freetoken.distributed import DistributedCommunicator
 from freetoken.engine.sample import make_device_tensor
 from freetoken.kernel.triton.dflash import ring_attention_workspace
 from freetoken.models.dflash.config import tp_heads
@@ -152,6 +153,8 @@ class DFlashProposer(Proposer):
         super().__init__(config, target_model)
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.dtype = config.dtype
+        self._tp_info = config.tp_info
+        self._comm = DistributedCommunicator() if self._tp_info.size > 1 else None
         module, name = _draft_entry(config)
         path = config.speculative_draft_model_path
         self.draft_config = c = self._draft_config(config)
@@ -197,6 +200,11 @@ class DFlashProposer(Proposer):
         candidate_ids, unary_logits = self.draft.compute_candidates(pred)
         uniforms = torch.rand(pred.shape[:2], device=pred.device)
         tokens, q = self.draft.candidate_selector.sample_path(candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms)
+        if self._comm is not None:
+            # every rank verifies the same drafts but walked its own path: rank 0's go to all, here so that every graph replay sends them
+            if not self._tp_info.is_primary():
+                tokens.zero_()
+            tokens = self._comm.all_reduce(tokens)
         return tokens, candidate_ids, q
 
     def _inject(self, features: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor | None) -> None:
