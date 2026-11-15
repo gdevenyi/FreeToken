@@ -235,9 +235,11 @@ class _ApiState:
         self.acks = acks
         self.sent = []
         self.aborted = []
+        self.next_uid = 7
 
     def new_user(self):
-        return 7
+        self.next_uid += 1
+        return self.next_uid - 1
 
     async def send_one(self, msg):
         self.sent.append(msg)
@@ -270,17 +272,19 @@ def test_chat_non_stream_disconnect_delivers_abort(monkeypatch):
     assert state.aborted == [7]
 
 
-def test_completion_non_stream_disconnect_delivers_abort(monkeypatch):
+@pytest.mark.parametrize(("prompt", "aborted"), [("hello", [7]), (["a", "b"], [7, 8])])
+def test_completion_non_stream_disconnect_delivers_abort(monkeypatch, prompt, aborted):
+    # every prompt of the request is in flight at once, so every one is aborted
     monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
     state = _ApiState(acks=None)
-    req = CompletionRequest(model="m", prompt="hello", max_tokens=8)
+    req = CompletionRequest(model="m", prompt=prompt, max_tokens=8)
 
     resp = asyncio.run(
         openai_api.handle_completion(req, _Request(disconnected=True), state, {})
     )
 
     assert resp.status_code == 499
-    assert state.aborted == [7]
+    assert state.aborted == aborted
 
 
 def test_non_stream_connected_client_gets_result_without_abort(monkeypatch):

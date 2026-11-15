@@ -640,6 +640,7 @@ class ManyUsersState(FakeState):
     def __init__(self, tokenizer=None) -> None:
         super().__init__([], tokenizer=tokenizer)
         self.msgs = []
+        self.queued_when_drained = []
 
     def new_user(self) -> int:
         return 100 + len(self.msgs)
@@ -648,6 +649,7 @@ class ManyUsersState(FakeState):
         self.msgs.append(msg)
 
     async def wait_for_ack(self, uid: int):
+        self.queued_when_drained.append(len(self.msgs))
         yield reply(str(uid), finished=True)
 
 
@@ -746,3 +748,38 @@ def test_chat_keeps_its_token_id_field_handling() -> None:
     )
     assert _status(resp) == 200
     assert state.sent.sampling_params.stop_token_ids == [248077]
+
+
+def test_completion_queues_every_prompt_before_it_drains_any() -> None:
+    # A K-prompt read costs one prefill pass, not K one after another: a drain that started
+    # before the next prompt was queued would mean the sequential loop came back.
+    state = ManyUsersState()
+    result = run(
+        handle_completion(_completion(prompt=["a", "b", "c"]), None, state, {})
+    )
+    assert state.queued_when_drained == [3, 3, 3]
+    assert [c["text"] for c in result["choices"]] == ["100", "101", "102"]
+
+
+def test_completion_aborts_the_queued_prompts_when_a_later_one_cannot_be_sent() -> None:
+    # nothing drains a queued prompt once the request answers 400: it must not run to max_tokens
+    class SecondSendFails(ManyUsersState):
+        def __init__(self) -> None:
+            super().__init__()
+            self.aborted, self.forgotten = [], []
+
+        async def send_one(self, msg):
+            if self.msgs:
+                raise OverflowError("int too big to convert")
+            await super().send_one(msg)
+
+        def forget_unsent_user(self, uid: int) -> None:
+            self.forgotten.append(uid)
+
+        async def abort_user(self, uid: int) -> None:
+            self.aborted.append(uid)
+
+    state = SecondSendFails()
+    resp = run(handle_completion(_completion(prompt=["a", "b"]), None, state, {}))
+    assert _status(resp) == 400
+    assert state.aborted == [100] and state.forgotten == [101]

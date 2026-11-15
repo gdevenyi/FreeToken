@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -175,16 +175,27 @@ def register_openai_routes(
 _DISCONNECT_POLL_SECONDS = 1.0
 
 
-async def _await_watching_disconnect(awaitable, request: Request | None, state: Any, uid: int):
+async def _await_watching_disconnect(
+    awaitable, request: Request | None, state: Any, uid: int | Sequence[int]
+):
     """Run an in-flight generation awaitable while watching the transport - the
     non-streaming twin of stream_with_cancellation. Returns the awaitable's result,
     or None when the client disconnected first: the same shielded abort_user is
-    delivered so an abandoned request stops burning decode slots instead of running
-    to max_tokens (with --max-running-requests 1 that is a full outage for its
-    remaining budget)."""
+    delivered for every uid (a completion's several prompts) so an abandoned request
+    stops burning decode slots instead of running to max_tokens (with
+    --max-running-requests 1 that is a full outage for its remaining budget)."""
     gen = asyncio.ensure_future(awaitable)
     if request is None:
         return await gen
+    uids = [uid] if isinstance(uid, int) else list(uid)
+
+    async def abort_all():
+        for u in uids:
+            try:
+                await asyncio.shield(state.abort_user(u))
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to deliver abort for user %s", u)
+
     try:
         while True:
             done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
@@ -195,18 +206,12 @@ async def _await_watching_disconnect(awaitable, request: Request | None, state: 
     except asyncio.CancelledError:
         # The handler itself was cancelled (server shutdown): deliver the abort,
         # then let the cancellation propagate - mirrors stream_with_cancellation.
-        try:
-            await asyncio.shield(state.abort_user(uid))
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to deliver abort for user %s", uid)
+        await abort_all()
         gen.cancel()
         raise
     # Client gone. Deliver the AbortMsg first (the decode stops sooner), then
     # wind down the drain task; its result is undeliverable either way.
-    try:
-        await asyncio.shield(state.abort_user(uid))
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to deliver abort for user %s", uid)
+    await abort_all()
     gen.cancel()
     try:
         await gen
@@ -568,51 +573,60 @@ async def handle_completion(
     completion_tokens = 0
     cached_tokens = 0
     # with several prompts the timings are the FIRST prompt's own spans, as llama.cpp
-    # returns arr[0]; one clock across the sequential loop would mix the later prompts'
-    # queue and prefill into the rates
+    # returns arr[0]; one clock across the prompts would mix the later prompts' queue and
+    # prefill into the rates
     first_timings: dict[str, Any] | None = None
-    for index, prompt in enumerate(prompts):
+    # every prompt is queued before any is drained, so the scheduler can prefill them together
+    uids: list[int] = []
+    for prompt in prompts:
         uid = state.new_user()
         try:
             await send_new_request(state, uid, _tokenize_msg(uid, prompt))
         except GenerationError as exc:
+            # nothing would drain the prompts already queued
+            for sent in uids:
+                await state.abort_user(sent)
             return create_error_response(str(exc))
+        uids.append(uid)
 
-        async def _drain_one(uid: int = uid, index: int = index):
-            nonlocal prompt_tokens, completion_tokens, cached_tokens, first_timings
-            text = ""
-            entries: list[dict] = []
-            offsets: list[int] = []
-            finish_reason = "stop"
-            async for ack in state.wait_for_ack(uid):
-                if getattr(ack, "error", None):
-                    return create_error_response(ack.error, code=getattr(ack, "error_code", None))
-                prompt_tokens += ack.prompt_tokens_delta
-                completion_tokens += ack.completion_tokens_delta
-                cached_tokens += ack.cached_tokens
-                if req.logprobs is not None and ack.logprobs is not None:
-                    entries.append(ack.logprobs)
-                    offsets.append(ack.text_offset)
-                text += ack.incremental_output
-                if ack.finished:
-                    if index == 0:
-                        first_timings = getattr(ack, "timings", None)
-                    finish_reason = getattr(ack, "finish_reason", None) or "stop"
-                    break
-            return {
-                "index": index,
-                "text": echo_texts[index] + text,
-                "finish_reason": finish_reason,
-                "logprobs": (
-                    completions_logprobs(entries, offsets, len(text), req.return_tokens_as_token_ids)
-                    if req.logprobs is not None
-                    else None
-                ),
-            }
+    async def _drain_one(uid: int, index: int) -> dict[str, Any] | JSONResponse:
+        nonlocal prompt_tokens, completion_tokens, cached_tokens, first_timings
+        text = ""
+        entries: list[dict] = []
+        offsets: list[int] = []
+        finish_reason = "stop"
+        async for ack in state.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                return create_error_response(ack.error, code=getattr(ack, "error_code", None))
+            prompt_tokens += ack.prompt_tokens_delta
+            completion_tokens += ack.completion_tokens_delta
+            cached_tokens += ack.cached_tokens
+            if req.logprobs is not None and ack.logprobs is not None:
+                entries.append(ack.logprobs)
+                offsets.append(ack.text_offset)
+            text += ack.incremental_output
+            if ack.finished:
+                if index == 0:
+                    first_timings = getattr(ack, "timings", None)
+                finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                break
+        return {
+            "index": index,
+            "text": echo_texts[index] + text,
+            "finish_reason": finish_reason,
+            "logprobs": (
+                completions_logprobs(entries, offsets, len(text), req.return_tokens_as_token_ids)
+                if req.logprobs is not None
+                else None
+            ),
+        }
 
-        choice = await _await_watching_disconnect(_drain_one(), request, state, uid)
-        if choice is None:
-            return _client_disconnected_response()
+    drained = await _await_watching_disconnect(
+        asyncio.gather(*(_drain_one(u, i) for i, u in enumerate(uids))), request, state, uids
+    )
+    if drained is None:
+        return _client_disconnected_response()
+    for choice in drained:
         if isinstance(choice, JSONResponse):
             return choice
         choices.append(choice)
