@@ -1,6 +1,6 @@
 """DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates.
 
-At TP=2, on the CPU with a simulated communicator: the config check, the sharded load, the budget against the sharded ring, the per-rank candidate gather, and the rank-0 drafts with the same collectives on both ranks."""
+At TP=2, on the CPU with a simulated communicator: the config check, the sharded load, the budget against the sharded ring, the per-rank candidate gather, and the rank-0 drafts with the same collectives on both ranks; on one GPU, both ranks' block forward in lockstep against the fp32 reference."""
 
 from __future__ import annotations
 
@@ -322,8 +322,8 @@ def _cpu_kernels(monkeypatch) -> None:
         monkeypatch.setattr(model, fn.__name__, fn)
 
 
-def _load_rank(monkeypatch, path: str, w: dict[str, torch.Tensor], rank: int, size: int = 2):
-    """The draft on the CPU as TP rank ``rank`` of ``size`` loads it, beside the target's embedding and head sharded by vocab rows."""
+def _load_rank(monkeypatch, path: str, w: dict[str, torch.Tensor], rank: int, size: int = 2, device: torch.device = CPU):
+    """The draft as TP rank ``rank`` of ``size`` loads it, beside the target's embedding and head sharded by vocab rows."""
     import freetoken.distributed.info as dist_info
     from freetoken.distributed import DistributedInfo
     from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
@@ -336,10 +336,10 @@ def _load_rank(monkeypatch, path: str, w: dict[str, torch.Tensor], rank: int, si
     with torch.device("meta"), torch_dtype(torch.bfloat16):
         embed, head = VocabParallelEmbedding(VOCAB, H), ParallelLMHead(VOCAB, H)
     for op, name, key in ((embed, "target.embed", "embed_tokens.weight"), (head, "target.head", "lm_head.weight")):
-        op.load_state_dict({"weight": shard_tensor(key, w[name], rank=rank, world_size=size, num_kv_heads=None)})
+        op.load_state_dict({"weight": shard_tensor(key, w[name], rank=rank, world_size=size, num_kv_heads=None).to(device)})
         finalize_quant(op)
     target = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), lm_head=head)
-    return DFlash2DraftModel.load(parse_config(cached_load_hf_config(path)), target, path, CPU, torch.bfloat16)
+    return DFlash2DraftModel.load(parse_config(cached_load_hf_config(path)), target, path, device, torch.bfloat16)
 
 
 def _config(path: str, tp: int, rank: int = 0) -> SimpleNamespace:
@@ -529,3 +529,71 @@ def test_collectives_match_across_ranks(tmp_path, monkeypatch):
         assert comm.calls == [], comm.signature()
     assert seen[0] == seen[1]
     assert seen[0]["greedy"] == seen[0]["sampled"] and seen[0]["greedy"][-1] == ("all_reduce", (2, K), torch.int64)
+
+
+@cuda
+def test_tp2_block_forward_matches_reference(tmp_path, monkeypatch):
+    """Both TP=2 ranks on one GPU, in lockstep threads whose all-reduce sums them: each rank's ring holds its KV heads of the reference K/V, and each rank's block forward matches the fp32 reference to bf16 noise, as the TP=1 draft does. The real kernels with the local head counts, which the CPU stand-ins only shape-check."""
+    import threading
+
+    w, block, tol = _weights(), 4, 2**-2
+    ref, path = _Reference(w), _checkpoint(tmp_path, w)
+    mask_row = w["target.embed"][MASK].to(DEV)
+    drafts = []
+    for rank in range(2):
+        # the load's one collective, the mask embedding: the sum of the two ranks' halves is the full row
+        _use(monkeypatch, _Comm(reply=lambda i, x: mask_row[None]))
+        drafts.append(_load_rank(monkeypatch, path, w, rank, device=DEV))
+    rings = [d.make_dflash_ring(max_rows=3, block=block, ring_len=RING, max_position=4096, device=DEV) for d in drafts]
+    torch.manual_seed(1)
+    lengths, rows, contexts = (5, 100), (2, 1), []
+    for n, row in zip(lengths, rows):
+        features = torch.randn(n, len(TAPS) * H, device=DEV, dtype=torch.bfloat16)
+        contexts.append(ref.context_rows(features))
+        tail = torch.arange(max(0, n - RING), n, device=DEV)
+        for rank, (draft, ring) in enumerate(zip(drafts, rings)):
+            draft.store_context(draft.context_rows(features)[tail], tail, torch.full((len(tail),), row, device=DEV), ring)
+            heads = slice(rank * KV_HEADS // 2, (rank + 1) * KV_HEADS // 2)
+            for i in range(LAYERS):
+                k, v = ref.kv(i, contexts[-1][tail], tail)
+                torch.testing.assert_close(ring.k[i, row, tail % RING].float(), k[:, heads], atol=2**-6, rtol=2**-6)
+                torch.testing.assert_close(ring.v[i, row, tail % RING].float(), v[:, heads], atol=2**-6, rtol=2**-6)
+    bonus, starts, rows_t = torch.tensor([3, 40], device=DEV), torch.tensor(lengths, device=DEV), torch.tensor(rows, device=DEV)
+    # the kernels compile here, outside the threads, with an all-reduce that waits for no one
+    _use(monkeypatch, _Comm())
+    drafts[0].forward_block(bonus, starts, rows_t, rings[0])
+    torch.cuda.synchronize()
+
+    barrier, parts, local = threading.Barrier(2, timeout=60), {}, threading.local()
+
+    class _Lockstep:
+        """The two threads' ranks summed; both threads queue on the device's one default stream, so the second wait orders each sum before either copy."""
+
+        def all_reduce(self, x):
+            parts[local.rank] = x
+            barrier.wait()
+            total = parts[0] + parts[1]
+            barrier.wait()
+            return x.copy_(total)
+
+    _use(monkeypatch, _Lockstep())
+    hidden, errors = [None, None], []
+
+    def run(rank):
+        local.rank = rank
+        try:
+            hidden[rank] = drafts[rank].forward_block(bonus, starts, rows_t, rings[rank])
+        except BaseException as e:  # noqa: BLE001 -- reported below; the other rank must not wait forever
+            errors.append(e)
+            barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    for rank in range(2):
+        for b in range(2):
+            want = ref.block(int(bonus[b]), lengths[b], contexts[b], block)
+            torch.testing.assert_close(hidden[rank][b * block : (b + 1) * block].float(), want, atol=tol, rtol=tol, msg=f"rank {rank} request {b}")
