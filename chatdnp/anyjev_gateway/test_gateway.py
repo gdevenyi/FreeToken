@@ -109,11 +109,9 @@ def test_jev_answers_are_keyed_by_name(server):
         a = d["answers"]
         assert a["route"]["choice"] == "billing" and set(a["route"]["probabilities"]) == {"billing", "bug"}
         assert a["escalate"]["type"] == "noul" and 0.5 < a["escalate"]["noul"] <= 1
-        assert set(a["urgency"]["probabilities"]) == {"0", "1", "2"} and a["urgency"]["legend"] == [
-            "routine",
-            "urgent",
-            "critical",
-        ]
+        # LiteLLM's System One schema (hosted_vllm provider) wants legend as {index: label}
+        assert set(a["urgency"]["probabilities"]) == {"0", "1", "2"}
+        assert a["urgency"]["legend"] == {"0": "routine", "1": "urgent", "2": "critical"}
         assert d["usage"]["cost_usd"] == pytest.approx(d["usage"]["input_tokens"] * 0.42 / 1e6)
 
 
@@ -187,3 +185,22 @@ def test_gzip_body(server):
     )
     s, d, _ = post(server(), "/v1/decide", None, {"Content-Encoding": "gzip"}, raw=body)
     assert s == 200 and d["answers"]["q"]["type"] == "noul"
+
+
+def test_error_replies_keep_a_reused_connection_usable(server):
+    # red if a 401 or 404 answers before reading the body: LiteLLM's pooled connection then breaks
+    import http.client
+
+    base = server(key="s3cret")
+    conn = http.client.HTTPConnection(base.split("//")[1], timeout=60)
+    body = json.dumps({"state": "x", "questions": {"q": {"type": "noul", "instructions": "y?"}}})
+    for path, headers, want in (
+        ("/v1/decide", {}, 401),
+        ("/v1/nothing", {"X-Gateway-Key": "s3cret"}, 404),
+        ("/v1/decide", {"X-Gateway-Key": "s3cret"}, 200),
+    ):
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json", **headers})
+        r = conn.getresponse()
+        r.read()
+        assert r.status == want, (path, r.status)
+    conn.close()

@@ -8,11 +8,11 @@
 | `POST /v1/decide`, `POST /v1/systemone` | Jev: `state` + `questions{name: {type: choice \| score \| noul, instructions, criteria}}` → `answers{name: ...}` |
 | `GET /v1/models`, `GET /health` | – |
 
-LiteLLM fronts the gateway with authenticated pass-through routes:
+LiteLLM 1.108.9 serves decisions natively (`/v1/decisions` in OpenAI's format, `/v1/systemone` in Jev's System One format) and routes them by model. One `model_list` entry with provider `openai` points at this gateway; LiteLLM converts either client format and calls the gateway's `/v1/decisions`:
 
-client (own LiteLLM key) → LiteLLM → gateway → FreeToken `127.0.0.1:8000` `/v1/completions`
+client (own LiteLLM key, `model: anyjev-decide`) → Caddy (`/v1/*`) → LiteLLM → gateway `/v1/decisions` → FreeToken `127.0.0.1:8000` `/v1/completions`
 
-FreeToken must run the AnyJev logprobs port (production since 2026-11-15, `688d49d8`).
+FreeToken must run the AnyJev logprobs port (production since 2026-11-15, `688d49d8`). The gateway's own `/v1/decide` and `/v1/systemone` stay available for direct, local use.
 
 ## Limits and behaviour
 
@@ -34,38 +34,44 @@ FreeToken must run the AnyJev logprobs port (production since 2026-11-15, `688d4
 
 ## Production steps (root-owned LiteLLM files, done by the operator)
 
+The full LiteLLM change plan is `LITELLM_CHANGES_PLAN.md` in the chatdnp-audit notes. The steps for the gateway:
+
 1. Add the key to `/opt/litellm/.env` (the value is in `~/anyjev-gw/key`):
    `ANYJEV_GW_KEY=<contents of ~/anyjev-gw/key>`
-2. Add the routes to `general_settings` in `/opt/litellm/config.yaml`:
+2. Add this entry **under the existing `model_list:`** in `/opt/litellm/config.yaml` (do not add a second `model_list:` or `general_settings:` key):
 
    ```yaml
-   general_settings:
-     pass_through_endpoints:
-       - path: "/v1/decisions"
-         target: "http://host.docker.internal:8100/v1/decisions"
-         auth: true
-         methods: ["POST"]
-         headers:
-           X-Gateway-Key: "os.environ/ANYJEV_GW_KEY"
-       - path: "/v1/decide"
-         target: "http://host.docker.internal:8100/v1/decide"
-         auth: true
-         methods: ["POST"]
-         headers:
-           X-Gateway-Key: "os.environ/ANYJEV_GW_KEY"
-       - path: "/v1/systemone"
-         target: "http://host.docker.internal:8100/v1/systemone"
-         auth: true
-         methods: ["POST"]
-         headers:
-           X-Gateway-Key: "os.environ/ANYJEV_GW_KEY"
+     - model_name: anyjev-decide
+       litellm_params:
+         model: openai/anyjev-qwen3.8-flash-next
+         api_base: http://host.docker.internal:8100
+         api_key: os.environ/ANYJEV_GW_KEY
+       model_info:
+         mode: decisions
+         input_cost_per_token: 0.0
+         output_cost_per_token: 0.0
    ```
 
-3. Start the gateway on docker0: `cp anyjev-gateway.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now anyjev-gateway`. Stop the localhost test copy first: `tmux kill-session -t =jevgw`.
-4. Restart LiteLLM when it is idle (`docker compose -f /opt/litellm/docker-compose.yml --project-directory /opt/litellm up -d litellm`).
-5. Test with a user key: `curl -s https://<litellm>/v1/decisions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{"model":"anyjev","input":"The package arrived with a broken screen.","questions":[{"type":"predicate","name":"damaged","instructions":"Does the customer report a damaged item?"}]}'`
+3. Start the gateway on docker0: `tmux kill-session -t =jevgw` (the localhost test copy), then `cp anyjev-gateway.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now anyjev-gateway`.
+4. Restart LiteLLM when it is idle: `docker compose -f /opt/litellm/docker-compose.yml --project-directory /opt/litellm up -d litellm`.
+5. Test with a user key:
 
-**Tested on 2026-11-15:** a throwaway LiteLLM 1.108.9 with exactly these blocks. Without a key it returned 401. With a key, all three routes returned the gateway's answers, and the injected `X-Gateway-Key` passed the gateway's check.
+   ```python
+   from openai import OpenAI  # openai >= 3.51 has client.decisions
+   c = OpenAI(api_key=KEY, base_url="https://<litellm>/v1")
+   c.decisions.create(model="anyjev-decide", input="The package arrived with a broken screen.",
+                      questions=[{"type": "predicate", "name": "damaged", "instructions": "Does the customer report a damaged item?"}])
+   ```
+
+   For Jev, `POST /v1/systemone` with `{"model": "anyjev-decide", "state": ..., "questions": {...}}`.
+
+**Tested on 2026-11-15** on a throwaway LiteLLM 1.108.9 with production's own `config.yaml` plus this entry, its own Postgres, and a virtual key from `/key/generate`:
+- the SDK `decisions.create` (3 questions, 2.4 s) and a Jev `/v1/systemone` call both returned 200;
+- each call wrote a spend row (`adecisions` or `asystemone`, with its prompt tokens);
+- with `max_parallel_requests: 1` on the key, two parallel calls gave 200 and 429;
+- a wrong key gave 401.
+
+**Known limit:** LiteLLM's decision endpoints do not decode gzip request bodies (400), so clients must send plain JSON. The official Jev SDKs compress by default.
 
 ## Tests
 

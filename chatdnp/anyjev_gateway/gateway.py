@@ -281,7 +281,7 @@ def jev_answer(d, meta: dict) -> dict:
         "score": d.value,
         "confidence": d.confidence,
         "probabilities": {str(i): p for i, p in enumerate(probs)},
-        "legend": meta["legend"],
+        "legend": {str(i): label for i, label in enumerate(meta["legend"])},
     }
 
 
@@ -345,14 +345,16 @@ def make_server(engine: Engine, host: str = "127.0.0.1", port: int = 8100, key: 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             openai = path == "/v1/decisions"
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY:
+                self.close_connection = True  # the unread body would be parsed as the next request
+                return self._error(openai, 413, "request body too large")
+            # read the body before any reply: LiteLLM reuses keep-alive connections
+            raw = self.rfile.read(length)
             if path not in ("/v1/decisions", "/v1/decide", "/v1/systemone"):
                 return self._error(True, 404, "not found")
             if not self._authorized():
                 return self._error(openai, 401, "invalid gateway key", code="invalid_api_key")
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > MAX_BODY:
-                return self._error(openai, 413, "request body too large")
-            raw = self.rfile.read(length)
             enc = (self.headers.get("Content-Encoding") or "identity").lower()
             t0 = time.time()
             try:
