@@ -433,7 +433,6 @@ def _one_token_state() -> FakeState:
 # Result-changing vLLM fields this server does not implement: a set value must be a 400,
 # never a 200 computed as if the field were absent.
 UNIMPLEMENTED_COMPLETION_FIELDS = [
-    ("return_tokens_as_token_ids", True),
     ("logprob_token_ids", [32]),
     ("prompt_logprobs", 0),
     ("guided_json", {"type": "object"}),
@@ -537,7 +536,7 @@ def test_completion_allowed_token_ids_reach_the_engine_sorted_and_unique() -> No
         ([], "1 to 1024"),
         (list(range(1025)), "1 to 1024"),
         ([-1, 3], "non-negative"),
-        ([248077], "vocabulary"),
+        ([248077], "[0, 248077)"),
     ],
 )
 def test_completion_allowed_token_ids_out_of_range(ids, fragment) -> None:
@@ -606,3 +605,144 @@ def test_non_finite_logprobs_are_clamped_to_the_vllm_floor() -> None:
         {"A": -9999.0, "x": -9999.0}
     ]
     json.dumps(result, allow_nan=False)
+
+
+def test_completion_return_tokens_as_token_ids_keys_by_id() -> None:
+    # two ids that decode to the same text stay two entries (vLLM's token_id:N names)
+    a = entry(32, "\ufffd", -0.1)
+    a["top"][1].update(token_id=900, token="\ufffd")
+    req = _completion(logprobs=2, return_tokens_as_token_ids=True)
+    result = run(
+        handle_completion(
+            req, None, FakeState([reply("A", finished=True, logprobs=a)]), {}
+        )
+    )
+    expected = {
+        "tokens": ["token_id:32"],
+        "token_logprobs": [-0.1],
+        "top_logprobs": [{"token_id:32": -0.1, "token_id:900": -1.1}],
+        "text_offset": [0],
+    }
+    assert result["choices"][0]["logprobs"] == expected
+    assert (
+        _joined_stream_logprobs(
+            [reply("A", finished=True, logprobs=a)],
+            logprobs=2,
+            return_tokens_as_token_ids=True,
+        )
+        == expected
+    )
+
+
+class ManyUsersState(FakeState):
+    """Hands out a fresh uid per queued request and replies with the uid as the text."""
+
+    def __init__(self, tokenizer=None) -> None:
+        super().__init__([], tokenizer=tokenizer)
+        self.msgs = []
+
+    def new_user(self) -> int:
+        return 100 + len(self.msgs)
+
+    async def send_one(self, msg):
+        self.msgs.append(msg)
+
+    async def wait_for_ack(self, uid: int):
+        yield reply(str(uid), finished=True)
+
+
+def test_completion_token_id_prompts_fan_out_prompt_major() -> None:
+    # Tacit sends a batch of token-id prompts and reads choices by index; a reordering would
+    # pair each decision with another prompt's answer, silently.
+    state = ManyUsersState(tokenizer=VocabTokenizer())
+    result = run(
+        handle_completion(_completion(prompt=[[1, 2], [3, 4, 5]]), None, state, {})
+    )
+    assert [m.input_ids for m in state.msgs] == [[1, 2], [3, 4, 5]]
+    assert all(m.text == "" for m in state.msgs)
+    choices = result["choices"]
+    assert [c["index"] for c in choices] == [0, 1]
+    assert [c["text"] for c in choices] == ["100", "101"]
+
+
+def test_completion_flat_token_id_prompt_is_one_prompt() -> None:
+    for stream in (False, True):
+        state = ManyUsersState()
+        resp = run(
+            handle_completion(
+                _completion(prompt=list(range(1, 300)), stream=stream), None, state, {}
+            )
+        )
+        assert _status(resp) == 200
+        assert len(state.msgs) == 1 and state.msgs[0].input_ids == list(range(1, 300))
+
+
+@pytest.mark.parametrize(
+    ("prompt", "tokenizer"),
+    [([[1], [248077]], VocabTokenizer()), ([5, -1], None), ([[2**40]], None)],
+)
+def test_completion_token_id_prompts_are_range_checked_before_queueing(
+    prompt, tokenizer
+) -> None:
+    # an id past the embedding rows faults the engine for every request, not just this one
+    state = ManyUsersState(tokenizer=tokenizer)
+    resp = run(handle_completion(_completion(prompt=prompt), None, state, {}))
+    assert (
+        _status(resp) == 400
+        and "prompt token ids" in json.loads(resp.body)["error"]["message"]
+    )
+    assert state.msgs == []
+
+
+@pytest.mark.parametrize("extra", [{"echo": True}, {"suffix": "tail"}])
+def test_completion_token_id_prompts_refuse_echo_and_suffix(extra) -> None:
+    resp = run(
+        handle_completion(
+            _completion(prompt=[[1, 2]], **extra), None, ManyUsersState(), {}
+        )
+    )
+    assert _status(resp) == 400
+
+
+ID_FIELD_CASES = [
+    ({"logit_bias": {"248077": 1.0}}, "logit_bias", True),
+    ({"stop_token_ids": [5, 248077]}, "stop_token_ids", True),
+    ({"logit_bias": {str(2**40): 1.0}}, "logit_bias", False),  # would overflow msgpack
+    ({"stop_token_ids": [2**40]}, "stop_token_ids", False),
+]
+
+
+@pytest.mark.parametrize(("extra", "field", "with_tokenizer"), ID_FIELD_CASES)
+def test_completion_token_id_fields_outside_the_vocabulary_are_400s(
+    extra, field, with_tokenizer
+) -> None:
+    state = FakeState(
+        [reply("A", finished=True)],
+        tokenizer=VocabTokenizer() if with_tokenizer else None,
+    )
+    resp = run(handle_completion(_completion(**extra), None, state, {}))
+    assert _status(resp) == 400
+    assert field in json.loads(resp.body)["error"]["message"]
+    assert state.sent is None
+
+
+def test_completion_token_id_fields_at_the_vocab_edge_pass() -> None:
+    extra = {"logit_bias": {"248076": 1.0}, "stop_token_ids": [0, 248076]}
+    state = FakeState([reply("A", finished=True)], tokenizer=VocabTokenizer())
+    assert _status(run(handle_completion(_completion(**extra), None, state, {}))) == 200
+    assert state.sent.sampling_params.stop_token_ids == [0, 248076]
+
+
+def test_chat_keeps_its_token_id_field_handling() -> None:
+    # 605b1ae0 also bounds these on chat; that half is held back, so chat answers as before
+    state = FakeState([reply("A", finished=True)], tokenizer=VocabTokenizer())
+    resp = run(
+        handle_chat_completion(
+            chat_request(logit_bias={"248077": 1.0}, stop_token_ids=[248077]),
+            None,
+            state,
+            {},
+        )
+    )
+    assert _status(resp) == 200
+    assert state.sent.sampling_params.stop_token_ids == [248077]

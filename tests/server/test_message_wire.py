@@ -40,6 +40,14 @@ def test_inline_system_policy_tokenizer_roundtrip():
     assert BaseTokenizerMsg.decoder(legacy).inline_system_policy is None
 
 
+def test_token_id_prompt_and_allowed_ids_survive_the_wire():
+    msg = TokenizeMsg(uid=1, text="", input_ids=[248045, 32, 0],
+                      sampling_params=SamplingParams(allowed_token_ids=[32, 33]))
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert decoded.input_ids == [248045, 32, 0]
+    assert decoded.sampling_params.allowed_token_ids == [32, 33]
+
+
 def test_cache_rebuild_msg_roundtrip():
     msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle")
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))

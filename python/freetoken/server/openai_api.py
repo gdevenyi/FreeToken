@@ -29,6 +29,7 @@ from .logprobs import completion_logprobs_error, completions_logprobs
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    MAX_TOKEN_ID,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -510,14 +511,17 @@ async def handle_completion(
         sampling = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
-    if sampling.allowed_token_ids:
-        # the tokenizer worker checks again; this one answers before anything is queued
-        vocab = await _vocab_len(state)
-        if vocab is not None and sampling.allowed_token_ids[-1] >= vocab:
-            return create_error_response(
-                f"allowed_token_ids must be below the vocabulary size {vocab}",
-                param="allowed_token_ids",
-            )
+    token_prompts = _is_token_prompt(req.prompt)
+    prompts = _prompt_list(req.prompt)
+    if len(prompts) > MAX_PROMPTS:
+        return create_error_response(
+            f"prompt must hold at most {MAX_PROMPTS} prompts, got {len(prompts)}", param="prompt"
+        )
+    id_fields = sampling.client_token_ids()
+    if token_prompts:
+        id_fields += [("prompt", ids) for ids in prompts]
+    if (bad := await _token_id_error(state, id_fields)) is not None:
+        return bad
 
     # stamp per-token only when the server opted into timings too; llama.cpp publishes
     # partial timings on streams, so non-stream requests never pay for the snapshots
@@ -526,12 +530,15 @@ async def handle_completion(
         and req.timings_per_token
         and getattr(state.config, "enable_timings_report", False)
     )
-    prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
-    assert isinstance(prompts, list)
-    if len(prompts) > MAX_PROMPTS:
-        return create_error_response(
-            f"prompt must hold at most {MAX_PROMPTS} prompts, got {len(prompts)}", param="prompt"
+
+    def _tokenize_msg(uid: int, prompt: str | list[int]) -> TokenizeMsg:
+        sampling_params = _resolve_sampling(
+            req, model_sampling, default_max_tokens=default_max_tokens, timings_per_token=timings_pt
         )
+        if token_prompts:
+            return TokenizeMsg(uid=uid, text="", input_ids=prompt, sampling_params=sampling_params)
+        return TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling_params)
+
     # echo returns what the client sent, so take it before the FIM wrap below
     echo_texts = list(prompts) if req.echo else [""] * len(prompts)
     if req.suffix is not None:
@@ -545,17 +552,10 @@ async def handle_completion(
         prompts = [_fim_prompt(p, req.suffix, markers) for p in prompts]
     if req.stream:
         if len(prompts) != 1:
-            return create_error_response("Streaming completions only support a single text prompt")
+            return create_error_response("Streaming completions only support a single prompt")
         uid = state.new_user()
         try:
-            await send_new_request(
-                state,
-                uid,
-                TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                    req, model_sampling, default_max_tokens=default_max_tokens,
-                    timings_per_token=timings_pt,
-                )),
-            )
+            await send_new_request(state, uid, _tokenize_msg(uid, prompts[0]))
         except GenerationError as exc:
             return create_error_response(str(exc))
         chunks = stream_completion_chunks(uid, req, state, echo_text=echo_texts[0])
@@ -574,18 +574,7 @@ async def handle_completion(
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
         try:
-            await send_new_request(
-                state,
-                uid,
-                TokenizeMsg(
-                    uid=uid,
-                    text=prompt,
-                    sampling_params=_resolve_sampling(
-                        req, model_sampling, default_max_tokens=default_max_tokens,
-                        timings_per_token=timings_pt,
-                    ),
-                ),
-            )
+            await send_new_request(state, uid, _tokenize_msg(uid, prompt))
         except GenerationError as exc:
             return create_error_response(str(exc))
 
@@ -615,7 +604,9 @@ async def handle_completion(
                 "text": echo_texts[index] + text,
                 "finish_reason": finish_reason,
                 "logprobs": (
-                    completions_logprobs(entries, offsets, len(text)) if req.logprobs is not None else None
+                    completions_logprobs(entries, offsets, len(text), req.return_tokens_as_token_ids)
+                    if req.logprobs is not None
+                    else None
                 ),
             }
 
@@ -702,7 +693,10 @@ async def stream_completion_chunks(
                         # Mid-stream, a stamp past sent_len is held-back text still to come.
                         "logprobs": (
                             completions_logprobs(
-                                pending, pending_offsets, sent_len if ack.finished else None
+                                pending,
+                                pending_offsets,
+                                sent_len if ack.finished else None,
+                                req.return_tokens_as_token_ids,
                             )
                             if pending
                             else None
@@ -724,7 +718,9 @@ async def stream_completion_chunks(
             "index": 0,
             "finish_reason": finish_reason,
             "logprobs": (
-                completions_logprobs(pending, pending_offsets, sent_len) if pending else None
+                completions_logprobs(pending, pending_offsets, sent_len, req.return_tokens_as_token_ids)
+                if pending
+                else None
             ),
         }],
     )
@@ -742,6 +738,20 @@ async def stream_completion_chunks(
 
 
 _FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
+
+
+async def _token_id_error(state: Any, fields: list[tuple[str, list[int]]]) -> JSONResponse | None:
+    """A 400 for the first client token id outside the vocabulary, before anything is
+    queued. Without a frontend tokenizer the bound is the engine's int32; the tokenizer
+    worker checks the completions-only fields against its own tokenizer either way."""
+    if not fields:
+        return None
+    bound = await _vocab_len(state) or MAX_TOKEN_ID + 1
+    for name, ids in fields:
+        if not all(0 <= t < bound for t in ids):
+            what = "prompt token ids" if name == "prompt" else name
+            return create_error_response(f"{what} must be in [0, {bound})", param=name)
+    return None
 
 
 async def _vocab_len(state: Any) -> int | None:
@@ -1026,7 +1036,6 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 # vLLM /v1/completions fields that change the result and are not implemented here: a set
 # value is a 400 rather than silently dropped by extra="allow".
 _UNIMPLEMENTED_COMPLETION_FIELDS = (
-    "return_tokens_as_token_ids",
     "logprob_token_ids",
     "prompt_logprobs",
     "guided_json",
@@ -1066,7 +1075,10 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if _empty_prompt(req):
         return "prompt must not be empty"
     if _is_token_prompt(req.prompt):
-        return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
+        if req.echo:
+            return "echo is not supported with token-id prompts"
+        if req.suffix is not None:
+            return "suffix is not supported with token-id prompts"
     logprobs_error = completion_logprobs_error(req)
     if logprobs_error is not None:
         return logprobs_error
@@ -1077,6 +1089,13 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
             "(supported: text, json_object, json_schema)"
         )
     return None
+
+
+def _prompt_list(prompt: Any) -> list:
+    """One entry per prompt: a string or a token-id list."""
+    if isinstance(prompt, str) or (prompt and all(isinstance(t, int) for t in prompt)):
+        return [prompt]
+    return list(prompt)
 
 
 def _is_token_prompt(prompt: Any) -> bool:

@@ -58,6 +58,16 @@ class SamplingParams:
     # also asks for logprobs gets them renormalized over this set (Sampler.compute_logprobs).
     allowed_token_ids: list[int] | None = None
 
+    def client_token_ids(self) -> list[tuple[str, list[int]]]:
+        """The token ids a client supplied, by request field (empty ones left out): each
+        must be checked against the tokenizer before the request reaches the engine."""
+        fields = [
+            ("allowed_token_ids", self.allowed_token_ids or []),
+            ("logit_bias", [int(tid) for tid, _ in self.logit_bias or ()]),
+            ("stop_token_ids", self.stop_token_ids),
+        ]
+        return [(name, ids) for name, ids in fields if ids]
+
     @property
     def is_greedy(self) -> bool:
         return self.temperature <= 0.0 or self.top_k == 1

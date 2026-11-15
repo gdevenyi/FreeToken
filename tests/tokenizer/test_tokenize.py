@@ -885,17 +885,29 @@ def test_mapped_developer_messages_are_merged_into_one_leading_system_message():
         _map_developer_role([{"role": "developer", "content": "A"}, {"role": "system", "content": image}], template)
 
 
-@pytest.mark.parametrize(("allowed", "ok"), [([0, 9], True), ([3, 10], False)])
-def test_tokenize_range_checks_allowed_token_ids(allowed, ok):
-    # an id past the real vocabulary indexes the padded logits tail, which samples garbage
+@pytest.mark.parametrize(
+    ("allowed", "prompt_ids", "error"),
+    [
+        ([0, 9], None, None),
+        ([3, 10], None, "allowed_token_ids"),
+        (None, [0, 9, 4], None),
+        (None, [3, 10], "prompt token ids"),
+        (None, [-1], "prompt token ids"),
+    ],
+)
+def test_tokenize_range_checks_client_token_ids(allowed, prompt_ids, error):
+    # an allowed id past the real vocabulary indexes the padded logits tail, which samples
+    # garbage; a prompt id past the embedding rows faults the engine for every request
     class TenIdTokenizer(Qwen38LikeTokenizer):
         def __len__(self) -> int:
             return 10
 
     manager = TokenizeManager(TenIdTokenizer())
-    msg = TokenizeMsg(uid=1, text="hi", sampling_params=SamplingParams(allowed_token_ids=allowed))
-    if ok:
-        assert manager.tokenize([msg])[0].input_ids.tolist() == [7, 8]
-    else:
-        with pytest.raises(ValueError, match="allowed_token_ids"):
+    msg = TokenizeMsg(uid=1, text="hi", input_ids=prompt_ids, sampling_params=SamplingParams(allowed_token_ids=allowed))
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
             manager.tokenize([msg])
+        return
+    out = manager.tokenize([msg])[0].input_ids
+    # a token-id prompt is taken as is, not encoded from text
+    assert out.tolist() == (prompt_ids or [7, 8]) and out.dtype == torch.int32

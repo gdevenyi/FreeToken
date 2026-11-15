@@ -88,6 +88,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
     inline_system_policy: str | None = None
+    # A token-id prompt (OpenAI / vLLM completions): used as is, ``text`` is ignored.
+    input_ids: list[int] | None = None
 
 
 @dataclass

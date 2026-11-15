@@ -144,6 +144,7 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     logprobs: int | None = None
     allowed_token_ids: list[int] | None = None
+    return_tokens_as_token_ids: bool = False
     echo: bool = False
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None

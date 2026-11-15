@@ -228,6 +228,9 @@ DEFAULT_MAX_OUTPUT_TOKENS = 32768
 
 # vLLM's MAX_NUM_ALLOWED_TOKEN_IDS: bounds the per-row mask upload
 MAX_ALLOWED_TOKEN_IDS = 1024
+# The int32 the engine holds ids in; also keeps them within what msgpack carries. The API
+# narrows this to len(tokenizer) when it has a frontend tokenizer, the tokenizer worker always.
+MAX_TOKEN_ID = 2**31 - 1
 
 
 def resolve_sampling(

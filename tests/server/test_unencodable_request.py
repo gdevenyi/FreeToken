@@ -89,8 +89,9 @@ def _responses(**fields):
         lambda: _chat(top_k=HUGE, stream=True),
         lambda: _completion(max_tokens=HUGE),
         lambda: _completion(top_k=HUGE),
-        lambda: _completion(logit_bias={str(HUGE): 1.0}),
-        lambda: _completion(stop_token_ids=[HUGE]),
+        # completions bounds client ids to the engine's int32 before anything is queued
+        lambda: (*_completion(logit_bias={str(HUGE): 1.0}), "logit_bias must be in [0, 2147483648)"),
+        lambda: (*_completion(stop_token_ids=[HUGE]), "stop_token_ids must be in [0, 2147483648)"),
         lambda: _completion(top_k=HUGE, stream=True),
         lambda: _messages(top_k=HUGE),
         lambda: _messages(stop_sequences=["\ud800"]),
@@ -98,12 +99,13 @@ def _responses(**fields):
     ],
 )
 def test_unencodable_field_is_a_400_with_no_bookkeeping_left(build):
-    handler, req = build()
+    handler, req, *expected = build()
     state = _state()
     # a field that does pack would wait for an ack forever
     response = asyncio.run(asyncio.wait_for(handler(req, None, state, {}), 10))
     assert response.status_code == 400
-    assert "request cannot be encoded" in json.loads(response.body)["error"]["message"]
+    message = expected[0] if expected else "request cannot be encoded"
+    assert message in json.loads(response.body)["error"]["message"]
     assert state.stats.active == 0
     assert state.ack_map == {} and state.event_map == {}
     assert state.sent == []
