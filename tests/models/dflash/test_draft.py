@@ -1,6 +1,6 @@
 """DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates.
 
-At TP=2, on the CPU with a simulated communicator: the config check."""
+At TP=2, on the CPU with a simulated communicator: the config check, the sharded load and the budget against the sharded ring."""
 
 from __future__ import annotations
 
@@ -257,6 +257,89 @@ def test_sample_path_walks_the_selector_lattice(tmp_path):
 
 K, MAX_REQ = 3, 4
 MAX_POS = CONFIG["max_position_embeddings"]
+SHARDED = (".q_proj.", ".k_proj.", ".v_proj.", ".o_proj.", ".gate_proj.", ".up_proj.", ".down_proj.")
+
+
+class _Comm:
+    """PyNCCL's two collectives on one simulated rank: every call is recorded; ``reply(i, x)`` stands in for the other rank, else an all-reduce gives its input back and an all-gather ``size`` copies of it, stacked on dim 0 as PyNCCL stacks them."""
+
+    def __init__(self, reply=None, size: int = 2) -> None:
+        self.reply, self.size, self.calls = reply, size, []
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls.append(("all_reduce", x.clone()))
+        return x if self.reply is None else x.copy_(self.reply(len(self.calls) - 1, x))
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls.append(("all_gather", x.clone()))
+        return torch.cat([x] * self.size) if self.reply is None else self.reply(len(self.calls) - 1, x)
+
+    def signature(self) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        return [(op, tuple(t.shape), t.dtype) for op, t in self.calls]
+
+
+def _use(monkeypatch, comm: _Comm) -> _Comm:
+    from freetoken.distributed import DistributedCommunicator
+
+    monkeypatch.setattr(DistributedCommunicator, "plugins", [comm])
+    return comm
+
+
+def _cpu_kernels(monkeypatch) -> None:
+    """Torch stand-ins for the GPU kernels under the draft, so the CPU runs its real modules and collectives: they keep shapes, not values, and the draft kernels' stand-ins assert the shapes the kernels read from their arguments."""
+    from freetoken import kernel
+    from freetoken.kernel import backend
+    from freetoken.kernel.triton import activation, norm
+    from freetoken.models.dflash import model
+
+    def indexing(weights, indices, *, output=None, vocab_range=None):
+        start, n = vocab_range or (0, weights.shape[0])
+        local = indices - start
+        return weights[local.clamp(0, n - 1)] * ((local >= 0) & (local < n))[:, None]
+
+    def norm_rope_store(src, *, num_layers, num_q_heads, q_out, ring_k, **_):
+        kv_heads, head_dim = ring_k.shape[3:]
+        assert src.shape[1] == num_layers * (num_q_heads + 2 * kv_heads) * head_dim, "the q|k|v rows do not match the ring's KV heads"
+        if q_out is not None:
+            assert q_out.shape[1] == num_q_heads * head_dim
+            q_out.copy_(src[:, : q_out.shape[1]])
+
+    def ring_attention(q, ring_k, *_):
+        assert q.shape[1] == HEADS // KV_HEADS * ring_k.shape[3] * ring_k.shape[4], "the query heads do not match the ring's KV heads"
+        return q.clone()
+
+    def selector_walk(ids, *_):
+        return ids[..., 0].clone(), F.one_hot(torch.zeros_like(ids[..., 0]), ids.shape[-1]).float()
+
+    for module in (backend, model):
+        monkeypatch.setattr(module, "is_flashinfer_installed", lambda: False)
+    monkeypatch.setattr(kernel, "indexing", indexing)
+    monkeypatch.setattr(norm, "rmsnorm", lambda x, w, eps, out=None: x.clone() if out is None else out.copy_(x))
+    monkeypatch.setattr(norm, "fused_add_rmsnorm", lambda x, residual, w, eps: x.copy_(residual.add_(x)))
+    monkeypatch.setattr(activation, "silu_and_mul", lambda x, out=None: x[..., : x.shape[-1] // 2] * x[..., x.shape[-1] // 2 :])
+    monkeypatch.setattr(model, "grouped_conv", lambda x, *_: x.clone())
+    for fn in (norm_rope_store, ring_attention, selector_walk):
+        monkeypatch.setattr(model, fn.__name__, fn)
+
+
+def _load_rank(monkeypatch, path: str, w: dict[str, torch.Tensor], rank: int, size: int = 2):
+    """The draft on the CPU as TP rank ``rank`` of ``size`` loads it, beside the target's embedding and head sharded by vocab rows."""
+    import freetoken.distributed.info as dist_info
+    from freetoken.distributed import DistributedInfo
+    from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
+    from freetoken.layers.quantization import finalize_quant
+    from freetoken.models.dflash import DFlash2DraftModel, parse_config
+    from freetoken.models.loader import shard_tensor
+    from freetoken.utils import cached_load_hf_config, torch_dtype
+
+    monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(rank, size))
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        embed, head = VocabParallelEmbedding(VOCAB, H), ParallelLMHead(VOCAB, H)
+    for op, name, key in ((embed, "target.embed", "embed_tokens.weight"), (head, "target.head", "lm_head.weight")):
+        op.load_state_dict({"weight": shard_tensor(key, w[name], rank=rank, world_size=size, num_kv_heads=None)})
+        finalize_quant(op)
+    target = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), lm_head=head)
+    return DFlash2DraftModel.load(parse_config(cached_load_hf_config(path)), target, path, CPU, torch.bfloat16)
 
 
 def _config(path: str, tp: int, rank: int = 0) -> SimpleNamespace:
@@ -273,6 +356,23 @@ def _config(path: str, tp: int, rank: int = 0) -> SimpleNamespace:
     )
 
 
+def _proposer(monkeypatch, path: str, draft, rank: int):
+    """DFlashProposer as TP rank ``rank`` of 2 builds it around ``draft``: its constructor needs a GPU only for the draft load, which hands back ``draft``."""
+    from freetoken.models.dflash import DFlash2DraftModel
+    from freetoken.spec.dflash.proposer import DFlashProposer
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(DFlash2DraftModel, "load", lambda *args: draft)
+    return DFlashProposer(_config(path, 2, rank), None)
+
+
+def _context(device: torch.device):
+    from freetoken.spec.proposer import DraftContext
+
+    page_table = torch.zeros(MAX_REQ + 1, MAX_POS, dtype=torch.int32, device=device)
+    return DraftContext(page_table=page_table, num_pages=0, device=device, stream=None, dummy_req=None, slot_states={}, kv_cache=None)
+
+
 @pytest.mark.parametrize("tp, refused", [(2, None), (3, "num_attention_heads"), (4, "num_key_value_heads")])
 def test_adjust_config_accepts_tp2_refuses_uneven_heads(tmp_path, tp, refused):
     """TP=2 passes the config check; a TP size that does not divide the query heads, or only the KV heads (which the qkv layer would replicate), is refused there, before the target loads."""
@@ -284,3 +384,46 @@ def test_adjust_config_accepts_tp2_refuses_uneven_heads(tmp_path, tp, refused):
         return
     with pytest.raises(ValueError, match=refused):
         DFlashProposer.adjust_config(config, None)
+
+
+def test_sharded_load_matches_checkpoint_slices(tmp_path, monkeypatch):
+    """At TP=2 each rank holds its half of the query and KV heads and of the MLP rows, sliced before the q|k|v and gate|up merge, and its half of the o/down columns; fc, the convs, the selector and the norms stay whole; the context projection holds the rank's K|V rows of every layer."""
+    _cpu_kernels(monkeypatch)
+    _use(monkeypatch, _Comm())
+    w = _weights()
+    path = _checkpoint(tmp_path, w)
+    for rank in range(2):
+        draft = _load_rank(monkeypatch, path, w, rank)
+        state = draft.state_dict()
+
+        def half(name, dim=0, rank=rank):
+            return w[name].chunk(2, dim)[rank]
+
+        for i in range(LAYERS):
+            attn, mlp = f"layers.{i}.self_attn", f"layers.{i}.mlp"
+            q, k, v = (half(f"{attn}.{x}_proj.weight") for x in "qkv")
+            assert torch.equal(state[f"{attn}.qkv_proj.weight"], torch.cat([q, k, v])), f"rank {rank} layer {i} q|k|v"
+            assert torch.equal(state[f"{attn}.o_proj.weight"], half(f"{attn}.o_proj.weight", 1))
+            assert torch.equal(state[f"{mlp}.gate_up_proj.weight"], torch.cat([half(f"{mlp}.gate_proj.weight"), half(f"{mlp}.up_proj.weight")]))
+            assert torch.equal(state[f"{mlp}.down_proj.weight"], half(f"{mlp}.down_proj.weight", 1))
+            assert torch.equal(draft._kv_all[i], torch.cat([k, v])), f"rank {rank} layer {i} context K|V"
+        whole = [name for name in w if not name.startswith("target.") and not any(s in name for s in SHARDED)]
+        assert len(whole) == 6 + 8 * LAYERS
+        for name in whole:
+            assert torch.equal(state[name], w[name]), f"rank {rank} {name}"
+
+
+def test_budget_matches_local_ring(tmp_path, monkeypatch):
+    """At TP=2 ``budget()`` is what rank 0's attach allocates: the K/V ring of its KV heads, the ring attention's scratch, the rope table and the verify feature buffer (the window rides the GDN slots and is budgeted with them)."""
+    from freetoken.spec.dflash.proposer import DFlashProposer
+
+    _cpu_kernels(monkeypatch)
+    _use(monkeypatch, _Comm())
+    w = _weights()
+    path = _checkpoint(tmp_path, w)
+    proposer = _proposer(monkeypatch, path, _load_rank(monkeypatch, path, w, 0), 0)
+    proposer.attach(_context(torch.device("meta")))
+    ring = proposer.dflash_ring
+    assert ring.k.shape[3] == KV_HEADS // 2
+    held = sum(t.nbytes for t in (ring.k, ring.v, *ring.workspace, ring.cos_sin, proposer.aux_buf))
+    assert DFlashProposer.budget(proposer.config) == (held, 0)

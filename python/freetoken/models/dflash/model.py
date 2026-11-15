@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.backend import is_flashinfer_installed
 from freetoken.kernel.triton.dflash import grouped_conv, norm_rope_store, ring_attention, ring_attention_workspace, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
@@ -19,7 +20,7 @@ from freetoken.layers.quantization import NoQuantConfig, QuantConfig, finalize_q
 from freetoken.models.blocks import GatedMLP
 from freetoken.utils import cached_load_hf_config, torch_dtype
 
-from .config import DFlashDraftConfig
+from .config import DFlashDraftConfig, tp_heads
 from .weight import iter_weights
 
 
@@ -56,12 +57,14 @@ class DFlashGroupedConv(BaseOP):
 
 class DFlashAttention(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
-        self.q_size = config.num_heads * config.head_dim
         self.qkv_proj = LinearQKVMerged(
             config.hidden_size, config.head_dim, config.num_heads, config.num_kv_heads, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearRowParallel(self.q_size, config.hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.o_proj")
+        # the full query width: the layer takes this rank's share itself
+        self.o_proj = LinearRowParallel(
+            config.num_heads * config.head_dim, config.hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.o_proj",
+        )
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
 
@@ -98,6 +101,8 @@ class DFlash2DraftModel(BaseOP):
 
     def __init__(self, config: DFlashDraftConfig, target_model, quant_config: QuantConfig) -> None:
         self.config = config
+        # this rank's heads: the ring, the q rows and the attention scratch hold these
+        self.num_local_heads, self.num_local_kv_heads = tp_heads(config, get_tp_info().size)
         hidden, taps = config.hidden_size, len(config.target_layer_ids)
         self.fc = LinearReplicated(taps * hidden, hidden, has_bias=False, quant_config=quant_config, prefix="fc")
         self.hidden_norm = RMSNorm(hidden, config.rms_norm_eps)
@@ -141,7 +146,7 @@ class DFlash2DraftModel(BaseOP):
         for op in (draft.fc, draft.layers, draft.candidate_selector):
             finalize_quant(op)
         layers = draft.layers.op_list
-        draft._kv_all = qkv[:, layers[0].self_attn.q_size :]
+        draft._kv_all = qkv[:, draft.num_local_heads * config.head_dim :]
         draft._k_norms = torch.stack([layer.self_attn.k_norm.weight for layer in layers]).contiguous()
         draft._mask_embedding = draft._embed_tokens.forward(torch.tensor([config.mask_token_id], device=device))[0]
         return draft
@@ -150,8 +155,8 @@ class DFlash2DraftModel(BaseOP):
         """A zeroed ring of ``ring_len`` positions for ``max_rows`` table rows, drafting blocks of ``block`` tokens at positions below ``max_position``."""
         c = self.config
         assert ring_len >= c.window + block, f"a ring of {ring_len} cannot hold the window {c.window} plus the block {block}"
-        k = torch.zeros(c.num_layers, max_rows, ring_len, c.num_kv_heads, c.head_dim, dtype=self._kv_all.dtype, device=device)
-        workspace = ring_attention_workspace(max_rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring_len, device)
+        k = torch.zeros(c.num_layers, max_rows, ring_len, self.num_local_kv_heads, c.head_dim, dtype=self._kv_all.dtype, device=device)
+        workspace = ring_attention_workspace(max_rows, block, self.num_local_heads, self.num_local_kv_heads, c.head_dim, ring_len, device)
         # not the cached get_rope: max_position follows the page table, so each rebuild would cache one more table
         inv_freq = 1.0 / (c.rope_theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float, device=device) / c.head_dim))
         freqs = torch.arange(max_position, dtype=torch.float, device=device)[:, None] * inv_freq[None, :]
@@ -191,10 +196,10 @@ class DFlash2DraftModel(BaseOP):
             attn = layer.self_attn
             h, residual = layer.input_layernorm.forward(x, residual)
             h, conv = layer.attention_conv.prepare(h, block)
-            q = torch.empty(bs * block, attn.q_size, dtype=h.dtype, device=h.device)
+            q = torch.empty(bs * block, self.num_local_heads * c.head_dim, dtype=h.dtype, device=h.device)
             # the block's own K/V go into the ring, so the attention reads window and block alike
             norm_rope_store(
-                attn.qkv_proj.forward(h), num_layers=1, num_q_heads=c.num_heads, q_out=q, q_norm=attn.q_norm.weight,
+                attn.qkv_proj.forward(h), num_layers=1, num_q_heads=self.num_local_heads, q_out=q, q_norm=attn.q_norm.weight,
                 k_norms=self._k_norms, cos_sin=dflash_ring.cos_sin, positions=positions, rows=token_rows,
                 ring_k=dflash_ring.k, ring_v=dflash_ring.v, layer0=i, eps=c.rms_norm_eps,
             )
