@@ -17,6 +17,7 @@ import asyncio
 import json
 import math
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -442,6 +443,16 @@ async def send_new_request(state: Any, uid: int, msg: TokenizeMsg) -> None:
     except (OverflowError, UnicodeEncodeError, TypeError, RecursionError) as exc:
         state.forget_unsent_user(uid)
         raise GenerationError(f"request cannot be encoded: {exc}") from exc
+
+
+# uid restarts at 0 with every server process, but clients and proxies key their request logs on
+# the response id (LiteLLM's spend log drops a repeated one), so a random per-process part goes first.
+_RESPONSE_ID_PREFIX = uuid.uuid4().hex[:12]
+
+
+def public_request_id(uid: int) -> str:
+    """The response id clients see for ``uid``: unique across server restarts, ending in the uid."""
+    return f"{_RESPONSE_ID_PREFIX}-{uid}"
 
 
 async def submit_generation(spec: GenSpec, state: Any) -> int:

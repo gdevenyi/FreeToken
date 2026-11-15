@@ -325,7 +325,7 @@ def test_full_response_text_and_tool():
     assert resp.type == "message"
     assert resp.role == "assistant"
     assert resp.model == "claude-x"
-    assert resp.id == "msg_9"
+    assert resp.id.startswith("msg_") and resp.id.endswith("-9") and resp.id != "msg_9"
     assert resp.stop_reason == "tool_use"
     assert resp.content[0].type == "text" and resp.content[0].text == "calling tool"
     assert resp.content[1].type == "tool_use"

@@ -240,7 +240,7 @@ def test_continue_final_message_needs_an_assistant_tail_and_reaches_the_template
 # ---- ids and usage ------------------------------------------------------------------------
 
 
-def test_request_id_becomes_the_response_id():
+def test_response_id_is_the_request_id_else_not_the_bare_uid():
     state = FakeState()
     body = run(handle_chat_completion(chat(request_id="abc-1"), None, state, {}))
     assert body["id"] == "chatcmpl-abc-1"
@@ -249,6 +249,16 @@ def test_request_id_becomes_the_response_id():
     )
     events = parse_sse(run(_collect(response.body_iterator)))
     assert events[0]["id"] == "chatcmpl-abc-2"
+    # the uid restarts with the server; proxies drop a repeated id from their request logs
+    body = run(handle_chat_completion(chat(), None, state, {}))
+    assert (
+        body["id"].endswith(f"-{state._next}")
+        and body["id"] != f"chatcmpl-{state._next}"
+    )
+    response = run(handle_chat_completion(chat(stream=True), None, state, {}))
+    events = parse_sse(run(_collect(response.body_iterator)))
+    ids = {e["id"] for e in events if e != "[DONE]"}
+    assert len(ids) == 1 and ids.pop().endswith(f"-{state._next}")
 
 
 def test_usage_details_appear_only_when_nonzero():

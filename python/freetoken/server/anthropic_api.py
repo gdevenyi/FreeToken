@@ -48,6 +48,7 @@ from .generation import (
     count_prompt_tokens,
     generate_events,
     generate_full,
+    public_request_id,
     render_messages,
     resolve_sampling,
     split_tool_lists,
@@ -416,7 +417,7 @@ def anthropic_full_response(
         )
     stop_reason, stop_sequence = _anthropic_stop(result.finish_reason, result.matched_stop)
     return AnthropicMessagesResponse(
-        id=f"msg_{uid}",
+        id=f"msg_{public_request_id(uid)}",
         content=content,
         model=model,
         stop_reason=stop_reason,
@@ -493,7 +494,7 @@ async def anthropic_event_stream(
         return _event(AnthropicStreamEvent(
             type="message_start",
             message=AnthropicMessagesResponse(
-                id=f"msg_{uid}", content=[], model=model, usage=usage,
+                id=f"msg_{public_request_id(uid)}", content=[], model=model, usage=usage,
             ),
         ))
 

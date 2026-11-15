@@ -39,6 +39,7 @@ from .generation import (
     generate_events,
     generate_full,
     prerender_error,
+    public_request_id,
     render_messages,
     resolve_sampling,
     send_new_request,
@@ -310,7 +311,7 @@ async def handle_chat_completion(
         message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
 
     response: dict[str, Any] = {
-        "id": _response_id("chatcmpl", req, uid),
+        "id": _response_id("chatcmpl", req, public_request_id(uid)),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
@@ -622,7 +623,7 @@ async def handle_completion(
 
 def _completion_chunk(req: CompletionRequest, uid: Any, choices: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "id": _response_id("cmpl", req, uid),
+        "id": _response_id("cmpl", req, public_request_id(uid)),
         "object": "text_completion.chunk",
         "created": int(time.time()),
         "model": req.model,
@@ -881,7 +882,7 @@ def _tool_call_id(name: str | None, index: int) -> str:
 
 def _chat_chunk(req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "id": _response_id("chatcmpl", req, uid),
+        "id": _response_id("chatcmpl", req, public_request_id(uid)),
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": req.model,
