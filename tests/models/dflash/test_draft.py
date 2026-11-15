@@ -311,8 +311,14 @@ def _cpu_kernels(monkeypatch) -> None:
     def selector_walk(ids, *_):
         return ids[..., 0].clone(), F.one_hot(torch.zeros_like(ids[..., 0]), ids.shape[-1]).float()
 
+    def topk(x, k, dim=-1):
+        # a top-k kernel promises no order among ties: this one gives the higher id first, the worst case for the merge
+        vals, idx = x.flip(dim).sort(dim=dim, descending=True, stable=True)
+        return vals.narrow(dim, 0, k), (x.shape[dim] - 1 - idx).narrow(dim, 0, k)
+
     for module in (backend, model):
         monkeypatch.setattr(module, "is_flashinfer_installed", lambda: False)
+    monkeypatch.setattr(torch, "topk", topk)
     monkeypatch.setattr(kernel, "indexing", indexing)
     monkeypatch.setattr(norm, "rmsnorm", lambda x, w, eps, out=None: x.clone() if out is None else out.copy_(x))
     monkeypatch.setattr(norm, "fused_add_rmsnorm", lambda x, residual, w, eps: x.copy_(residual.add_(x)))
@@ -430,7 +436,7 @@ def test_budget_matches_local_ring(tmp_path, monkeypatch):
 
 
 def test_gathered_topk_matches_full(tmp_path, monkeypatch):
-    """At TP=2 a rank gathers its best TOP_K (id, value) pairs, not its logits, and every rank gets the full head's candidates: ids in the full vocab, best first, ties to the lower id, also across the ranks' halves (the expectation is a stable sort of the full logits; no tie crosses the TOP_K cut, where the top-k kernel decides)."""
+    """At TP=2 a rank gathers its best TOP_K (id, value) pairs, not its logits, and every rank gets the full head's candidates: ids in the full vocab, best first, ties to the lower id, inside a rank's half (whose top-k gives ties the higher id first) and across the halves (the expectation is a stable sort of the full logits; no tie crosses the TOP_K cut, where the top-k kernel decides)."""
     _cpu_kernels(monkeypatch)
     w = _weights()
     # an identity head makes each logit the hidden value itself, so the ties are exact in every rank's GEMM
