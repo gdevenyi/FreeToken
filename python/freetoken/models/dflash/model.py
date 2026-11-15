@@ -230,7 +230,7 @@ class DFlash2DraftModel(BaseOP):
         head = self._lm_head
         start, count = head.vocab_range
         # _local_logits is the head's shard GEMM, the seam a quantized head overrides; columns past count pad the last shard
-        vals, ids = self._top_k(head._local_logits(x)[:, :count], k)
+        vals, ids = self._top_k(head._local_logits(x)[:, :count].contiguous(), k)
         pairs = torch.stack([(ids.long() + start).float(), vals.float()], dim=-1)
         # PyNCCL stacks the ranks on dim 0: [tp*n, k, 2] -> [n, tp*k, 2]
         pairs = self._comm.all_gather(pairs).view(head.tp_size, *pairs.shape).transpose(0, 1).reshape(x.shape[0], -1, 2)
