@@ -611,10 +611,11 @@ def _():
 
 @test("oa.comp.logprobs")
 def _():
+    # one token: with MTP on, the AnyJev logprobs port serves logprobs for one-token reads only
     s, d = comp(
         {
             "prompt": "The capital of France is",
-            "max_tokens": 3,
+            "max_tokens": 1,
             "temperature": 0,
             "logprobs": 2,
         }
