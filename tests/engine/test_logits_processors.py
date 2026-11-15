@@ -236,3 +236,40 @@ def test_repetition_penalty_reads_the_prompt_once_and_counts_output_on_the_devic
     assert req.prompt_token_mask is mask
     out = apply_penalties(logits, args)
     assert out[0].tolist() == [0.0, 0.5, 0.5, 2.0, 0.5, 0.0, 0.0, 0.0]
+
+
+def test_allowed_token_ids_mask_everything_else_in_the_row_only():
+    logits = torch.arange(2 * V, dtype=torch.float32).view(2, V)
+    # duplicates and the vocab_size padding column are harmless
+    plan = _plan([0, 1], allow_rows=torch.tensor([1]), allow_ids=_ids([[2, 2, 5]]))
+    out = apply_logits_processors(logits, plan, V)
+    assert torch.isfinite(out[1]).tolist() == [i in (2, 5) for i in range(V)]
+    assert out[1, 2].item() == logits[1, 2].item() and out[1, 5].item() == logits[1, 5].item()
+    assert torch.equal(out[0], logits[0])
+
+
+def test_prepare_masks_sampling_to_the_allowed_ids():
+    sampler = Sampler(CPU, V)
+    req = _req([1], [], 4, allowed_token_ids=[2, 4, 99])  # 99: past the logits, dropped
+    other = _req([1], [], 4)
+    logits = torch.zeros((2, V))
+    logits[:, 7] = 10.0
+    logits[:, 4] = 1.0
+    args = sampler.prepare(SimpleNamespace(reqs=[req, other]))
+    assert args.plan.allow_rows.tolist() == [0] and args.plan.allow_ids.tolist() == [[2, 4]]
+    assert sampler.sample(logits, args).tolist() == [4, 7]
+
+
+def test_verify_rows_keep_their_requests_allowed_ids():
+    # An MTP verify samples k + 1 rows per request; every row of a restricted request must
+    # stay inside its set, or a draft outside it is accepted.
+    sampler = Sampler(CPU, V)
+    req = _req([1], [], 4, allowed_token_ids=[2, 4])
+    other = _req([1], [], 4)
+    args = sampler.prepare(SimpleNamespace(reqs=[req, other]))
+    k = 2
+    logits = torch.zeros((2 * (k + 1), V))
+    logits[:, 7] = 10.0
+    logits[:, 4] = 1.0
+    drafts = torch.full((2, k), 7, dtype=torch.int64)
+    assert sampler.sample_verify(logits, args, drafts).tolist() == [4, 4, 4, 7, 7, 7]

@@ -62,11 +62,11 @@ prompt only); the same sampling parameters as above; plus:
 | `echo` | honoured (the prompt leads the text; not with `logprobs`) | honoured | honoured | no |
 | `suffix` | honoured on models with fill-in-the-middle tokens (`<|fim_prefix|>` ... `<|fim_middle|>`): the prompt becomes prefix-suffix-middle | 400 | 400 | `/infill` |
 | `n` | 400 unless 1 | honoured | honoured | no |
-| `logprobs` | honoured, 0..5: raw pre-temperature logprobs of the sampled token and its top alternatives | honoured | honoured | `n_probs` |
+| `logprobs` | honoured, 0..32: raw pre-temperature logprobs of the sampled token and its top alternatives; -inf is sent as -9999 | honoured (`--max-logprobs`, default 20) | honoured | `n_probs` |
+| `allowed_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: sampling is masked to them at every position. With `logprobs` the values are renormalized over the set (vLLM's `processed_logprobs` at temperature 0), so `temperature > 0`, penalties, `min_tokens` and `logit_bias` are a 400 there; entries past the set are left out | honoured (raw logprobs unless `--logprobs-mode processed_logprobs`) | no | no |
 
-Set values of the vLLM fields this server does not implement (`allowed_token_ids`,
-`return_tokens_as_token_ids`, `logprob_token_ids`, `prompt_logprobs`, `guided_*`,
-`structured_outputs`, `bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
+Set values of the vLLM fields this server does not implement (`return_tokens_as_token_ids`,
+`logprob_token_ids`, `prompt_logprobs`, `guided_*`, `structured_outputs`, `bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
 Empty prompts and more than 256 prompts are a 400.
 
 ## Responses

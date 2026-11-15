@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import replace
@@ -1048,14 +1049,22 @@ class Scheduler(SchedulerIOMixin):
         return forward_output
 
 
+def logprob_candidates(ids: list[int], logprobs: list[float]) -> tuple[list[int], list[float]]:
+    """A row's top-logprob slice minus what is not a candidate: padding (-1 ids) and the
+    -inf tail of a row restricted to fewer allowed_token_ids than it asked for."""
+    keep = [k for k, (t, lp) in enumerate(zip(ids, logprobs)) if t >= 0 and math.isfinite(lp)]
+    return [int(ids[k]) for k in keep], [logprobs[k] for k in keep]
+
+
 def _attach_logprobs(msg: DetokenizeMsg, output: ForwardOutput, row: int, top: int) -> None:
     """Copy batch row ``row``'s sampled-token logprobs onto its reply, cut to ``top`` alternatives."""
     if output.chosen_logprobs_cpu is None:
         return
     msg.chosen_logprob = float(output.chosen_logprobs_cpu[row].item())
     if top > 0 and output.top_ids_cpu is not None:
-        msg.top_ids = [int(t) for t in output.top_ids_cpu[row, :top].tolist()]
-        msg.top_logprobs = output.top_logprobs_cpu[row, :top].tolist()
+        msg.top_ids, msg.top_logprobs = logprob_candidates(
+            output.top_ids_cpu[row, :top].tolist(), output.top_logprobs_cpu[row, :top].tolist()
+        )
     else:
         msg.top_ids, msg.top_logprobs = [], []
 

@@ -143,6 +143,7 @@ class CompletionRequest(BaseModel):
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     ignore_eos: bool = False
     logprobs: int | None = None
+    allowed_token_ids: list[int] | None = None
     echo: bool = False
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None

@@ -226,6 +226,10 @@ class GenSpec:
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
 
 
+# vLLM's MAX_NUM_ALLOWED_TOKEN_IDS: bounds the per-row mask upload
+MAX_ALLOWED_TOKEN_IDS = 1024
+
+
 def resolve_sampling(
     *,
     temperature: float | None,
@@ -246,6 +250,7 @@ def resolve_sampling(
     include_stop_str_in_output: bool = False,
     skip_special_tokens: bool | None = None,
     timings_per_token: bool = False,
+    allowed_token_ids: list[int] | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults. Range errors
@@ -295,6 +300,15 @@ def resolve_sampling(
     ids = [int(t) for t in (stop_token_ids or [])]
     if any(t < 0 for t in ids):
         raise ValueError("stop_token_ids must be non-negative token ids")
+    allowed = None
+    if allowed_token_ids is not None:
+        if not 1 <= len(allowed_token_ids) <= MAX_ALLOWED_TOKEN_IDS:
+            raise ValueError(
+                f"allowed_token_ids must hold 1 to {MAX_ALLOWED_TOKEN_IDS} ids, got {len(allowed_token_ids)}"
+            )
+        allowed = sorted({int(t) for t in allowed_token_ids})
+        if allowed[0] < 0:
+            raise ValueError("allowed_token_ids must be non-negative token ids")
     params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
@@ -311,6 +325,7 @@ def resolve_sampling(
         stop_token_ids=ids,
         include_stop_str_in_output=bool(include_stop_str_in_output),
         timings_per_token=timings_per_token,
+        allowed_token_ids=allowed,
     )
     if skip_special_tokens is not None:
         params.skip_special_tokens = bool(skip_special_tokens)

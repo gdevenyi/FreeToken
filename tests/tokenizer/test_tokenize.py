@@ -883,3 +883,19 @@ def test_mapped_developer_messages_are_merged_into_one_leading_system_message():
     image = [{"type": "text", "text": "B"}, {"type": "image", "freetoken_ref": {"kind": "url", "data": "x"}}]
     with pytest.raises(ValueError, match="System message cannot contain images"):
         _map_developer_role([{"role": "developer", "content": "A"}, {"role": "system", "content": image}], template)
+
+
+@pytest.mark.parametrize(("allowed", "ok"), [([0, 9], True), ([3, 10], False)])
+def test_tokenize_range_checks_allowed_token_ids(allowed, ok):
+    # an id past the real vocabulary indexes the padded logits tail, which samples garbage
+    class TenIdTokenizer(Qwen38LikeTokenizer):
+        def __len__(self) -> int:
+            return 10
+
+    manager = TokenizeManager(TenIdTokenizer())
+    msg = TokenizeMsg(uid=1, text="hi", sampling_params=SamplingParams(allowed_token_ids=allowed))
+    if ok:
+        assert manager.tokenize([msg])[0].input_ids.tolist() == [7, 8]
+    else:
+        with pytest.raises(ValueError, match="allowed_token_ids"):
+            manager.tokenize([msg])
