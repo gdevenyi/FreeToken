@@ -1,6 +1,6 @@
 """DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates.
 
-At TP=2, on the CPU with a simulated communicator: the config check, the sharded load, the budget against the sharded ring, and the rank-0 drafts with the same collectives on both ranks."""
+At TP=2, on the CPU with a simulated communicator: the config check, the sharded load, the budget against the sharded ring, the per-rank candidate gather, and the rank-0 drafts with the same collectives on both ranks."""
 
 from __future__ import annotations
 
@@ -427,6 +427,37 @@ def test_budget_matches_local_ring(tmp_path, monkeypatch):
     assert ring.k.shape[3] == KV_HEADS // 2
     held = sum(t.nbytes for t in (ring.k, ring.v, *ring.workspace, ring.cos_sin, proposer.aux_buf))
     assert DFlashProposer.budget(proposer.config) == (held, 0)
+
+
+def test_gathered_topk_matches_full(tmp_path, monkeypatch):
+    """At TP=2 a rank gathers its best TOP_K (id, value) pairs, not its logits, and every rank gets the full head's candidates: ids in the full vocab, best first, ties to the lower id, also across the ranks' halves (the expectation is a stable sort of the full logits; no tie crosses the TOP_K cut, where the top-k kernel decides)."""
+    _cpu_kernels(monkeypatch)
+    w = _weights()
+    # an identity head makes each logit the hidden value itself, so the ties are exact in every rank's GEMM
+    w["target.head"] = torch.eye(VOCAB, H, dtype=torch.bfloat16)
+    path = _checkpoint(tmp_path, w)
+    tops = ({3: 4.0, 40: 4.0, 5: 4.0, 60: 3.0}, {33: 2.0, 50: 2.0, 63: 3.0, 32: 1.5}, {10: 5.0, 20: 4.5, 31: 4.0, 32: 4.0})
+    logits = -torch.randperm(VOCAB, generator=torch.Generator().manual_seed(7)).float().div(8).expand(len(tops), -1).clone()
+    for row, top in enumerate(tops):
+        logits[row, list(top)] = torch.tensor(list(top.values()))
+    hidden = logits.to(torch.bfloat16).view(len(tops), 1, H)
+    vals, ids = logits.sort(dim=-1, descending=True, stable=True)
+    want_ids, want_vals = ids[:, None, :TOP_K], vals[:, None, :TOP_K]
+
+    drafts, sent = [], []
+    for rank in range(2):
+        comm = _use(monkeypatch, _Comm())
+        drafts.append(_load_rank(monkeypatch, path, w, rank))
+        comm.calls.clear()
+        drafts[-1].compute_candidates(hidden)
+        assert [op for op, _ in comm.calls] == ["all_gather"] and comm.calls[0][1].numel() == len(tops) * TOP_K * 2, comm.signature()
+        sent.append(comm.calls[0][1])
+    gathered = torch.cat(sent)
+    for draft in drafts:
+        _use(monkeypatch, _Comm(reply=lambda i, x: gathered))
+        cand, unary = draft.compute_candidates(hidden)
+        assert torch.equal(cand, want_ids), cand.view(len(tops), -1).tolist()
+        assert torch.equal(unary, want_vals) and cand.is_contiguous() and unary.is_contiguous()
 
 
 def test_drafts_follow_rank0(tmp_path, monkeypatch):

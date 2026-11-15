@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.kernel.backend import is_flashinfer_installed
 from freetoken.kernel.triton.dflash import grouped_conv, norm_rope_store, ring_attention, ring_attention_workspace, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
@@ -112,6 +112,7 @@ class DFlash2DraftModel(BaseOP):
         # the target's own modules; underscore names keep them out of this module's state dict
         self._embed_tokens = target_model.model.embed_tokens
         self._lm_head = target_model.lm_head
+        self._comm = DistributedCommunicator()
         if is_flashinfer_installed():
             from flashinfer import top_k
 
@@ -125,6 +126,8 @@ class DFlash2DraftModel(BaseOP):
         quant = QuantConfig.from_hf(cached_load_hf_config(model_path))
         if not isinstance(quant, NoQuantConfig):
             raise ValueError(f"{model_path}: quantized DFlash drafts are not supported yet")
+        if get_tp_info().size > 1 and config.vocab_size > 2**24:
+            raise ValueError(f"{model_path}: at TP > 1 the candidate gather carries token ids as fp32, exact only up to 2**24, not vocab {config.vocab_size}")
         with torch.device("meta"), torch_dtype(dtype):
             draft = cls(config, target_model, quant)
         expected = draft.state_dict()
@@ -214,6 +217,23 @@ class DFlash2DraftModel(BaseOP):
 
     def compute_candidates(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The target head's top-K token ids and their fp32 logits over ``hidden [..., H]``, best first, so a tie in the walk takes the first."""
-        vals, ids = self._top_k(self._lm_head.logits(hidden.reshape(-1, hidden.shape[-1])), self.config.selector_top_k)
+        x, k = hidden.reshape(-1, hidden.shape[-1]), self.config.selector_top_k
+        if self._lm_head.tp_size == 1:
+            vals, ids = self._top_k(self._lm_head.logits(x), k)
+        else:
+            vals, ids = self._gathered_top_k(x, k)
         shape = hidden.shape[:-1] + (-1,)
         return ids.long().view(shape), vals.float().view(shape)
+
+    def _gathered_top_k(self, x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The best ``k`` of every rank's vocab shard, gathered as (id, value) pairs instead of the logits; ties go to the lower id, so the order does not depend on the top-k kernel."""
+        head = self._lm_head
+        start, count = head.vocab_range
+        # _local_logits is the head's shard GEMM, the seam a quantized head overrides; columns past count pad the last shard
+        vals, ids = self._top_k(head._local_logits(x)[:, :count], k)
+        pairs = torch.stack([(ids.long() + start).float(), vals.float()], dim=-1)
+        # PyNCCL stacks the ranks on dim 0: [tp*n, k, 2] -> [n, tp*k, 2]
+        pairs = self._comm.all_gather(pairs).view(head.tp_size, *pairs.shape).transpose(0, 1).reshape(x.shape[0], -1, 2)
+        ids, order = pairs[..., 0].long().sort(dim=-1)
+        vals, order = pairs[..., 1].gather(-1, order).sort(dim=-1, descending=True, stable=True)
+        return vals[:, :k].contiguous(), ids.gather(-1, order[:, :k])
