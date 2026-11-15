@@ -168,6 +168,10 @@ class CompletionRequest(BaseModel):
         return self
 
 
+# prompts per /v1/completions request: every one is queued before any is awaited
+MAX_PROMPTS = 256
+
+
 class TokenizeRequest(BaseModel):
     """``POST /tokenize`` (the vLLM / SGLang shape): a raw prompt, or chat messages that
     are rendered through the model's chat template first."""

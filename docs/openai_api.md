@@ -64,6 +64,11 @@ prompt only); the same sampling parameters as above; plus:
 | `n` | 400 unless 1 | honoured | honoured | no |
 | `logprobs` | honoured, 0..5: raw pre-temperature logprobs of the sampled token and its top alternatives | honoured | honoured | `n_probs` |
 
+Set values of the vLLM fields this server does not implement (`allowed_token_ids`,
+`return_tokens_as_token_ids`, `logprob_token_ids`, `prompt_logprobs`, `guided_*`,
+`structured_outputs`, `bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
+Empty prompts and more than 256 prompts are a 400.
+
 ## Responses
 
 | field | FreeToken | notes |

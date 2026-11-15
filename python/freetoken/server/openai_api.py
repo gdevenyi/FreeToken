@@ -15,6 +15,7 @@ from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 
 from .api_models import (
+    MAX_PROMPTS,
     ChatCompletionRequest,
     CompletionRequest,
     DetokenizeRequest,
@@ -519,8 +520,10 @@ async def handle_completion(
     )
     prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
     assert isinstance(prompts, list)
-    if not prompts:
-        return create_error_response("prompt must not be empty", param="prompt")
+    if len(prompts) > MAX_PROMPTS:
+        return create_error_response(
+            f"prompt must hold at most {MAX_PROMPTS} prompts, got {len(prompts)}", param="prompt"
+        )
     # echo returns what the client sent, so take it before the FIM wrap below
     echo_texts = list(prompts) if req.echo else [""] * len(prompts)
     if req.suffix is not None:
@@ -983,7 +986,49 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
     return response_format.get("type") not in (None, "text", "json_object", "json_schema")
 
 
+# vLLM /v1/completions fields that change the result and are not implemented here: a set
+# value is a 400 rather than silently dropped by extra="allow".
+_UNIMPLEMENTED_COMPLETION_FIELDS = (
+    "allowed_token_ids",
+    "return_tokens_as_token_ids",
+    "logprob_token_ids",
+    "prompt_logprobs",
+    "guided_json",
+    "guided_regex",
+    "guided_choice",
+    "guided_grammar",
+    "structured_outputs",
+    "bad_words",
+)
+
+
+def _is_set(value: Any) -> bool:
+    # not truthiness: prompt_logprobs=0 is a real request, and 0 == False
+    if value is None or value is False:
+        return False
+    return not (isinstance(value, (str, list, dict)) and not value)
+
+
+def _empty_prompt(req: CompletionRequest) -> bool:
+    prompt = req.prompt
+    if isinstance(prompt, str):
+        # suffix-only fill-in-the-middle is a real request
+        return not prompt and req.suffix is None
+    if not prompt:
+        return True
+    return any(
+        (isinstance(item, list) and not item)
+        or (isinstance(item, str) and not item and req.suffix is None)
+        for item in prompt
+    )
+
+
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
+    for name in _UNIMPLEMENTED_COMPLETION_FIELDS:
+        if _is_set(getattr(req, name, None)):
+            return f"{name} is not supported by this server"
+    if _empty_prompt(req):
+        return "prompt must not be empty"
     if _is_token_prompt(req.prompt):
         return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
     logprobs_error = completion_logprobs_error(req)

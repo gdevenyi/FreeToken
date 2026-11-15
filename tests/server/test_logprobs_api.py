@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from freetoken.message import TokenizeMsg, UserReply
+from freetoken.server import openai_api
 from freetoken.server.openai_api import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -413,3 +414,75 @@ def test_completion_stream_logprobs_match_non_stream() -> None:
     joined = _joined_stream_logprobs(_crab_replies(), logprobs=1)
     assert joined == expected["choices"][0]["logprobs"]
     assert len(joined["tokens"]) == 5
+
+
+def _completion(**kwargs) -> CompletionRequest:
+    return CompletionRequest(
+        **{"model": "client-model", "prompt": "hello", "max_tokens": 1, **kwargs}
+    )
+
+
+def _one_token_state() -> FakeState:
+    return FakeState([reply("A", finished=True, logprobs=entry(32, "A", -0.1))])
+
+
+# Result-changing vLLM fields this server does not implement: a set value must be a 400,
+# never a 200 computed as if the field were absent.
+UNIMPLEMENTED_COMPLETION_FIELDS = [
+    ("allowed_token_ids", [32, 33]),
+    ("return_tokens_as_token_ids", True),
+    ("logprob_token_ids", [32]),
+    ("prompt_logprobs", 0),
+    ("guided_json", {"type": "object"}),
+    ("guided_regex", "[AB]"),
+    ("guided_choice", ["A", "B"]),
+    ("guided_grammar", 'root ::= "A"'),
+    ("structured_outputs", {"choice": ["A"]}),
+    ("bad_words", ["B"]),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), UNIMPLEMENTED_COMPLETION_FIELDS)
+def test_completion_rejects_unimplemented_fields_when_set(field, value) -> None:
+    state = _one_token_state()
+    resp = run(
+        handle_completion(_completion(logprobs=2, **{field: value}), None, state, {})
+    )
+    assert _status(resp) == 400
+    assert field in json.loads(resp.body)["error"]["message"]
+    assert state.sent is None
+
+
+@pytest.mark.parametrize("value", [None, False, [], {}, ""])
+def test_completion_accepts_unimplemented_fields_left_unset(value) -> None:
+    # clients send the vLLM defaults explicitly; not truthiness: prompt_logprobs=0 is set
+    resp = run(
+        handle_completion(
+            _completion(prompt_logprobs=value), None, _one_token_state(), {}
+        )
+    )
+    assert resp["choices"][0]["text"] == "A"
+
+
+@pytest.mark.parametrize("prompt", ["", [], [""], ["ok", ""], [[]]])
+def test_completion_rejects_empty_prompts(prompt) -> None:
+    state = _one_token_state()
+    resp = run(handle_completion(_completion(prompt=prompt), None, state, {}))
+    assert _status(resp) == 400
+    assert state.sent is None  # nothing was queued
+
+
+def test_completion_suffix_only_fim_prompt_is_not_empty() -> None:
+    reason = openai_api._completion_unsupported_reason(
+        _completion(prompt="", suffix="tail")
+    )
+    assert reason is None
+
+
+@pytest.mark.parametrize(("num_prompts", "status"), [(256, 200), (257, 400)])
+def test_completion_caps_the_prompt_count(num_prompts, status) -> None:
+    state = FakeState([reply("A", finished=True)])
+    resp = run(
+        handle_completion(_completion(prompt=["p"] * num_prompts), None, state, {})
+    )
+    assert _status(resp) == status
