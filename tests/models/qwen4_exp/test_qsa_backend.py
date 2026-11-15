@@ -207,8 +207,8 @@ def test_decode_graph_replay_matches_eager(rows_per_req):
     # GraphRunner drops the capture batch after capture: nothing the graph reads may live only on its metadata (a
     # verify graph once baked in a prefill row-tile map built there, and its replay read freed memory)
     capture_batch.attn_metadata = None
-    scrub = torch.full((1 << 22,), -1, dtype=torch.int32, device=fixture.device)  # take the freed blocks
-    del scrub
+    # refill the freed small blocks (a tile map is a few hundred bytes) with -1 and keep them through the replays
+    scrub = [torch.full((128,), -1, dtype=torch.int32, device=fixture.device) for _ in range(8192)]
 
     for step in range(steps):
         for req in reqs:
@@ -227,6 +227,7 @@ def test_decode_graph_replay_matches_eager(rows_per_req):
         replayed = captured_out.clone()
         eager = attn.forward(x, fixture.batch(reqs, phase))
         assert torch.equal(replayed, eager), f"graph replay diverged at {phase} step {step}"
+    del scrub
 
 
 @requires_cuda
