@@ -50,6 +50,10 @@ class SamplingParams:
     # Stamp the ReqStats snapshot on every reply, not just the terminal one (llama.cpp's
     # timings_per_token; the API layer has already ANDed it with --enable-timings-report).
     timings_per_token: bool = False
+    # Sampled-token logprobs (completions `logprobs`): when on, the sampler reports the chosen
+    # token's raw (pre-temperature) logprob and the top_logprobs best alternatives.
+    logprobs: bool = False
+    top_logprobs: int = 0
 
     @property
     def is_greedy(self) -> bool:

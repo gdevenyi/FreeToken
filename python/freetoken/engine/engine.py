@@ -514,6 +514,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Sampled-token logprobs (None unless some request in the batch asked): host copies
+    # covered by copy_done_event, padded to the batch's widest top_logprobs.
+    chosen_logprobs_cpu: torch.Tensor | None = None
+    top_ids_cpu: torch.Tensor | None = None
+    top_logprobs_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -1615,12 +1620,20 @@ class Engine:
             )
             next_tokens_gpu = self._comm.all_reduce(next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        # after the TP all-reduce (the rows' agreed tokens), before the event that covers the copies
+        logprobs_out = self.sampler.compute_logprobs(batch_logits, next_tokens_gpu, args)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         if spec_prefill:
             # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
             self.spec.on_prefill(batch, next_tokens_gpu)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        if logprobs_out is None:
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        chosen_logprobs, top_ids, top_logprobs = logprobs_out
+        return ForwardOutput(
+            next_tokens_gpu, next_tokens_cpu, copy_done_event,
+            chosen_logprobs_cpu=chosen_logprobs, top_ids_cpu=top_ids, top_logprobs_cpu=top_logprobs,
+        )
 
     def _warmup_prefill_lens(self) -> list[int]:
         """Prefill lengths that cross every size bucket the in-repo Triton prefill kernels specialize on."""

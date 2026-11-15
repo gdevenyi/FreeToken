@@ -378,6 +378,8 @@ class Scheduler(SchedulerIOMixin):
                         # client's terminal reply.
                         continue
                     msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                    if req.sampling_params.logprobs:
+                        _attach_logprobs(msg, output, i, req.sampling_params.top_logprobs)
                     req.stats.stamp_token(now)
                     reply.append(msg)
                     # a timings_per_token request gets the snapshot on every reply, growing
@@ -1044,6 +1046,18 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _attach_logprobs(msg: DetokenizeMsg, output: ForwardOutput, row: int, top: int) -> None:
+    """Copy batch row ``row``'s sampled-token logprobs onto its reply, cut to ``top`` alternatives."""
+    if output.chosen_logprobs_cpu is None:
+        return
+    msg.chosen_logprob = float(output.chosen_logprobs_cpu[row].item())
+    if top > 0 and output.top_ids_cpu is not None:
+        msg.top_ids = [int(t) for t in output.top_ids_cpu[row, :top].tolist()]
+        msg.top_logprobs = output.top_logprobs_cpu[row, :top].tolist()
+    else:
+        msg.top_ids, msg.top_logprobs = [], []
 
 
 def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:

@@ -24,6 +24,7 @@ from .api_models import (
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
+from .logprobs import completion_logprobs_error, completions_logprobs
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -580,6 +581,7 @@ async def handle_completion(
         async def _drain_one(uid: int = uid, index: int = index):
             nonlocal prompt_tokens, completion_tokens, cached_tokens, first_timings
             text = ""
+            entries: list[dict] = []
             finish_reason = "stop"
             async for ack in state.wait_for_ack(uid):
                 if getattr(ack, "error", None):
@@ -588,6 +590,8 @@ async def handle_completion(
                 completion_tokens += ack.completion_tokens_delta
                 cached_tokens += ack.cached_tokens
                 text += ack.incremental_output
+                if req.logprobs is not None and ack.logprobs is not None:
+                    entries.append(ack.logprobs)
                 if ack.finished:
                     if index == 0:
                         first_timings = getattr(ack, "timings", None)
@@ -597,7 +601,7 @@ async def handle_completion(
                 "index": index,
                 "text": echo_texts[index] + text,
                 "finish_reason": finish_reason,
-                "logprobs": None,
+                "logprobs": completions_logprobs(entries) if req.logprobs is not None else None,
             }
 
         choice = await _await_watching_disconnect(_drain_one(), request, state, uid)
@@ -649,6 +653,7 @@ async def stream_completion_chunks(
         return _sse(chunk)
 
     finish_reason = "stop"
+    text_offset = 0
     if echo_text:
         # echo: the prompt leads the stream (vLLM sends it in the first chunk)
         yield _sse(_completion_chunk(req, uid, [{"text": echo_text, "index": 0, "finish_reason": None, "logprobs": None}]))
@@ -667,9 +672,19 @@ async def stream_completion_chunks(
             yield emit(
                 _completion_chunk(
                     req, uid,
-                    [{"text": ack.incremental_output, "index": 0, "finish_reason": None, "logprobs": None}],
+                    [{
+                        "text": ack.incremental_output,
+                        "index": 0,
+                        "finish_reason": None,
+                        "logprobs": (
+                            completions_logprobs([ack.logprobs], text_offset)
+                            if req.logprobs is not None and ack.logprobs is not None
+                            else None
+                        ),
+                    }],
                 )
             )
+            text_offset += len(ack.incremental_output)
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
@@ -793,7 +808,7 @@ def _resolve_sampling(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     timings_per_token: bool = False,
 ) -> SamplingParams:
-    return resolve_sampling(
+    sampling_params = resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
         top_p=req.top_p,
@@ -813,6 +828,11 @@ def _resolve_sampling(
         skip_special_tokens=req.skip_special_tokens,
         timings_per_token=timings_per_token,
     )
+    # completions only: on chat, extra="allow" leaves a client's logprobs readable but unhonoured
+    if isinstance(req, CompletionRequest) and req.logprobs is not None:
+        sampling_params.logprobs = True
+        sampling_params.top_logprobs = req.logprobs
+    return sampling_params
 
 
 def _response_id(prefix: str, req: Any, fallback: Any) -> str:
@@ -939,8 +959,9 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if _is_token_prompt(req.prompt):
         return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
-    if req.logprobs is not None:
-        return "logprobs is not supported"
+    logprobs_error = completion_logprobs_error(req)
+    if logprobs_error is not None:
+        return logprobs_error
     if _response_format_unsupported(req.response_format):
         rtype = (req.response_format or {}).get("type")
         return (

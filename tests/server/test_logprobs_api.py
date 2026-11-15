@@ -6,7 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 from freetoken.message import TokenizeMsg, UserReply
-from freetoken.server.openai_api import ChatCompletionRequest, handle_chat_completion
+from freetoken.server.openai_api import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    handle_chat_completion,
+    handle_completion,
+    stream_completion_chunks,
+)
 
 
 def run(coro):
@@ -42,7 +48,7 @@ class FakeState:
             yield reply
 
 
-def reply(text: str, *, finished: bool = False) -> UserReply:
+def reply(text: str, *, finished: bool = False, logprobs: dict | None = None) -> UserReply:
     return UserReply(
         uid=42,
         incremental_output=text,
@@ -50,7 +56,31 @@ def reply(text: str, *, finished: bool = False) -> UserReply:
         prompt_tokens_delta=3 if not text else 0,
         completion_tokens_delta=1 if text else 0,
         cached_tokens=0,
+        logprobs=logprobs,
     )
+
+
+def entry(token_id: int, token: str, logprob: float) -> dict:
+    return {
+        "token_id": token_id,
+        "token": token,
+        "bytes": list(token.encode("utf-8")),
+        "logprob": logprob,
+        "top": [
+            {
+                "token_id": token_id,
+                "token": token,
+                "bytes": list(token.encode("utf-8")),
+                "logprob": logprob,
+            },
+            {
+                "token_id": token_id + 1,
+                "token": "x",
+                "bytes": [120],
+                "logprob": logprob - 1,
+            },
+        ],
+    }
 
 
 def chat_request(**kwargs) -> ChatCompletionRequest:
@@ -121,3 +151,55 @@ def test_chat_ignores_logprobs_and_vllm_extras(stream, tools) -> None:
         getattr(sp, "logprobs", False) is False and getattr(sp, "top_logprobs", 0) == 0
     )
     assert getattr(sp, "allowed_token_ids", None) is None
+
+
+def _status(resp) -> int:
+    return getattr(resp, "status_code", 200)
+
+
+def test_completion_logprobs_non_stream_and_stream() -> None:
+    first = entry(1, "Hi", -0.1)
+    second = entry(2, "!", -0.2)
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=2, max_tokens=8)
+    state = FakeState([reply("Hi", logprobs=first), reply("!", finished=True, logprobs=second)])
+
+    result = run(handle_completion(req, None, state, {}))
+    assert _status(result) == 200
+    assert state.sent.sampling_params.logprobs is True
+    assert state.sent.sampling_params.top_logprobs == 2
+    assert result["choices"][0]["logprobs"] == {
+        "tokens": ["Hi", "!"],
+        "token_logprobs": [-0.1, -0.2],
+        "top_logprobs": [
+            {"Hi": -0.1, "x": -1.1},
+            {"!": -0.2, "x": -1.2},
+        ],
+        "text_offset": [0, 2],
+    }
+
+    stream_req = CompletionRequest(model="client-model", prompt="hello", logprobs=2, max_tokens=8, stream=True)
+    events = parse_sse(
+        run(_collect(stream_completion_chunks(42, stream_req, FakeState([reply("Hi", finished=True, logprobs=first)]))))
+    )
+    chunk = next(event for event in events if isinstance(event, dict) and event["choices"][0]["text"])
+    assert chunk["choices"][0]["logprobs"] == {
+        "tokens": ["Hi"],
+        "token_logprobs": [-0.1],
+        "top_logprobs": [{"Hi": -0.1, "x": -1.1}],
+        "text_offset": [0],
+    }
+
+
+def test_completion_without_logprobs_asks_the_engine_for_none() -> None:
+    state = FakeState([reply("Hi", finished=True, logprobs=entry(1, "Hi", -0.1))])
+    result = run(handle_completion(CompletionRequest(model="client-model", prompt="hello"), None, state, {}))
+    assert result["choices"][0]["logprobs"] is None
+    assert state.sent.sampling_params.logprobs is False
+
+
+@pytest.mark.parametrize("extra", [{"logprobs": 33}, {"logprobs": -1}, {"echo": True, "logprobs": 1}])
+def test_completion_logprobs_validation_errors(extra) -> None:
+    state = FakeState([])
+    resp = run(handle_completion(CompletionRequest(model="client-model", prompt="hello", **extra), None, state, {}))
+    assert resp.status_code == 400
+    assert state.sent is None

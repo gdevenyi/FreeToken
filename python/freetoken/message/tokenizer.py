@@ -41,6 +41,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     keep_stop_str: bool = False
     # Decode this request with skip_special_tokens (SamplingParams.skip_special_tokens).
     skip_special_tokens: bool = False
+    # Sampled-token logprobs of the one committed token (None unless the request asked):
+    # the chosen token's raw logprob and the top alternatives, cut to its top_logprobs.
+    chosen_logprob: float | None = None
+    top_ids: list[int] | None = None
+    top_logprobs: list[float] | None = None
     # KV page-pool usage snapshot at this step (not-evictable used/total), passed
     # through to the frontend for the shell status bar. 0/0 for owned-KV models.
     kv_used_pages: int = 0

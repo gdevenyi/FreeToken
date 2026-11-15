@@ -40,7 +40,7 @@ effect; "400" means the server refuses the request with a clear message.
 | `skip_special_tokens` | honoured; default off here, the reasoning and tool parsers read the tags | honoured (default on) | honoured (default on) | n/a |
 | `n` | 400 unless 1 | honoured | honoured | `n_cmpl` |
 | `stream`, `stream_options.include_usage` | honoured | honoured | honoured | honoured |
-| `logprobs`, `top_logprobs` | accepted, ignored on this route; `/v1/completions` `logprobs` 400 | honoured | honoured | `n_probs` |
+| `logprobs`, `top_logprobs` | accepted, ignored on this route (`/v1/completions` honours `logprobs`) | honoured | honoured | `n_probs` |
 | `tools`, `tool_choice` (`auto` / `none` / `required` / named), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
 | `reasoning_effort`, `thinking`, `chat_template_kwargs` | honoured | `chat_template_kwargs` | honoured | honoured |
 | `continue_final_message` | honoured (the last assistant message is continued, no generation prompt) | honoured | honoured | no |
@@ -62,7 +62,7 @@ prompt only); the same sampling parameters as above; plus:
 | `echo` | honoured (the prompt leads the text; not with `logprobs`) | honoured | honoured | no |
 | `suffix` | honoured on models with fill-in-the-middle tokens (`<|fim_prefix|>` ... `<|fim_middle|>`): the prompt becomes prefix-suffix-middle | 400 | 400 | `/infill` |
 | `n` | 400 unless 1 | honoured | honoured | no |
-| `logprobs` | 400 (see #224 for the sampled-token logprobs) | honoured | honoured | `n_probs` |
+| `logprobs` | honoured, 0..5: raw pre-temperature logprobs of the sampled token and its top alternatives | honoured | honoured | `n_probs` |
 
 ## Responses
 
