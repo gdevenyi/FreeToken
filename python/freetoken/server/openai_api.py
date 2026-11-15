@@ -516,6 +516,13 @@ async def handle_completion(
         sampling = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
+    if sampling.logprobs and not sampling.is_logprob_read and getattr(state.config, "speculative_algorithm", None):
+        # speculative decode steps go through verify_step, which samples no logprobs; a
+        # max_tokens=1 read finishes on its prefill sample, which has them
+        return create_error_response(
+            "logprobs need max_tokens=1 when the server runs speculative decoding (--spec-algo)",
+            param="max_tokens",
+        )
     token_prompts = _is_token_prompt(req.prompt)
     prompts = _prompt_list(req.prompt)
     if len(prompts) > MAX_PROMPTS:

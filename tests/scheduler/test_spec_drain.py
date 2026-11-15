@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import Batch, Req, SamplingParams
@@ -237,3 +238,73 @@ def test_a_padded_one_row_batch_gets_one_row_per_padding_request(monkeypatch):
     assert _make_positions(batch, torch.device("cpu")).numel() == 3 + K + 1
     for req in reqs:
         stub._free_req_resources(req)
+
+
+def test_a_one_token_read_takes_its_logprobs_from_the_prefill_sample(monkeypatch):
+    """Under MTP a logprob read (max_tokens=1) finishes on its prefill forward: the engine reads
+    the logprobs of the prefill sample and the drain hands them on. verify_step computes none,
+    so a read that reached it, or a spec prefill that dropped them, would answer without them."""
+    from freetoken.engine import engine as engine_mod
+    from freetoken.engine.engine import Engine
+    from freetoken.engine.sample import Sampler
+    from freetoken.scheduler.scheduler import ForwardInput
+
+    # the CPU build has no CUDA stream or event; the drain only waits on the event
+    monkeypatch.setattr(engine_mod.torch.cuda, "current_stream", lambda: "stream")
+    monkeypatch.setattr(engine_mod.torch.cuda, "Event", lambda: SimpleNamespace(record=lambda _s: None, synchronize=lambda: None))
+    pool, cm, tm, _dm, stub, events = _setup()
+    vocab, labels = 64, [10, 11, 12]
+    logits = torch.randn(2, vocab, generator=torch.Generator().manual_seed(4))
+    spec = SimpleNamespace(
+        feature_sink=lambda _batch: None,
+        on_prefill=lambda _batch, tokens: events.append(("draft", tokens.tolist())),
+        verify_step=lambda *_: pytest.fail("a prefill reached verify_step"),
+        release=lambda req: events.append(("release", req.uid)),
+    )
+    engine = SimpleNamespace(stream="stream", spec=spec, _comm=None, sampler=Sampler(torch.device("cpu"), vocab),
+                             forward_logits=lambda _batch: logits)
+    engine.forward_batch = lambda batch, args: Engine.forward_batch(engine, batch, args)
+    sent = []
+    stub.__dict__.update(
+        engine=engine, spec=spec, finished_reqs=set(), send_result=sent.extend,
+        status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
+        _kv_usage_pages=cm.page_usage, _mamba_slot_usage=lambda: None, _swa_token_usage=lambda: None,
+        _gpu_mem_bytes=lambda: 0, prefill_manager=SimpleNamespace(pending_list=[]),
+        config=SimpleNamespace(decode_rows_per_req=K + 1, page_size=1),
+    )
+
+    def prefill_req(uid, sp):
+        prompt = torch.arange(1, PROMPT + 1, dtype=torch.int32) + 100 * uid
+        match = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=PROMPT))
+        req = Req(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=sp.max_tokens, uid=uid,
+                  sampling_params=sp, cache_handle=match.cuda_handle)
+        req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+        req.mamba_next_track_idx = 1
+        cm.lock(match.cuda_handle)
+        cm.allocate_paged([req])
+        return req
+
+    chat = prefill_req(1, SamplingParams(max_tokens=4))
+    read = prefill_req(2, SamplingParams(max_tokens=1, logprobs=True, top_logprobs=4, allowed_token_ids=labels))
+    batch = Batch(reqs=[chat, read], phase="prefill")  # the read in row 1: the drain must not read row 0
+    tables = torch.tensor([chat.table_idx, read.table_idx])
+    forward_input = ForwardInput(
+        batch=batch,
+        sample_args=engine.sampler.prepare(batch),
+        input_tuple=(tables.repeat_interleave(PROMPT), torch.arange(PROMPT).repeat(2)),
+        write_tuple=(tables, torch.tensor([PROMPT, PROMPT])),
+    )
+
+    Scheduler._process_last_data(stub, (forward_input, Scheduler._forward(stub, forward_input)))
+
+    by_uid = {m.uid: m for m in sent}
+    expected = torch.log_softmax(logits[1, labels], dim=-1)
+    token = labels[int(expected.argmax())]
+    assert by_uid[2].next_tokens == [token] and by_uid[2].finished
+    assert by_uid[2].chosen_logprob == pytest.approx(float(expected.max()))
+    # three labels asked four alternatives: the -inf tail past the set is no candidate
+    order = expected.argsort(descending=True).tolist()
+    assert by_uid[2].top_ids == [labels[k] for k in order]
+    assert by_uid[2].top_logprobs == pytest.approx(expected[order].tolist())
+    assert by_uid[1].chosen_logprob is None and not by_uid[1].finished
+    assert ("draft", [int(logits[0].argmax()), token]) in events  # the draft still saw the prefill sample

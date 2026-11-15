@@ -783,3 +783,37 @@ def test_completion_aborts_the_queued_prompts_when_a_later_one_cannot_be_sent() 
     resp = run(handle_completion(_completion(prompt=["a", "b"]), None, state, {}))
     assert _status(resp) == 400
     assert state.aborted == [100] and state.forgotten == [101]
+
+
+@pytest.mark.parametrize(
+    ("spec_algo", "extra", "status"),
+    [
+        ("mtp", {"logprobs": 2, "max_tokens": 8}, 400),
+        (
+            "mtp",
+            {"logprobs": 2, "max_tokens": None},
+            400,
+        ),  # the default budget is not one token
+        (
+            "mtp",
+            {"logprobs": 2, "max_tokens": 1},
+            200,
+        ),  # a read: its logprobs come from the prefill sample
+        ("mtp", {"max_tokens": 8}, 200),
+        (None, {"logprobs": 2, "max_tokens": 8}, 200),
+    ],
+)
+def test_completion_logprobs_past_one_token_need_a_runtime_without_spec(
+    spec_algo, extra, status
+) -> None:
+    # verify_step samples MTP decode tokens with no logprobs, so a reply would silently
+    # carry fewer entries than tokens
+    state = _one_token_state()
+    state.config.speculative_algorithm = spec_algo
+    resp = run(handle_completion(_completion(**extra), None, state, {}))
+    assert _status(resp) == status
+    if status == 400:
+        assert (
+            state.sent is None
+            and "max_tokens" in json.loads(resp.body)["error"]["message"]
+        )
