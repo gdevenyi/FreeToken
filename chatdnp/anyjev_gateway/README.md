@@ -38,19 +38,44 @@ The full LiteLLM change plan is `LITELLM_CHANGES_PLAN.md` in the chatdnp-audit n
 
 1. Add the key to `/opt/litellm/.env` (the value is in `~/anyjev-gw/key`):
    `ANYJEV_GW_KEY=<contents of ~/anyjev-gw/key>`
-2. Add this entry **under the existing `model_list:`** in `/opt/litellm/config.yaml` (do not add a second `model_list:` or `general_settings:` key):
+2. Add these entries **under the existing `model_list:`** in `/opt/litellm/config.yaml` (do not add a second `model_list:` or `general_settings:` key):
 
    ```yaml
+     # under the existing model_list:, written out in full (YAML anchors would share one dict between deployments)
      - model_name: anyjev-decide
        litellm_params:
          model: openai/anyjev-qwen3.8-flash-next
          api_base: http://host.docker.internal:8100
          api_key: os.environ/ANYJEV_GW_KEY
+         timeout: 300
+         max_parallel_requests: 4
        model_info:
          mode: decisions
          input_cost_per_token: 0.0
          output_cost_per_token: 0.0
-   ```
+     - model_name: jev-latest          # the Jev SDKs' default model name
+       litellm_params:
+         model: openai/anyjev-qwen3.8-flash-next
+         api_base: http://host.docker.internal:8100
+         api_key: os.environ/ANYJEV_GW_KEY
+         timeout: 300
+         max_parallel_requests: 4
+       model_info:
+         mode: decisions
+         input_cost_per_token: 0.0
+         output_cost_per_token: 0.0
+     - model_name: gpt-6-luna          # the OpenAI Decisions model name
+       litellm_params:
+         model: openai/anyjev-qwen3.8-flash-next
+         api_base: http://host.docker.internal:8100
+         api_key: os.environ/ANYJEV_GW_KEY
+         timeout: 300
+         max_parallel_requests: 4
+       model_info:
+         mode: decisions
+         input_cost_per_token: 0.0
+         output_cost_per_token: 0.0
+   `````````
 
 3. Start the gateway on docker0: `tmux kill-session -t =jevgw` (the localhost test copy), then `cp anyjev-gateway.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now anyjev-gateway`.
 4. Restart LiteLLM when it is idle: `docker compose -f /opt/litellm/docker-compose.yml --project-directory /opt/litellm up -d litellm`.
@@ -65,11 +90,13 @@ The full LiteLLM change plan is `LITELLM_CHANGES_PLAN.md` in the chatdnp-audit n
 
    For Jev, `POST /v1/systemone` with `{"model": "anyjev-decide", "state": ..., "questions": {...}}`.
 
-**Tested on 2026-11-15** on a throwaway LiteLLM 1.108.9 with production's own `config.yaml` plus this entry, its own Postgres, and a virtual key from `/key/generate`:
-- the SDK `decisions.create` (3 questions, 2.4 s) and a Jev `/v1/systemone` call both returned 200;
+**Tested on 2026-11-15** on throwaway LiteLLM 1.108.9 runs with production's own `config.yaml` plus these entries, their own Postgres, and virtual keys from `/key/generate`:
+- the SDK `decisions.create` returned 200 with `anyjev-decide` and `gpt-6-luna`, and Jev `/v1/systemone` with `anyjev-decide` and `jev-latest`;
 - each call wrote a spend row (`adecisions` or `asystemone`, with its prompt tokens);
 - with `max_parallel_requests: 1` on the key, two parallel calls gave 200 and 429;
 - a wrong key gave 401.
+
+A Jev request without `model` gives 400: clients must send one of the three names.
 
 **Known limit:** LiteLLM's decision endpoints do not decode gzip request bodies (400), so clients must send plain JSON. The official Jev SDKs compress by default.
 
