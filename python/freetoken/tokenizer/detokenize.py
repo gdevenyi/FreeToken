@@ -73,6 +73,7 @@ class DecodeStatus:
     sent_offset: int  # length of sent out string
     skip_special: bool = False  # decode this request with skip_special_tokens
     think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
+    output_len: int = 0  # decoded text so far, before holdback: where the next token starts
 
 
 class DetokenizeManager:
@@ -113,9 +114,13 @@ class DetokenizeManager:
                     out[i] = t
         return [t if t is not None else "" for t in out]
 
-    def detokenize_with_meta(self, msgs: List[DetokenizeMsg]) -> tuple[List[str], List[int]]:
-        """Incremental text per message plus, for a finished message, its reasoning token
-        count (0 otherwise or when the model emitted no reasoning end tag)."""
+    def detokenize_with_meta(
+        self, msgs: List[DetokenizeMsg]
+    ) -> tuple[list[str], list[int], list[int]]:
+        """Incremental text per message; for a finished message, its reasoning token count
+        (0 otherwise or when the model emitted no reasoning end tag); and where each message's
+        first token starts in the generated text. That offset ignores stop-string holdback,
+        which delays when text is sent but not where it lands."""
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         skip: List[bool] = []
@@ -145,8 +150,10 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         reasoning_tokens: List[int] = []
+        text_offsets: list[int] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
+            text_offsets.append(s.output_len)
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
             if len(new_text) > 0 and not new_text.endswith("�"):
@@ -157,6 +164,7 @@ class DetokenizeManager:
             else:
                 new_text = find_printable_text(new_text)
                 output_str = s.decoded_str + new_text
+            s.output_len = max(s.output_len, len(output_str))
 
             prev_sent = s.sent_offset
             if msg.finished:
@@ -184,7 +192,7 @@ class DetokenizeManager:
             if msg.finished:
                 del self.decode_map[msg.uid]
 
-        return incremental_strs, reasoning_tokens
+        return incremental_strs, reasoning_tokens, text_offsets
 
 
 def build_logprobs_entry(
@@ -196,10 +204,14 @@ def build_logprobs_entry(
 ) -> dict:
     """Neutral sampled-token logprobs entry (UserReply.logprobs). Values are the raw
     pre-temperature logprobs the sampler computed; token text comes from a single-id
-    decode, with UTF-8 bytes alongside."""
+    decode, with UTF-8 bytes alongside. Ids past the real vocab (the padded tail of the
+    logits) report an empty token."""
 
     def _fields(tid: int) -> tuple[str, list[int]]:
-        text = tokenizer.decode([tid])
+        try:
+            text = tokenizer.decode([tid])
+        except Exception:  # noqa: BLE001 -- a padded id some tokenizers refuse to decode
+            text = ""
         return text, list(text.encode("utf-8"))
 
     token, token_bytes = _fields(token_id)

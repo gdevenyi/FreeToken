@@ -39,7 +39,7 @@ def _run(manager, uid, tokens, *, finished_kwargs=None, **msg_kwargs):
         kwargs = dict(msg_kwargs)
         if last and finished_kwargs:
             kwargs.update(finished_kwargs)
-        strs, counts = manager.detokenize_with_meta(
+        strs, counts, _ = manager.detokenize_with_meta(
             [DetokenizeMsg(uid=uid, next_tokens=[t], finished=last, **kwargs)]
         )
         text += strs[0]
@@ -79,3 +79,18 @@ def test_reasoning_tokens_count_up_to_the_end_tag():
     assert reasoning == 3  # b, c and the tag itself
     _, none = _run(manager, 2, [1, 2, EOS])
     assert none == 0
+
+
+def test_text_offset_is_where_the_token_starts_despite_holdback():
+    # "c" is held back as a possible start of the stop "cx", then sent with "d": its offset
+    # is still where it starts, not how much text had been sent at its message.
+    manager = DetokenizeManager(_Tok(), frozenset({EOS}))
+    sent, offsets = [], []
+    for i, t in enumerate([1, 2, 3, EOS]):
+        strs, _, offs = manager.detokenize_with_meta(
+            [DetokenizeMsg(uid=1, next_tokens=[t], finished=i == 3, stop_strs=["cx"])]
+        )
+        sent.append(strs[0])
+        offsets.append(offs[0])
+    assert sent == ["b", "", "cd", ""]
+    assert offsets == [0, 1, 2, 3]
