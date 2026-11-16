@@ -217,6 +217,8 @@ class HybridRadixCache:
             self.full_evictable -= node.length
             if node.mamba_value is not None:
                 self.counts["kv_snapshot"] += 1
+            if node.mamba_host is not None:
+                self.counts["kv_host"] += 1
             self._free_node_mamba(node, mamba)
             self._detach_host(node, host)
             self._record_ghost(node)

@@ -744,7 +744,7 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
 
 
 def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False,
-                  order=None, overlap=True):
+                  order=None, overlap=True, pages=None):
     """A replay-like agent load: ``sessions`` sessions take turns round-robin (or in ``order``, one
     session index per turn), each turn sending the conversation so far plus a 64-token generation
     and a 256-token tool result. One request runs at a time with 16 idle snapshot slots
@@ -756,7 +756,7 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
 
     ps, first, step = 64, 1024, 320
     order = [s for _ in range(turns) for s in range(sessions)] if order is None else order
-    pages = (sessions * first + len(order) * step) // ps + 64
+    pages = (sessions * first + len(order) * step) // ps + 64 if pages is None else pages
     pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=1 + 3 + 16, host_slots=host_slots,
                                      pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead)
     cm.turn_end_id = 7
@@ -929,6 +929,18 @@ def test_long_active_sessions_do_not_push_idle_sessions_out_of_the_bank(monkeypa
     print(f"{policy}: idle sessions back from the host {sum(k == 'host' for _, _, k in back)}/{idle}, "
           f"recomputed {recomputed}, counts {counts}")
     assert [(c, k) for _, c, k in back] == [(1024, "host")] * idle
+
+
+
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
+def test_kv_pressure_takes_demoted_leaves_with_their_host_copies(monkeypatch, policy):
+    """A demoted leaf keeps its KV, so with a bank the KV pool can become the limit (as the design
+    expects). KV eviction then takes the least recently used leaves and frees their host copies
+    with them; the bank stays conserved and every restore still holds its prefix's state."""
+    adm, recomputed, _, counts = _agent_replay(monkeypatch, host_slots=64, policy=policy, pages=500)
+    print(f"{policy}: KV-bound replay: recomputed {recomputed}, counts {counts}")
+    assert counts["kv_tokens"] > 0 and counts["demote"] > 0 and counts["kv_host"] > 0
+    assert any(kind == "host" for _, _, kind in adm)
 
 
 if __name__ == "__main__":
