@@ -740,7 +740,7 @@ class _CopiesAtTheFence:
         self.queue.clear()
 
 
-def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None):
+def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False):
     from freetoken import core
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
@@ -751,7 +751,8 @@ def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", co
     if copies is not None:
         pool.host_copies = copies
     pt = torch.zeros(2, pages * ps, dtype=torch.int32)
-    cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy)
+    cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy,
+                      radix_lookahead=radix_lookahead)
     monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
     tm = TableManager(max_running_reqs=1, page_table=pt)
     pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
@@ -799,7 +800,7 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
     assert pool.num_free_host_slots + pc.mamba_host_evictable == pool.num_host_slots
 
 
-def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None):
+def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False):
     """A replay-like agent load: ``sessions`` sessions take turns round-robin, each turn sending the
     conversation so far plus a 64-token generation and a 256-token tool result. One request runs
     at a time with 16 idle snapshot slots (production's count), and the KV pool holds every session,
@@ -811,7 +812,7 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
     ps, first, step = 64, 1024, 320
     pages = sessions * (first + turns * step) // ps + 64
     pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=1 + 3 + 16, host_slots=host_slots,
-                                     pages=pages, policy=policy, copies=copies)
+                                     pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead)
     cm.turn_end_id = 7
     admitted, recomputed = [], 0
     convs = []
@@ -845,6 +846,8 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
                 pool.from_host(n.mamba_host, probe)
             if n.mamba_value is not None or n.mamba_host is not None:
                 keys = torch.cat([m._key for m in reversed(_root_path(n))])
+                if radix_lookahead:
+                    keys = (keys >> 31).to(torch.int32)              # MTP pair keys: (token, next token)
                 slot = probe if n.mamba_value is None else n.mamba_value
                 assert pool.recurrent_states[0, slot, 0, 0, 0].item() == _state(keys), pc._path_len(n)
             tree.append((pc._path_len(n), -1 if n.mamba_value is None else n.mamba_value,
@@ -861,15 +864,17 @@ def _root_path(node):
     return out
 
 
+@pytest.mark.parametrize("radix_lookahead", [False, True])   # MTP keys position i by (t_i, t_i+1)
 @pytest.mark.parametrize("policy", ["chunk", "structural"])
-def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, policy):
+def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, policy, radix_lookahead):
     """Every tier decision is a function of the operations alone (TP ranks see the same message
     stream, not the same copy timing): with device->host copies done at once or only at the next
     fence, the admissions, restores, slots and eviction counts are identical, and every restore
     holds the state of its prefix."""
-    now = _agent_replay(monkeypatch, host_slots=8, policy=policy, sessions=12, turns=3)
+    now = _agent_replay(monkeypatch, host_slots=8, policy=policy, sessions=12, turns=3,
+                        radix_lookahead=radix_lookahead)
     late = _agent_replay(monkeypatch, host_slots=8, policy=policy, sessions=12, turns=3,
-                         copies=_CopiesAtTheFence())
+                         copies=_CopiesAtTheFence(), radix_lookahead=radix_lookahead)
     assert now == late
     assert now[3]["demote"] > 0 and now[3]["host_drop"] > 0         # the bank filled and gave way
     assert any(kind == "host" for _, _, kind in now[0])
