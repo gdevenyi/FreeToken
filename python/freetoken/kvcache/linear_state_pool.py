@@ -109,14 +109,15 @@ class LinearStatePool:
     def _alloc_host_bank(self, host_slots: int, engine_stream: torch.cuda.Stream | None) -> None:
         """--mamba-host-slots: one pinned host buffer per bank slot, so registration goes in pieces
         of one slot, holding each slot tensor's layer rows (KV host tier design 3.1, 3.7)."""
-        from freetoken.moe.host_banks import HostBank
-
         self._num_host_slots = max(0, int(host_slots))
         self._free_host_slots: list[int] = list(range(self._num_host_slots))
         self._host_views: list[dict[str, torch.Tensor]] = []
-        self.host_copies = _HostCopies(self._device, engine_stream)
+        self.host_copies: _HostCopies | None = None
         if not self._num_host_slots:
-            return
+            return  # no bank: no side stream, and fence_host_copies does nothing
+        from freetoken.moe.host_banks import HostBank
+
+        self.host_copies = _HostCopies(self._device, engine_stream)
         layout, offset = {}, 0
         for name, t in self._slot_tensors().items():
             nbytes = t[:, 0].numel() * t.element_size()
@@ -176,7 +177,8 @@ class LinearStatePool:
     def fence_host_copies(self) -> None:
         """Make the caller's stream wait for every ``to_host`` so far. The scheduler calls it on the
         engine stream before each forward, so no slot a demotion freed is written before its copy."""
-        self.host_copies.fence()
+        if self.host_copies is not None:
+            self.host_copies.fence()
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
