@@ -73,7 +73,9 @@ class PrefillAdder:
         ) * page_size
 
     def _try_allocate_one(self, req: PendingReq):
+        stats = self.cache_manager.stats
         if self.table_manager.available_size == 0:
+            stats.note_refusal("table", req.uid)
             return None
 
         # TODO: consider host cache match case (it needs the same replay cap)
@@ -92,9 +94,11 @@ class PrefillAdder:
         )
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            stats.note_refusal("kv", req.uid)
             return None
         self.cache_manager.lock(handle)
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            stats.note_refusal("kv", req.uid)
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -104,6 +108,7 @@ class PrefillAdder:
             if pool.num_free_slots < 3:
                 self.cache_manager.ensure_mamba_slots(3)
             if pool.num_free_slots < 3:
+                stats.note_refusal("gdn", req.uid)
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -118,9 +123,11 @@ class PrefillAdder:
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
+                stats.note_refusal("swa", req.uid)
                 return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
+        self.cache_manager.note_admission(req, handle)
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             device_ids.copy_(_maybe_pinned(req.input_ids[:cached_len]), non_blocking=True)

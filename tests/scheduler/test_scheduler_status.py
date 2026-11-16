@@ -169,3 +169,17 @@ def test_moe_stats_line_follows_each_decode_line():
         rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1)
     assert len(calls) == 2
     assert [line.split(",")[0] for line in logs] == ["Decode batch", "MoE decode"] * 2
+
+
+def test_kv_stats_line_at_most_once_per_interval():
+    """KVSTATS is one aggregated line per interval on prefill or decode traffic, never per batch."""
+    logs: list[str] = []
+    clock = {"t": 0.0}
+    window = iter(["KVSTATS a", None, "KVSTATS b"])
+    rep = SchedulerStatusReporter(log=logs.append, clock=lambda: clock["t"], decode_log_interval=1000,
+                                  kv_stats=lambda: next(window), kv_stats_interval=60.0)
+    for t in (1.0, 59.0, 60.0, 61.0, 119.0, 120.5, 200.0):
+        clock["t"] = t
+        rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1)
+    # 60.0 logs a; 120.5 finds an empty window (None) and logs nothing; 200.0 logs b
+    assert logs == ["KVSTATS a", "KVSTATS b"]

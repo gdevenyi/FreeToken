@@ -383,5 +383,84 @@ def test_non_donating_read_chunk_commit_leaves_the_tree_alone(policy, isolate):
     _assert_no_leak(cm)
 
 
+def test_kvstats_classifies_admissions_and_snapshot_victims():
+    """P0: each admission's walk before and after the snapshot cut, an evicted continuation of
+    the prompt, and what evict_mamba takes, counted on the admission's own walk."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool(num_slots=32)
+    pt = torch.zeros(5, 1024, dtype=torch.int32)
+    cm = CacheManager(64, 64, pt, "hybrid_radix", linear_state_pool=pool)
+    tree = cm.prefix_cache
+    x = torch.arange(1, 257, dtype=torch.int32)        # snapshots at 128 and 256
+    y = torch.arange(1001, 1257, dtype=torch.int32)    # the same shape
+    for ids in (x, y):
+        kv = cm._page_to_token(cm._allocate(4))
+        tree.insert(ids[:128], kv[:128], pool.alloc(1)[0])
+        tree.insert(ids, kv, pool.alloc(1)[0])
+    y_leaf = tree.match_prefix(y).node
+    tree.inc_lock(y_leaf)
+    x_leaf = tree.match_prefix(x).node
+    tree.inc_lock(x_leaf)
+    pool.free(cm.prefix_cache.evict_mamba(2).mamba_slots)   # both interior snapshots: tombstones
+    tree.dec_lock(x_leaf)
+    ev = tree.evict_mamba(1)                                # x's leaf, and its tombstone parent with it
+    pool.free(ev.mamba_slots)
+    cm._free(ev.kv_indices)
+    tree.dec_lock(y_leaf)
+    # the leaf victim took its KV and the tombstone above it: 256 tokens
+    assert (tree.counts["victim_interior"], tree.counts["victim_leaf"], tree.counts["victim_kv_tokens"]) == (2, 1, 256)
+
+    def pend(uid, ids):
+        return PendingReq(uid, torch.cat([ids, torch.tensor([7], dtype=torch.int32)]),
+                          SamplingParams(max_tokens=4))
+
+    pm = PrefillManager(cm, TableManager(max_running_reqs=4, page_table=pt), DecodeManager(page_size=64))
+    pm.pending_list = [
+        pend(1, torch.cat([x[:200], torch.full((60,), 5, dtype=torch.int32)])),  # x was evicted
+        pend(2, torch.cat([y[:192], torch.full((70,), 6, dtype=torch.int32)])),  # KV to 192, no snapshot
+        pend(3, y),                                                               # full hit at 256
+        pend(4, torch.arange(5001, 5300, dtype=torch.int32)),                     # never seen
+    ]
+    batch = pm.schedule_next_batch(4096)
+    assert [r.cache_handle.cached_len for r in batch.reqs] == [0, 0, 256, 0]
+
+    s = cm.stats
+    assert (s.admits, s.walk_tokens, s.kept_tokens) == (4, 192 + 256, 256)
+    assert (s.cut_admits, s.cut_tokens) == (1, 192)
+    assert (s.evicted_admits, s.evicted_tokens) == (1, 128)   # the cascaded parent [0, 128)
+    assert s.cold_admits == 2
+    line = cm.kv_stats_line()
+    assert line.startswith("KVSTATS ") and "victim_leaf=1" in line
+    assert cm.stats.admits == 0 and not tree.counts           # the line resets the window
+
+
+@pytest.mark.parametrize("cause", ["kv", "gdn", "table"])
+def test_kvstats_counts_admission_refusals_by_cause(cause):
+    """A queued request is refused again on every pass: count the events and the distinct
+    requests per cause, so a KV-reservation wait (design 7.2) is not read as a slot wait."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool(num_slots=16)
+    pt = torch.zeros(3, 256, dtype=torch.int32)
+    cm = CacheManager(8 if cause == "kv" else 64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    tm = TableManager(max_running_reqs=2, page_table=pt)
+    if cause == "table":
+        tm.allocate(), tm.allocate()
+    if cause == "gdn":
+        pool.alloc(pool.num_free_slots - 2)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=1))
+    pm.pending_list = [PendingReq(5, torch.arange(1, 9, dtype=torch.int32), SamplingParams(max_tokens=4))]
+    for _ in range(2):
+        assert pm.schedule_next_batch(4096) is None
+    assert cm.stats.refusals == {cause: (2, {5})}
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

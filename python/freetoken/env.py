@@ -80,6 +80,8 @@ class EnvClassSingleton:
     # cuGraphUpload each decode graph at capture (#697); off keeps the first-launch upload, which
     # replays ~0.2 ms/step faster on Qwen3.8-Flash / RTX 5080 but can block the first launch on a stream WAIT
     GRAPH_UPLOAD = EnvBool(True)
+    # seconds between KVSTATS log lines on TP rank 0 (prefix-cache, admission and accept-len counters); 0 = off
+    KVSTATS_INTERVAL = EnvFloat(60.0)
 
     def __new__(cls):
         # single instance

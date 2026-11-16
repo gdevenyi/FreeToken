@@ -1,10 +1,91 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Callable
 
 from freetoken.core import Batch
+
+# KVSTATS accept-len buckets: verify steps by the request's context length before the step
+ACCEPT_BUCKETS = (32768, 131072, 262144)
+_ACCEPT_NAMES = ("<32k", "32-128k", "128-256k", ">=256k")
+REFUSAL_CAUSES = ("kv", "table", "gdn", "swa")
+
+
+@dataclass
+class KVStats:
+    """One window of the counters behind the ``KVSTATS`` log line (KV host tier design, P0).
+
+    Counts on TP rank 0 only (``enabled``); every rank takes the same decisions without them.
+    """
+
+    enabled: bool = True
+    admits: int = 0
+    walk_tokens: int = 0     # matched KV tokens before the snapshot cut
+    kept_tokens: int = 0     # reused tokens after it
+    cut_admits: int = 0      # admissions whose KV match went deeper than their snapshot
+    cut_tokens: int = 0
+    evicted_admits: int = 0  # admissions whose prompt continued into an evicted node
+    evicted_tokens: int = 0  # the evicted nodes' lengths (a lower bound of the loss)
+    cold_admits: int = 0     # no KV match at all
+    refusals: dict = field(default_factory=dict)  # cause -> (events, set of uids)
+    accept: list = field(default_factory=lambda: [[0, 0] for _ in _ACCEPT_NAMES])  # [steps, tokens]
+
+    def note_admission(self, walk_len: int, cached_len: int, evicted_len: int) -> None:
+        if not self.enabled:
+            return
+        self.admits += 1
+        self.walk_tokens += walk_len
+        self.kept_tokens += cached_len
+        if walk_len > cached_len:
+            self.cut_admits += 1
+            self.cut_tokens += walk_len - cached_len
+        if walk_len == 0:
+            self.cold_admits += 1
+        if evicted_len:
+            self.evicted_admits += 1
+            self.evicted_tokens += evicted_len
+
+    def note_refusal(self, cause: str, uid: int) -> None:
+        if not self.enabled:
+            return
+        events, uids = self.refusals.setdefault(cause, (0, set()))
+        uids.add(uid)
+        self.refusals[cause] = (events + 1, uids)
+
+    def note_accept(self, context_len: int, committed: int) -> None:
+        if not self.enabled:
+            return
+        bucket = self.accept[sum(context_len >= b for b in ACCEPT_BUCKETS)]
+        bucket[0] += 1
+        bucket[1] += committed
+
+    def line(self, tree: Mapping[str, int] | None = None, extra: str | None = None) -> str | None:
+        """The window's ``KVSTATS`` line, or None when nothing happened; starts a new window."""
+        tree = dict(tree or {})
+        if not (self.admits or self.refusals or any(tree.values()) or any(s for s, _ in self.accept) or extra):
+            return None
+        refuse = " ".join(
+            f"{c}={self.refusals.get(c, (0, ()))[0]}/{len(self.refusals.get(c, (0, ()))[1])}" for c in REFUSAL_CAUSES
+        )
+        accept = " ".join(
+            f"{name}={(tokens / steps if steps else 0):.2f}/{steps}" for name, (steps, tokens) in zip(_ACCEPT_NAMES, self.accept)
+        )
+        parts = [
+            (
+                f"KVSTATS admit={self.admits} walk={self.walk_tokens} kept={self.kept_tokens} "
+                f"cut={self.cut_admits}/{self.cut_tokens} evicted={self.evicted_admits}/{self.evicted_tokens} "
+                f"cold={self.cold_admits}"
+            ),
+            f"refuse {refuse}",
+            "tree " + (" ".join(f"{k}={v}" for k, v in sorted(tree.items())) or "-"),
+            f"accept {accept}",
+        ]
+        if extra:
+            parts.append(extra)
+        self.__init__(enabled=self.enabled)
+        return " | ".join(parts)
 
 
 @dataclass
@@ -14,7 +95,11 @@ class SchedulerStatusReporter:
     decode_log_interval: int = 40
     # --moe-collect-stats: one more line per decode log line (the stats since the previous one), or None to skip
     moe_stats: Callable[[], str | None] | None = None
+    # the KVSTATS line of the window (None when it is empty), at most once per kv_stats_interval seconds
+    kv_stats: Callable[[], str | None] | None = None
+    kv_stats_interval: float = 60.0
     _last_prefill_time: float = field(init=False)
+    _last_kv_stats_time: float = field(init=False)
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
@@ -28,6 +113,7 @@ class SchedulerStatusReporter:
         now = self.clock()
         self._last_prefill_time = now
         self._last_decode_time = now
+        self._last_kv_stats_time = now
         self.decode_log_interval = max(1, self.decode_log_interval)
 
     def report_batch(
@@ -66,6 +152,12 @@ class SchedulerStatusReporter:
                 swa_tokens=swa_tokens,
                 generated=generated,
             )
+        if self.kv_stats is not None:
+            now = self.clock()
+            if now - self._last_kv_stats_time >= self.kv_stats_interval:
+                self._last_kv_stats_time = now
+                if line := self.kv_stats():
+                    self.log(line)
 
     def take_spec_counts(self) -> tuple[int, int]:
         """Requests stepped and tokens they committed over the speculative decode steps since the last call."""

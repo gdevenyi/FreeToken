@@ -9,6 +9,8 @@ from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil
 
+from .status import KVStats
+
 if TYPE_CHECKING:
     from .utils import PendingReq
 
@@ -66,6 +68,8 @@ class CacheManager:
         # attributes leave the defaults untouched (Gemma4).
         if swa_pool is not None:
             self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
+        # KVSTATS counters (rank 0); set_stats_enabled turns them off elsewhere
+        self.stats = KVStats()
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
         self.device = device
         self.num_pages = num_pages
@@ -103,7 +107,7 @@ class CacheManager:
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridRadixCache(device, page_size)
+            return HybridRadixCache(device, page_size, ghosts=self.stats.enabled)
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
             return SWARadixCache(device, page_size, self.sliding_window_size)
@@ -122,8 +126,33 @@ class CacheManager:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(
-                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
+                HybridCacheHandle(m.cached_len, m.node, m.kv_indices, m.walk_len), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
+
+    def set_stats_enabled(self, enabled: bool) -> None:
+        self.stats.enabled = enabled
+        if self.is_hybrid:
+            from collections import OrderedDict
+            self.prefix_cache.ghosts = OrderedDict() if enabled else None
+
+    def note_admission(self, req: PendingReq, handle: BaseCacheHandle) -> None:
+        """KVSTATS: an admitted request's walk, kept length and evicted continuation."""
+        if not self.stats.enabled:
+            return
+        walk = getattr(handle, "walk_len", handle.cached_len) if self.is_hybrid else handle.cached_len
+        evicted = 0
+        if self.is_hybrid:
+            from freetoken.kvcache.hybrid_radix_cache import GHOST_KEYS
+            evicted = self.prefix_cache.evicted_len(walk, self._keys(req.input_ids[walk:], GHOST_KEYS))
+        self.stats.note_admission(walk, handle.cached_len, evicted)
+
+    def kv_stats_line(self, extra: str | None = None) -> str | None:
+        """The KVSTATS line of the window since the last call (radix eviction counts included)."""
+        tree = self.prefix_cache.counts if self.is_hybrid else None
+        line = self.stats.line(tree, extra)
+        if tree is not None:
+            tree.clear()
+        return line
 
     @property
     def available_size(self) -> int:

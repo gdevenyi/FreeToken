@@ -163,10 +163,15 @@ class Scheduler(SchedulerIOMixin):
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         moe_cache = getattr(self.engine, "moe_offload_cache", None)
+        kv_stats_interval = float(ENV.KVSTATS_INTERVAL.value)
+        kv_stats = config.tp_info.is_primary() and kv_stats_interval > 0
+        self.cache_manager.set_stats_enabled(kv_stats)
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
             moe_stats=self._moe_stats_line if config.moe_collect_stats and moe_cache is not None else None,
+            kv_stats=self.cache_manager.kv_stats_line if kv_stats else None,
+            kv_stats_interval=kv_stats_interval,
         )
 
         # Initialize the I/O mixin
@@ -457,6 +462,7 @@ class Scheduler(SchedulerIOMixin):
             req.stats.stamp_token(now)
             req.stats.draft_n += k
             req.stats.draft_n_accepted += min(n, emitted)
+            self.cache_manager.stats.note_accept(cached, n)
             reply.append(msg)
             # a timings_per_token request gets the snapshot on every reply, growing
             if msg.finished or req.sampling_params.timings_per_token:

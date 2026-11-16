@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -35,6 +36,7 @@ class HybridCacheHandle(BaseCacheHandle):
 
     node: RadixTreeNode
     kv_indices: torch.Tensor
+    walk_len: int = 0             # matched KV length before the snapshot cut (statistics only)
 
     def get_matched_indices(self) -> torch.Tensor:
         return self.kv_indices
@@ -45,6 +47,7 @@ class HybridMatch(NamedTuple):
     cached_len: int               # truncated to the deepest LIVE-snapshot boundary
     mamba_value: Optional[int]    # GDN snapshot slot to restore from (None = cold start)
     node: RadixTreeNode           # the matched node (lock target)
+    walk_len: int = 0             # matched KV length before the snapshot cut
 
 
 class EvictResult(NamedTuple):
@@ -52,8 +55,15 @@ class EvictResult(NamedTuple):
     mamba_slots: List[int]        # GDN state slots to free
 
 
+# Evicted-node record for the KVSTATS miss causes: keyed by the node's start depth and its
+# first GHOST_KEYS keys, so an admission can tell "this prompt's continuation was evicted"
+# from "never cached". Nodes shorter than GHOST_KEYS are not recognised.
+GHOST_KEYS = 64
+GHOST_CAP = 4096
+
+
 class HybridRadixCache:
-    def __init__(self, device: torch.device, page_size: int) -> None:
+    def __init__(self, device: torch.device, page_size: int, ghosts: bool = False) -> None:
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
         # Snapshots land on ×CHUNK_SIZE boundaries; require them to be page-aligned so the KV
         # node boundary and the GDN-state boundary coincide (page_size in {1,2,4,8,16,32,64}).
@@ -71,6 +81,9 @@ class HybridRadixCache:
         self.full_protected = 0
         self.mamba_evictable = 0     # number of live, unlocked snapshots
         self.mamba_protected = 0
+        # Statistics only (KVSTATS); no decision reads them.
+        self.counts: Counter = Counter()
+        self.ghosts: OrderedDict | None = OrderedDict() if ghosts else None
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -80,12 +93,13 @@ class HybridRadixCache:
         node, _ = self._walk(input_ids)
         # walk up to the deepest node whose END boundary has a live snapshot
         cur, end_len = node, self._path_len(node)
+        walk_len = end_len
         while not cur.is_root():
             if cur.mamba_value is not None:
-                return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur)
+                return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur, walk_len)
             end_len -= cur.length
             cur = cur.parent
-        return HybridMatch(self.empty, 0, None, self.root)
+        return HybridMatch(self.empty, 0, None, self.root, walk_len)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                mamba_value: int) -> Tuple[int, bool]:
@@ -161,11 +175,15 @@ class HybridRadixCache:
             freed += node.length
             kv.append(node.value)
             self.full_evictable -= node.length
+            if node.mamba_value is not None:
+                self.counts["kv_snapshot"] += 1
             self._free_node_mamba(node, mamba)
+            self._record_ghost(node)
             parent, casc = self._cascade_tombstone_leaves(self._unlink(node), kv)
             freed += casc
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
                 heapq.heappush(leaves, parent)
+        self.counts["kv_tokens"] += freed
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
 
     def evict_mamba(self, num: int) -> EvictResult:
@@ -185,8 +203,12 @@ class HybridRadixCache:
                 self.full_evictable -= node.length
                 self._free_node_mamba(node, mamba)
                 freed += 1
-                self._cascade_tombstone_leaves(self._unlink(node), kv)
+                self._record_ghost(node)
+                _, casc = self._cascade_tombstone_leaves(self._unlink(node), kv)
+                self.counts["victim_leaf"] += 1
+                self.counts["victim_kv_tokens"] += node.length + casc
             else:
+                self.counts["victim_fork" if len(node.children) > 1 else "victim_interior"] += 1
                 self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
                 freed += 1
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
@@ -236,8 +258,25 @@ class HybridRadixCache:
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
             freed += parent.length
+            self._record_ghost(parent)
             parent = self._unlink(parent)
         return parent, freed
+
+    def _record_ghost(self, node: RadixTreeNode) -> None:
+        """Remember an evicted node (call before unlinking it), for the KVSTATS miss causes."""
+        if self.ghosts is None:
+            return
+        key = (self._path_len(node) - node.length, _ghost_hash(node._key[:GHOST_KEYS]))
+        self.ghosts[key] = node.length
+        self.ghosts.move_to_end(key)
+        if len(self.ghosts) > GHOST_CAP:
+            self.ghosts.popitem(last=False)
+
+    def evicted_len(self, start: int, keys: torch.Tensor) -> int:
+        """Length of an evicted node that started at ``start`` with these keys, else 0."""
+        if self.ghosts is None or len(keys) == 0:
+            return 0
+        return self.ghosts.get((start, _ghost_hash(keys[:GHOST_KEYS])), 0)
 
     def _path_len(self, node: RadixTreeNode) -> int:
         n, total = node, 0
@@ -292,6 +331,10 @@ class HybridRadixCache:
                 return node, prefix_len
             node.timestamp = tic
         return node, prefix_len
+
+
+def _ghost_hash(keys: torch.Tensor) -> int:
+    return hash(keys.cpu().numpy().tobytes())
 
 
 __all__ = ["HybridRadixCache", "HybridMatch", "EvictResult", "HybridCacheHandle"]

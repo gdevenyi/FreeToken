@@ -107,6 +107,8 @@ def test_drain_commits_the_accepted_tokens_and_returns_the_rejected_slots():
     # slots from cached_len on go back (allocate_paged allocates from cached_len again next step); b gave everything back
     assert cm.available_size - free_before == (K + 1 - 2) + (K + 1 - 4) + (PROMPT + K + 1)
     assert dm.running_reqs == {a, c}
+    # KVSTATS: three verify steps of context PROMPT (< 32k), 8 committed tokens
+    assert cm.stats.accept[0] == [3, 8]
     # no slot was freed twice: with every request gone the pool adds up
     for req in (a, c):
         stub._free_req_resources(req)
