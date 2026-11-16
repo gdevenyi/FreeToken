@@ -902,5 +902,68 @@ def test_returning_agent_sessions_hit_their_own_host_snapshot(monkeypatch, polic
           f"{on} with 256 ({new} are new)")
 
 
+
+@pytest.mark.parametrize("overlap", [True, False])
+def test_structural_cap_demotes_stride_snapshots_to_the_host_bank(monkeypatch, overlap):
+    """Design 3.4 (P1): under "structural" the per-path cap thins the path to 2 device snapshots; with
+    a bank it demotes the thinned ones, so after a cold 213,000-token prefill every stride point
+    still resumes (from the host, about 5 s of replay after an edit there instead of the whole
+    prompt), and the idle snapshots of other sessions are demoted, not lost."""
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    ps, prompt_len, others = 64, 213_000, 12
+    pages = prompt_len // ps + others + 8
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=others + 4, host_slots=16, pages=pages,
+                                     policy="structural")
+    cm.turn_end_id = 7
+    sessions = [torch.arange(60_000 + 200 * i, 60_000 + 200 * i + 2 * ps, dtype=torch.int32) for i in range(others)]
+    for ids in sessions:
+        cm.prefix_cache.insert(ids[:ps], cm._page_to_token(cm._allocate(1)), pool.alloc(1)[0])
+    prompt = torch.arange(prompt_len, dtype=torch.int32) % 50_000 + 100
+    prompt[4_999] = 7
+    pc = cm.prefix_cache
+    device_path = []
+    run = drive_prefill(cm, pm, pool, PendingReq(0, prompt, SamplingParams(max_tokens=8)), budget=8192,
+                        overlap=overlap, on_forward=_forward_writes(pool),
+                        on_drain=lambda r: device_path.append(pc.mamba_evictable_size + pc.mamba_protected))
+    Scheduler._free_req_resources(stub, run.final)
+    strides = [k * 32_768 - ps for k in range(1, 7)]
+    for b in strides:
+        m = cm.match_req(_pend(prompt[: b + 100].tolist()))
+        assert (m.cuda_handle.cached_len, m.mamba_value) == (b, None) and m.mamba_host is not None, b
+    assert max(device_path) <= others + 2                         # the cap still bounds the device path
+    assert pc.counts["cap"] >= len(strides) - 1 and pc.counts["demote"] >= pc.counts["cap"]
+    assert sum(cm.match_req(_pend(ids.tolist())).cuda_handle.cached_len == ps for ids in sessions) == others
+    cm.check_integrity()
+
+
+def test_flush_and_rebuild_empty_the_host_bank(monkeypatch):
+    """Design 3.9: a flush evicts every unlocked prefix with its host copy, and a rebuild discards the
+    tree, so both return every bank slot."""
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=8, host_slots=4, pages=64)
+    for uid in range(2):
+        for prompt in (torch.arange(100 + 1_000 * uid, 300 + 1_000 * uid, dtype=torch.int32),):
+            run = drive_prefill(cm, pm, pool, PendingReq(uid, prompt, SamplingParams(max_tokens=4)),
+                                budget=8192, overlap=False)
+            Scheduler._free_req_resources(stub, run.final)
+        cm.ensure_mamba_slots(pool.num_free_slots + 1)
+    assert pool.num_free_host_slots == 2
+    with cm.lazy_free_region():
+        cm.flush()
+    assert pool.num_free_host_slots == 4 and cm.prefix_cache.mamba_host_evictable == 0
+    cm.check_integrity()
+    run = drive_prefill(cm, pm, pool, PendingReq(5, torch.arange(5_000, 5_200, dtype=torch.int32),
+                                                 SamplingParams(max_tokens=4)), budget=8192, overlap=False)
+    Scheduler._free_req_resources(stub, run.final)
+    cm.ensure_mamba_slots(pool.num_free_slots + 1)
+    assert pool.num_free_host_slots == 3
+    cm.rebuild(64, cm.page_table)
+    assert pool.num_free_host_slots == 4
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
