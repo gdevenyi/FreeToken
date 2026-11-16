@@ -16,6 +16,7 @@ from __future__ import annotations
 import heapq
 import time
 from collections import Counter, OrderedDict
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -48,11 +49,19 @@ class HybridMatch(NamedTuple):
     mamba_value: Optional[int]    # GDN snapshot slot to restore from (None = cold start)
     node: RadixTreeNode           # the matched node (lock target)
     walk_len: int = 0             # matched KV length before the snapshot cut
+    mamba_host: int | None = None  # host-bank slot to restore from, when there is no device one
 
 
 class EvictResult(NamedTuple):
     kv_indices: torch.Tensor      # KV page indices to free
     mamba_slots: List[int]        # GDN state slots to free
+    host_slots: Sequence[int] = ()                 # host-bank slots to free
+    # (device slot, host slot): copy each to the host before its device slot (in mamba_slots) is reused
+    demoted: Sequence[tuple[int, int]] = ()
+
+
+# --mamba-host-slots: returns a free host-bank slot, or None when the bank has none
+HostAlloc = Callable[[], int | None]
 
 
 # Evicted-node record for the KVSTATS miss causes: keyed by the node's start depth and its
@@ -83,6 +92,10 @@ class HybridRadixCache:
         self.full_protected = 0
         self.mamba_evictable = 0     # number of live, unlocked snapshots
         self.mamba_protected = 0
+        # host-tier snapshots (--mamba-host-slots), counted apart from the device slots
+        self.mamba_host_evictable = 0
+        self.mamba_host_protected = 0
+        self.clock = 0               # logical clock of the host LRU: one tick per walk
         # Statistics only (KVSTATS); no decision reads them.
         self.counts: Counter = Counter()
         self.ghosts: OrderedDict | None = OrderedDict() if ghosts else None
@@ -94,26 +107,28 @@ class HybridRadixCache:
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
         """Match the token prefix, then truncate the reusable length to the deepest node on
-        the path that still owns a LIVE snapshot (a continuation can only resume the GDN
-        recurrence from a checkpointed boundary)."""
+        the path that still owns a snapshot, on the device or in the host bank (a continuation
+        can only resume the GDN recurrence from a checkpointed boundary)."""
         node, _ = self._walk(input_ids)
-        # walk up to the deepest node whose END boundary has a live snapshot
+        # walk up to the deepest node whose END boundary has a snapshot
         cur, end_len = node, self._path_len(node)
         walk_len = end_len
         while not cur.is_root():
-            if cur.mamba_value is not None:
+            if cur.mamba_value is not None or cur.mamba_host is not None:
                 self._touch_pins(cur)
-                return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur, walk_len)
+                return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur, walk_len,
+                                   cur.mamba_host)
             end_len -= cur.length
             cur = cur.parent
         return HybridMatch(self.empty, 0, None, self.root, walk_len)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               mamba_value: int) -> Tuple[int, bool]:
+               mamba_value: int, host_freed: list[int] | None = None) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
         boundary node. Returns (matched_prefix_len, mamba_exist). If the boundary node already
         owns a live snapshot, returns mamba_exist=True and does not attach (caller frees the
-        donated slot -- dedup)."""
+        donated slot -- dedup). A snapshot is on one tier: the donation replaces an unlocked host
+        copy (its bank slot goes to ``host_freed``) and is a duplicate of a locked one."""
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
         node, prefix_len = self._walk(input_ids)
@@ -125,11 +140,16 @@ class HybridRadixCache:
             )
             new_node.set_parent(node)
             self.full_evictable += new_node.length
+            new_node.host_tick = self.clock
             node = new_node
         if node.is_root():
             return prefix_len, True   # root can't hold a snapshot; report exist so caller frees it
         if node.mamba_value is not None:
             return prefix_len, True                 # dedup: caller frees its donated slot
+        if node.mamba_host is not None:
+            if node.mamba_host_ref_count > 0 or host_freed is None:
+                return prefix_len, True             # a restore reads the host copy: keep it
+            self._detach_host(node, host_freed)
         node.mamba_value = mamba_value              # fills a fresh node or a tombstone
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
@@ -145,6 +165,11 @@ class HybridRadixCache:
                 self.mamba_evictable -= 1
                 self.mamba_protected += 1
             node.mamba_ref_count += 1
+        if node.mamba_host is not None:
+            if node.mamba_host_ref_count == 0:
+                self.mamba_host_evictable -= 1
+                self.mamba_host_protected += 1
+            node.mamba_host_ref_count += 1
         cur = node
         while not cur.is_root():
             if cur.ref_count == 0:
@@ -159,6 +184,11 @@ class HybridRadixCache:
             if node.mamba_ref_count == 0:
                 self.mamba_evictable += 1
                 self.mamba_protected -= 1
+        if node.mamba_host is not None and node.mamba_host_ref_count > 0:
+            node.mamba_host_ref_count -= 1
+            if node.mamba_host_ref_count == 0:
+                self.mamba_host_evictable += 1
+                self.mamba_host_protected -= 1
         cur = node
         while not cur.is_root():
             cur.ref_count -= 1
@@ -171,10 +201,10 @@ class HybridRadixCache:
     # ---------------------------------------------------------------- eviction (dual)
     def evict_full(self, num_tokens: int) -> EvictResult:
         """Evict KV tokens by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix
-        dependency for all descendants). Frees each evicted node's snapshot too."""
+        dependency for all descendants). Frees each evicted node's snapshot too, on either tier."""
         leaves = [n for n in self._leaves() if n.ref_count == 0]
         heapq.heapify(leaves)
-        kv, mamba, freed = [], [], 0
+        kv, mamba, host, freed = [], [], [], 0
         while freed < num_tokens and leaves:
             node = heapq.heappop(leaves)
             if node.ref_count != 0 or not node.is_leaf() or node.is_root():
@@ -185,30 +215,35 @@ class HybridRadixCache:
             if node.mamba_value is not None:
                 self.counts["kv_snapshot"] += 1
             self._free_node_mamba(node, mamba)
+            self._detach_host(node, host)
             self._record_ghost(node)
             parent, casc = self._cascade_tombstone_leaves(self._unlink(node), kv)
             freed += casc
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
                 heapq.heappush(leaves, parent)
         self.counts["kv_tokens"] += freed
-        return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
+        return EvictResult(torch.cat(kv) if kv else self.empty, mamba, host)
 
-    def evict_mamba(self, num: int) -> EvictResult:
+    def evict_mamba(self, num: int, host_alloc: HostAlloc | None = None) -> EvictResult:
         """Evict GDN snapshots by LRU over UNLOCKED snapshot-bearing nodes -- internal nodes
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
-        upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
+        upward (so a leaf always carries a live snapshot -- mirrors sglang). With ``host_alloc``
+        (--mamba-host-slots) a victim is DEMOTED instead: the node, leaf or not, keeps its KV and
+        moves its snapshot to a bank slot, and the caller copies it before reusing the device slot."""
         # pinned roots go last (structural policy), so a small idle cache cannot stall admission
         cands = [(n.uuid in self.pinned, n) for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
         heapq.heapify(cands)
-        kv, mamba, freed = [], [], 0
+        kv, mamba, demoted, freed = [], [], [], 0
         while freed < num and cands:
             pinned, node = heapq.heappop(cands)
             if node.mamba_value is None or node.mamba_ref_count != 0 or node.is_root():
                 continue
             if pinned:
                 self.counts["victim_pinned"] += 1
-            if node.is_leaf() and node.ref_count == 0:
+            if self._demote(node, host_alloc, mamba, demoted, kv):
+                freed += 1
+            elif node.is_leaf() and node.ref_count == 0:
                 kv.append(node.value)
                 self.full_evictable -= node.length
                 self._free_node_mamba(node, mamba)
@@ -221,7 +256,51 @@ class HybridRadixCache:
                 self.counts["victim_fork" if len(node.children) > 1 else "victim_interior"] += 1
                 self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
                 freed += 1
-        return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
+        return EvictResult(torch.cat(kv) if kv else self.empty, mamba, (), demoted)
+
+    def evict_host(self, num: int) -> EvictResult:
+        """Drop up to ``num`` unlocked host copies, least recently used first (see _drop_host)."""
+        kv, host = [], []
+        while len(host) < num and (slot := self._drop_host(kv)) is not None:
+            host.append(slot)
+        return EvictResult(torch.cat(kv) if kv else self.empty, [], host)
+
+    def _demote(self, node: RadixTreeNode, host_alloc: HostAlloc | None, mamba: list[int],
+                demoted: list[tuple[int, int]], kv: list[torch.Tensor]) -> bool:
+        """Move an unlocked device snapshot to a bank slot: a free one, else the slot of the least
+        recently used unlocked host copy. False (no bank, or no slot) leaves the node alone."""
+        if host_alloc is None:
+            return False
+        slot = host_alloc()
+        if slot is None:
+            slot = self._drop_host(kv)
+        if slot is None:
+            return False
+        demoted.append((node.mamba_value, slot))
+        self.counts["demote"] += 1
+        self._free_node_mamba(node, mamba)
+        node.mamba_host = slot
+        self.mamba_host_evictable += 1
+        return True
+
+    def _drop_host(self, kv: list[torch.Tensor]) -> int | None:
+        """Drop the least recently used unlocked host copy and return its bank slot (None: nothing
+        to drop). At a tie an internal copy goes first: dropping a leaf's copy costs its KV, since an
+        unlocked leaf must keep a snapshot on some tier."""
+        cands = [n for n in self._host_nodes() if n.mamba_host_ref_count == 0]
+        if not cands:
+            return None
+        node = min(cands, key=lambda n: (n.host_tick, n.is_leaf(), n.uuid))
+        slot: list[int] = []
+        self._detach_host(node, slot)
+        self.counts["host_drop"] += 1
+        if node.is_leaf() and node.ref_count == 0 and node.mamba_value is None:
+            kv.append(node.value)
+            self.full_evictable -= node.length
+            self._record_ghost(node)
+            _, casc = self._cascade_tombstone_leaves(self._unlink(node), kv)
+            self.counts["host_drop_kv_tokens"] += node.length + casc
+        return slot[0]
 
     @property
     def full_evictable_size(self) -> int:
@@ -243,6 +322,13 @@ class HybridRadixCache:
         # (KV/page conservation is checked by CacheManager.check_integrity.)
         for n in self._snapshot_nodes():
             assert n.mamba_value is not None and n.mamba_ref_count >= 0 and n.ref_count >= 0
+        host_nodes = self._host_nodes()
+        for n in host_nodes:
+            assert n.mamba_value is None, "a snapshot is on one tier"
+            assert n.mamba_host_ref_count >= 0 and n.ref_count >= n.mamba_host_ref_count
+        assert self.mamba_host_evictable + self.mamba_host_protected == len(host_nodes), (
+            f"host bank: evictable({self.mamba_host_evictable}) + "
+            f"protected({self.mamba_host_protected}) != nodes({len(host_nodes)})")
 
     # ---------------------------------------------------------------- helpers
     def _free_node_mamba(self, node: RadixTreeNode, out: List[int]) -> None:
@@ -253,6 +339,14 @@ class HybridRadixCache:
             self.prompt_ends.discard(node.uuid)
             if node.mamba_ref_count == 0:
                 self.mamba_evictable -= 1
+
+    def _detach_host(self, node: RadixTreeNode, out: list[int]) -> None:
+        if node.mamba_host is None:
+            return
+        assert node.mamba_host_ref_count == 0, "dropping a host copy that a restore reads"
+        out.append(node.mamba_host)
+        node.mamba_host = None
+        self.mamba_host_evictable -= 1
 
     # ---------------------------------------------------------------- structural policy (P1a)
     def pin(self, node: RadixTreeNode) -> None:
@@ -270,28 +364,30 @@ class HybridRadixCache:
         if node.mamba_value is not None:
             self.prompt_ends.add(node.uuid)
 
-    def cap_path(self, node: RadixTreeNode, cap: int) -> list[int]:
+    def cap_path(self, node: RadixTreeNode, cap: int, host_alloc: HostAlloc | None = None) -> EvictResult:
         """Free the shallowest snapshots on the path root..node while it holds more than ``cap``.
         Keeps the deepest one (the tail), pinned roots, forks (several children) and locked ones,
         and on top of the cap the deepest prompt end above the tail (the previous turn's, where an
         edited, regenerated or sibling turn resumes). A freed snapshot is interior, so its node
-        keeps its KV as a tombstone. Returns the slots."""
+        keeps its KV as a tombstone. The cap counts device snapshots only; with ``host_alloc`` a
+        thinned snapshot is demoted to the bank (as in evict_mamba) instead of freed."""
         path, cur = [], node
         while not cur.is_root():
             if cur.mamba_value is not None:
                 path.append(cur)
             cur = cur.parent
         previous = next((n for n in path[1:] if n.uuid in self.prompt_ends), None)
-        excess, freed = len(path) - (previous is not None) - cap, []
+        excess, freed, kv, demoted = len(path) - (previous is not None) - cap, [], [], []
         for cur in reversed(path[1:]):                 # shallowest first, never the tail
             if excess <= 0:
                 break
             if cur is previous or cur.uuid in self.pinned or len(cur.children) > 1 or cur.mamba_ref_count > 0:
                 continue
-            self._free_node_mamba(cur, freed)
+            if not self._demote(cur, host_alloc, freed, demoted, kv):
+                self._free_node_mamba(cur, freed)
             self.counts["cap"] += 1
             excess -= 1
-        return freed
+        return EvictResult(torch.cat(kv) if kv else self.empty, freed, (), demoted)
 
     def _touch_pins(self, node: RadixTreeNode) -> None:
         if not self.pinned:
@@ -312,7 +408,7 @@ class HybridRadixCache:
         Keeps the 'a leaf always carries a live snapshot' invariant (sglang
         _iteratively_delete_tombstone_leaf). Returns (highest surviving ancestor, freed_tokens)."""
         freed = 0
-        while (parent.mamba_value is None and parent.is_leaf()
+        while (parent.mamba_value is None and parent.mamba_host is None and parent.is_leaf()
                and parent.ref_count == 0 and not parent.is_root()):
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
@@ -364,6 +460,15 @@ class HybridRadixCache:
                 stack.extend(n.children.values())
         return out
 
+    def _host_nodes(self) -> list[RadixTreeNode]:
+        out, stack = [], [self.root]
+        while stack:
+            n = stack.pop()
+            if n.mamba_host is not None and not n.is_root():
+                out.append(n)
+            stack.extend(n.children.values())
+        return out
+
     def _snapshot_nodes(self) -> List[RadixTreeNode]:
         out, stack = [], [self.root]
         while stack:
@@ -377,6 +482,7 @@ class HybridRadixCache:
         prefix_len, total = 0, len(input_ids)
         node = self.root
         tic = time.monotonic_ns()
+        self.clock += 1
         while prefix_len < total:
             child = node.children.get(self.key_fn(input_ids[prefix_len:]))
             if child is None:
@@ -387,8 +493,10 @@ class HybridRadixCache:
             if match_len != node.length:
                 node = node.split_at(match_len)
                 node.timestamp = tic
+                node.host_tick = self.clock
                 return node, prefix_len
             node.timestamp = tic
+            node.host_tick = self.clock
         return node, prefix_len
 
 
@@ -396,4 +504,4 @@ def _ghost_hash(keys: torch.Tensor) -> int:
     return hash(keys.cpu().numpy().tobytes())
 
 
-__all__ = ["HybridRadixCache", "HybridMatch", "EvictResult", "HybridCacheHandle"]
+__all__ = ["HybridRadixCache", "HybridMatch", "EvictResult", "HybridCacheHandle", "HostAlloc"]

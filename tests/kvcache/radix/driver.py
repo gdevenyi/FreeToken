@@ -56,7 +56,7 @@ class CacheSpec:
                     f"page_size({self.page_size}) == 0")
         return None
 
-    def build(self) -> Tuple[Adapter, RefModel]:
+    def build(self, host_slots: int = 0) -> Tuple[Adapter, RefModel]:
         dev, P = torch.device("cpu"), self.page_size
         if self.kind == "plain":
             from freetoken.kvcache.radix_cache import RadixPrefixCache
@@ -68,7 +68,7 @@ class CacheSpec:
                     SWAModel(P, w))
         if self.kind == "hybrid":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridAdapter(HybridRadixCache(dev, page_size=P), P), HybridModel(P)
+            return HybridAdapter(HybridRadixCache(dev, page_size=P), P), HybridModel(P, host_slots)
         raise ValueError(f"unknown cache kind {self.kind!r}")
 
 
@@ -95,16 +95,21 @@ class Session:
     """Executes ops against one cache + its reference model, comparing every answer; ``check()``
     runs the whole invariant battery, which is why the scenario tests can be short."""
 
-    def __init__(self, spec: CacheSpec) -> None:
+    def __init__(self, spec: CacheSpec, host_slots: int = 0) -> None:
         self.spec = spec
         self.P = spec.page_size
-        self.ad, self.model = spec.build()
+        self.ad, self.model = spec.build(host_slots)
         self.kv = SlotLedger(1_000_000, "kv")
         self.second: Optional[SlotLedger] = (
             SlotLedger(9_000_000, "mamba") if self.ad.second_currency == "mamba" else None)
+        # --mamba-host-slots: a bank of ``host_slots`` slots; the tree takes one per demotion
+        self.host: SlotLedger | None = SlotLedger(5_000_000, "host") if host_slots else None
+        if host_slots:
+            host = self.host
+            self.ad.host_alloc = lambda: host.take(1)[0] if len(host.in_use()) < host_slots else None
 
     def check(self) -> None:
-        check_all(self.ad, self.model, self.kv, self.second)
+        check_all(self.ad, self.model, self.kv, self.second, self.host)
 
     @staticmethod
     def _same(tag: str, what: str, got, want) -> None:
@@ -122,6 +127,7 @@ class Session:
         self._same("match.node", f"{q} lock-target node's root path",
                    node_path_slots(got.node), exp.indices)
         self._same("match.second", f"{q} second-currency value", got.second, exp.second)
+        self._same("match.host", f"{q} host-bank slot", got.host, exp.host)
         return got, exp
 
     def do_insert(self, ids: Sequence[int], swa_evicted: int = 0, *,
@@ -151,6 +157,11 @@ class Session:
         if "mamba" in kw and exp.second_exists:
             assert self.second is not None
             self.second.release([kw["mamba"]])
+        if "mamba" in kw:
+            self._same("insert.host_freed", f"{q} displaced host copy", got.host_freed, exp.host_freed)
+            if exp.host_freed:
+                assert self.host is not None
+                self.host.release(exp.host_freed)
         return got, exp
 
     def _lock(self, got, exp) -> Optional[Tuple[LockToken, ExpLock]]:
@@ -171,10 +182,26 @@ class Session:
 
     def _evict(self, which: str, n: int) -> None:
         got = getattr(self.ad, which)(n)
-        getattr(self.model, which)(n, got.primary, got.second)
+        if which == "evict_second" and self.spec.kind == "hybrid":
+            self.model.evict_second(n, got.primary, got.second, got.demoted)
+        elif which == "evict_full" and self.spec.kind == "hybrid":
+            self.model.evict_full(n, got.primary, got.second, got.host)
+        else:
+            getattr(self.model, which)(n, got.primary, got.second)
         self.kv.release(got.primary)
         if self.second is not None:
             self.second.release(got.second)
+        if self.host is not None:
+            self.host.release(got.host)
+        elif getattr(got, "host", None):
+            raise ModelMismatch("evict.host", f"{which} freed host slots {got.host} with no bank")
+
+    def do_evict_host(self, n: int) -> None:
+        got = self.ad.evict_host(n)
+        self.model.evict_host(n, got.primary, got.host)
+        self.kv.release(got.primary)
+        assert self.host is not None
+        self.host.release(got.host)
 
     def do_evict_full(self, n: int) -> None:
         if self.spec.kind == "plain":

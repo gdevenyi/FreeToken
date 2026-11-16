@@ -20,6 +20,7 @@ every public result against it and ``Session.check()`` runs the invariant batter
 """
 from __future__ import annotations
 
+import time
 from typing import Sequence, Tuple
 
 import pytest
@@ -66,6 +67,11 @@ def full_size(s: Session) -> int:
 def live_snapshots(s: Session) -> int:
     c = s.model.counters()
     return c["mamba_evictable"] + c["mamba_protected"]
+
+
+def host_snapshots(s: Session) -> int:
+    c = s.model.counters()
+    return c["mamba_host_evictable"] + c["mamba_host_protected"]
 
 
 @pytest.fixture
@@ -351,3 +357,127 @@ def test_lock_pins_the_snapshot_and_the_whole_kv_path(hyb):
     assert events(hyb)["evict_full.cascade"] == 1
     assert hyb.kv.in_use() == set() and hyb.second.in_use() == set()
     hyb.check()
+
+
+# --------------------------------------------------------------------------- host bank (--mamba-host-slots)
+def test_evict_mamba_demotes_to_the_host_bank_and_a_match_resumes_there():
+    """With a bank, ``evict_mamba`` copies the snapshot to the host instead of freeing it: the node
+    keeps its KV, even a leaf, and a match returns the same pages and the bank slot."""
+    s = Session(SPEC, host_slots=2)
+    chain, mx, my = two_node_tree(s)
+    pages = s.do_match(chain)[0].indices
+
+    s.do_evict_second(1)                       # X (internal, LRU)
+    s.do_evict_second(1)                       # Y (a leaf): without a bank its KV would go too
+    assert events(s)["evict_mamba.demote"] == 2 and events(s)["evict_mamba.leaf_free"] == 0
+    assert {mx, my} <= s.second.free and s.kv.free == set()
+    assert (live_snapshots(s), host_snapshots(s), full_size(s)) == (0, 2, 4 * PAGE)
+    s.check()
+
+    m, _ = s.do_match(chain)
+    assert (m.cached_len, m.indices, m.second) == (4 * PAGE, pages, None) and m.host is not None
+    m2, _ = s.do_match(ids(1, 2))
+    assert m2.cached_len == 2 * PAGE and m2.host not in (None, m.host)
+    s.check()
+
+
+def test_a_full_bank_drops_its_lru_copy_and_a_bare_leaf_goes_with_its_kv():
+    """The bank holds one copy. Demoting B drops A's older copy; A is a leaf with no snapshot left,
+    so its KV goes too (an unlocked leaf keeps a snapshot on some tier)."""
+    s = Session(SPEC, host_slots=1)
+    a = s.kv.take(PAGE)
+    s.do_insert(ids(1), slots=a)
+    s.do_insert(ids(2))
+    s.do_evict_second(1)                       # A -> the bank
+    s.do_evict_second(1)                       # B -> the bank, which drops A
+    assert events(s)["evict_mamba.demote"] == 2 and events(s)["evict_host.leaf_free"] == 1
+    assert set(a) <= s.kv.free and host_snapshots(s) == 1 and full_size(s) == PAGE
+    s.check()
+    assert s.do_match(ids(1))[0].cached_len == 0
+    assert s.do_match(ids(2))[0].host is not None
+
+
+def test_a_full_bank_tombstones_an_internal_copy():
+    s = Session(SPEC, host_slots=1)
+    chain, _mx, _my = two_node_tree(s)
+    s.do_evict_second(1)                       # X -> the bank
+    s.do_evict_second(1)                       # Y -> the bank; X's copy goes, X keeps its KV for Y
+    assert events(s)["evict_host.tombstone_in_place"] == 1 and s.kv.free == set()
+    s.check()
+    assert s.do_match(ids(1, 2))[0].cached_len == 0
+    assert s.do_match(chain)[0].cached_len == 4 * PAGE
+
+
+def test_nothing_evictable_in_the_bank_falls_back_to_a_free():
+    """Every bank copy is a restore source (locked): the next victim is freed as without a bank."""
+    s = Session(SPEC, host_slots=1)
+    s.do_insert(ids(1))
+    s.do_evict_second(1)
+    held = s.do_lock(ids(1))
+    s.do_insert(ids(2))
+    s.do_evict_second(1)
+    assert events(s)["evict_mamba.leaf_free"] == 1 and host_snapshots(s) == 1
+    s.check()
+    s.do_unlock(held)
+    s.check()
+
+
+def test_evict_full_frees_the_host_copy_with_the_kv():
+    """A host copy describes its node's KV: when the KV goes, the bank slot goes with it."""
+    s = Session(SPEC, host_slots=2)
+    chain, _mx, _my = two_node_tree(s)
+    s.do_evict_second(2)                       # both to the bank
+    s.do_evict_full(2 * PAGE)                  # Y's KV and its host copy
+    assert len(s.host.free) == 1 and host_snapshots(s) == 1
+    s.check()
+    assert s.do_match(chain)[0].cached_len == 2 * PAGE
+    s.do_evict_full(2 * PAGE)
+    assert len(s.host.free) == 2 and s.kv.in_use() == set()
+    s.check()
+
+
+def test_device_donation_displaces_an_unlocked_host_copy_only():
+    """One tier per snapshot: a device donation replaces an unlocked host copy (the caller frees its
+    bank slot), but a locked one is a running restore's source, so the donation is a duplicate."""
+    s = Session(SPEC, host_slots=2)
+    s.do_insert(ids(1, 2))
+    s.do_evict_second(1)
+    held = s.do_lock(ids(1, 2))                # a request restores from the host copy
+    got, _ = s.do_insert(ids(1, 2))
+    assert got.second_exists and got.host_freed == []
+    s.check()
+    s.do_unlock(held)
+    got, _ = s.do_insert(ids(1, 2))
+    assert not got.second_exists and len(got.host_freed) == 1
+    assert events(s)["insert.host_displaced"] == 1
+    m, _ = s.do_match(ids(1, 2))
+    assert (m.second, m.host) == (donated(s), None)
+    s.check()
+
+
+def test_host_lru_runs_on_the_logical_clock(monkeypatch):
+    """The host LRU must not read the wall clock (TP ranks agree on the operation order, not on the
+    time): with a clock that ties everything, the least recently matched copy still goes first."""
+    monkeypatch.setattr(time, "monotonic_ns", lambda: 7)
+    s = Session(SPEC, host_slots=2)
+    s.do_insert(ids(1))                        # A
+    s.do_insert(ids(2))                        # B
+    s.do_evict_second(2)                       # both to the bank
+    s.do_insert(ids(3))                        # C
+    s.do_match(ids(1))                         # A is used again
+    s.do_evict_second(1)                       # C to the full bank: B goes, not A
+    s.check()
+    assert s.do_match(ids(2))[0].cached_len == 0
+    assert s.do_match(ids(1))[0].host is not None
+
+
+def test_evict_host_drops_copies_lru_first():
+    s = Session(SPEC, host_slots=3)
+    chain, _mx, _my = two_node_tree(s)
+    s.do_insert(ids(5))
+    s.do_evict_second(3)
+    s.do_match(chain)                          # X and Y are used again; the session at 5 is the LRU
+    s.do_evict_host(2)                         # the leaf at 5 (with its KV), then X (tombstone)
+    assert events(s)["evict_host.leaf_free"] == 1 and events(s)["evict_host.tombstone_in_place"] == 1
+    s.check()
+    assert s.do_match(chain)[0].cached_len == 4 * PAGE

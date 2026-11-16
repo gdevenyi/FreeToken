@@ -33,6 +33,11 @@ class RadixTreeNode:
         # whose end boundary is unchanged. Forward-compat seam for SWA.
         self.mamba_value: int | None = None
         self.mamba_ref_count: int = 0
+        # The same snapshot in the host bank (--mamba-host-slots) when it is not on the device: a
+        # snapshot is on one tier. Its own ref count (a restore's source), and a logical LRU clock.
+        self.mamba_host: int | None = None
+        self.mamba_host_ref_count: int = 0
+        self.host_tick: int = 0
 
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
         # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is
@@ -92,6 +97,7 @@ class RadixTreeNode:
         new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
+        new_node.host_tick = self.host_tick
         # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves
         # stay within a locked window, so the swa lock copies; the window-boundary uuid migrates
         # to the root-side (prefix) node and is cleared on the suffix (matches sglang _split_node).

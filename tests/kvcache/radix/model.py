@@ -73,6 +73,9 @@ def sizes(records: Iterable[Record], currency: Optional[str]) -> Dict[str, int]:
         live = [r for r in recs if r["mamba"] is not None]
         out["mamba_evictable"] = sum(1 for r in live if r["mamba_ref"] == 0)
         out["mamba_protected"] = sum(1 for r in live if r["mamba_ref"] > 0)
+        host = [r for r in recs if r["host"] is not None]
+        out["mamba_host_evictable"] = sum(1 for r in host if r["host_ref"] == 0)
+        out["mamba_host_protected"] = sum(1 for r in host if r["host_ref"] > 0)
     return out
 
 
@@ -84,7 +87,7 @@ class MGroup:
     node's end boundary; ``slots`` holds ``page_size`` slot ids per page, flattened."""
 
     __slots__ = ("paths", "slots", "stamp", "ref", "tomb", "swa_ref", "swa_uuid",
-                 "mamba", "mamba_ref")
+                 "mamba", "mamba_ref", "host", "host_ref", "htick")
 
     def __init__(self, paths: Sequence[Path], slots: Sequence[int], stamp: int):
         self.paths: List[Path] = list(paths)
@@ -96,6 +99,9 @@ class MGroup:
         self.swa_uuid: Optional[int] = None
         self.mamba: Optional[int] = None
         self.mamba_ref = 0
+        self.host: int | None = None        # hybrid: the snapshot's host-bank slot (HOST state)
+        self.host_ref = 0
+        self.htick = 0                      # hybrid: logical clock of the host LRU
 
     length = property(lambda self: len(self.slots))
     n_pages = property(lambda self: len(self.paths))
@@ -105,7 +111,8 @@ class MGroup:
     def record(self) -> Record:
         return {"length": self.length, "slots": tuple(self.slots), "ref": self.ref,
                 "tomb": self.tomb, "swa_ref": self.swa_ref, "swa_uuid": self.swa_uuid,
-                "mamba": self.mamba, "mamba_ref": self.mamba_ref}
+                "mamba": self.mamba, "mamba_ref": self.mamba_ref,
+                "host": self.host, "host_ref": self.host_ref}
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"MGroup(end={self.end}, len={self.length}, ref={self.ref}, tomb={self.tomb},"
@@ -190,6 +197,7 @@ class PageTrie:
         assert 0 < n_pages < g.n_pages, f"bad split {n_pages} of {g.n_pages}"
         pre = MGroup(g.paths[:n_pages], g.slots[: n_pages * self.P], g.stamp)
         pre.ref, pre.tomb, pre.swa_ref, pre.swa_uuid = g.ref, g.tomb, g.swa_ref, g.swa_uuid
+        pre.htick = g.htick
         g.swa_uuid = None
         g.paths = g.paths[n_pages:]
         g.slots = g.slots[n_pages * self.P:]
@@ -220,6 +228,7 @@ class ExpMatch:
     indices: List[int]
     group: Optional[MGroup]
     second: Optional[int] = None          # hybrid: the GDN snapshot slot to restore from
+    host: int | None = None               # hybrid: the host-bank slot, when there is no device one
 
 
 @dataclass
@@ -229,6 +238,7 @@ class ExpInsert:
     dups: List[int]                       # what the CALLER must free by convention (see _commit)
     adopted: List[int]                    # supplied slots the tree took ownership of
     second_exists: Optional[bool] = None  # hybrid dedup flag
+    host_freed: list[int] | None = None  # hybrid: the host copy a device donation displaced
 
 
 @dataclass
@@ -389,6 +399,10 @@ class RefModel:
         """Consume the second-currency slots the cache reported for ``g`` (none by default)."""
         return pos
 
+    def _host_free(self, g: MGroup, obs: Sequence[int], pos: int, tag: str) -> int:
+        """Consume the host-bank slot the cache reported for ``g`` (none by default)."""
+        return pos
+
     def _cascade(self, parent: Optional[MGroup], obs_kv: Sequence[int], pk: int,
                  cands: List[MGroup], tag: str, label: str):
         """Reclaim exposed ancestors carrying no second-currency value.  Returns ``(first
@@ -404,11 +418,12 @@ class RefModel:
             parent = self.trie.remove(parent)
         return parent, pk, got
 
-    def evict_full(self, n: int, obs_kv: Sequence[int], obs_second: Sequence[int] = ()) -> None:
+    def evict_full(self, n: int, obs_kv: Sequence[int], obs_second: Sequence[int] = (),
+                   obs_host: Sequence[int] = ()) -> None:
         """The full-KV pass: unlocked LEAVES only, least recently used first."""
         tag = "model.evict"
         cands = [g for g in self.trie.groups() if g.ref == 0 and self.trie.is_leaf(g)]
-        freed, pk, ps = 0, 0, 0
+        freed, pk, ps, ph = 0, 0, 0, 0
         while freed < n and cands:
             if pk >= len(obs_kv):
                 raise _fail(tag, f"evict_full({n}) stopped after {freed} token(s) but "
@@ -418,6 +433,7 @@ class RefModel:
             pk = self._take(obs_kv, pk, victim, tag, "evict_full kv")
             freed += victim.length
             ps = self._second_free(victim, obs_second, ps, tag)
+            ph = self._host_free(victim, obs_host, ph, tag)
             cands.remove(victim)
             parent, pk, extra = self._cascade(self.trie.remove(victim), obs_kv, pk, cands,
                                               tag, "evict_full")
@@ -428,6 +444,7 @@ class RefModel:
                 cands.append(parent)
         self._drained(obs_kv, pk, tag, "evict_full kv")
         self._drained(obs_second, ps, tag, "evict_full second")
+        self._drained(obs_host, ph, tag, "evict_full host")
 
 
 # --------------------------------------------------------------------------- SWA radix
@@ -665,45 +682,77 @@ class SWAModel(RefModel):
 
 # --------------------------------------------------------------------------- hybrid (GDN) radix
 class HybridModel(RefModel):
-    """HybridRadixCache: full KV + an optional GDN snapshot slot at a node's END boundary."""
+    """HybridRadixCache: full KV + an optional GDN snapshot slot at a node's END boundary.
+
+    With a host bank (``host_slots > 0``, ``--mamba-host-slots``) a snapshot is on the device
+    (``mamba``) or in the bank (``host``), never both: ``evict_mamba`` demotes instead of freeing, a
+    full bank first drops its least recently used unlocked host copy (on a logical clock, one tick per
+    walk; at a tie an interior copy before a leaf, whose drop costs KV), and a dropped leaf goes with
+    its KV, so an unlocked leaf always keeps a snapshot on some tier."""
 
     second_currency = "mamba"
 
+    def __init__(self, page_size: int, host_slots: int = 0) -> None:
+        super().__init__(page_size)
+        self.host_slots = host_slots
+        self.hclk = 0
+
+    def _stamped_cover(self, ids: Sequence[int]) -> list[MGroup]:
+        gs = super()._stamped_cover(ids)
+        self.hclk += 1
+        for g in gs:
+            g.htick = self.hclk
+        return gs
+
     def match(self, ids: Sequence[int]) -> ExpMatch:
         gs = self._stamped_cover(ids)
-        for i, g in enumerate(reversed(gs)):  # deepest node that still owns a LIVE snapshot
-            if g.mamba is not None:
+        for i, g in enumerate(reversed(gs)):  # deepest node that still owns a snapshot on a tier
+            if g.mamba is not None or g.host is not None:
                 if i:
                     self.events["match.snapshot_truncation"] += 1
-                return ExpMatch(self.trie.path_len(g), self.trie.path_slots(g), g, g.mamba)
+                if g.mamba is None:
+                    self.events["match.host"] += 1
+                return ExpMatch(self.trie.path_len(g), self.trie.path_slots(g), g, g.mamba, g.host)
         self.events["match.no_snapshot"] += 1
         return ExpMatch(0, [], None, None)
 
     def insert(self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0,
                *, mamba: int) -> ExpInsert:
         node, exp = self._commit(ids, slots, reused_len)
-        exp.second_exists = node is None or node.mamba is not None
+        if node is not None and exp.adopted:
+            node.htick = self.hclk            # a new node gets the clock of the insert's walk
+        exp.host_freed = []
+        exp.second_exists = (node is None or node.mamba is not None
+                             or (node.host is not None and node.host_ref > 0))
         if exp.second_exists:
             self.events["insert.snapshot_dedup"] += 1
         else:
             self.events["insert.snapshot_attach"] += 1
+            if node.host is not None:         # the fresh device copy displaces an unlocked host copy
+                self.events["insert.host_displaced"] += 1
+                exp.host_freed = [node.host]
+                node.host = None
             node.mamba = mamba
         return exp
 
     def inc_lock(self, g: Optional[MGroup], uuid: Optional[int] = None) -> ExpLock:
         if g is not None and g.mamba is not None:
             g.mamba_ref += 1
+        if g is not None and g.host is not None:
+            g.host_ref += 1
         return super().inc_lock(g)
 
     def dec_lock(self, lock: ExpLock, skip_swa: bool = False) -> None:
         g = lock.group
         if g is not None and g.mamba is not None and g.mamba_ref > 0:
             g.mamba_ref -= 1
+        if g is not None and g.host is not None and g.host_ref > 0:
+            g.host_ref -= 1
         super().dec_lock(lock)
 
     # -- eviction -----------------------------------------------------------
     def _cascadable(self, g: MGroup) -> bool:
-        return g.mamba is None               # no snapshot left => nothing can resume from it
+        return g.mamba is None and g.host is None  # no snapshot on any tier => nothing can resume
 
     def _second_free(self, g: MGroup, obs: Sequence[int], pos: int, tag: str) -> int:
         if g.mamba is None:
@@ -715,11 +764,51 @@ class HybridModel(RefModel):
         g.mamba_ref = 0
         return pos + 1
 
-    def evict_second(self, n: int, obs_kv: Sequence[int], obs_mamba: Sequence[int]) -> None:
-        """``evict_mamba(n)`` counts SNAPSHOTS, not tokens."""
+    def _host_free(self, g: MGroup, obs: Sequence[int], pos: int, tag: str) -> int:
+        if g.host is None:
+            return pos
+        if pos >= len(obs) or obs[pos] != g.host:
+            raise _fail(tag, f"expected host slot {g.host} of node end={g.end} to be freed, "
+                             f"got {list(obs[pos:pos + 1]) or 'nothing'}")
+        g.host = None
+        g.host_ref = 0
+        return pos + 1
+
+    def _host_key(self, g: MGroup) -> tuple[int, bool]:
+        return g.htick, self.trie.is_leaf(g)
+
+    def _drop_host(self, slot: int, obs_kv: Sequence[int], pk: int, tag: str,
+                   cands: list[MGroup] | None = None) -> int:
+        """The cache dropped the host copy in ``slot``: it must be the least recently used unlocked
+        one. A leaf left with no snapshot goes with its KV, cascading upward."""
+        owners = [g for g in self.trie.groups() if g.host == slot]
+        if len(owners) != 1:
+            raise _fail(tag, f"host slot {slot} has {len(owners)} owner(s) in the model")
+        victim = owners[0]
+        eligible = [g for g in self.trie.groups() if g.host is not None and g.host_ref == 0]
+        if victim not in eligible or self._host_key(victim) != min(map(self._host_key, eligible)):
+            raise _fail(tag, f"non-LRU host victim end={victim.end} key={self._host_key(victim)}; "
+                             f"eligible: {[(g.end, self._host_key(g)) for g in eligible]}")
+        victim.host = None
+        if self.trie.is_leaf(victim) and victim.ref == 0 and victim.mamba is None:
+            self.events["evict_host.leaf_free"] += 1
+            pk = self._take(obs_kv, pk, victim, tag, "evict_host kv")
+            _, pk, _ = self._cascade(self.trie.remove(victim), obs_kv, pk, cands or [], tag,
+                                     "evict_host")
+        else:
+            self.events["evict_host.tombstone_in_place"] += 1
+        return pk
+
+    def evict_second(self, n: int, obs_kv: Sequence[int], obs_mamba: Sequence[int],
+                     obs_demoted: Sequence[tuple[int, int]] = ()) -> None:
+        """``evict_mamba(n)`` counts SNAPSHOTS, not tokens. With a bank, each victim is demoted:
+        ``obs_demoted`` names the (device slot, host slot) of each demotion."""
         tag = "model.evict_mamba"
+        demoted = dict(obs_demoted)
+        if len(demoted) != len(obs_demoted):
+            raise _fail(tag, f"a device slot was demoted twice: {list(obs_demoted)}")
         cands = [g for g in self.trie.groups() if g.mamba is not None and g.mamba_ref == 0]
-        freed, pk, pm = 0, 0, 0
+        freed, pk, pm, pd = 0, 0, 0, 0
         while freed < n and cands:
             if pm >= len(obs_mamba):
                 raise _fail(tag, f"evict_mamba({n}) stopped after {freed} snapshot(s) with "
@@ -732,7 +821,25 @@ class HybridModel(RefModel):
             self._pick_victim(cands, victim, tag)
             cands.remove(victim)
             freed += 1
-            if self.trie.is_leaf(victim) and victim.ref == 0:
+            in_use = sum(g.host is not None for g in self.trie.groups())
+            can_demote = self.host_slots > 0 and (
+                in_use < self.host_slots
+                or any(g.host is not None and g.host_ref == 0 for g in self.trie.groups()))
+            if can_demote != (victim.mamba in demoted):
+                raise _fail(tag, f"snapshot of node end={victim.end}: model expects "
+                                 f"{'a demotion' if can_demote else 'no demotion'}, cache "
+                                 f"{'demoted' if victim.mamba in demoted else 'did not'}")
+            if can_demote:
+                slot = demoted[victim.mamba]
+                if obs_demoted[pd] != (victim.mamba, slot):
+                    raise _fail(tag, f"demotions out of order: {list(obs_demoted)}")
+                pd += 1
+                if in_use >= self.host_slots:  # the bank is full: its LRU copy gives way
+                    pk = self._drop_host(slot, obs_kv, pk, tag, cands)
+                self.events["evict_mamba.demote"] += 1
+                pm = self._second_free(victim, obs_mamba, pm, tag)
+                victim.host = slot
+            elif self.trie.is_leaf(victim) and victim.ref == 0:
                 self.events["evict_mamba.leaf_free"] += 1
                 pk = self._take(obs_kv, pk, victim, tag, "evict_mamba kv")
                 pm = self._second_free(victim, obs_mamba, pm, tag)
@@ -743,3 +850,18 @@ class HybridModel(RefModel):
                 pm = self._second_free(victim, obs_mamba, pm, tag)
         self._drained(obs_kv, pk, tag, "evict_mamba kv")
         self._drained(obs_mamba, pm, tag, "evict_mamba mamba")
+        if pd != len(obs_demoted):
+            raise _fail(tag, f"evict_mamba reported demotions {list(obs_demoted)[pd:]} the model "
+                             f"did not predict")
+
+    def evict_host(self, n: int, obs_kv: Sequence[int], obs_host: Sequence[int]) -> None:
+        """``evict_host(n)`` drops ``n`` host copies, least recently used first."""
+        tag = "model.evict_host"
+        eligible = [g for g in self.trie.groups() if g.host is not None and g.host_ref == 0]
+        if len(obs_host) != min(n, len(eligible)):
+            raise _fail(tag, f"evict_host({n}) dropped {len(obs_host)} host copies; "
+                             f"{len(eligible)} were eligible")
+        pk = 0
+        for slot in obs_host:
+            pk = self._drop_host(slot, obs_kv, pk, tag)
+        self._drained(obs_kv, pk, tag, "evict_host kv")

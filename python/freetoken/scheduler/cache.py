@@ -549,8 +549,7 @@ class CacheManager:
                 self.prefix_cache.mark_prompt_end(m.node)
             # before the replacement alloc below: the thinned slot replaces the donated one, so a
             # long prefill stops taking other sessions' snapshots once its path holds the cap
-            if freed := self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP):
-                pool.free(freed)
+            pool.free(self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP).mamba_slots)
         if not mamba_exist:                                # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
