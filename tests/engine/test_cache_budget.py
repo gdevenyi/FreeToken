@@ -712,3 +712,89 @@ def test_moe_pool_flags_and_decode_batch_clamp():
     )
     _clamp_decode_batch_to_pools(config, [12, 16, 9])
     assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (1, 1, [1])
+
+
+def test_linear_state_cache_ratio_flag_sets_the_gdn_snapshot_cache():
+    """--linear-state-cache-ratio sets the GDN snapshot cache (ratio x max_running_req idle slots,
+    at least 4); a negative or non-finite ratio is refused when the flags are parsed."""
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    class HF:
+        def to_dict(self):
+            return {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"}
+
+    def parse(*argv):
+        with patch("freetoken.utils.cached_load_hf_config", lambda _path: HF()):
+            return parse_args(["--model", "/models/anon", *argv])[0]
+
+    assert parse().linear_state_cache_ratio == 2.0
+    assert parse("--linear-state-cache-ratio", "6").linear_state_cache_ratio == 6.0
+    for bad in ("-1", "nan", "inf", "two"):
+        with pytest.raises(SystemExit):
+            parse("--linear-state-cache-ratio", bad)
+
+
+def test_more_gdn_snapshot_slots_come_out_of_the_expert_cache():
+    """Production sizes the expert cache from free memory (--moe-strategy offload, no cache-size
+    flag) beside a fixed --num-tokens. The GDN state pool is fixed cost in that plan, so each extra
+    snapshot slot costs its bytes in expert slots, and a ratio whose slots leave less than the
+    expert floor fails at start."""
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.linear_state_pool import (
+        _linear_pool_num_slots,
+        state_pool_bytes,
+    )
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec, LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1, 2), num_key_heads=4, num_value_heads=8,
+        key_head_dim=64, value_head_dim=64, conv_kernel_dim=4, output_gate="silu",
+    )
+
+    class ModelConfig:
+        has_swa_attention = False
+        num_experts = 4
+        num_moe_layers = 64                           # 256 experts in all
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(name="full", layer_ids=(3,), num_kv_heads=2, head_dim=64, sliding_window=None)]
+
+        def linear_attention_group(self):
+            return group
+
+    class Config:
+        dtype = torch.bfloat16
+        page_size = 64
+        max_running_req = 8
+        max_seq_len = 4096
+        cache_type = "hybrid_radix"
+        memory_ratio = 0.94
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 0
+        num_page_override = 32                        # --num-tokens 2048
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        model_config = ModelConfig()
+
+        class tp_info:
+            size = 1
+
+        def __init__(self, ratio):
+            self.linear_state_cache_ratio = ratio
+
+    banks = SimpleNamespace(sources={"w": [torch.zeros(4, 512, 256, dtype=torch.bfloat16)] * 64})  # 262,144 B/expert
+
+    engine = Engine.__new__(Engine)                   # the budget glue only: no GPU
+    engine._baseline_free, engine._weights_bytes, engine._pool_cls = 200 << 20, 118 << 20, MHAKVCache
+    base, more = Config(2.0), Config(6.0)
+    assert _linear_pool_num_slots(more) - _linear_pool_num_slots(base) == 32
+    experts_base = engine._resolve_auto_moe_cache_size(base, banks)[0]
+    experts_more = engine._resolve_auto_moe_cache_size(more, banks)[0]
+    assert 8 < experts_more < experts_base < 256       # between the floor (2 x 4) and the cap
+    extra = state_pool_bytes(more) - state_pool_bytes(base)
+    assert experts_base - experts_more in (extra // 262_144, extra // 262_144 + 1)
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        engine._resolve_auto_moe_cache_size(Config(200.0), banks)
