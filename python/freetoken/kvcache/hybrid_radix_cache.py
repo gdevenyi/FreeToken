@@ -88,6 +88,8 @@ class HybridRadixCache:
         self.ghosts: OrderedDict | None = OrderedDict() if ghosts else None
         # uuid -> node of the pinned snapshots, least recently used first (structural policy only)
         self.pinned: OrderedDict = OrderedDict()
+        # uuids of prompt-end snapshots (structural policy only): the cap keeps the previous one
+        self.prompt_ends: set = set()
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -248,6 +250,7 @@ class HybridRadixCache:
             out.append(node.mamba_value)
             node.mamba_value = None
             self.pinned.pop(node.uuid, None)
+            self.prompt_ends.discard(node.uuid)
             if node.mamba_ref_count == 0:
                 self.mamba_evictable -= 1
 
@@ -263,20 +266,27 @@ class HybridRadixCache:
             self.pinned.popitem(last=False)
             self.counts["unpin"] += 1
 
+    def mark_prompt_end(self, node: RadixTreeNode) -> None:
+        if node.mamba_value is not None:
+            self.prompt_ends.add(node.uuid)
+
     def cap_path(self, node: RadixTreeNode, cap: int) -> list[int]:
         """Free the shallowest snapshots on the path root..node while it holds more than ``cap``.
-        Keeps the deepest one (the tail), pinned roots, forks (several children) and locked ones;
-        a freed snapshot is interior, so its node keeps its KV as a tombstone. Returns the slots."""
+        Keeps the deepest one (the tail), pinned roots, forks (several children) and locked ones,
+        and on top of the cap the deepest prompt end above the tail (the previous turn's, where an
+        edited, regenerated or sibling turn resumes). A freed snapshot is interior, so its node
+        keeps its KV as a tombstone. Returns the slots."""
         path, cur = [], node
         while not cur.is_root():
             if cur.mamba_value is not None:
                 path.append(cur)
             cur = cur.parent
-        excess, freed = len(path) - cap, []
+        previous = next((n for n in path[1:] if n.uuid in self.prompt_ends), None)
+        excess, freed = len(path) - (previous is not None) - cap, []
         for cur in reversed(path[1:]):                 # shallowest first, never the tail
             if excess <= 0:
                 break
-            if cur.uuid in self.pinned or len(cur.children) > 1 or cur.mamba_ref_count > 0:
+            if cur is previous or cur.uuid in self.pinned or len(cur.children) > 1 or cur.mamba_ref_count > 0:
                 continue
             self._free_node_mamba(cur, freed)
             self.counts["cap"] += 1

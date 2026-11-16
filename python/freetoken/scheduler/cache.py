@@ -37,7 +37,7 @@ LOGPROB_READ_SNAPSHOT_DONATE = ("all", "boundary", "none")
 # boundary, a fork from an existing path and each SNAPSHOT_STRIDE tokens, and caps each path
 GDN_SNAPSHOT_POLICIES = ("chunk", "structural")
 SNAPSHOT_STRIDE = 32768
-SNAPSHOT_PATH_CAP = 2  # the pinned root and the tail
+SNAPSHOT_PATH_CAP = 2  # the pinned root and the tail; the previous turn's prompt end stays on top
 
 
 class CacheManager:
@@ -527,6 +527,8 @@ class CacheManager:
             pin = req.snapshot_pin
             if pin is not None and pin - CHUNK_SIZE < L <= pin:
                 self.prefix_cache.pin(m.node)
+            if req.prompt_len - L <= 2 * CHUNK_SIZE:  # the prompt end's track (or the last one that can track)
+                self.prefix_cache.mark_prompt_end(m.node)
             # before the replacement alloc below: the thinned slot replaces the donated one, so a
             # long prefill stops taking other sessions' snapshots once its path holds the cap
             if freed := self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP):

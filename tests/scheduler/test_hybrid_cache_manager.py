@@ -319,10 +319,11 @@ def test_snapshot_placement_on_a_cold_long_prefill(monkeypatch, prompt_len, poli
 @pytest.mark.parametrize("diverge", ["anchor", "prompt_end", "resend"])
 def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix_lookahead, diverge):
     """Each turn adds its prompt end and, at finish, its tool-call anchor. "chunk" keeps them all;
-    the per-path cap thins the old turn at the next turn's first donation, never at a finish, so
-    the next turn still resumes at the anchor or the prompt end. A fork stays: when the reasoning is
-    dropped, the old prompt end branches into the old generation and the new prompt. The cost: an
-    edited last message resumes at the root, not at the turn before (design section 6)."""
+    the per-path cap thins the old turn at the next turn's first donation, never at a finish, and
+    keeps the pinned root, the previous turn's prompt end and the tail. So the next turn resumes at
+    the anchor or the prompt end, and an edited, regenerated or sibling last turn resumes at the
+    turn before, as under "chunk" (design section 6). A fork stays: when the reasoning is dropped,
+    the old prompt end branches into the old generation and the new prompt."""
     from freetoken import core
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
@@ -342,7 +343,7 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
     stub = SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None)
     prompt = torch.arange(100, 800, dtype=torch.int32)
     prompt[319] = turn                                 # the system block ends at 320
-    resumed, anchors, ends = [], [], []
+    resumed, anchors, ends, conversations = [], [], [], []
     for k in range(turns):
         run = drive_prefill(cm, pm, pool, PendingReq(k, prompt, SamplingParams(max_tokens=256, ignore_eos=True)),
                             budget=256, overlap=overlap)
@@ -360,6 +361,7 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
         ends.append(run.tracks[-1][0])                 # the prompt-end snapshot
         keep = {"anchor": anchor + 8, "prompt_end": len(prompt), "resend": final.input_ids.numel()}[diverge]
         conversation = final.input_ids[:keep].clone()
+        conversations.append(conversation)
         Scheduler._free_req_resources(stub, final)
         last_prompt = prompt
         # the client rewrites the echoed tool call after its first tokens, adds the tool result and a new message
@@ -368,19 +370,25 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
     assert resumed == [0, *(anchors if diverge == "anchor" else ends)[:-1]]
     pc = cm.prefix_cache
     snapshots = pc.mamba_evictable_size + pc.mamba_protected
-    if diverge == "resend":    # one prompt end per turn; "structural": the pinned root and the last
-        assert snapshots == (turns if policy == "chunk" else 2)
-    elif diverge == "anchor":  # a prompt end and an anchor per turn; the root and the last two
-        assert snapshots == (2 * turns if policy == "chunk" else 3)
-    else:                      # every old prompt end is a fork; each old generation keeps its anchor leaf
-        assert snapshots == 2 * turns + (policy == "structural")
+    if diverge == "resend":    # one prompt end per turn; "structural": root, previous prompt end, tail
+        assert snapshots == (turns if policy == "chunk" else 3)
+    elif diverge == "anchor":  # a prompt end and an anchor per turn; the same three and the last anchor
+        assert snapshots == (2 * turns if policy == "chunk" else 4)
+    else:  # every old prompt end is a fork; each old generation keeps its anchor leaf. With plain keys
+        # turn 4's prompt ends on a page (1,600): turn 5 forks there, past turn 4's prompt end (1,536)
+        assert snapshots == 2 * turns + (policy == "structural") * (1 + (not radix_lookahead))
     if diverge == "resend":
-        # the client edits the last user message 100 tokens before its end
-        edited = torch.cat([last_prompt[:-100], torch.arange(50_000, 50_300, dtype=torch.int32)])
-        pm.pending_list = [PendingReq(99, edited, SamplingParams(max_tokens=4))]
-        batch = pm.schedule_next_batch(256)
-        assert batch.prompt_admissions[0][2] == (ends[-2] if policy == "chunk" else 320)
-        Scheduler._free_req_resources(stub, batch.reqs[0])
+        other = torch.arange(50_000, 50_300, dtype=torch.int32)
+        retries = [
+            torch.cat([last_prompt[:-100], other]),          # the client edits the last user message
+            torch.cat([last_prompt[: ends[-1] - 2], other]),  # a regenerated last turn re-renders 2 tokens before its snapshot
+            torch.cat([conversations[-2], other]),           # a sibling of the last turn
+        ]
+        for uid, retry in enumerate(retries, start=90):
+            pm.pending_list = [PendingReq(uid, retry, SamplingParams(max_tokens=4))]
+            batch = pm.schedule_next_batch(256)
+            assert batch.prompt_admissions[0][2] == ends[-2]  # the turn before, not the root (320)
+            Scheduler._free_req_resources(stub, batch.reqs[0])
     cm.check_integrity()
     assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1
 
