@@ -423,7 +423,8 @@ class _HostCopies:
 HOST_BANK_MIN_AVAILABLE = 32 * 2**30
 
 
-def _mem_available() -> int:
+def read_mem_available() -> int:
+    """``MemAvailable`` of /proc/meminfo, in bytes."""
     with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("MemAvailable:"):
@@ -434,7 +435,7 @@ def _mem_available() -> int:
 def check_host_bank_memory(nbytes: int, mem_available: int | None = None) -> None:
     """Refuse a GDN host bank of ``nbytes`` (the sum over the local TP ranks) that would leave less
     than 32 GiB MemAvailable."""
-    available = _mem_available() if mem_available is None else mem_available
+    available = read_mem_available() if mem_available is None else mem_available
     if available - nbytes < HOST_BANK_MIN_AVAILABLE:
         raise RuntimeError(
             f"--mamba-host-slots asks for {nbytes / 2**30:.1f} GiB of pinned host memory with "
@@ -465,7 +466,7 @@ def linear_state_bytes_per_req(
     return int(total)
 
 
-__all__ = ["LinearStatePool", "check_host_bank_memory", "linear_state_bytes_per_req"]
+__all__ = ["LinearStatePool", "check_host_bank_memory", "linear_state_bytes_per_req", "read_mem_available"]
 
 
 _GDN_CHUNK_SIZE = 64  # keep in lockstep with kernel/fla/chunk_delta_h.py CHUNK_SIZE
