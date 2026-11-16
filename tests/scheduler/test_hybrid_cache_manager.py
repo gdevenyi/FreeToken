@@ -693,7 +693,7 @@ def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", co
     pool = _pool(num_slots=num_slots, host_slots=host_slots)
     if copies is not None:
         pool.host_copies = copies
-    pt = torch.zeros(2, pages * ps, dtype=torch.int32)
+    pt = torch.zeros(2, (pages + two_level.get("host_pages", 0)) * ps, dtype=torch.int32)
     cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy,
                       radix_lookahead=radix_lookahead, **two_level)
     monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
@@ -1017,6 +1017,65 @@ def test_device_window_charge_counts_the_pages_of_the_last_w_tokens():
     cm = CacheManager(8, 64, pt, "hybrid_radix", linear_state_pool=_pool(), host_pages=8, device_window=128)
     assert [cm.device_charge(n) for n in (1, 64, 65, 128, 129, 200, 256, 1000)] == [
         64, 64, 128, 128, 192, 192, 128, 192]
+
+
+def test_demotion_takes_idle_prefix_pages_first_then_the_oldest_pages_of_the_longest_requests():
+    """Design 8.4: when device slots run out, unlocked idle prefix pages go first (least recently
+    walked: host_tick, then uuid), then the pages before the last W tokens of the running requests,
+    longest request first, oldest page first. A page inside any request's last W tokens stays, and
+    the order does not depend on the order of the inputs."""
+    from freetoken.scheduler.cache import LOC_HOST, demotion_order
+
+    table = torch.arange(40, dtype=torch.int32)                    # every page on the device
+    table[5] = LOC_HOST                                            # already host-only
+    idle = [(7, 3, torch.tensor([10, 11])), (2, 9, torch.tensor([12, 5])), (7, 1, torch.tensor([13]))]
+    rows = [(40, 1, torch.tensor([20, 21, 22, 23, 24, 25, 26, 27, 33, 29])),   # window: pages 6-9
+            (48, 2, torch.tensor([20, 21, *range(30, 40)])),       # shares 20, 21; 33 is in uid 1's window
+            (12, 0, torch.tensor([0, 1, 2]))]                      # shorter than W: all in its window
+    want = [12, 13, 10, 11, 20, 21, 30, 31, 32, 34, 35, 22, 23, 24, 25]
+    assert demotion_order(table, idle, rows, window=16, page_size=4).tolist() == want
+    assert demotion_order(table, idle[::-1], rows[::-1], window=16, page_size=4).tolist() == want
+
+
+def test_demotion_under_device_pressure_keeps_the_window_and_the_ids(monkeypatch):
+    """Two idle sessions and a long prompt on a 12-page device pool: the prompt's first chunk demotes
+    the older session, the second chunk the other session and then its own oldest pages; its last
+    W tokens stay on the device and no id changes. Each choice is a function of the operations alone
+    (TP ranks see the same message stream, not the same clock): with the wall clock reversed the
+    location table is the same."""
+    from freetoken.kvcache import radix_cache
+    from freetoken.scheduler.cache import LOC_HOST
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    def scenario():
+        pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=8, host_slots=0, pages=12, host_pages=20,
+                                         device_window=256)
+        loc, sessions = cm.locations, []
+        for s in range(2):
+            prompt = torch.arange(1_000 * (s + 1), 1_000 * (s + 1) + 300, dtype=torch.int32)
+            run = drive_prefill(cm, pm, pool, PendingReq(s, prompt, SamplingParams(max_tokens=4)),
+                                budget=8192, overlap=False)
+            Scheduler._free_req_resources(stub, run.final)
+            sessions.append(cm.match_req(_pend(prompt.tolist())).cuda_handle.get_matched_indices()[::64] // 64)
+        assert loc.num_free_device == 4
+        run = drive_prefill(cm, pm, pool, PendingReq(5, torch.arange(9_000, 9_900, dtype=torch.int32),
+                                                     SamplingParams(max_tokens=4)), budget=512, overlap=False)
+        row = cm.page_table[run.final.table_idx, :900:64].long() // 64
+        assert all((loc.table[ids.long()] == LOC_HOST).all() for ids in sessions)
+        assert (loc.table[row[:3]] == LOC_HOST).all() and (loc.table[row[3:]] >= 0).all()
+        assert loc.num_free_device == 0 and loc.demotions == 11
+        assert cm.match_req(_pend(list(range(1_000, 1_300)))).cuda_handle.cached_len == 256  # the ids stay
+        Scheduler._free_req_resources(stub, run.final)
+        cm.check_integrity()
+        return loc.table.clone()
+
+    forward = scenario()
+    with monkeypatch.context() as m:
+        ticks = iter(range(10**12, 0, -1))
+        m.setattr(radix_cache.time, "monotonic_ns", lambda: next(ticks))
+        backward = scenario()
+    assert torch.equal(forward, backward)
 
 
 def test_no_location_table_without_kv_host_tokens(monkeypatch):

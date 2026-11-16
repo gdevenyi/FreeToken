@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -54,6 +55,7 @@ class PageLocations:
         self.num_device = num_device
         self.table = torch.full((num_ids,), LOC_FREE, dtype=torch.int32, device=device)
         self.free_device = torch.arange(num_device, dtype=torch.int32, device=device)
+        self.demotions = 0  # pages made host-only since the table was made
 
     @property
     def num_free_device(self) -> int:
@@ -72,6 +74,7 @@ class PageLocations:
         assert (slots >= 0).all(), "demote of a page that is not on the device"
         self.free_device = torch.cat([self.free_device, slots])
         self.table[ids.long()] = LOC_HOST
+        self.demotions += len(ids)
 
     def release(self, ids: torch.Tensor) -> None:
         """Free page ids on either tier; a device slot goes back to the free list."""
@@ -86,6 +89,26 @@ class PageLocations:
         assert len(torch.cat([placed, self.free_device]).unique()) == self.num_device, "a device slot is held twice"
         assert (self.table[free_ids.long()] == LOC_FREE).all(), "a free page id holds a location"
         assert int((self.table != LOC_FREE).sum()) == len(self.table) - len(free_ids), "a used page id is LOC_FREE"
+
+
+def demotion_order(table: torch.Tensor, idle: list, rows: list, *, window: int, page_size: int) -> torch.Tensor:
+    """The device pages to demote, first victim first (KV host tier design 8.4). ``idle``: (host_tick,
+    uuid, page ids) of each unlocked prefix node; ``rows``: (length, uid, page ids in position order)
+    of each running request. Idle pages go first, least recently walked first; then the pages before
+    the last ``window`` tokens of the running requests, longest request first, oldest page first. A
+    page inside any request's last ``window`` tokens is never chosen. No clock and no event query:
+    every TP rank chooses the same pages from the same operations."""
+    out = [ids[table[ids.long()] >= 0] for _, _, ids in sorted(idle, key=lambda t: (t[0], t[1]))]
+    in_window = torch.zeros(len(table), dtype=torch.bool, device=table.device)
+    for length, _, ids in rows:
+        in_window[ids[max(0, length - window) // page_size :].long()] = True
+    taken = torch.zeros_like(in_window)
+    for length, _, ids in sorted(rows, key=lambda r: (-r[0], r[1])):
+        old = ids[: max(0, length - window) // page_size].long()
+        old = old[(table[old] >= 0) & ~in_window[old] & ~taken[old]]
+        taken[old] = True
+        out.append(old)
+    return torch.cat(out).to(torch.int32) if out else torch.empty(0, dtype=torch.int32, device=table.device)
 
 
 class CacheManager:
@@ -461,7 +484,8 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
-    def allocate_paged(self, reqs: List[Req]) -> None:
+    def allocate_paged(self, reqs: List[Req], running: Iterable[Req] = ()) -> None:
+        """``running``: the other requests that hold pages (--kv-host-tokens: demotion candidates)."""
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
@@ -471,7 +495,8 @@ class CacheManager:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
         if needed_pages > 0:
-            allocated = self._page_to_token(self._allocate(needed_pages))
+            rows = None if self.locations is None else self._rows(reqs, running)
+            allocated = self._page_to_token(self._allocate(needed_pages, rows))
             if self.swa_paged:
                 # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
                 # written; read back via the full->swa mapping). radix reuses the existing prefix's
@@ -864,7 +889,7 @@ class CacheManager:
             return er.kv_indices
         return self.prefix_cache.evict(need)
 
-    def _allocate(self, needed_pages: int) -> torch.Tensor:
+    def _allocate(self, needed_pages: int, rows: list | None = None) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
             evicted = self._evict((needed_pages - free_pages) * self.page_size)
             self._return_pages([evicted[:: self.page_size]])
@@ -872,8 +897,34 @@ class CacheManager:
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         if self.locations is not None:
+            # new pages are device pages; demote first when the device slots run out
+            short = needed_pages - self.locations.num_free_device
+            if short > 0:
+                victims = demotion_order(self.locations.table, self._idle_pages(), rows or [],
+                                         window=self.device_window, page_size=self.page_size)[:short]
+                assert len(victims) == short, "no device page to demote"
+                self.locations.demote(victims)
             self.locations.place(allocated // self.page_size)
         return allocated
+
+    def _idle_pages(self) -> list:
+        """(host_tick, uuid, page ids) of each unlocked prefix node: demotion's first candidates."""
+        out, stack = [], [self.prefix_cache.root]
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children.values())
+            if not n.is_root() and n.ref_count == 0:
+                out.append((n.host_tick, n.uuid, n.value[:: self.page_size] // self.page_size))
+        return out
+
+    def _rows(self, reqs: Iterable[Req], running: Iterable[Req]) -> list:
+        """(length, uid, placed page ids) of each request that holds pages; pages below cached_len are
+        placed, and the window ends at device_len, where the coming forward ends."""
+        by_row = {r.table_idx: r for r in running}
+        by_row.update({r.table_idx: r for r in reqs})
+        ps = self.page_size
+        return [(r.device_len, r.uid, self.page_table[r.table_idx, : div_ceil(r.cached_len, ps) * ps : ps] // ps)
+                for r in by_row.values()]
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
