@@ -647,7 +647,8 @@ class QSASelectionSampler:
             return
         rows_per_req = batch.rows_per_req or 1
         rows = len(batch.reqs) * rows_per_req
-        view = backend.selection_view(rows) if isinstance(backend, QSASparseAttnBackend) else None
+        select = getattr(backend, "selection_view", None)  # only the QSA backend has one
+        view = select(rows) if select is not None else None
         if view is None or self.pending is not None:
             self.skipped += 1
             return

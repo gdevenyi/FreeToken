@@ -366,3 +366,33 @@ def test_selection_stats_match_a_token_loop():
         want["overlap_reqs"] += 1
     assert counts == want
     assert want["old16384"] > 0 and want["overlap_hits"] > 0
+
+
+def test_selection_sampler_takes_every_verify_row():
+    """FREETOKEN_QSA_SELECTION_STATS under DFlash: every decode step is a verify step with 4 rows
+    per request. The sampler reads all rows of the real requests (not the padding) and takes each
+    request's selection as the union over its rows."""
+    from freetoken.attention.qsa_sparse import QSASelectionSampler, qsa_selection_stats
+    from freetoken.core import Batch, Req, SamplingParams
+
+    rows_per_req, uids, width = 4, [5, 6], 24
+    reqs = [Req(input_ids=torch.arange(70_000, dtype=torch.int32), table_idx=i, cached_len=69_996, output_len=8,
+                uid=uid, sampling_params=SamplingParams(), cache_handle=None) for i, uid in enumerate(uids)]
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=rows_per_req)
+    batch.positions = torch.arange(69_996, 70_000).repeat(3)       # 2 requests and one padding request
+    gen = torch.Generator().manual_seed(5)
+    steps = [torch.randint(0, 70_000, (12, width), generator=gen, dtype=torch.int32) for _ in range(2)]
+    steps[1][4:8, :12] = steps[0][4:8, :12]                         # request 6 keeps part of its selection
+    buffer = steps[0].clone()                                       # the static buffer, padding rows included
+    backend = SimpleNamespace(selection_view=lambda rows: buffer[:rows])
+    sampler = QSASelectionSampler(1)
+    sampler.after_forward(batch, backend)
+    buffer.copy_(steps[1])
+    sampler.after_forward(batch, backend)
+    line = sampler.line()
+
+    row_uids = [u for u in uids for _ in range(rows_per_req)]
+    first, prev = qsa_selection_stats(steps[0][:8], batch.positions[:8], row_uids, {})
+    second, _ = qsa_selection_stats(steps[1][:8], batch.positions[:8], row_uids, prev)
+    assert f"samples=2 skipped=0 rows=16 tokens={first['tokens'] + second['tokens']} " in line
+    assert line.endswith(f"overlap={second['overlap_hits'] / second['overlap_tokens']:.3f}/2")
