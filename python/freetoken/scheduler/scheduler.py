@@ -174,6 +174,10 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = (
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
+        if self.cache_manager.locations is not None and self.prefill_budget > self.cache_manager.device_window:
+            # the device charge at admission covers one window; a chunk's new pages are all device pages
+            raise ValueError(f"--kv-host-tokens needs --max-extend-tokens {self.prefill_budget} <= "
+                             f"{self.cache_manager.device_window}")
         self.config = config
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False

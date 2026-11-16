@@ -290,11 +290,9 @@ class CacheManager:
 
     def device_charge(self, tokens: int) -> int:
         """--kv-host-tokens: the device slots (tokens, whole pages) that the last device_window
-        tokens of a ``tokens`` reservation can span; older pages may be demoted to the host."""
-        pages = div_ceil(tokens, self.page_size)
-        if tokens > self.device_window:
-            pages -= (tokens - self.device_window) // self.page_size
-        return pages * self.page_size
+        tokens can span at any length up to a ``tokens`` reservation; older pages may be demoted."""
+        span = div_ceil(self.device_window - 1, self.page_size) + 1  # an unaligned window
+        return min(div_ceil(tokens, self.page_size), span) * self.page_size
 
     @property
     def available_size(self) -> int:

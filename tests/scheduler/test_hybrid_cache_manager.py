@@ -1015,8 +1015,85 @@ def test_admission_charges_logical_ids_and_a_device_window(device, host, prompt,
 def test_device_window_charge_counts_the_pages_of_the_last_w_tokens():
     pt = torch.zeros(1, 64, dtype=torch.int32)
     cm = CacheManager(8, 64, pt, "hybrid_radix", linear_state_pool=_pool(), host_pages=8, device_window=128)
+    # an unaligned window of 128 tokens spans 3 pages (positions 1-128 at a length of 129)
     assert [cm.device_charge(n) for n in (1, 64, 65, 128, 129, 200, 256, 1000)] == [
-        64, 64, 128, 128, 192, 192, 128, 192]
+        64, 64, 128, 128, 192, 192, 192, 192]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_admitted_requests_always_find_device_pages_to_demote(monkeypatch, seed):
+    """The device charge at admission (design 8.4) is what keeps demotion possible: requests that
+    prefill in chunks and decode past W, on a device pool smaller than their reservations, always
+    find their victims; the pages a request wrote in its last W tokens stay on the device; the
+    location table stays conserved at every step."""
+    import random
+
+    from freetoken import core
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.table import TableManager
+
+    rng, ps, window = random.Random(seed), 64, 256
+    pool = _pool(num_slots=1 + 3 * 4 + 4)
+    pt = torch.zeros(5, 64 * ps, dtype=torch.int32)
+    cm = CacheManager(16, ps, pt, "hybrid_radix", linear_state_pool=pool, host_pages=48, device_window=window)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
+    tm = TableManager(max_running_reqs=4, page_table=pt)
+    dm = DecodeManager(page_size=ps)
+    pm = PrefillManager(cm, tm, dm)
+    stub = SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None)
+    system = torch.arange(1, 129, dtype=torch.int32)
+    admitted_at, uid, finished = {}, 0, 0
+
+    def live():
+        return [*dm.running_reqs, *(p.chunked_req for p in pm.pending_list if p.chunked_req is not None)]
+
+    for _ in range(400):
+        if len(pm.pending_list) < 2 and rng.random() < 0.3:
+            body = torch.randint(200, 30_000, (rng.randint(100, 700),), dtype=torch.int32)
+            prompt = torch.cat([system, body]) if rng.random() < 0.5 else body
+            pm.add_one_req(SimpleNamespace(uid=uid, input_ids=prompt, sampling_params=SamplingParams(
+                max_tokens=rng.randint(50, 400)), mm_items=None, mrope_positions=None, mrope_delta=None))
+            uid += 1
+        # a prefill chunk is at most W tokens (production: 8192 against 65536), so it fits its window
+        batch = pm.schedule_next_batch(window) if pm.runnable and rng.random() < 0.5 else None
+        if batch is not None:
+            admitted_at.update({u: c for u, _, c in batch.prompt_admissions})
+            batch.padded_reqs = batch.reqs
+            cm.allocate_paged(batch.reqs, running=live())
+            build_fla_metadata(batch, torch.device("cpu"), pool)
+        elif dm.runnable:
+            batch = dm.schedule_next_batch()
+            for r in batch.reqs:
+                r.append_host(torch.tensor([7], dtype=torch.int32))
+            cm.allocate_paged(batch.reqs, running=live())
+        else:
+            continue
+        for r in batch.reqs:                                        # the window it wrote is on the device
+            # not the shared system block: a commit can dedup it onto demoted tree pages (no promotion, P3)
+            first = max(max(0, r.device_len - window) // ps, admitted_at[r.uid] // ps, len(system) // ps)
+            ids = pt[r.table_idx, first * ps : r.device_len : ps]
+            assert (cm.locations.table[(ids // ps).long()] >= 0).all()
+        cm.locations.check(cm.free_slots // ps)
+        for r in batch.reqs:
+            r.complete_one()
+            if isinstance(r, ChunkedReq):
+                cm.commit_chunk(r)
+            elif batch.is_prefill:
+                cm.cache_req(r, finished=False)
+                dm.filter_reqs([r])
+            elif not r.can_decode or rng.random() < 0.01:
+                dm.remove_req(r)
+                Scheduler._free_req_resources(stub, r)
+                finished += 1
+    for r in list(dm.running_reqs):
+        dm.remove_req(r)
+        Scheduler._free_req_resources(stub, r)
+    print(f"seed {seed}: {uid} requests, {finished} finished, {cm.locations.demotions} demotions, "
+          f"refusals {cm.stats.refusals}")
+    assert cm.locations.demotions > 0 and finished > 0
 
 
 def test_demotion_takes_idle_prefix_pages_first_then_the_oldest_pages_of_the_longest_requests():
