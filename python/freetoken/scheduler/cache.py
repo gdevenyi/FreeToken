@@ -181,6 +181,7 @@ class CacheManager:
         # with locations: table_idx -> the request that holds that row's pages (allocation to finish),
         # also while it is in flight, so admission charges it and demotion sees its pages
         self.live_rows: dict[int, Req] = {}
+        self._demote_mark = 0  # loc.demotions at the last KVSTATS line
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
@@ -303,6 +304,11 @@ class CacheManager:
         pool = self.linear_state_pool
         if line is not None and getattr(pool, "num_host_slots", 0):
             line += f" | host used={pool.num_host_slots - pool.num_free_host_slots}/{pool.num_host_slots}"
+        if line is not None and (loc := self.locations) is not None:
+            # the two KV tiers now, and the pages demoted in this window
+            used, host = loc.num_device - loc.num_free_device, int((loc.table == LOC_HOST).sum())
+            line += f" | kv dev={used}/{loc.num_device} host={host} demote={loc.demotions - self._demote_mark}"
+            self._demote_mark = loc.demotions
         return line
 
     def device_charge(self, tokens: int) -> int:
@@ -861,6 +867,7 @@ class CacheManager:
         if self.locations is not None:
             self.locations = PageLocations(self.num_pages, num_pages, device)
             self.live_rows.clear()
+            self._demote_mark = 0
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).

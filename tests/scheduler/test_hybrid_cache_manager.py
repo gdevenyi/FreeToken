@@ -1153,6 +1153,9 @@ def test_demotion_under_device_pressure_keeps_the_window_and_the_ids(monkeypatch
         assert all((loc.table[ids.long()] == LOC_HOST).all() for ids in sessions)
         assert (loc.table[row[:3]] == LOC_HOST).all() and (loc.table[row[3:]] >= 0).all()
         assert loc.num_free_device == 0 and loc.demotions == 11
+        assert cm.kv_stats_line().endswith(" | kv dev=12/12 host=11 demote=11")   # KVSTATS: the two tiers
+        loc.demote(row[3:4])
+        assert cm.kv_stats_line(extra="x").endswith(" | kv dev=11/12 host=12 demote=1")  # per window
         assert cm.match_req(_pend(list(range(1_000, 1_300)))).cuda_handle.cached_len == 256  # the ids stay
         Scheduler._free_req_resources(stub, run.final)
         cm.check_integrity()
