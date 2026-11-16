@@ -1123,6 +1123,8 @@ def test_demotion_takes_idle_prefix_pages_first_then_the_oldest_pages_of_the_lon
     want = [12, 13, 10, 11, 20, 21, 30, 31, 32, 34, 35, 22, 23, 24, 25]
     assert demotion_order(table, idle, rows, window=16, page_size=4).tolist() == want
     assert demotion_order(table, idle[::-1], rows[::-1], window=16, page_size=4).tolist() == want
+    for k in (3, 4, 9, 15, 40):                                     # the early stop that _allocate uses
+        assert demotion_order(table, idle, rows, window=16, page_size=4, limit=k).tolist() == want[:k]
 
 
 def test_demotion_under_device_pressure_keeps_the_window_and_the_ids(monkeypatch):
@@ -1153,6 +1155,8 @@ def test_demotion_under_device_pressure_keeps_the_window_and_the_ids(monkeypatch
         assert all((loc.table[ids.long()] == LOC_HOST).all() for ids in sessions)
         assert (loc.table[row[:3]] == LOC_HOST).all() and (loc.table[row[3:]] >= 0).all()
         assert loc.num_free_device == 0 and loc.demotions == 11
+        # the clock-ordered KV and snapshot eviction never ran, so only the new decisions acted
+        assert not any(v for k, v in cm.prefix_cache.counts.items() if k.startswith(("kv_", "victim_")))
         assert cm.kv_stats_line().endswith(" | kv dev=12/12 host=11 demote=11")   # KVSTATS: the two tiers
         loc.demote(row[3:4])
         assert cm.kv_stats_line(extra="x").endswith(" | kv dev=11/12 host=12 demote=1")  # per window
