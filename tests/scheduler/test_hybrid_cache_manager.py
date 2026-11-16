@@ -332,7 +332,8 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
     """Each turn adds its prompt end and, at finish, its tool-call anchor. "chunk" keeps them all;
     the per-path cap thins the old turn at the next turn's first donation, never at a finish, so
     the next turn still resumes at the anchor or the prompt end. A fork stays: when the reasoning is
-    dropped, the old prompt end branches into the old generation and the new prompt."""
+    dropped, the old prompt end branches into the old generation and the new prompt. The cost: an
+    edited last message resumes at the root, not at the turn before (design section 6)."""
     from freetoken import core
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.scheduler.decode import DecodeManager
@@ -388,6 +389,7 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
         keep = {"anchor": anchor + 8, "prompt_end": len(prompt), "resend": final.input_ids.numel()}[diverge]
         conversation = final.input_ids[:keep].clone()
         Scheduler._free_req_resources(stub, final)
+        last_prompt = prompt
         # the client rewrites the echoed tool call after its first tokens, adds the tool result and a new message
         prompt = torch.cat([conversation, torch.arange(40_000 + 300 * k, 40_000 + 300 * k + 300, dtype=torch.int32)])
 
@@ -400,6 +402,13 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
         assert snapshots == (2 * turns if policy == "chunk" else 3)
     else:                      # every old prompt end is a fork; each old generation keeps its anchor leaf
         assert snapshots == 2 * turns + (policy == "structural")
+    if diverge == "resend":
+        # the client edits the last user message 100 tokens before its end
+        edited = torch.cat([last_prompt[:-100], torch.arange(50_000, 50_300, dtype=torch.int32)])
+        pm.pending_list = [PendingReq(99, edited, SamplingParams(max_tokens=4))]
+        batch = pm.schedule_next_batch(256)
+        assert batch.prompt_admissions[0][2] == (ends[-2] if policy == "chunk" else 320)
+        Scheduler._free_req_resources(stub, batch.reqs[0])
     cm.check_integrity()
     assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1
 
