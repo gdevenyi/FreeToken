@@ -90,14 +90,28 @@ class PageLocations:
         assert int((self.table != LOC_FREE).sum()) == len(self.table) - len(free_ids), "a used page id is LOC_FREE"
 
 
-def demotion_order(table: torch.Tensor, idle: list, rows: list, *, window: int, page_size: int) -> torch.Tensor:
-    """The device pages to demote, first victim first (KV host tier design 8.4). ``idle``: (host_tick,
-    uuid, page ids) of each unlocked prefix node; ``rows``: (length, uid, page ids in position order)
-    of each running request. Idle pages go first, least recently walked first; then the pages before
-    the last ``window`` tokens of the running requests, longest request first, oldest page first. A
-    page inside any request's last ``window`` tokens is never chosen. No clock and no event query:
-    every TP rank chooses the same pages from the same operations."""
-    out = [ids[table[ids.long()] >= 0] for _, _, ids in sorted(idle, key=lambda t: (t[0], t[1]))]
+def demotion_order(table: torch.Tensor, idle: list, rows: list, *, window: int, page_size: int,
+                   limit: int | None = None) -> torch.Tensor:
+    """The device pages to demote, first victim first (KV host tier design 8.4), at most ``limit``.
+    ``idle``: (host_tick, uuid, page ids or a function that returns them) of each unlocked prefix node
+    (a function: only the nodes it reaches pay for the ids); ``rows``: (length, uid, page ids
+    in position order) of each running request. Idle pages go first, least recently walked first;
+    then the pages before the last ``window`` tokens of the running requests, longest request first,
+    oldest page first. A page inside any request's last ``window`` tokens is never chosen. No clock
+    and no event query: every TP rank chooses the same pages from the same operations."""
+    out, n = [], 0
+    empty = torch.empty(0, dtype=torch.int32, device=table.device)
+
+    def done(ids: torch.Tensor) -> bool:
+        nonlocal n
+        out.append(ids.to(torch.int32))
+        n += len(ids)
+        return limit is not None and n >= limit
+
+    for _, _, ids in sorted(idle, key=lambda t: (t[0], t[1])):
+        ids = ids() if callable(ids) else ids
+        if done(ids[table[ids.long()] >= 0]):
+            return torch.cat(out)[:limit]
     in_window = torch.zeros(len(table), dtype=torch.bool, device=table.device)
     for length, _, ids in rows:
         in_window[ids[max(0, length - window) // page_size :].long()] = True
@@ -106,8 +120,9 @@ def demotion_order(table: torch.Tensor, idle: list, rows: list, *, window: int, 
         old = ids[: max(0, length - window) // page_size].long()
         old = old[(table[old] >= 0) & ~in_window[old] & ~taken[old]]
         taken[old] = True
-        out.append(old)
-    return torch.cat(out).to(torch.int32) if out else torch.empty(0, dtype=torch.int32, device=table.device)
+        if done(old):
+            break
+    return torch.cat(out)[:limit] if out else empty
 
 
 class CacheManager:
@@ -905,7 +920,7 @@ class CacheManager:
             short = needed_pages - self.locations.num_free_device
             if short > 0:
                 victims = demotion_order(self.locations.table, self._idle_pages(), rows or [],
-                                         window=self.device_window, page_size=self.page_size)[:short]
+                                         window=self.device_window, page_size=self.page_size, limit=short)
                 assert len(victims) == short, "no device page to demote"
                 self.locations.demote(victims)
             self.locations.place(allocated // self.page_size)
@@ -918,7 +933,7 @@ class CacheManager:
             n = stack.pop()
             stack.extend(n.children.values())
             if not n.is_root() and n.ref_count == 0:
-                out.append((n.host_tick, n.uuid, n.value[:: self.page_size] // self.page_size))
+                out.append((n.host_tick, n.uuid, lambda v=n.value: v[:: self.page_size] // self.page_size))
         return out
 
     def _rows(self) -> list:
