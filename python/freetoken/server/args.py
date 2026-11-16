@@ -575,6 +575,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--gdn-snapshot-policy",
+        type=str,
+        default=ServerArgs.gdn_snapshot_policy,
+        choices=["chunk", "structural"],
+        help="Hybrid (GDN) models: where a prefill donates state snapshots to the prefix cache. "
+        "'chunk' (default): the last prefill boundary of the prompt, plus the tool-call anchor and "
+        "the final state at finish. 'structural': also the first chat-turn boundary (pinned, at "
+        "most 4), the point where the prompt leaves a cached path, and each 32768 tokens; prefill "
+        "chunks end at these points, and each path keeps at most 2 snapshots besides forks.",
+    )
+
+    parser.add_argument(
         "--logprob-read-isolate",
         action="store_true",
         default=ServerArgs.logprob_read_isolate,

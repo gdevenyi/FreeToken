@@ -60,6 +60,8 @@ class EvictResult(NamedTuple):
 # from "never cached". Nodes shorter than GHOST_KEYS are not recognised.
 GHOST_KEYS = 64
 GHOST_CAP = 4096
+# --gdn-snapshot-policy structural: pinned first-turn snapshots, the LRU one loses its pin
+MAX_PINNED_ROOTS = 4
 
 
 class HybridRadixCache:
@@ -84,6 +86,8 @@ class HybridRadixCache:
         # Statistics only (KVSTATS); no decision reads them.
         self.counts: Counter = Counter()
         self.ghosts: OrderedDict | None = OrderedDict() if ghosts else None
+        # uuid -> node of the pinned snapshots, least recently used first (structural policy only)
+        self.pinned: OrderedDict = OrderedDict()
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -96,6 +100,7 @@ class HybridRadixCache:
         walk_len = end_len
         while not cur.is_root():
             if cur.mamba_value is not None:
+                self._touch_pins(cur)
                 return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur, walk_len)
             end_len -= cur.length
             cur = cur.parent
@@ -191,13 +196,16 @@ class HybridRadixCache:
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
         upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
-        cands = [n for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
+        # pinned roots go last (structural policy), so a small idle cache cannot stall admission
+        cands = [(n.uuid in self.pinned, n) for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
         heapq.heapify(cands)
         kv, mamba, freed = [], [], 0
         while freed < num and cands:
-            node = heapq.heappop(cands)
+            pinned, node = heapq.heappop(cands)
             if node.mamba_value is None or node.mamba_ref_count != 0 or node.is_root():
                 continue
+            if pinned:
+                self.counts["victim_pinned"] += 1
             if node.is_leaf() and node.ref_count == 0:
                 kv.append(node.value)
                 self.full_evictable -= node.length
@@ -239,8 +247,49 @@ class HybridRadixCache:
         if node.mamba_value is not None:
             out.append(node.mamba_value)
             node.mamba_value = None
+            self.pinned.pop(node.uuid, None)
             if node.mamba_ref_count == 0:
                 self.mamba_evictable -= 1
+
+    # ---------------------------------------------------------------- structural policy (P1a)
+    def pin(self, node: RadixTreeNode) -> None:
+        """Pin a node's snapshot (a first turn boundary): the per-path cap keeps it and evict_mamba
+        takes it last. At most MAX_PINNED_ROOTS; the least recently used one loses its pin."""
+        if node.mamba_value is None or node.is_root():
+            return
+        self.pinned[node.uuid] = node
+        self.pinned.move_to_end(node.uuid)
+        while len(self.pinned) > MAX_PINNED_ROOTS:
+            self.pinned.popitem(last=False)
+            self.counts["unpin"] += 1
+
+    def cap_path(self, node: RadixTreeNode, cap: int) -> list[int]:
+        """Free the shallowest snapshots on the path root..node while it holds more than ``cap``.
+        Keeps the deepest one (the tail), pinned roots, forks (several children) and locked ones;
+        a freed snapshot is interior, so its node keeps its KV as a tombstone. Returns the slots."""
+        path, cur = [], node
+        while not cur.is_root():
+            if cur.mamba_value is not None:
+                path.append(cur)
+            cur = cur.parent
+        excess, freed = len(path) - cap, []
+        for cur in reversed(path[1:]):                 # shallowest first, never the tail
+            if excess <= 0:
+                break
+            if cur.uuid in self.pinned or len(cur.children) > 1 or cur.mamba_ref_count > 0:
+                continue
+            self._free_node_mamba(cur, freed)
+            self.counts["cap"] += 1
+            excess -= 1
+        return freed
+
+    def _touch_pins(self, node: RadixTreeNode) -> None:
+        if not self.pinned:
+            return
+        while not node.is_root():
+            if node.uuid in self.pinned:
+                self.pinned.move_to_end(node.uuid)
+            node = node.parent
 
     def _unlink(self, node: RadixTreeNode) -> RadixTreeNode:
         parent = node.parent

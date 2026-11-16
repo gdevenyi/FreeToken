@@ -382,6 +382,7 @@ def _tracked_req(table_idx, cached_len, tokens, *, live, ping_pong):
     req.linear_slot_idx = live
     req.mamba_ping_pong = ping_pong
     req.mamba_next_track_idx = 0
+    req.gdn_track = True
     return req
 
 

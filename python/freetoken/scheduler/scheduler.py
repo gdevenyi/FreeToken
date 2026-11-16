@@ -67,6 +67,10 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+# one-token chat-turn ends, in order of preference (ChatML, Llama 3, Gemma, Phi)
+_TURN_END_MARKERS = ("<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|end|>")
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -99,6 +103,7 @@ class Scheduler(SchedulerIOMixin):
             radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
             logprob_read_snapshot_donate=config.logprob_read_snapshot_donate,
             isolate_logprob_reads=config.logprob_read_isolate,
+            snapshot_policy=getattr(config, "gdn_snapshot_policy", "chunk"),
         )
         token_headroom = config.decode_rows_per_req - 1
         self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
@@ -150,6 +155,14 @@ class Scheduler(SchedulerIOMixin):
             self.toolcall_anchor_id = load_toolcall_anchor_id(
                 self.tokenizer,
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
+            )
+        if self.cache_manager.structural:
+            # the first turn boundary's snapshot is the pinned root; the marker must be one token
+            marker = next((m for m in _TURN_END_MARKERS if load_toolcall_anchor_id(self.tokenizer, m) is not None), None)
+            self.cache_manager.turn_end_id = load_toolcall_anchor_id(self.tokenizer, marker)
+            logger.info_rank0(
+                f"GDN snapshot policy structural: turn end {marker!r} (id {self.cache_manager.turn_end_id})"
+                if marker else "GDN snapshot policy structural: no one-token turn end, so no pinned root"
             )
         self.token_pool = self.table_manager.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
@@ -380,6 +393,10 @@ class Scheduler(SchedulerIOMixin):
                             # popped the pending continuation (no next chunk launches), and this
                             # drain point frees the chunk's pages/slots exactly once.
                             self._free_req_resources(req)
+                        else:
+                            # --gdn-snapshot-policy structural: donate a snapshot point's track now
+                            # and hand the new handle to an already-built next chunk
+                            self.cache_manager.commit_chunk(req)
                         continue
                     if req.aborted:
                         # Aborted while this final-chunk prefill / decode step was in flight: free

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import Batch, Req, SamplingParams
@@ -43,11 +44,11 @@ def _pool(num_slots=16):
                            device=torch.device("cpu"), tp_size=1)
 
 
-def _setup():
+def _setup(snapshot_policy="chunk"):
     """Hybrid managers + a stub Scheduler `self` for the real unbound methods."""
     pool = _pool()
     pt = torch.zeros(4, 64, dtype=torch.int32)
-    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=snapshot_policy)
     tm = TableManager(max_running_reqs=4, page_table=pt)
     dm = DecodeManager(page_size=1)
     pm = PrefillManager(cm, tm, dm)
@@ -223,4 +224,18 @@ def test_post_terminal_overlap_step_is_dropped():
     Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
+    cm.check_integrity()
+
+
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
+def test_drain_commits_an_intermediate_chunk_only_under_the_structural_policy(policy):
+    """The drain skips an intermediate chunk ("chunk", the overlap double-free fix); under
+    --gdn-snapshot-policy structural it donates the snapshot point the chunk tracked."""
+    pool, cm, tm, _dm, _pm, _sent, stub = _setup(policy)
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    req = _launch_req(pool, cm, tm, prompt, cls=ChunkedReq, track_seqlen=8)
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="prefill")))
+    hit = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt))).cuda_handle.cached_len
+    assert hit == (8 if policy == "structural" else 0)
+    stub._free_req_resources(req)
     cm.check_integrity()

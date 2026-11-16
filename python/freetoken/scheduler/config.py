@@ -22,6 +22,8 @@ class SchedulerConfig(EngineConfig):
     logprob_read_snapshot_donate: str = "all"
     # logprob reads prefill alone and bypass the prefix cache, so their logprobs do not depend on other traffic
     logprob_read_isolate: bool = False
+    # hybrid GDN: where prefills donate state snapshots (CacheManager): chunk | structural
+    gdn_snapshot_policy: str = "chunk"
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

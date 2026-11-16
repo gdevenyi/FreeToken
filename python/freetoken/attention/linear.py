@@ -118,7 +118,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
     dst, src, h_row, conv_src, boundary_rows = [], [], [], [], []
     for i, r in enumerate(reqs):
-        if r.mamba_ping_pong is None:
+        if r.mamba_ping_pong is None or not r.gdn_track:
             continue
         # deepest mid-chunk boundary strictly inside the extend (h has the per-chunk state;
         # the exact extend-end / aligned-final state lives in the live slot -> finish-donate).

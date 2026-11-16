@@ -30,6 +30,9 @@ def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:
 
 
 class ChunkedReq(Req):
+    # the next chunk, when overlap scheduling builds it before this one drains (structural commit)
+    next_chunk: Req | None = None
+
     def _alloc_ids_buf(self) -> None:
         pass  # never sampled; keep input_ids a view of the pending prompt
 
@@ -128,6 +131,7 @@ class PrefillAdder:
 
         table_idx = self.table_manager.allocate()
         self.cache_manager.note_admission(req, handle)
+        req.snapshot_ends, req.snapshot_pin = self.cache_manager.snapshot_plan(req, handle)
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             device_ids.copy_(_maybe_pinned(req.input_ids[:cached_len]), non_blocking=True)
@@ -199,6 +203,18 @@ class PrefillAdder:
             # the request until it gets a bigger turn.
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
+        if self.cache_manager.structural:
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+            # end the chunk at the next snapshot point's chunk end
+            ends = pending_req.snapshot_ends
+            cut = next((e for e in ends if cached_len + CHUNK_SIZE < e < cached_len + chunk_size), None)
+            if cut is not None:
+                chunk_size = cut - cached_len
+            elif 0 < remain_len - chunk_size <= CHUNK_SIZE < chunk_size and cached_len + chunk_size not in ends:
+                # a final chunk of 64 tokens or less cannot track: leave it 65-128, so the prompt-end
+                # snapshot is the deepest x64 boundary (the cut above can shift a prompt's chunk grid)
+                chunk_size -= CHUNK_SIZE
         if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
             # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
             unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)
@@ -248,6 +264,14 @@ class PrefillAdder:
         # A short continuation cannot make a new snapshot; retain the pending one
         # together with its ping-pong cursor until the final prefill commit.
         req.mamba_last_track_seqlen = last_track_seqlen
+        if self.cache_manager.structural:
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+            # track only at a snapshot point, at the prompt end, or in the last chunk that can
+            # track when the final one is too short to (as "chunk" donates today)
+            end, left = cached_len + chunk_size, remain_len - chunk_size
+            req.gdn_track = left == 0 or left <= CHUNK_SIZE or end in pending_req.snapshot_ends
+            req.snapshot_pin = pending_req.snapshot_pin
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -257,7 +281,7 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
+            chunked_req.next_chunk = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
@@ -269,6 +293,7 @@ class PrefillAdder:
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
+            return chunked_req.next_chunk
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource

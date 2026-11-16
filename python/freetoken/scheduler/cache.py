@@ -32,12 +32,19 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 _SWA_RETAIN_GAP = 16
 
 LOGPROB_READ_SNAPSHOT_DONATE = ("all", "boundary", "none")
+# --gdn-snapshot-policy: "chunk" donates the last prefill track of a prompt (and the anchor and
+# final state at finish); "structural" (KV host tier design 3.4) also donates at the first turn
+# boundary, a fork from an existing path and each SNAPSHOT_STRIDE tokens, and caps each path
+GDN_SNAPSHOT_POLICIES = ("chunk", "structural")
+SNAPSHOT_STRIDE = 32768
+SNAPSHOT_PATH_CAP = 2  # the pinned root and the tail
 
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
-                 logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False):
+                 logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False,
+                 snapshot_policy: str = "chunk"):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -57,6 +64,11 @@ class CacheManager:
             raise ValueError(f"unknown snapshot donate policy {logprob_read_snapshot_donate!r}")
         self.logprob_read_snapshot_donate = logprob_read_snapshot_donate
         self.isolate_logprob_reads = isolate_logprob_reads
+        if snapshot_policy not in GDN_SNAPSHOT_POLICIES:
+            raise ValueError(f"unknown GDN snapshot policy {snapshot_policy!r}")
+        self.structural = self.is_hybrid and snapshot_policy == "structural"
+        # the single token that ends a chat turn (ChatML <|im_end|>); None = no pinned root
+        self.turn_end_id: int | None = None
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
@@ -145,6 +157,46 @@ class CacheManager:
             from freetoken.kvcache.hybrid_radix_cache import GHOST_KEYS
             evicted = self.prefix_cache.evicted_len(walk, self._keys(req.input_ids[walk:], GHOST_KEYS))
         self.stats.note_admission(walk, handle.cached_len, evicted)
+
+    def snapshot_plan(self, req: PendingReq, handle: BaseCacheHandle) -> tuple[tuple[int, ...], int | None]:
+        """Structural policy: the chunk ends that make a prefill track a snapshot point, and the
+        first turn boundary to pin. A track lands on the deepest x64 boundary strictly inside its
+        chunk, so an exact point b needs a chunk end at b + 64; a stride ends a chunk at the stride
+        itself, which is a natural chunk end of a cold prompt (its snapshot is 64 tokens before)."""
+        if not self.structural:
+            return (), None
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+        start, n = handle.cached_len, req.input_len
+        ends, pin = set(range((start // SNAPSHOT_STRIDE + 1) * SNAPSHOT_STRIDE, n, SNAPSHOT_STRIDE)), None
+        if self.turn_end_id is not None:
+            hit = (req.input_ids == self.turn_end_id).nonzero()
+            if len(hit):
+                b = align_down(int(hit[0]) + 1, CHUNK_SIZE)
+                if b > start:
+                    pin = b
+                    ends.add(b + CHUNK_SIZE)
+        walk = getattr(handle, "walk_len", 0)
+        if walk > start:  # the prompt leaves an existing path here: snapshot the branch point
+            ends.add(walk + CHUNK_SIZE)
+        return tuple(sorted(e for e in ends if start + CHUNK_SIZE < e < n)), pin
+
+    def commit_chunk(self, req: Req) -> None:
+        """Structural policy: donate the snapshot an intermediate prefill chunk tracked (no-op for
+        "chunk", which commits the prompt once). Under overlap scheduling the next chunk was built
+        from this chunk's handle and ping-pong pair before this commit, so it gets the new ones."""
+        if not self.structural or req.mamba_last_track_seqlen is None:
+            return
+        old_handle, old_cursor, tracked = req.cache_handle, req.mamba_next_track_idx, req.mamba_last_track_seqlen
+        self._cache_req_hybrid(req, finished=False)
+        succ = getattr(req, "next_chunk", None)
+        if succ is None:
+            return
+        assert succ.cache_handle is old_handle, "the next chunk must hold this chunk's handle"
+        succ.cache_handle = req.cache_handle
+        succ.mamba_ping_pong = req.mamba_ping_pong
+        if succ.mamba_next_track_idx == old_cursor and succ.mamba_last_track_seqlen == tracked:
+            succ.mamba_last_track_seqlen = None  # it made no track of its own: this one is consumed
 
     def kv_stats_line(self, extra: str | None = None) -> str | None:
         """The KVSTATS line of the window since the last call (radix eviction counts included)."""
@@ -469,6 +521,16 @@ class CacheManager:
                 m.kv_indices[old_handle.cached_len : prefix_len])
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
+        if self.structural:
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+            pin = req.snapshot_pin
+            if pin is not None and pin - CHUNK_SIZE < L <= pin:
+                self.prefix_cache.pin(m.node)
+            # before the replacement alloc below: the thinned slot replaces the donated one, so a
+            # long prefill stops taking other sessions' snapshots once its path holds the cap
+            if freed := self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP):
+                pool.free(freed)
         if not mamba_exist:                                # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)

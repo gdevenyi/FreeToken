@@ -154,11 +154,14 @@ def test_naive_cache_does_not_align_prefill_chunks():
     assert adder.try_add_one(pending).extend_len == 100
 
 
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
 @pytest.mark.parametrize("full_chunks", [2, 3])
 @pytest.mark.parametrize("tail", [1, 59, 64, 65])
 @pytest.mark.parametrize("finish_early", [False, True])
-def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, tail, finish_early):
-    """A short final extend must retain the prior state; a longer one must replace it."""
+def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, tail, finish_early, policy):
+    """A short final extend must retain the prior state; a longer one must replace it. A short
+    prompt has no structural point; "structural" only keeps the final chunk long enough to
+    track, so a short tail resumes at the deepest x64 boundary, not one page before it."""
     import freetoken.core as core
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.scheduler.decode import DecodeManager
@@ -169,7 +172,7 @@ def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, ta
 
     pool = _pool()
     pt = torch.zeros(2, 1024, dtype=torch.int32)
-    cm = CacheManager(32, 64, pt, "hybrid_radix", linear_state_pool=pool)
+    cm = CacheManager(32, 64, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy)
     tm = TableManager(max_running_reqs=1, page_table=pt)
     pm = PrefillManager(cm, tm, DecodeManager(page_size=64))
     monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=64, linear_state_pool=pool))
@@ -198,14 +201,17 @@ def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, ta
             req.complete_one()
         if last_batch is not None:
             previous = last_batch.reqs[0]
-            if not isinstance(previous, ChunkedReq):
+            if isinstance(previous, ChunkedReq):
+                cm.commit_chunk(previous)  # as Scheduler._process_last_data
+            else:
                 final = previous
                 if not finish_early:
                     cm.cache_req(final, finished=False)
         last_batch = batch
 
     # Before the finish path can donate an aligned live state, require the frozen checkpoint.
-    expected = full_chunks * 128 - 64 if tail <= 64 else full_chunks * 128 + 64
+    short = full_chunks * 128 if policy == "structural" else full_chunks * 128 - 64
+    expected = short if tail <= 64 else full_chunks * 128 + 64
     if not finish_early:
         match = cm.match_req(_pend(prompt.tolist() + [999]))
         assert match.cuda_handle.cached_len == expected
@@ -229,6 +235,246 @@ def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, ta
     cm.check_integrity()
     assert pool.num_free_slots == pool.num_slots - 1
     assert len(cm.free_slots) == cm.num_pages
+
+
+@pytest.mark.parametrize("radix_lookahead", [False, True])   # MTP keys position i by (t_i, t_i+1)
+@pytest.mark.parametrize("overlap", [True, False])            # no spec / DFlash and MTP (normal_loop)
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
+@pytest.mark.parametrize("prompt_len", [213_000, 524_288])    # a long agent prompt; YaRN's whole context
+def test_snapshot_placement_on_a_cold_long_prefill(monkeypatch, prompt_len, policy, overlap, radix_lookahead):
+    """Design P1a (3.4). "structural" tracks and donates only at the first turn boundary (pinned),
+    each 32,768 tokens and the prompt end, keeps at most 2 snapshots on its path and takes at most 2
+    idle snapshots of other sessions; "chunk" (today) donates once. Every track lies at most 64
+    tokens before its chunk end, so the DFlash window copied with it holds its own rows, and the
+    finished request resumes at the same length under both policies."""
+    from freetoken import core
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    ps, budget, turn, others = 64, 8192, 7, 12
+    pool = _pool(num_slots=others + 4)                # the others' snapshots + the 3 working slots
+    pages = prompt_len // ps + others + 8
+    pt = torch.zeros(2, pages * ps, dtype=torch.int32)
+    cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool,
+                      radix_lookahead=radix_lookahead, snapshot_policy=policy)
+    cm.turn_end_id = turn
+    monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
+    sessions = [torch.arange(60_000 + 200 * i, 60_000 + 200 * i + 2 * ps, dtype=torch.int32) for i in range(others)]
+    for ids in sessions:                              # older idle sessions, one snapshot each
+        cm.prefix_cache.insert(cm._keys(ids, ps), cm._page_to_token(cm._allocate(1)), pool.alloc(1)[0])
+    prompt = torch.arange(prompt_len, dtype=torch.int32) % 50_000 + 100
+    prompt[4_999] = turn                              # the system block ends at 5,000
+
+    def resume(ids, n):
+        return cm.match_req(_pend(ids[:n].tolist() + [12345])).cuda_handle.cached_len
+
+    pc = cm.prefix_cache
+    tm = TableManager(max_running_reqs=1, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
+    pm.pending_list = [PendingReq(0, prompt, SamplingParams(max_tokens=8))]
+    tracked, tails, tree_max, final, pending = [], [], 0, None, None
+    while pm.runnable or pending is not None:
+        batch = pm.schedule_next_batch(budget)
+        if batch is not None:
+            batch.padded_reqs = batch.reqs
+            cm.allocate_paged(batch.reqs)
+            (req,) = batch.reqs
+            if build_fla_metadata(batch, torch.device("cpu"), pool).track_dst is not None:
+                tracked.append((req.mamba_last_track_seqlen, req.device_len))
+            req.complete_one()
+        drained, pending = ([pending], batch) if overlap else ([batch], None)
+        for done in filter(None, drained):            # as Scheduler._process_last_data
+            (r,) = done.reqs
+            if isinstance(r, ChunkedReq):
+                cm.commit_chunk(r)
+            else:
+                cm.cache_req(r, finished=False)
+                final = r
+            tails.append(resume(prompt, r.cached_len))
+            tree_max = max(tree_max, pc.mamba_evictable_size + pc.mamba_protected)
+    Scheduler._free_req_resources(SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None), final)
+
+    alive = sum(resume(ids, len(ids)) == ps for ids in sessions)
+    # the prompt end's track. "chunk" (today): 213,000 ends on an 8-token chunk, so the chunk before
+    # tracks 64 tokens earlier; "structural" leaves the final chunk long enough to track the deepest
+    end = {213_000: 212_928 if policy == "chunk" else 212_992, 524_288: 524_224}[prompt_len]
+    assert all(0 < e - b <= ps for b, e in tracked)
+    # the final state rides on an aligned end; pair keys need the token after it
+    live = prompt_len % ps == 0 and not radix_lookahead
+    assert resume(prompt, prompt_len) == (prompt_len if live else end)
+    if policy == "chunk":
+        assert set(tails) - {0} == {end} and others - alive == 1
+        assert resume(prompt, 5_000) == 0
+    else:
+        points = [4_992, *(k * 32_768 - ps for k in range(1, -(-prompt_len // 32_768))), end]
+        assert [b for b, _ in tracked] == points       # no track anywhere else
+        assert sorted(set(tails)) == points            # each point was donated and became the tail
+        assert tree_max - alive <= 2                   # path snapshots after every commit
+        assert others - alive == 2
+        assert resume(prompt, 5_000) == 4_992          # the pinned root survived the cap
+    cm.check_integrity()
+    assert pc.full_protected == 0 and pc.mamba_protected == 0
+    assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1
+
+
+@pytest.mark.parametrize("radix_lookahead", [False, True])
+@pytest.mark.parametrize("overlap", [True, False])
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
+# next turn: "anchor" rewrites the tool call after its opener, "prompt_end" drops the reasoning
+# (both with --enable-special-token-ckpt), "resend" sends the generation back with no anchor
+# (production at c323e469: no anchor, and an unaligned finish frees the generation's KV)
+@pytest.mark.parametrize("diverge", ["anchor", "prompt_end", "resend"])
+def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix_lookahead, diverge):
+    """Each turn adds its prompt end and, at finish, its tool-call anchor. "chunk" keeps them all;
+    the per-path cap thins the old turn at the next turn's first donation, never at a finish, so
+    the next turn still resumes at the anchor or the prompt end. A fork stays: when the reasoning is
+    dropped, the old prompt end branches into the old generation and the new prompt."""
+    from freetoken import core
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    ps, turns, turn = 64, 5, 7
+    pool = _pool(num_slots=2 * turns + 6)
+    pt = torch.zeros(2, 8192, dtype=torch.int32)
+    cm = CacheManager(128, ps, pt, "hybrid_radix", linear_state_pool=pool,
+                      radix_lookahead=radix_lookahead, snapshot_policy=policy)
+    cm.turn_end_id = turn
+    monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
+    tm = TableManager(max_running_reqs=1, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
+    stub = SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None)
+    prompt = torch.arange(100, 800, dtype=torch.int32)
+    prompt[319] = turn                                 # the system block ends at 320
+    resumed, anchors, ends = [], [], []
+    for k in range(turns):
+        pm.pending_list = [PendingReq(k, prompt, SamplingParams(max_tokens=256, ignore_eos=True))]
+        final, pending = None, None
+        while pm.runnable or pending is not None:
+            batch = pm.schedule_next_batch(256)
+            if batch is not None:
+                batch.padded_reqs = batch.reqs
+                cm.allocate_paged(batch.reqs)
+                if build_fla_metadata(batch, torch.device("cpu"), pool).track_dst is not None:
+                    last_track = batch.reqs[0].mamba_last_track_seqlen
+                if batch.prompt_admissions:
+                    resumed.append(batch.prompt_admissions[0][2])
+                batch.reqs[0].complete_one()
+            drained, pending = ([pending], batch) if overlap else ([batch], None)
+            for done in filter(None, drained):
+                (r,) = done.reqs
+                if isinstance(r, ChunkedReq):
+                    cm.commit_chunk(r)
+                else:
+                    cm.cache_req(r, finished=False)
+                    final = r
+        # decode; the tool-call opener closes a page, so the anchor snapshot is page-aligned
+        anchor = (len(prompt) // ps + 2) * ps
+        final.toolcall_anchor_len = None if diverge == "resend" else anchor
+        while final.cached_len < anchor + 40:
+            final.append_host(torch.tensor([20_000 + 1_000 * k + final.cached_len % 1_000], dtype=torch.int32))
+            cm.allocate_paged([final])
+            cm.snapshot_toolcall_anchor([final])
+            final.complete_one()
+        anchors.append(anchor)
+        ends.append(last_track)
+        keep = {"anchor": anchor + 8, "prompt_end": len(prompt), "resend": final.input_ids.numel()}[diverge]
+        conversation = final.input_ids[:keep].clone()
+        Scheduler._free_req_resources(stub, final)
+        # the client rewrites the echoed tool call after its first tokens, adds the tool result and a new message
+        prompt = torch.cat([conversation, torch.arange(40_000 + 300 * k, 40_000 + 300 * k + 300, dtype=torch.int32)])
+
+    assert resumed == [0, *(anchors if diverge == "anchor" else ends)[:-1]]
+    pc = cm.prefix_cache
+    snapshots = pc.mamba_evictable_size + pc.mamba_protected
+    if diverge == "resend":    # one prompt end per turn; "structural": the pinned root and the last
+        assert snapshots == (turns if policy == "chunk" else 2)
+    elif diverge == "anchor":  # a prompt end and an anchor per turn; the root and the last two
+        assert snapshots == (2 * turns if policy == "chunk" else 3)
+    else:                      # every old prompt end is a fork; each old generation keeps its anchor leaf
+        assert snapshots == 2 * turns + (policy == "structural")
+    cm.check_integrity()
+    assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1
+
+
+@pytest.mark.parametrize("radix_lookahead", [False, True])
+@pytest.mark.parametrize("overlap", [True, False])
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
+def test_fork_snapshot_and_pinned_roots(monkeypatch, policy, overlap, radix_lookahead):
+    """A prompt that leaves a cached path donates a snapshot at the branch point, which serves a
+    third session and which the cap keeps as a fork. At most 4 first-turn roots stay pinned (the
+    least recently used loses its pin), and evict_mamba takes them only after every other one."""
+    from freetoken import core
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    ps, turn = 64, 7
+    pool = _pool(num_slots=24)
+    pt = torch.zeros(2, 2048, dtype=torch.int32)
+    cm = CacheManager(256, ps, pt, "hybrid_radix", linear_state_pool=pool,
+                      radix_lookahead=radix_lookahead, snapshot_policy=policy)
+    cm.turn_end_id = turn
+    monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
+    tm = TableManager(max_running_reqs=1, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
+    stub = SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None)
+    a = torch.arange(1_000, 2_000, dtype=torch.int32)
+    a[199] = turn                                      # a's system block ends at 200
+    b = torch.cat([a[:600], torch.arange(5_000, 5_400, dtype=torch.int32)])
+    c = torch.cat([a[:600], torch.arange(6_000, 6_400, dtype=torch.int32)])
+    systems = []                                       # five more sessions, each with its own system block
+    for i in range(5):
+        d = torch.arange(10_000 + 1_000 * i, 10_000 + 1_000 * i + 300, dtype=torch.int32)
+        d[99] = turn
+        systems.append(d)
+    resumed = []
+    for uid, prompt in enumerate([a, b, c, *systems]):
+        pm.pending_list = [PendingReq(uid, prompt, SamplingParams(max_tokens=4))]
+        final, pending = None, None
+        while pm.runnable or pending is not None:
+            batch = pm.schedule_next_batch(8192)
+            if batch is not None:
+                batch.padded_reqs = batch.reqs
+                cm.allocate_paged(batch.reqs)
+                build_fla_metadata(batch, torch.device("cpu"), pool)
+                if batch.prompt_admissions:
+                    resumed.append(batch.prompt_admissions[0][2])
+                batch.reqs[0].complete_one()
+            drained, pending = ([pending], batch) if overlap else ([batch], None)
+            for done in filter(None, drained):
+                (r,) = done.reqs
+                if isinstance(r, ChunkedReq):
+                    cm.commit_chunk(r)
+                else:
+                    cm.cache_req(r, finished=False)
+                    final = r
+        Scheduler._free_req_resources(stub, final)
+
+    pc = cm.prefix_cache
+    # b resumes at a's root (structural) and leaves a's path at 576; c resumes at that branch point
+    assert resumed[:3] == ([0, 192, 576] if policy == "structural" else [0, 0, 0])
+    if policy == "structural":
+        assert len(pc.pinned) == 4 and pc.counts["unpin"] == 2   # a's root and the first system's lost the pin
+        # no probe before the eviction: a match stamps its path, and LRU alone would then spare the roots
+        unpinned = pc.mamba_evictable_size - 4
+        cm.ensure_mamba_slots(pool.num_free_slots + unpinned)
+        assert pc.counts["victim_pinned"] == 0 and pc.mamba_evictable_size == 4
+        assert [cm.match_req(_pend(d[:100].tolist())).cuda_handle.cached_len for d in systems] == [0] + [64] * 4
+        cm.ensure_mamba_slots(pool.num_free_slots + 1)
+        assert pc.counts["victim_pinned"] == 1
+    cm.check_integrity()
+    assert pool.num_free_slots + pc.mamba_evictable_size == pool.num_slots - 1
 
 
 def test_pool_sizing_covers_4mr_floor():

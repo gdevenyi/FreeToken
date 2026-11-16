@@ -25,6 +25,10 @@ class PendingReq:
     # timing/draft counters; add_one_req stamps enqueued_at on it, and every chunk
     # Req built from this pending request shares the same instance
     stats: ReqStats = field(default_factory=ReqStats)
+    # --gdn-snapshot-policy structural, set at admission: the chunk ends of the snapshot points
+    # (CacheManager.snapshot_plan) and the first turn boundary to pin
+    snapshot_ends: tuple = ()
+    snapshot_pin: int | None = None
 
     @property
     def input_len(self) -> int:
