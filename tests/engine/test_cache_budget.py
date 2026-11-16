@@ -738,7 +738,7 @@ def test_linear_state_cache_ratio_flag_sets_the_gdn_snapshot_cache():
 
 def test_kv_host_tokens_flag_is_refused_under_mtp():
     """--kv-host-tokens (KV host tier design 8.7, R7 exception): v1 refuses it under MTP, whose draft
-    pool follows the page ids, when the flags are parsed, so before any weights load."""
+    pool follows the page ids, when the flags are parsed and in _adjust_config, before any weights load."""
     from unittest.mock import patch
 
     from freetoken.server.args import parse_args
@@ -757,6 +757,11 @@ def test_kv_host_tokens_flag_is_refused_under_mtp():
     for bad in (["--kv-host-tokens", "2097152", "--spec-algo", "mtp"], ["--kv-host-tokens", "-1"]):
         with pytest.raises(SystemExit):
             parse(*bad)
+    # the programmatic LLM(...) path skips parse_args but not _adjust_config (before the weights load)
+    from freetoken.engine.engine import _adjust_config
+
+    with pytest.raises(ValueError, match="--kv-host-tokens"):
+        _adjust_config(SimpleNamespace(kv_host_tokens=4096, speculative_algorithm="mtp", model_config=SimpleNamespace()))
 
 
 def test_more_gdn_snapshot_slots_come_out_of_the_expert_cache():

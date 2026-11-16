@@ -2233,6 +2233,9 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
+    if getattr(config, "kv_host_tokens", 0) and config.speculative_algorithm == "mtp":
+        # parse_args refuses it too; the programmatic LLM(...) path comes only here
+        raise ValueError("--kv-host-tokens cannot be used with --spec-algo mtp: the MTP draft pool follows the page ids")
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
         # is worse than inert -- engine init would build an expert cache for a model that has
