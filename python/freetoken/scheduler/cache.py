@@ -204,6 +204,9 @@ class CacheManager:
         line = self.stats.line(tree, extra)
         if tree is not None:
             tree.clear()
+        pool = self.linear_state_pool
+        if line is not None and getattr(pool, "num_host_slots", 0):
+            line += f" | host used={pool.num_host_slots - pool.num_free_host_slots}/{pool.num_host_slots}"
         return line
 
     @property

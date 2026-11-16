@@ -728,6 +728,7 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
     assert req.mamba_restore_src is None and req.mamba_restore_host is not None
     assert (pc.mamba_host_evictable, pc.mamba_host_protected) == (0, 1)   # the bank cannot drop it now
     assert pc.counts["host_hit"] == 1                               # KVSTATS: tree ... host_hit=1
+    assert cm.kv_stats_line().endswith(" | host used=1/2")          # the bank's occupancy
     if abort:
         Scheduler._free_req_resources(stub, req)
         assert (pc.mamba_host_evictable, pc.mamba_host_protected) == (1, 0)
