@@ -150,7 +150,9 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+        # a device snapshot wins; else the host copy (--mamba-host-slots), locked with the handle
+        restore_host = mr.mamba_host if mr.mamba_value is None else None
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, restore_host
 
     def _add_one_req(
         self,
@@ -164,6 +166,7 @@ class PrefillAdder:
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
         last_track_seqlen: int | None = None,
+        restore_host: int | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -273,6 +276,7 @@ class PrefillAdder:
             req.gdn_track = left == 0 or left <= CHUNK_SIZE or end in pending_req.snapshot_ends
             req.snapshot_pin = pending_req.snapshot_pin
         req.mamba_restore_src = restore_src
+        req.mamba_restore_host = restore_host
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -296,7 +300,7 @@ class PrefillAdder:
             return chunked_req.next_chunk
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -306,6 +310,7 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
+                restore_host=restore_host,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its

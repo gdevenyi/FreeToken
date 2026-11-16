@@ -746,15 +746,24 @@ class Scheduler(SchedulerIOMixin):
 
     def _restore_linear_states(self, batch) -> None:
         """COW-restore a hybrid prefix hit's GDN snapshot into its freshly-allocated live slot
-        (first chunk only). MUST run on the ENGINE stream so it is program-ordered after the
-        prior batch's snapshot writes and before this forward reads the live slot."""
+        (first chunk only), from the tree's device slot or its host-bank copy. MUST run on the
+        ENGINE stream so it is program-ordered after the prior batch's snapshot writes and before
+        this forward reads the live slot."""
         pool = self.engine.linear_state_pool
-        if pool is None or not batch.is_prefill:
+        if pool is None:
+            return
+        # every batch: a slot a demotion freed may be written by this forward (any phase), and a
+        # host copy may be read below, so both wait for the demotions' device->host copies
+        pool.fence_host_copies()
+        if not batch.is_prefill:
             return
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
+            elif req.mamba_restore_host is not None:
+                pool.from_host(req.mamba_restore_host, req.linear_slot_idx)
+                req.mamba_restore_host = None
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an

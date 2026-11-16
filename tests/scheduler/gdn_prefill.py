@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
-from freetoken.core import Req
+from freetoken.core import Batch, Req
 from freetoken.scheduler.prefill import ChunkedReq
 
 
@@ -19,12 +19,16 @@ class PrefillRun(NamedTuple):
 
 
 def drive_prefill(cm, pm, pool, pending, *, budget: int, overlap: bool,
-                  on_drain: Callable[[Req], None] | None = None) -> PrefillRun:
+                  on_drain: Callable[[Req], None] | None = None,
+                  on_launch: Callable[[Batch], None] | None = None,
+                  on_forward: Callable[[Req, bool], None] | None = None) -> PrefillRun:
     """Prefill ``pending`` chunk by chunk: allocate pages, build the GDN track metadata (which
     advances the track cursor as a forward does), complete the chunk, then drain it as
     Scheduler._process_last_data does (commit_chunk for an intermediate chunk, cache_req for the
     final one). ``overlap`` schedules the next chunk before the previous one drains (no spec);
-    otherwise each chunk drains before the next is scheduled (normal_loop: DFlash and MTP)."""
+    otherwise each chunk drains before the next is scheduled (normal_loop: DFlash and MTP).
+    ``on_launch(batch)`` runs where the scheduler restores GDN states (after the allocation, before
+    the forward); ``on_forward(req, tracked)`` stands in for the forward's writes to the GDN slots."""
     pm.pending_list = [pending]
     tracks, cached, final, waiting = [], None, None, None
     while pm.runnable or waiting is not None:
@@ -33,8 +37,13 @@ def drive_prefill(cm, pm, pool, pending, *, budget: int, overlap: bool,
             batch.padded_reqs = batch.reqs
             cm.allocate_paged(batch.reqs)
             (req,) = batch.reqs
-            if build_fla_metadata(batch, torch.device("cpu"), pool).track_dst is not None:
+            if on_launch is not None:
+                on_launch(batch)
+            tracked = build_fla_metadata(batch, torch.device("cpu"), pool).track_dst is not None
+            if tracked:
                 tracks.append((req.mamba_last_track_seqlen, req.device_len))
+            if on_forward is not None:
+                on_forward(req, tracked)
             if batch.prompt_admissions:
                 cached = batch.prompt_admissions[0][2]
             req.complete_one()
