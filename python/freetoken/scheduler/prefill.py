@@ -152,6 +152,8 @@ class PrefillAdder:
 
         # a device snapshot wins; else the host copy (--mamba-host-slots), locked with the handle
         restore_host = mr.mamba_host if mr.mamba_value is None else None
+        if restore_host is not None:
+            self.cache_manager.prefix_cache.counts["host_hit"] += 1  # KVSTATS only
         return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, restore_host
 
     def _add_one_req(

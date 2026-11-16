@@ -640,8 +640,22 @@ class Engine:
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
-            from freetoken.kvcache.linear_state_pool import LinearStatePool
+            from freetoken.kvcache.linear_state_pool import (
+                LinearStatePool,
+                check_host_bank_memory,
+                linear_state_bytes_per_req,
+            )
 
+            # only the hybrid radix has a tree for a host copy to hang on
+            host_slots = config.mamba_host_slots if config.cache_type == "hybrid_radix" else 0
+            if host_slots:
+                per_slot = linear_state_bytes_per_req(linear_group, config.tp_info.size, self.dtype, config.slot_states)
+                # after the weights: MemAvailable now excludes the pinned expert banks; every local rank asks the same
+                check_host_bank_memory(host_slots * per_slot * config.tp_info.size)
+                logger.info_rank0(
+                    f"GDN host snapshot bank (--mamba-host-slots): {host_slots} x {mem_GB(per_slot)} = "
+                    f"{mem_GB(host_slots * per_slot)} pinned host RAM per rank"
+                )
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
                 num_slots=_linear_pool_num_slots(config),
@@ -649,6 +663,8 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.slot_states,
+                host_slots=host_slots,
+                engine_stream=self.stream,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
