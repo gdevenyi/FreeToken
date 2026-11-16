@@ -682,7 +682,8 @@ def test_kvstats_counts_admission_refusals_by_cause(cause):
 
 
 # --------------------------------------------------------------------------- --mamba-host-slots (P1)
-def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False):
+def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False,
+                **two_level):
     from freetoken import core
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
@@ -694,7 +695,7 @@ def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", co
         pool.host_copies = copies
     pt = torch.zeros(2, pages * ps, dtype=torch.int32)
     cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy,
-                      radix_lookahead=radix_lookahead)
+                      radix_lookahead=radix_lookahead, **two_level)
     monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
     tm = TableManager(max_running_reqs=1, page_table=pt)
     pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
@@ -941,6 +942,48 @@ def test_kv_pressure_takes_demoted_leaves_with_their_host_copies(monkeypatch, po
     print(f"{policy}: KV-bound replay: recomputed {recomputed}, counts {counts}")
     assert counts["kv_tokens"] > 0 and counts["demote"] > 0 and counts["kv_host"] > 0
     assert any(kind == "host" for _, _, kind in adm)
+
+
+# --------------------------------------------------------------------------- --kv-host-tokens (P2w-a)
+def test_page_location_table_round_trip_and_reset(monkeypatch):
+    """Design 8.1: one int32 per logical page id, a device page slot or host-only. A new page gets a
+    device slot, a demotion gives the slot back and keeps the id, a free returns both, and flush and
+    rebuild leave every id free and every device slot unused."""
+    from freetoken.scheduler.cache import LOC_FREE, LOC_HOST
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=8, host_slots=0, pages=8, host_pages=8)
+    loc = cm.locations
+    assert (cm.num_pages, cm.num_device_pages, len(cm.free_slots), len(loc.table)) == (16, 8, 16, 16)
+    assert loc.table.dtype == torch.int32 and (loc.table == LOC_FREE).all() and loc.num_free_device == 8
+    run = drive_prefill(cm, pm, pool, PendingReq(0, torch.arange(100, 400, dtype=torch.int32),
+                                                 SamplingParams(max_tokens=4)), budget=8192, overlap=False)
+    ids = cm.page_table[run.final.table_idx, :300:64] // 64
+    slots = loc.table[ids.long()]
+    assert (slots >= 0).all() and len(set(slots.tolist())) == 5 and loc.num_free_device == 3
+    Scheduler._free_req_resources(stub, run.final)                 # 256 tokens stay in the tree
+    cm.check_integrity()
+    loc.demote(ids[:2])                                            # the ids stay; the slots come back
+    assert (loc.table[ids[:2].long()] == LOC_HOST).all() and loc.num_free_device == 8 - 2
+    assert torch.equal(loc.table[ids[2:4].long()], slots[2:4])
+    cm.check_integrity()
+    with cm.lazy_free_region():
+        cm.flush()
+    assert (loc.table == LOC_FREE).all() and loc.num_free_device == 8 and len(cm.free_slots) == 16
+    cm.check_integrity()
+    drive_prefill(cm, pm, pool, PendingReq(1, torch.arange(500, 700, dtype=torch.int32),
+                                           SamplingParams(max_tokens=4)), budget=8192, overlap=False)
+    assert (loc.table >= 0).sum() == 4
+    cm.rebuild(12, cm.page_table)                                  # idle-only: a new table for the new pool
+    assert (cm.num_pages, cm.num_device_pages, len(cm.locations.table)) == (20, 12, 20)
+    assert (cm.locations.table == LOC_FREE).all() and cm.locations.num_free_device == 12
+    cm.check_integrity()
+
+
+def test_no_location_table_without_kv_host_tokens(monkeypatch):
+    _, cm, _, _ = _host_setup(monkeypatch, num_slots=8, host_slots=0, pages=8)
+    assert cm.locations is None and cm.num_pages == cm.num_device_pages == 8
 
 
 if __name__ == "__main__":

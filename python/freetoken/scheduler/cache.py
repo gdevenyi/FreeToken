@@ -39,16 +39,66 @@ GDN_SNAPSHOT_POLICIES = ("chunk", "structural")
 SNAPSHOT_STRIDE = 32768
 SNAPSHOT_PATH_CAP = 2  # the pinned root and the tail; the previous turn's prompt end stays on top
 
+# --kv-host-tokens (KV host tier design 8.4): each running request keeps its last W tokens on the device
+DEVICE_WINDOW = 65536
+LOC_HOST = -1  # the page's K/V is in the host mirror only
+LOC_FREE = -2  # the id is on the free list
+
+
+class PageLocations:
+    """Two-level page pool (KV host tier design 8.1): one int32 per logical page id, its device page
+    slot (0 or more), LOC_HOST or LOC_FREE. Page tables and radix nodes keep the id, so a move
+    between tiers rewrites one entry. Bookkeeping only: no kernel reads it yet."""
+
+    def __init__(self, num_ids: int, num_device: int, device: torch.device):
+        self.num_device = num_device
+        self.table = torch.full((num_ids,), LOC_FREE, dtype=torch.int32, device=device)
+        self.free_device = torch.arange(num_device, dtype=torch.int32, device=device)
+
+    @property
+    def num_free_device(self) -> int:
+        return len(self.free_device)
+
+    def place(self, ids: torch.Tensor) -> None:
+        """Give each new page id a free device slot, in free-list order."""
+        n = len(ids)
+        assert n <= len(self.free_device), "no free device slot: demote first"
+        self.table[ids.long()] = self.free_device[:n]
+        self.free_device = self.free_device[n:]
+
+    def demote(self, ids: torch.Tensor) -> None:
+        """Make device pages host-only; their slots go back to the free list, the ids stay."""
+        slots = self.table[ids.long()]
+        assert (slots >= 0).all(), "demote of a page that is not on the device"
+        self.free_device = torch.cat([self.free_device, slots])
+        self.table[ids.long()] = LOC_HOST
+
+    def release(self, ids: torch.Tensor) -> None:
+        """Free page ids on either tier; a device slot goes back to the free list."""
+        slots = self.table[ids.long()]
+        self.free_device = torch.cat([self.free_device, slots[slots >= 0]])
+        self.table[ids.long()] = LOC_FREE
+
+    def check(self, free_ids: torch.Tensor) -> None:
+        placed = self.table[self.table >= 0]
+        assert len(placed) + len(self.free_device) == self.num_device, (
+            f"device slot leak: placed({len(placed)}) + free({len(self.free_device)}) != {self.num_device}")
+        assert len(torch.cat([placed, self.free_device]).unique()) == self.num_device, "a device slot is held twice"
+        assert (self.table[free_ids.long()] == LOC_FREE).all(), "a free page id holds a location"
+        assert int((self.table != LOC_FREE).sum()) == len(self.table) - len(free_ids), "a used page id is LOC_FREE"
+
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
                  logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False,
-                 snapshot_policy: str = "chunk"):
+                 snapshot_policy: str = "chunk", host_pages: int = 0, device_window: int = DEVICE_WINDOW):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
+        # With host_pages (--kv-host-tokens) it holds logical page ids: num_pages device slots
+        # plus host_pages more ids, whose places PageLocations keeps.
         device = page_table.device
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+        self.free_slots = torch.arange(num_pages + host_pages, dtype=torch.int32, device=device) * page_size
         # Hybrid GDN models drive a second currency (GDN state snapshots in LinearStatePool)
         # through a HybridRadixCache; SWA models drive a second currency (swa-pool KV slots in
         # the HybridSWAKVCache global-paged mode) through a SWARadixCache; non-hybrid models keep
@@ -84,7 +134,13 @@ class CacheManager:
         self.stats = KVStats()
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
         self.device = device
-        self.num_pages = num_pages
+        self.num_pages = num_pages + host_pages
+        self.num_device_pages = num_pages
+        self.host_pages = host_pages
+        self.device_window = device_window
+        if host_pages and not self.is_hybrid:
+            raise ValueError("--kv-host-tokens needs the hybrid radix cache")
+        self.locations = PageLocations(self.num_pages, num_pages, device) if host_pages else None
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
@@ -735,6 +791,8 @@ class CacheManager:
             )
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
+        if self.locations is not None:
+            self.locations.check(self.free_slots // self.page_size)
 
     def rebuild(self, num_pages: int, page_table: torch.Tensor) -> None:
         """Re-point the page table and reset page accounting + prefix cache IN PLACE.
@@ -745,9 +803,12 @@ class CacheManager:
         """
         device = page_table.device
         self.device = device
-        self.num_pages = num_pages
+        self.num_pages = num_pages + self.host_pages
+        self.num_device_pages = num_pages
         self.page_table = page_table
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
+        self.free_slots = torch.arange(self.num_pages, dtype=torch.int32, device=device) * self.page_size
+        if self.locations is not None:
+            self.locations = PageLocations(self.num_pages, num_pages, device)
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
@@ -770,7 +831,7 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            self._return_pages(lazy_free_list)
 
     def flush(self) -> int:
         """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
@@ -798,15 +859,23 @@ class CacheManager:
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
             evicted = self._evict((needed_pages - free_pages) * self.page_size)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+            self._return_pages([evicted[:: self.page_size]])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
+        if self.locations is not None:
+            self.locations.place(allocated // self.page_size)
         return allocated
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
-            self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+            self._return_pages([indices[:: self.page_size]])
+
+    def _return_pages(self, pages: list[torch.Tensor]) -> None:
+        """Every page id that goes back to the free list passes here (one per page, as token index)."""
+        self.free_slots = torch.cat([self.free_slots] + pages)
+        if self.locations is not None and pages:
+            self.locations.release(torch.cat(pages) // self.page_size)
 
     def _keys(self, ids: torch.Tensor, n: int) -> torch.Tensor:
         """Radix keys of the first ``n`` positions of ``ids``; with radix_lookahead, fewer when the token after them is not known yet."""
