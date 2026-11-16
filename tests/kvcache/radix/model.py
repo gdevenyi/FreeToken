@@ -774,8 +774,26 @@ class HybridModel(RefModel):
         g.host_ref = 0
         return pos + 1
 
-    def _host_key(self, g: MGroup) -> tuple[int, bool]:
-        return g.htick, self.trie.is_leaf(g)
+    def _host_key(self, g: MGroup) -> tuple[bool, int, bool]:
+        return not self._superseded(g), g.htick, self.trie.is_leaf(g)
+
+    def _superseded(self, g: MGroup) -> bool:
+        """An internal host copy with a deeper internal host copy after it on its chain (no fork
+        between), within the same window of HOST_THIN_WINDOW tokens."""
+        from freetoken.kvcache.hybrid_radix_cache import HOST_THIN_WINDOW
+
+        kids = self.trie.kids.get(g.end, {})
+        if len(kids) != 1:
+            return False
+        end = (len(g.end) // HOST_THIN_WINDOW + 1) * HOST_THIN_WINDOW
+        while len(kids) == 1:
+            g = self.trie.page_group[next(iter(kids.values()))]
+            if len(g.end) >= end:
+                return False
+            kids = self.trie.kids.get(g.end, {})
+            if g.host is not None and kids:
+                return True
+        return False
 
     def _drop_host(self, slot: int, obs_kv: Sequence[int], pk: int, tag: str,
                    cands: list[MGroup] | None = None) -> int:

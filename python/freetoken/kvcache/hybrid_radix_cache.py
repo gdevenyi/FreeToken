@@ -71,6 +71,9 @@ GHOST_KEYS = 64
 GHOST_CAP = 4096
 # --gdn-snapshot-policy structural: pinned first-turn snapshots, the LRU one loses its pin
 MAX_PINNED_ROOTS = 4
+# --mamba-host-slots: a full bank first drops a host copy that a deeper one supersedes within the same
+# window of this many tokens (the structural stride; design 3.4: a leaf and one ancestor per window)
+HOST_THIN_WINDOW = 32768
 
 
 class HybridRadixCache:
@@ -284,13 +287,14 @@ class HybridRadixCache:
         return True
 
     def _drop_host(self, kv: list[torch.Tensor]) -> int | None:
-        """Drop the least recently used unlocked host copy and return its bank slot (None: nothing
-        to drop). At a tie an internal copy goes first: dropping a leaf's copy costs its KV, since an
-        unlocked leaf must keep a snapshot on some tier."""
+        """Drop an unlocked host copy and return its bank slot (None: nothing to drop). Superseded
+        copies go first (see _superseded), then the least recently used one. At a tie an internal
+        copy goes first: dropping a leaf's copy costs its KV, since an unlocked leaf must keep a
+        snapshot on some tier."""
         cands = [n for n in self._host_nodes() if n.mamba_host_ref_count == 0]
         if not cands:
             return None
-        node = min(cands, key=lambda n: (n.host_tick, n.is_leaf(), n.uuid))
+        node = min(cands, key=lambda n: (not self._superseded(n), n.host_tick, n.is_leaf(), n.uuid))
         slot: list[int] = []
         self._detach_host(node, slot)
         self.counts["host_drop"] += 1
@@ -339,6 +343,26 @@ class HybridRadixCache:
             self.prompt_ends.discard(node.uuid)
             if node.mamba_ref_count == 0:
                 self.mamba_evictable -= 1
+
+    def _superseded(self, node: RadixTreeNode) -> bool:
+        """An internal host copy is superseded when a deeper internal host copy follows it on its
+        chain (no fork between) within the same HOST_THIN_WINDOW: an edit between the two resumes
+        at most a window early. So a chain keeps its leaf and its deepest copy per window (the
+        previous prompt end), and an active session's old turns do not push other sessions' resume
+        points out of the bank. A leaf or a fork is never superseded."""
+        if len(node.children) != 1:
+            return False
+        depth = self._path_len(node)
+        end = (depth // HOST_THIN_WINDOW + 1) * HOST_THIN_WINDOW
+        cur = node
+        while len(cur.children) == 1:
+            cur = next(iter(cur.children.values()))
+            depth += cur.length
+            if depth >= end:
+                return False
+            if cur.mamba_host is not None and not cur.is_leaf():
+                return True
+        return False
 
     def _detach_host(self, node: RadixTreeNode, out: list[int]) -> None:
         if node.mamba_host is None:

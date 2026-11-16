@@ -3,7 +3,6 @@ CPU, real LinearStatePool + page_table, hand-built Reqs. Exercises the two-curre
 without the full scheduler/engine."""
 from __future__ import annotations
 
-import zlib
 from types import SimpleNamespace
 
 import torch
@@ -14,7 +13,7 @@ from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
 
-from .gdn_prefill import drive_prefill
+from .gdn_prefill import CopiesAtTheFence, drive_prefill, forward_writes, gdn_state, restore_and_check
 
 
 def _pool(num_slots=16, host_slots=0):
@@ -683,63 +682,6 @@ def test_kvstats_counts_admission_refusals_by_cause(cause):
 
 
 # --------------------------------------------------------------------------- --mamba-host-slots (P1)
-def _state(ids: torch.Tensor) -> float:
-    """A stand-in GDN state: a function of the tokens it has consumed, exact in fp32."""
-    return float(zlib.crc32(ids.numpy().tobytes()) % 1_000_003)
-
-
-def _forward_writes(pool):
-    """``on_forward`` for drive_prefill: the forward leaves the live slot at the state of the whole
-    chunk and, when it tracks, the frozen ping-pong slot at the state of the tracked boundary."""
-    def write(req, tracked):
-        pool.recurrent_states[:, req.linear_slot_idx] = _state(req.input_ids[: req.device_len])
-        if tracked:
-            frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
-            pool.recurrent_states[:, frozen] = _state(req.input_ids[: req.mamba_last_track_seqlen])
-    return write
-
-
-def _restore_and_check(pool, admitted: list):
-    """``on_launch`` for drive_prefill: run the scheduler's restore, then check that the live slot of
-    each resumed request holds the state of exactly its cached prefix, from either tier."""
-    from freetoken.scheduler.scheduler import Scheduler
-
-    stub = SimpleNamespace(engine=SimpleNamespace(linear_state_pool=pool))
-
-    def launch(batch):
-        kinds = [("device" if r.mamba_restore_src is not None else
-                  "host" if r.mamba_restore_host is not None else None) for r in batch.reqs]
-        Scheduler._restore_linear_states(stub, batch)
-        for r, kind in zip(batch.reqs, kinds):
-            if r.cached_len == r.cache_handle.cached_len and r.cached_len > 0 and kind is not None:
-                assert pool.recurrent_states[0, r.linear_slot_idx, 0, 0, 0].item() == _state(
-                    r.input_ids[: r.cached_len]), f"{kind} restore of {r.cached_len} tokens holds another state"
-                admitted.append((r.uid, r.cached_len, kind))
-            elif r.cached_len == r.cache_handle.cached_len:
-                admitted.append((r.uid, r.cached_len, kind))
-    return launch
-
-
-class _CopiesAtTheFence:
-    """A host-bank copier whose device->host copies run only at the next fence: the latest point
-    a real stream could run them. A slot written before its copy ran would reach the bank wrong."""
-
-    def __init__(self):
-        self.queue = []
-
-    def to_host(self, pairs):
-        self.queue.extend(pairs)
-
-    def from_host(self, pairs):
-        for dst, src in pairs:
-            dst.copy_(src)
-
-    def fence(self):
-        for dst, src in self.queue:
-            dst.copy_(src)
-        self.queue.clear()
-
-
 def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False):
     from freetoken import core
     from freetoken.scheduler.decode import DecodeManager
@@ -771,7 +713,7 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
     pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=8, host_slots=2, pages=64)
     prompt = torch.arange(100, 366, dtype=torch.int32)              # 266 tokens: a snapshot at 256
     run = drive_prefill(cm, pm, pool, PendingReq(0, prompt, SamplingParams(max_tokens=4)), budget=8192,
-                        overlap=False, on_forward=_forward_writes(pool))
+                        overlap=False, on_forward=forward_writes(pool))
     Scheduler._free_req_resources(stub, run.final)
     pc = cm.prefix_cache
     cm.ensure_mamba_slots(pool.num_free_slots + 1)                  # the only snapshot is demoted
@@ -793,24 +735,27 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
         assert cm.match_req(_pend(retry.tolist())).mamba_host is not None
     else:
         admitted = []
-        _restore_and_check(pool, admitted)(batch)
+        restore_and_check(pool, admitted)(batch)
         assert admitted == [(1, 256, "host")] and req.mamba_restore_host is None
         Scheduler._free_req_resources(stub, req)
     cm.check_integrity()
     assert pool.num_free_host_slots + pc.mamba_host_evictable == pool.num_host_slots
 
 
-def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False):
-    """A replay-like agent load: ``sessions`` sessions take turns round-robin, each turn sending the
-    conversation so far plus a 64-token generation and a 256-token tool result. One request runs
-    at a time with 16 idle snapshot slots (production's count), and the KV pool holds every session,
-    so only snapshot pressure decides what is recomputed. Returns the admissions as
-    (uid, cached tokens, restore tier), the recomputed tokens and the tree's (depth, tiers)."""
+def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False,
+                  order=None):
+    """A replay-like agent load: ``sessions`` sessions take turns round-robin (or in ``order``, one
+    session index per turn), each turn sending the conversation so far plus a 64-token generation
+    and a 256-token tool result. One request runs at a time with 16 idle snapshot slots
+    (production's count), and the KV pool holds every session, so only snapshot pressure decides
+    what is recomputed. Returns the admissions as (uid, cached tokens, restore tier), the
+    recomputed tokens, the tree's (depth, slot, host slot) and the tree's counters."""
     from freetoken.scheduler.scheduler import Scheduler
     from freetoken.scheduler.utils import PendingReq
 
     ps, first, step = 64, 1024, 320
-    pages = sessions * (first + turns * step) // ps + 64
+    order = [s for _ in range(turns) for s in range(sessions)] if order is None else order
+    pages = (sessions * first + len(order) * step) // ps + 64
     pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=1 + 3 + 16, host_slots=host_slots,
                                      pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead)
     cm.turn_end_id = 7
@@ -820,16 +765,14 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
         c = torch.arange(10_000 * (s + 1), 10_000 * (s + 1) + first, dtype=torch.int32)
         c[511] = 7                                                   # the system block ends at 512
         convs.append(c)
-    for t in range(turns):
-        for s in range(sessions):
-            uid = t * sessions + s
-            run = drive_prefill(cm, pm, pool, PendingReq(uid, convs[s], SamplingParams(max_tokens=4)),
-                                budget=512, overlap=True, on_forward=_forward_writes(pool),
-                                on_launch=_restore_and_check(pool, admitted))
-            recomputed += len(convs[s]) - run.cached
-            Scheduler._free_req_resources(stub, run.final)
-            more = torch.arange(500_000 + 1_000 * uid, 500_000 + 1_000 * uid + step, dtype=torch.int32)
-            convs[s] = torch.cat([convs[s], more])
+    for uid, s in enumerate(order):
+        run = drive_prefill(cm, pm, pool, PendingReq(uid, convs[s], SamplingParams(max_tokens=4)),
+                            budget=512, overlap=True, on_forward=forward_writes(pool),
+                            on_launch=restore_and_check(pool, admitted))
+        recomputed += len(convs[s]) - run.cached
+        Scheduler._free_req_resources(stub, run.final)
+        more = torch.arange(500_000 + 1_000 * uid, 500_000 + 1_000 * uid + step, dtype=torch.int32)
+        convs[s] = torch.cat([convs[s], more])
     cm.check_integrity()
     pc = cm.prefix_cache
     assert pool.num_free_host_slots + pc.mamba_host_evictable == pool.num_host_slots
@@ -849,7 +792,7 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
                 if radix_lookahead:
                     keys = (keys >> 31).to(torch.int32)              # MTP pair keys: (token, next token)
                 slot = probe if n.mamba_value is None else n.mamba_value
-                assert pool.recurrent_states[0, slot, 0, 0, 0].item() == _state(keys), pc._path_len(n)
+                assert pool.recurrent_states[0, slot, 0, 0, 0].item() == gdn_state(keys), pc._path_len(n)
             tree.append((pc._path_len(n), -1 if n.mamba_value is None else n.mamba_value,
                          -1 if n.mamba_host is None else n.mamba_host))
     pool.free([probe])
@@ -874,7 +817,7 @@ def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, po
     now = _agent_replay(monkeypatch, host_slots=8, policy=policy, sessions=12, turns=3,
                         radix_lookahead=radix_lookahead)
     late = _agent_replay(monkeypatch, host_slots=8, policy=policy, sessions=12, turns=3,
-                         copies=_CopiesAtTheFence(), radix_lookahead=radix_lookahead)
+                         copies=CopiesAtTheFence(), radix_lookahead=radix_lookahead)
     assert now == late
     assert now[3]["demote"] > 0 and now[3]["host_drop"] > 0         # the bank filled and gave way
     assert any(kind == "host" for _, _, kind in now[0])
@@ -885,14 +828,15 @@ def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, po
 def test_returning_agent_sessions_hit_their_own_host_snapshot(monkeypatch, policy, late_copies):
     """The measured production failure: 24 sessions exceed the 16 idle snapshot slots, so a session
     that returns after the others finds its snapshot evicted (with its leaf's KV) and recomputes its
-    whole conversation, although the KV pool never filled. With a host bank that holds every
-    snapshot (256, the design's GPU arm), every returning session resumes at its own previous prompt
-    end, from the host; a smaller bank (64) drops the least recently used sessions first."""
+    whole conversation, although the KV pool never filled. With a host bank of 64 slots, every
+    returning session resumes at its own previous prompt end, from the host: the bank drops the old
+    turns' superseded copies first, so about 2 copies per session (its leaf and its previous
+    prompt end) suffice. (A bank below the sessions' working set misses on every return under
+    round robin, as any LRU does.)"""
     turns, sessions, first, step = 3, 24, 1024, 320
     _, off, _, off_counts = _agent_replay(monkeypatch, host_slots=0, policy=policy)
-    _, mid, _, mid_counts = _agent_replay(monkeypatch, host_slots=64, policy=policy)
-    on_adm, on, _, on_counts = _agent_replay(monkeypatch, host_slots=256, policy=policy,
-                                             copies=_CopiesAtTheFence() if late_copies else None)
+    on_adm, on, _, on_counts = _agent_replay(monkeypatch, host_slots=64, policy=policy,
+                                             copies=CopiesAtTheFence() if late_copies else None)
     total = sum(first + t * step for t in range(turns)) * sessions
     new = sessions * (first + (turns - 1) * step)                    # the first turns and the new tokens
     returning = [(uid, c, kind) for uid, c, kind in on_adm if uid >= sessions]
@@ -901,10 +845,9 @@ def test_returning_agent_sessions_hit_their_own_host_snapshot(monkeypatch, polic
         t = uid // sessions
         assert (cached, kind) == (first + (t - 1) * step, "host"), (uid, cached, kind)
     assert on == new and on_counts["demote"] > 0 and "victim_leaf" not in on_counts
-    assert "host_drop" not in on_counts and mid_counts["host_drop"] > 0
-    assert off > mid > on and off_counts["victim_leaf"] > 0
-    print(f"recomputed tokens ({policy}): {off} of {total} without a bank, {mid} with 64 slots, "
-          f"{on} with 256 ({new} are new)")
+    assert on_counts["host_drop"] > 0                               # 64 slots hold fewer than every snapshot
+    assert off == total and off_counts["victim_leaf"] > 0
+    print(f"recomputed tokens ({policy}): {off} of {total} without a bank, {on} with 64 slots ({new} are new)")
 
 
 
@@ -930,7 +873,7 @@ def test_structural_cap_demotes_stride_snapshots_to_the_host_bank(monkeypatch, o
     pc = cm.prefix_cache
     device_path = []
     run = drive_prefill(cm, pm, pool, PendingReq(0, prompt, SamplingParams(max_tokens=8)), budget=8192,
-                        overlap=overlap, on_forward=_forward_writes(pool),
+                        overlap=overlap, on_forward=forward_writes(pool),
                         on_drain=lambda r: device_path.append(pc.mamba_evictable_size + pc.mamba_protected))
     Scheduler._free_req_resources(stub, run.final)
     strides = [k * 32_768 - ps for k in range(1, 7)]
@@ -968,6 +911,22 @@ def test_flush_and_rebuild_empty_the_host_bank(monkeypatch):
     assert pool.num_free_host_slots == 3
     cm.rebuild(64, cm.page_table)
     assert pool.num_free_host_slots == 4
+
+
+
+@pytest.mark.parametrize("policy", ["chunk", "structural"])
+def test_long_active_sessions_do_not_push_idle_sessions_out_of_the_bank(monkeypatch, policy):
+    """Two sessions run 40 turns each while 20 one-turn sessions wait; then the 20 return. Each turn
+    adds snapshots on the long paths, and a match refreshes a whole path, so the long sessions' old
+    turns must not take the bank from the idle sessions' resume points."""
+    idle, long_turns = 20, 40
+    order = list(range(idle)) + [idle, idle + 1] * long_turns + list(range(idle))
+    adm, recomputed, _, counts = _agent_replay(monkeypatch, host_slots=64, policy=policy,
+                                               sessions=idle + 2, order=order)
+    back = adm[-idle:]
+    print(f"{policy}: idle sessions back from the host {sum(k == 'host' for _, _, k in back)}/{idle}, "
+          f"recomputed {recomputed}, counts {counts}")
+    assert [(c, k) for _, c, k in back] == [(1024, "host")] * idle
 
 
 if __name__ == "__main__":

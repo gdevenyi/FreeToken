@@ -481,3 +481,21 @@ def test_evict_host_drops_copies_lru_first():
     assert events(s)["evict_host.leaf_free"] == 1 and events(s)["evict_host.tombstone_in_place"] == 1
     s.check()
     assert s.do_match(chain)[0].cached_len == 4 * PAGE
+
+
+def test_a_full_bank_drops_a_superseded_copy_before_an_older_leaf():
+    """X and Y are internal host copies on one chain with no fork, so Y supersedes X (an edit after X
+    resumes at Y almost as well). The full bank drops X, not S's older leaf copy, which is S's only
+    resume point (and whose drop would take S's KV too)."""
+    s = Session(SPEC, host_slots=3)
+    s.do_insert(ids(5))                        # S, the oldest
+    s.do_insert(ids(1))                        # X
+    s.do_request(ids(1, 2), prompt_pages=1)    # Y
+    s.do_request(ids(1, 2, 3), prompt_pages=2)  # Z, the leaf of the chain
+    s.do_evict_second(3)                       # S, X and Y to the bank, which is now full
+    s.do_evict_second(1)                       # Z to the bank: X goes, though S is older
+    assert events(s)["evict_host.tombstone_in_place"] == 1 and events(s)["evict_host.leaf_free"] == 0
+    s.check()
+    assert s.do_match(ids(5))[0].host is not None
+    assert s.do_match(ids(1))[0].cached_len == 0
+    assert s.do_match(ids(1, 2))[0].host is not None
