@@ -1020,12 +1020,15 @@ def test_device_window_charge_counts_the_pages_of_the_last_w_tokens():
         64, 64, 128, 128, 192, 192, 192, 192]
 
 
+@pytest.mark.parametrize("overlap", [True, False])            # no spec / DFlash and MTP (normal_loop)
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
-def test_admitted_requests_always_find_device_pages_to_demote(monkeypatch, seed):
+def test_admitted_requests_always_find_device_pages_to_demote(monkeypatch, seed, overlap):
     """The device charge at admission (design 8.4) is what keeps demotion possible: requests that
     prefill in chunks and decode past W, on a device pool smaller than their reservations, always
     find their victims; the pages a request wrote in its last W tokens stay on the device; the
-    location table stays conserved at every step."""
+    location table stays conserved at every step. ``overlap`` launches the next batch before the
+    previous one drains, as the scheduler's overlap loop does (lengths advance at launch, tokens and
+    finishes at the drain), so a request can hold its row outside the decode set."""
     import random
 
     from freetoken import core
@@ -1036,6 +1039,7 @@ def test_admitted_requests_always_find_device_pages_to_demote(monkeypatch, seed)
     from freetoken.scheduler.table import TableManager
 
     rng, ps, window = random.Random(seed), 64, 256
+    gen = torch.Generator().manual_seed(seed)
     pool = _pool(num_slots=1 + 3 * 4 + 4)
     pt = torch.zeros(5, 64 * ps, dtype=torch.int32)
     cm = CacheManager(16, ps, pt, "hybrid_radix", linear_state_pool=pool, host_pages=48, device_window=window)
@@ -1045,54 +1049,61 @@ def test_admitted_requests_always_find_device_pages_to_demote(monkeypatch, seed)
     pm = PrefillManager(cm, tm, dm)
     stub = SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None)
     system = torch.arange(1, 129, dtype=torch.int32)
-    admitted_at, uid, finished = {}, 0, 0
+    admitted_at, uid, finished, waiting = {}, 0, 0, None
 
-    def live():
-        return [*dm.running_reqs, *(p.chunked_req for p in pm.pending_list if p.chunked_req is not None)]
+    def drain(done):
+        nonlocal finished
+        for r in done.reqs:
+            if r.table_idx == -1:
+                continue                                            # finished at an earlier drain
+            if isinstance(r, ChunkedReq):
+                cm.commit_chunk(r)
+                continue
+            r.append_host(torch.tensor([7], dtype=torch.int32))     # the sampled token
+            if r.input_ids.numel() == r.max_device_len or rng.random() < 0.01:
+                dm.remove_req(r)
+                Scheduler._free_req_resources(stub, r)
+                finished += 1
+            elif done.is_prefill:
+                cm.cache_req(r, finished=False)
 
     for _ in range(400):
         if len(pm.pending_list) < 2 and rng.random() < 0.3:
-            body = torch.randint(200, 30_000, (rng.randint(100, 700),), dtype=torch.int32)
+            body = torch.randint(200, 30_000, (rng.randint(100, 700),), dtype=torch.int32, generator=gen)
             prompt = torch.cat([system, body]) if rng.random() < 0.5 else body
             pm.add_one_req(SimpleNamespace(uid=uid, input_ids=prompt, sampling_params=SamplingParams(
                 max_tokens=rng.randint(50, 400)), mm_items=None, mrope_positions=None, mrope_delta=None))
             uid += 1
         # a prefill chunk is at most W tokens (production: 8192 against 65536), so it fits its window
         batch = pm.schedule_next_batch(window) if pm.runnable and rng.random() < 0.5 else None
+        if batch is None and dm.runnable:
+            batch = dm.schedule_next_batch()
         if batch is not None:
             admitted_at.update({u: c for u, _, c in batch.prompt_admissions})
             batch.padded_reqs = batch.reqs
-            cm.allocate_paged(batch.reqs, running=live())
-            build_fla_metadata(batch, torch.device("cpu"), pool)
-        elif dm.runnable:
-            batch = dm.schedule_next_batch()
+            cm.allocate_paged(batch.reqs)
+            if batch.is_prefill:
+                build_fla_metadata(batch, torch.device("cpu"), pool)
+            for r in batch.reqs:                                    # the window it wrote is on the device
+                # not the shared system block: a commit can dedup it onto demoted tree pages (no promotion, P3)
+                first = max(max(0, r.device_len - window) // ps, admitted_at[r.uid] // ps, len(system) // ps)
+                ids = pt[r.table_idx, first * ps : r.device_len : ps]
+                assert (cm.locations.table[(ids // ps).long()] >= 0).all()
+            cm.locations.check(cm.free_slots // ps)
             for r in batch.reqs:
-                r.append_host(torch.tensor([7], dtype=torch.int32))
-            cm.allocate_paged(batch.reqs, running=live())
-        else:
-            continue
-        for r in batch.reqs:                                        # the window it wrote is on the device
-            # not the shared system block: a commit can dedup it onto demoted tree pages (no promotion, P3)
-            first = max(max(0, r.device_len - window) // ps, admitted_at[r.uid] // ps, len(system) // ps)
-            ids = pt[r.table_idx, first * ps : r.device_len : ps]
-            assert (cm.locations.table[(ids // ps).long()] >= 0).all()
-        cm.locations.check(cm.free_slots // ps)
-        for r in batch.reqs:
-            r.complete_one()
-            if isinstance(r, ChunkedReq):
-                cm.commit_chunk(r)
-            elif batch.is_prefill:
-                cm.cache_req(r, finished=False)
-                dm.filter_reqs([r])
-            elif not r.can_decode or rng.random() < 0.01:
-                dm.remove_req(r)
-                Scheduler._free_req_resources(stub, r)
-                finished += 1
-    for r in list(dm.running_reqs):
+                r.complete_one()                                    # at launch (engine.forward_batch)
+            dm.filter_reqs(batch.reqs)                              # at launch (Scheduler._forward)
+        drained, waiting = ([waiting], batch) if overlap else ([batch], None)
+        for done in filter(None, drained):
+            drain(done)
+    if waiting is not None:
+        drain(waiting)
+    for r in list(cm.live_rows.values()):
         dm.remove_req(r)
         Scheduler._free_req_resources(stub, r)
-    print(f"seed {seed}: {uid} requests, {finished} finished, {cm.locations.demotions} demotions, "
-          f"refusals {cm.stats.refusals}")
+    cm.check_integrity()
+    print(f"seed {seed} overlap {overlap}: {uid} requests, {finished} finished, "
+          f"{cm.locations.demotions} demotions, refusals {cm.stats.refusals}")
     assert cm.locations.demotions > 0 and finished > 0
 
 

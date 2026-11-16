@@ -992,12 +992,7 @@ class Scheduler(SchedulerIOMixin):
                 req.widen_pending(batch.rows_per_req - 1)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
-        if self.cache_manager.locations is None:
-            self.cache_manager.allocate_paged(batch.reqs)
-        else:
-            # --kv-host-tokens: every request that holds pages is a demotion candidate
-            chunked = [p.chunked_req for p in self.prefill_manager.pending_list if p.chunked_req is not None]
-            self.cache_manager.allocate_paged(batch.reqs, running=[*self.decode_manager.running_reqs, *chunked])
+        self.cache_manager.allocate_paged(batch.reqs)
         if batch.phase == "verify" and batch.rows_per_req > 1:
             # the drafts run on the GPU while the host builds this batch's metadata below
             self.spec.propose_into(batch.reqs, self.token_pool)

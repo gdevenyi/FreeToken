@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -164,6 +163,9 @@ class CacheManager:
         if host_pages and not self.is_hybrid:
             raise ValueError("--kv-host-tokens needs the hybrid radix cache")
         self.locations = PageLocations(self.num_pages, num_pages, device) if host_pages else None
+        # with locations: table_idx -> the request that holds that row's pages (allocation to finish),
+        # also while it is in flight, so admission charges it and demotion sees its pages
+        self.live_rows: dict[int, Req] = {}
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
@@ -482,8 +484,9 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
-    def allocate_paged(self, reqs: List[Req], running: Iterable[Req] = ()) -> None:
-        """``running``: the other requests that hold pages (--kv-host-tokens: demotion candidates)."""
+    def allocate_paged(self, reqs: List[Req]) -> None:
+        if self.locations is not None:
+            self.live_rows.update({r.table_idx: r for r in reqs})
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
@@ -493,7 +496,7 @@ class CacheManager:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
         if needed_pages > 0:
-            rows = None if self.locations is None else self._rows(reqs, running)
+            rows = None if self.locations is None else self._rows()
             allocated = self._page_to_token(self._allocate(needed_pages, rows))
             if self.swa_paged:
                 # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
@@ -506,6 +509,8 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if finished and self.locations is not None:
+            self.live_rows.pop(req.table_idx, None)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -840,6 +845,7 @@ class CacheManager:
         self.free_slots = torch.arange(self.num_pages, dtype=torch.int32, device=device) * self.page_size
         if self.locations is not None:
             self.locations = PageLocations(self.num_pages, num_pages, device)
+            self.live_rows.clear()
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
@@ -915,14 +921,16 @@ class CacheManager:
                 out.append((n.host_tick, n.uuid, n.value[:: self.page_size] // self.page_size))
         return out
 
-    def _rows(self, reqs: Iterable[Req], running: Iterable[Req]) -> list:
+    def _rows(self) -> list:
         """(length, uid, placed page ids) of each request that holds pages; pages below cached_len are
         placed, and the window ends at device_len, where the coming forward ends."""
-        by_row = {r.table_idx: r for r in running}
-        by_row.update({r.table_idx: r for r in reqs})
         ps = self.page_size
         return [(r.device_len, r.uid, self.page_table[r.table_idx, : div_ceil(r.cached_len, ps) * ps : ps] // ps)
-                for r in by_row.values()]
+                for r in self.live_rows.values()]
+
+    def device_reserved(self, headroom: int) -> int:
+        """--kv-host-tokens: the device charge of every request that holds a row."""
+        return sum(self.device_charge(r.prompt_len + r.output_len + headroom) for r in self.live_rows.values())
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:

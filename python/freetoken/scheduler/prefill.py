@@ -250,7 +250,8 @@ class PrefillAdder:
         self.reserved_size += self._kv_reservation_size(
             pending_req.input_len + pending_req.output_len + self.token_headroom, cached_len
         )
-        if self.cache_manager.locations is not None:
+        if self.cache_manager.locations is not None and pending_req.chunked_req is None:
+            # a continuation's row is already in device_reserved (it holds pages)
             self.reserved_device += self.cache_manager.device_charge(
                 pending_req.input_len + pending_req.output_len + self.token_headroom)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
@@ -370,10 +371,8 @@ class PrefillManager:
 
         # estimated offset due to in-flight decode
         cm = self.cache_manager
-        reserved_device = 0 if cm.locations is None else sum(
-            cm.device_charge(r.max_device_len + self.token_headroom) for r in self.decode_manager.running_reqs)
         adder = PrefillAdder(
-            reserved_device=reserved_device,
+            reserved_device=0 if cm.locations is None else cm.device_reserved(self.token_headroom),
             token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
