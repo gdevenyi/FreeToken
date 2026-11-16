@@ -744,7 +744,7 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
 
 
 def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False,
-                  order=None):
+                  order=None, overlap=True):
     """A replay-like agent load: ``sessions`` sessions take turns round-robin (or in ``order``, one
     session index per turn), each turn sending the conversation so far plus a 64-token generation
     and a 256-token tool result. One request runs at a time with 16 idle snapshot slots
@@ -768,7 +768,7 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
         convs.append(c)
     for uid, s in enumerate(order):
         run = drive_prefill(cm, pm, pool, PendingReq(uid, convs[s], SamplingParams(max_tokens=4)),
-                            budget=512, overlap=True, on_forward=forward_writes(pool),
+                            budget=512, overlap=overlap, on_forward=forward_writes(pool),
                             on_launch=restore_and_check(pool, admitted))
         recomputed += len(convs[s]) - run.cached
         Scheduler._free_req_resources(stub, run.final)
@@ -824,9 +824,10 @@ def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, po
     assert any(kind == "host" for _, _, kind in now[0])
 
 
+@pytest.mark.parametrize("overlap", [True, False])            # no spec / DFlash and MTP (normal_loop)
 @pytest.mark.parametrize("late_copies", [False, True], ids=["copies_at_once", "copies_at_the_fence"])
 @pytest.mark.parametrize("policy", ["chunk", "structural"])
-def test_returning_agent_sessions_hit_their_own_host_snapshot(monkeypatch, policy, late_copies):
+def test_returning_agent_sessions_hit_their_own_host_snapshot(monkeypatch, policy, late_copies, overlap):
     """The measured production failure: 24 sessions exceed the 16 idle snapshot slots, so a session
     that returns after the others finds its snapshot evicted (with its leaf's KV) and recomputes its
     whole conversation, although the KV pool never filled. With a host bank of 64 slots, every
@@ -835,8 +836,8 @@ def test_returning_agent_sessions_hit_their_own_host_snapshot(monkeypatch, polic
     prompt end) suffice. (A bank below the sessions' working set misses on every return under
     round robin, as any LRU does.)"""
     turns, sessions, first, step = 3, 24, 1024, 320
-    _, off, _, off_counts = _agent_replay(monkeypatch, host_slots=0, policy=policy)
-    on_adm, on, _, on_counts = _agent_replay(monkeypatch, host_slots=64, policy=policy,
+    _, off, _, off_counts = _agent_replay(monkeypatch, host_slots=0, policy=policy, overlap=overlap)
+    on_adm, on, _, on_counts = _agent_replay(monkeypatch, host_slots=64, policy=policy, overlap=overlap,
                                              copies=CopiesAtTheFence() if late_copies else None)
     total = sum(first + t * step for t in range(turns)) * sessions
     new = sessions * (first + (turns - 1) * step)                    # the first turns and the new tokens
