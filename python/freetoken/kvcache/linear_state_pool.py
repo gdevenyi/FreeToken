@@ -53,6 +53,8 @@ class LinearStatePool:
         device: torch.device,
         tp_size: int | None = None,
         slot_states: tuple[SlotStateSpec, ...] = (),
+        host_slots: int = 0,
+        engine_stream: torch.cuda.Stream | None = None,
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
@@ -98,6 +100,83 @@ class LinearStatePool:
         self.verify_scratch: LinearVerifyScratch | None = None
         self._verify_handlers: dict[str, SlotVerify] = {}
         self._free_slots: list[int] = list(range(1, num_slots))
+        self._alloc_host_bank(host_slots, engine_stream)
+
+    def _slot_tensors(self) -> dict[str, torch.Tensor]:
+        """Every tensor a slot holds, ``[layers, num_slots, ...]`` each (re-read: rebuild replaces them)."""
+        return {"conv": self.conv_states, "recurrent": self.recurrent_states, **self.slot_states}
+
+    def _alloc_host_bank(self, host_slots: int, engine_stream: torch.cuda.Stream | None) -> None:
+        """--mamba-host-slots: one pinned host buffer per bank slot, so registration goes in pieces
+        of one slot, holding each slot tensor's layer rows (KV host tier design 3.1, 3.7)."""
+        from freetoken.moe.host_banks import HostBank
+
+        self._num_host_slots = max(0, int(host_slots))
+        self._free_host_slots: list[int] = list(range(self._num_host_slots))
+        self._host_views: list[dict[str, torch.Tensor]] = []
+        self.host_copies = _HostCopies(self._device, engine_stream)
+        if not self._num_host_slots:
+            return
+        layout, offset = {}, 0
+        for name, t in self._slot_tensors().items():
+            nbytes = t[:, 0].numel() * t.element_size()
+            layout[name] = (offset, t.dtype, (t.shape[0], *t.shape[2:]))
+            offset += -(-nbytes // 16) * 16  # 16-byte aligned, so each dtype view is legal
+        cuda = self._device.type == "cuda"
+        for _ in range(self._num_host_slots):
+            bank = HostBank((offset,), torch.uint8, backing=None if cuda else "mmap")
+            if cuda:
+                bank.pin()  # page-locked and device-mapped: the copies are async on the copy engine
+            self._host_views.append({
+                name: bank.tensor[o : o + math.prod(shape) * torch.empty((), dtype=dt).element_size()]
+                .view(dt).view(shape)
+                for name, (o, dt, shape) in layout.items()
+            })
+
+    @property
+    def num_host_slots(self) -> int:
+        return self._num_host_slots
+
+    @property
+    def num_free_host_slots(self) -> int:
+        return len(self._free_host_slots)
+
+    def host_bytes_per_slot(self) -> int:
+        if not self._host_views:
+            return 0
+        return sum(t.numel() * t.element_size() for t in self._host_views[0].values())
+
+    def alloc_host(self, n: int = 1) -> list[int]:
+        if n > len(self._free_host_slots):
+            raise RuntimeError(f"GDN host bank exhausted: need {n}, have {len(self._free_host_slots)}")
+        return [self._free_host_slots.pop() for _ in range(n)]
+
+    def free_host(self, slots) -> None:
+        self._free_host_slots.extend(int(s) for s in slots)
+
+    def reclaim_all_host_slots(self) -> None:
+        """Idle-only, as ``reclaim_all_slots``: the caller discards the tree that owned the bank slots."""
+        self._free_host_slots = list(range(self._num_host_slots))
+
+    def to_host(self, src: int, dst: int) -> None:
+        """Copy device slot ``src`` into bank slot ``dst`` (the caller then frees ``src``). Each layer row
+        is contiguous on both sides, so every copy is a plain memcpy and no temporary is made."""
+        self.host_copies.to_host([
+            (self._host_views[dst][name][li], t[li, src])
+            for name, t in self._slot_tensors().items() for li in range(t.shape[0])
+        ])
+
+    def from_host(self, src: int, dst: int) -> None:
+        """Copy bank slot ``src`` into device slot ``dst``, on the caller's (engine) stream after ``fence_host_copies``."""
+        self.host_copies.from_host([
+            (t[li, dst], self._host_views[src][name][li])
+            for name, t in self._slot_tensors().items() for li in range(t.shape[0])
+        ])
+
+    def fence_host_copies(self) -> None:
+        """Make the caller's stream wait for every ``to_host`` so far. The scheduler calls it on the
+        engine stream before each forward, so no slot a demotion freed is written before its copy."""
+        self.host_copies.fence()
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
@@ -174,6 +253,7 @@ class LinearStatePool:
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
+        self.reclaim_all_host_slots()  # the bank keeps its geometry; its tree is discarded too
 
     def free(self, slots) -> None:
         """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
@@ -304,6 +384,65 @@ class LinearVerifyScratch:
         pool.conv_states[:, slot_idx] = self.conv_window[:, row_idx, count - 1]
 
 
+class _HostCopies:
+    """The copies between device slots and the GDN host bank. CUDA: a device->host copy runs on a side
+    stream (the copy engine) behind the caller's and the engine stream; ``fence`` makes the caller's
+    stream wait for all of them. A host->device copy runs on the caller's stream. CPU: plain copies.
+    No decision reads the state of a copy: the copies only order streams."""
+
+    def __init__(self, device: torch.device, engine_stream: torch.cuda.Stream | None = None) -> None:
+        self.side = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.engine_stream = engine_stream
+        self._pending = False
+
+    def to_host(self, pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        if self.side is None:
+            for dst, src in pairs:
+                dst.copy_(src)
+            return
+        cur = torch.cuda.current_stream()
+        self.side.wait_stream(cur)
+        if self.engine_stream is not None and self.engine_stream != cur:
+            self.side.wait_stream(self.engine_stream)  # the forwards that wrote the snapshot
+        with torch.cuda.stream(self.side):
+            for dst, src in pairs:
+                dst.copy_(src, non_blocking=True)
+        self._pending = True
+
+    def from_host(self, pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        for dst, src in pairs:
+            dst.copy_(src, non_blocking=self.side is not None)
+
+    def fence(self) -> None:
+        if self._pending:
+            torch.cuda.current_stream().wait_stream(self.side)
+            self._pending = False
+
+
+# KV host tier design 3.7: the host bank must leave this much MemAvailable
+HOST_BANK_MIN_AVAILABLE = 32 * 2**30
+
+
+def _mem_available() -> int:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("/proc/meminfo has no MemAvailable")
+
+
+def check_host_bank_memory(nbytes: int, mem_available: int | None = None) -> None:
+    """Refuse a GDN host bank of ``nbytes`` (the sum over the local TP ranks) that would leave less
+    than 32 GiB MemAvailable."""
+    available = _mem_available() if mem_available is None else mem_available
+    if available - nbytes < HOST_BANK_MIN_AVAILABLE:
+        raise RuntimeError(
+            f"--mamba-host-slots asks for {nbytes / 2**30:.1f} GiB of pinned host memory with "
+            f"MemAvailable {available / 2**30:.1f} GiB: less than "
+            f"{HOST_BANK_MIN_AVAILABLE // 2**30} GiB would remain"
+        )
+
+
 def linear_state_bytes_per_req(
     group: LinearGatedDeltaGroupConfig,
     tp_size: int,
@@ -326,7 +465,7 @@ def linear_state_bytes_per_req(
     return int(total)
 
 
-__all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
+__all__ = ["LinearStatePool", "check_host_bank_memory", "linear_state_bytes_per_req"]
 
 
 _GDN_CHUNK_SIZE = 64  # keep in lockstep with kernel/fla/chunk_delta_h.py CHUNK_SIZE

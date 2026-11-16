@@ -232,3 +232,68 @@ def test_gdn_prefill_workspace_chunk_matches_the_kernel():
     from freetoken.kvcache.linear_state_pool import _GDN_CHUNK_SIZE
 
     assert _GDN_CHUNK_SIZE == CHUNK_SIZE
+
+
+# Every slot tensor of qwen4_exp at toy size, per spec mode (R7): the PLE conv history (per PLE layer)
+# and n-gram ids (int32, a fill value) in every mode, plus the draft's context window under DFlash.
+_PLE = (
+    SlotStateSpec(name="ple_conv", shape=(32, 9), layer_ids=(1,)),
+    SlotStateSpec(name="ple_ngram", shape=(2,), dtype=torch.int32, fill_value=7.0),
+)
+_DFLASH = (SlotStateSpec(name="dflash_window", shape=(10, 24)),)
+
+
+@pytest.mark.parametrize("slot_states", [(), _PLE, _PLE + _DFLASH], ids=["gdn_only", "ple_off_or_mtp", "ple_dflash"])
+def test_host_bank_round_trip_of_every_slot_tensor(slot_states):
+    """--mamba-host-slots: a snapshot demoted to the host bank and restored into another slot holds
+    the same bytes in every slot tensor, and the bank slot is as large as the device slot."""
+    pool = LinearStatePool(group=_group(), num_slots=6, dtype=torch.bfloat16, device=torch.device("cpu"),
+                           tp_size=1, slot_states=slot_states, host_slots=3)
+    assert (pool.num_host_slots, pool.num_free_host_slots) == (3, 3)
+    assert pool.host_bytes_per_slot() == pool.bytes_per_slot()
+    tensors = {"conv": pool.conv_states, "recurrent": pool.recurrent_states, **pool.slot_states}
+    assert set(tensors) == {"conv", "recurrent", *(s.name for s in slot_states)}
+    torch.manual_seed(0)
+    src, dst, other = pool.alloc(3)
+    for t in tensors.values():
+        t[:, src] = (torch.randint(-1000, 1000, t[:, src].shape) if t.dtype == torch.int32
+                     else torch.randn(t[:, src].shape)).to(t.dtype)
+        t[:, other] = 3
+    want = {name: t[:, src].clone() for name, t in tensors.items()}
+    a, b = pool.alloc_host(2)
+    pool.to_host(other, b)
+    pool.to_host(src, a)
+    for t in tensors.values():
+        t[:, src] = 0                                 # the device slot is free and reused
+    pool.fence_host_copies()
+    pool.from_host(a, dst)
+    for name, t in tensors.items():
+        assert torch.equal(t[:, dst], want[name]), name
+    pool.from_host(b, src)
+    for name, t in tensors.items():
+        assert bool((t[:, src] == 3).all()), name     # one bank slot does not overlap another
+    pool.free_host([a, b])
+    assert pool.num_free_host_slots == 3
+    pool.alloc_host(3)
+    with pytest.raises(RuntimeError, match="exhausted"):
+        pool.alloc_host(1)
+    pool.reclaim_all_host_slots()
+    assert pool.num_free_host_slots == 3
+
+
+def test_no_host_bank_by_default():
+    pool = _pool(slot_states=_PLE)
+    assert (pool.num_host_slots, pool.num_free_host_slots, pool.host_bytes_per_slot()) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(("available_gib", "ok"), [(64, True), (48, True), (47, False), (16, False)])
+def test_host_bank_refuses_to_leave_less_than_32_gib(available_gib, ok):
+    """Design 3.7: refuse to start when the bank of all local ranks leaves less than 32 GiB MemAvailable."""
+    from freetoken.kvcache.linear_state_pool import check_host_bank_memory
+
+    request = 2 * 8 * 2**30                           # 2 ranks x 8 GiB
+    if ok:
+        check_host_bank_memory(request, mem_available=available_gib * 2**30)
+    else:
+        with pytest.raises(RuntimeError, match="MemAvailable"):
+            check_host_bank_memory(request, mem_available=available_gib * 2**30)
