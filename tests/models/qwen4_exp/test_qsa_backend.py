@@ -326,3 +326,43 @@ def test_only_prefill_scores_in_row_tiles(monkeypatch):
     batch = SimpleNamespace(phase="prefill", reqs=reqs, padded_reqs=reqs)
     backend.prepare_metadata(batch)
     assert not backend._scores_in_row_tiles(batch.attn_metadata)
+
+
+def test_selection_stats_match_a_token_loop():
+    """P0 (KVSTATS qsa): the ages of the selected tokens behind each query row, and the share of a
+    request's selection (union over its verify rows) that its previous sample also selected."""
+    from freetoken.attention.qsa_sparse import QSA_SELECTION_AGES, qsa_selection_stats
+
+    gen = torch.Generator().manual_seed(3)
+    uids = [7, 7, 9, 9, 4, 4]                                     # two verify rows per request
+    positions = torch.tensor([300_000, 300_001, 70_000, 70_001, 20_000, 20_001], dtype=torch.int32)
+
+    def sample():
+        idx = torch.randint(0, 20_000, (6, 24), generator=gen, dtype=torch.int32)
+        idx = idx * (positions.unsqueeze(1) // 20_000) + torch.randint(0, 3, (6, 24), generator=gen, dtype=torch.int32)
+        idx[torch.rand(6, 24, generator=gen) < 0.2] = -1        # padding
+        idx[1, :12] = idx[0, :12]                                 # verify rows share blocks
+        return idx
+
+    first, second = sample(), sample()
+    second[2, :10] = first[3, :10]                                # request 9 keeps part of its selection
+    counts, prev = qsa_selection_stats(first, positions, uids, {})
+    counts, _ = qsa_selection_stats(second, positions, uids, prev)
+
+    want = {"rows": 6, "tokens": 0, "overlap_hits": 0, "overlap_tokens": 0, "overlap_reqs": 0}
+    want.update({f"old{a}": 0 for a in QSA_SELECTION_AGES})
+    for r in range(6):
+        for t in second[r].tolist():
+            if t >= 0:
+                want["tokens"] += 1
+                for a in QSA_SELECTION_AGES:
+                    want[f"old{a}"] += int(positions[r]) - t > a
+    for uid in dict.fromkeys(uids):
+        rows = [r for r in range(6) if uids[r] == uid]
+        cur = {t for r in rows for t in second[r].tolist() if t >= 0}
+        old = {t for r in rows for t in first[r].tolist() if t >= 0}
+        want["overlap_hits"] += len(cur & old)
+        want["overlap_tokens"] += len(cur)
+        want["overlap_reqs"] += 1
+    assert counts == want
+    assert want["old16384"] > 0 and want["overlap_hits"] > 0

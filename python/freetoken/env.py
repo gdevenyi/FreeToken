@@ -82,6 +82,8 @@ class EnvClassSingleton:
     GRAPH_UPLOAD = EnvBool(True)
     # seconds between KVSTATS log lines on TP rank 0 (prefix-cache, admission and accept-len counters); 0 = off
     KVSTATS_INTERVAL = EnvFloat(60.0)
+    # every N decode/verify steps, copy the QSA selection to the host for the KVSTATS line; 0 = off (no work)
+    QSA_SELECTION_STATS = EnvInt(0)
 
     def __new__(cls):
         # single instance

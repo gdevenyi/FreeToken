@@ -54,6 +54,8 @@ _SCORE_ROWS = 16  # prefill query rows per score program (qsa_mqa_paged_rows)
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
+# KVSTATS selection statistics: a selected token more than this far behind its query row counts as old
+QSA_SELECTION_AGES = (16384, 65536, 262144)
 
 
 def _resolve_block_topk() -> Callable | None:
@@ -586,5 +588,105 @@ class QSASparseAttnBackend(BaseAttnBackend):
         super().reset_capture()
         self._graph = {}
 
+    def selection_view(self, rows: int) -> torch.Tensor | None:
+        """The last QSA layer's selected token indices of a decode or verify step, rows ``[0, rows)``; None
+        without the static decode buffers (graphs off), where each step's selection is a transient."""
+        buffer = self._graph.get("indices")
+        return buffer[:rows] if buffer is not None and rows <= buffer.shape[0] else None
 
-__all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]
+
+def qsa_selection_stats(
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    row_uids: list[int],
+    previous: dict,
+    ages: tuple = QSA_SELECTION_AGES,
+) -> tuple[dict, dict]:
+    """Statistics of one sampled step's selection (host tensors).
+
+    ``indices [rows, w]``: selected token positions, -1 padded; ``positions [rows]``: each row's query position;
+    ``row_uids``: each row's request. Counts the selected tokens more than ``a`` positions behind their row for each
+    age ``a``, and for each request seen in ``previous`` (uid -> its last selection) how many tokens of its current
+    selection (the union over its rows) the previous one held. Returns (counts, uid -> current selection).
+    """
+    valid = indices >= 0
+    behind = positions.to(torch.int64).unsqueeze(1) - indices.to(torch.int64)
+    counts = {"rows": indices.shape[0], "tokens": int(valid.sum()), "overlap_hits": 0, "overlap_tokens": 0, "overlap_reqs": 0}
+    for a in ages:
+        counts[f"old{a}"] = int((valid & (behind > a)).sum())
+    uids = torch.tensor(row_uids)
+    current = {}
+    for uid in dict.fromkeys(row_uids):
+        rows = indices[uids == uid]
+        selection = torch.unique(rows[rows >= 0])
+        current[uid] = selection
+        if uid in previous:
+            counts["overlap_hits"] += int(torch.isin(selection, previous[uid]).sum())
+            counts["overlap_tokens"] += selection.numel()
+            counts["overlap_reqs"] += 1
+    return counts, current
+
+
+class QSASelectionSampler:
+    """``FREETOKEN_QSA_SELECTION_STATS=N``: every N decode or verify steps, copy the last QSA layer's selection of
+    the step to the host on the engine stream after the step (outside the graph, no change to its numerics) and
+    aggregate :func:`qsa_selection_stats` for the KVSTATS line. The overlap compares samples N steps apart."""
+
+    def __init__(self, every: int) -> None:
+        self.every = every
+        self.steps = 0
+        self.pending = None
+        self.previous: dict = {}
+        self.window: dict = {}
+        self.samples = self.skipped = 0
+
+    def after_forward(self, batch: Batch, backend) -> None:
+        self._take_ready()
+        self.steps += 1
+        if self.steps % self.every:
+            return
+        rows_per_req = batch.rows_per_req or 1
+        rows = len(batch.reqs) * rows_per_req
+        view = backend.selection_view(rows) if isinstance(backend, QSASparseAttnBackend) else None
+        if view is None or self.pending is not None:
+            self.skipped += 1
+            return
+        pin = torch.cuda.is_available()
+        indices = torch.empty(view.shape, dtype=view.dtype, pin_memory=pin).copy_(view, non_blocking=pin)
+        positions = torch.empty(rows, dtype=batch.positions.dtype, pin_memory=pin).copy_(batch.positions[:rows], non_blocking=pin)
+        event = None
+        if pin:
+            event = torch.cuda.Event()
+            event.record()
+        uids = [r.uid for r in batch.reqs for _ in range(rows_per_req)]
+        self.pending = (indices, positions, uids, event)
+
+    def _take_ready(self) -> None:
+        if self.pending is None or (self.pending[3] is not None and not self.pending[3].query()):
+            return
+        indices, positions, uids, _ = self.pending
+        self.pending = None
+        counts, current = qsa_selection_stats(indices, positions, uids, self.previous)
+        # requests missing from this sample have finished or left the batch
+        self.previous = current
+        self.samples += 1
+        for key, value in counts.items():
+            self.window[key] = self.window.get(key, 0) + value
+
+    def line(self) -> str | None:
+        """The window's ``qsa ...`` part of the KVSTATS line, or None without samples; starts a new window."""
+        self._take_ready()
+        if not self.samples and not self.skipped:
+            return None
+        w, tokens = self.window, self.window.get("tokens", 0)
+        old = " ".join(f"old{a // 1024}k={w.get(f'old{a}', 0) / tokens if tokens else 0:.3f}" for a in QSA_SELECTION_AGES)
+        hits, base = w.get("overlap_hits", 0), w.get("overlap_tokens", 0)
+        text = (
+            f"qsa samples={self.samples} skipped={self.skipped} rows={w.get('rows', 0)} tokens={tokens} {old} "
+            f"overlap={hits / base if base else 0:.3f}/{w.get('overlap_reqs', 0)}"
+        )
+        self.window, self.samples, self.skipped = {}, 0, 0
+        return text
+
+
+__all__ = ["QSASelectionSampler", "QSASparseAttnBackend", "QSASparseMetadata", "qsa_selection_stats"]

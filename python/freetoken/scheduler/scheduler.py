@@ -166,11 +166,17 @@ class Scheduler(SchedulerIOMixin):
         kv_stats_interval = float(ENV.KVSTATS_INTERVAL.value)
         kv_stats = config.tp_info.is_primary() and kv_stats_interval > 0
         self.cache_manager.set_stats_enabled(kv_stats)
+        # the qsa part rides the KVSTATS line, so it samples only where that line is written
+        self._qsa_selection = None
+        if kv_stats and ENV.QSA_SELECTION_STATS.value > 0:
+            from freetoken.attention.qsa_sparse import QSASelectionSampler
+
+            self._qsa_selection = QSASelectionSampler(ENV.QSA_SELECTION_STATS.value)
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
             moe_stats=self._moe_stats_line if config.moe_collect_stats and moe_cache is not None else None,
-            kv_stats=self.cache_manager.kv_stats_line if kv_stats else None,
+            kv_stats=self._kv_stats_line if kv_stats else None,
             kv_stats_interval=kv_stats_interval,
         )
 
@@ -181,6 +187,10 @@ class Scheduler(SchedulerIOMixin):
         # on the engine stream, so the read and the zeroing fall between decode replays
         with torch.cuda.stream(self.engine.stream):
             return self.engine.moe_offload_cache.decode_stats_line()
+
+    def _kv_stats_line(self) -> str | None:
+        qsa = self._qsa_selection.line() if self._qsa_selection is not None else None
+        return self.cache_manager.kv_stats_line(qsa)
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -1051,10 +1061,14 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         if batch.phase == "verify":
-            return self.spec.verify_step(batch, sample_args)
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+            forward_output = self.spec.verify_step(batch, sample_args)
+        else:
+            forward_output = self.engine.forward_batch(batch, sample_args)
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+            self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        # getattr: the drain tests run this method on a stub scheduler
+        if (sampler := getattr(self, "_qsa_selection", None)) is not None and not batch.is_prefill:
+            sampler.after_forward(batch, self.engine.backends_for(batch)[0])
         return forward_output
 
 
