@@ -981,6 +981,44 @@ def test_page_location_table_round_trip_and_reset(monkeypatch):
     cm.check_integrity()
 
 
+@pytest.mark.parametrize("device, host, prompt, max_tokens, admitted, cause", [
+    (64, 192, 24, 36, 2, "kvdev"),    # 4 reservations of 60 fit the 256 ids; 2 windows of 32 fill the 64 slots
+    (128, 128, 30, 70, 2, "kv"),      # 2 reservations of 100 fit the ids; the device would take 4 windows
+    (256, 0, 30, 70, 2, "kv"),        # no host pages: today's single check
+])
+def test_admission_charges_logical_ids_and_a_device_window(device, host, prompt, max_tokens, admitted, cause):
+    """Design 8.4: admission charges logical page ids for the whole reservation (prompt +
+    max_tokens) and device slots for its last W tokens only; running requests keep their window
+    charge. A request waits when either runs out."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool(num_slots=16)
+    pt = torch.zeros(4, 256, dtype=torch.int32)
+    cm = CacheManager(device, 1, pt, "hybrid_radix", linear_state_pool=pool, host_pages=host, device_window=32)
+    dm = DecodeManager(page_size=1)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=3, page_table=pt), dm)
+    pm.pending_list = [PendingReq(uid, torch.arange(1 + 1000 * uid, 1 + 1000 * uid + prompt, dtype=torch.int32),
+                                  SamplingParams(max_tokens=max_tokens)) for uid in range(3)]
+    batch = pm.schedule_next_batch(4096)
+    assert [r.uid for r in batch.reqs] == list(range(admitted))
+    assert cm.stats.refusals == {cause: (1, {admitted})}
+    cm.allocate_paged(batch.reqs)
+    dm.filter_reqs(batch.reqs)                                     # now decoding: the charges stay
+    assert pm.schedule_next_batch(4096) is None
+    assert cm.stats.refusals == {cause: (2, {admitted})}
+    assert f" {cause}=2/1" in cm.kv_stats_line()
+
+
+def test_device_window_charge_counts_the_pages_of_the_last_w_tokens():
+    pt = torch.zeros(1, 64, dtype=torch.int32)
+    cm = CacheManager(8, 64, pt, "hybrid_radix", linear_state_pool=_pool(), host_pages=8, device_window=128)
+    assert [cm.device_charge(n) for n in (1, 64, 65, 128, 129, 200, 256, 1000)] == [
+        64, 64, 128, 128, 192, 192, 128, 192]
+
+
 def test_no_location_table_without_kv_host_tokens(monkeypatch):
     _, cm, _, _ = _host_setup(monkeypatch, num_slots=8, host_slots=0, pages=8)
     assert cm.locations is None and cm.num_pages == cm.num_device_pages == 8

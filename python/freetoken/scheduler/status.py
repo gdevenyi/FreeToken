@@ -75,7 +75,8 @@ class KVStats:
         if not (self.admits or self.refusals or self.anchors or any(tree.values()) or any(s for s, _ in self.accept) or extra):
             return None
         refuse = " ".join(
-            f"{c}={self.refusals.get(c, (0, ()))[0]}/{len(self.refusals.get(c, (0, ()))[1])}" for c in REFUSAL_CAUSES
+            f"{c}={self.refusals.get(c, (0, ()))[0]}/{len(self.refusals.get(c, (0, ()))[1])}"
+            for c in REFUSAL_CAUSES + tuple(sorted(set(self.refusals) - set(REFUSAL_CAUSES)))  # kvdev: --kv-host-tokens only
         )
         accept = " ".join(
             f"{name}={(tokens / steps if steps else 0):.2f}/{steps}" for name, (steps, tokens) in zip(_ACCEPT_NAMES, self.accept)

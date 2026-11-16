@@ -63,6 +63,8 @@ class PrefillAdder:
     token_headroom: int = 0
     # a logprob read (max_tokens=1 + logprobs) neither resumes from nor feeds the prefix cache
     isolate_logprob_reads: bool = False
+    # --kv-host-tokens: device slots charged to the running requests and those admitted this pass
+    reserved_device: int = 0
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -99,6 +101,13 @@ class PrefillAdder:
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             stats.note_refusal("kv", req.uid)
             return None
+        cm = self.cache_manager
+        if cm.locations is not None:
+            # the whole reservation took logical ids above; the device holds only its last W tokens
+            device = cm.device_charge(req.input_len + req.output_len + self.token_headroom)
+            if device + self.reserved_device > cm.num_device_pages * cm.page_size:
+                stats.note_refusal("kvdev", req.uid)
+                return None
         self.cache_manager.lock(handle)
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             stats.note_refusal("kv", req.uid)
@@ -241,6 +250,9 @@ class PrefillAdder:
         self.reserved_size += self._kv_reservation_size(
             pending_req.input_len + pending_req.output_len + self.token_headroom, cached_len
         )
+        if self.cache_manager.locations is not None:
+            self.reserved_device += self.cache_manager.device_charge(
+                pending_req.input_len + pending_req.output_len + self.token_headroom)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -357,7 +369,11 @@ class PrefillManager:
             return None
 
         # estimated offset due to in-flight decode
+        cm = self.cache_manager
+        reserved_device = 0 if cm.locations is None else sum(
+            cm.device_charge(r.max_device_len + self.token_headroom) for r in self.decode_manager.running_reqs)
         adder = PrefillAdder(
+            reserved_device=reserved_device,
             token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,

@@ -265,6 +265,14 @@ class CacheManager:
             line += f" | host used={pool.num_host_slots - pool.num_free_host_slots}/{pool.num_host_slots}"
         return line
 
+    def device_charge(self, tokens: int) -> int:
+        """--kv-host-tokens: the device slots (tokens, whole pages) that the last device_window
+        tokens of a ``tokens`` reservation can span; older pages may be demoted to the host."""
+        pages = div_ceil(tokens, self.page_size)
+        if tokens > self.device_window:
+            pages -= (tokens - self.device_window) // self.page_size
+        return pages * self.page_size
+
     @property
     def available_size(self) -> int:
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
