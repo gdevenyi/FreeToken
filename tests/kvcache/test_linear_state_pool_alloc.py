@@ -243,11 +243,14 @@ _PLE = (
 _DFLASH = (SlotStateSpec(name="dflash_window", shape=(10, 24)),)
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a GPU: pinned bank, side stream, async copies"))])
 @pytest.mark.parametrize("slot_states", [(), _PLE, _PLE + _DFLASH], ids=["gdn_only", "ple_off_or_mtp", "ple_dflash"])
-def test_host_bank_round_trip_of_every_slot_tensor(slot_states):
+def test_host_bank_round_trip_of_every_slot_tensor(slot_states, device):
     """--mamba-host-slots: a snapshot demoted to the host bank and restored into another slot holds
-    the same bytes in every slot tensor, and the bank slot is as large as the device slot."""
-    pool = LinearStatePool(group=_group(), num_slots=6, dtype=torch.bfloat16, device=torch.device("cpu"),
+    the same bytes in every slot tensor, and the bank slot is as large as the device slot. The test
+    keeps the stream contract: a freed device slot is written only after fence_host_copies."""
+    pool = LinearStatePool(group=_group(), num_slots=6, dtype=torch.bfloat16, device=torch.device(device),
                            tp_size=1, slot_states=slot_states, host_slots=3)
     assert (pool.num_host_slots, pool.num_free_host_slots) == (3, 3)
     assert pool.host_bytes_per_slot() == pool.bytes_per_slot()
@@ -263,17 +266,21 @@ def test_host_bank_round_trip_of_every_slot_tensor(slot_states):
     a, b = pool.alloc_host(2)
     pool.to_host(other, b)
     pool.to_host(src, a)
+    pool.fence_host_copies()
     for t in tensors.values():
         t[:, src] = 0                                 # the device slot is free and reused
-    pool.fence_host_copies()
     pool.from_host(a, dst)
     for name, t in tensors.items():
         assert torch.equal(t[:, dst], want[name]), name
     pool.from_host(b, src)
     for name, t in tensors.items():
         assert bool((t[:, src] == 3).all()), name     # one bank slot does not overlap another
-    pool.free_host([a, b])
+    pool.rebuild(5)                                   # a cache rebuild keeps the bank's geometry
     assert pool.num_free_host_slots == 3
+    tensors = {"conv": pool.conv_states, "recurrent": pool.recurrent_states, **pool.slot_states}
+    pool.from_host(a, 2)
+    for name, t in tensors.items():
+        assert torch.equal(t[:, 2], want[name]), name
     pool.alloc_host(3)
     with pytest.raises(RuntimeError, match="exhausted"):
         pool.alloc_host(1)
