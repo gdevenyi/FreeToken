@@ -736,6 +736,29 @@ def test_linear_state_cache_ratio_flag_sets_the_gdn_snapshot_cache():
             parse("--linear-state-cache-ratio", bad)
 
 
+def test_kv_host_tokens_flag_is_refused_under_mtp():
+    """--kv-host-tokens (KV host tier design 8.7, R7 exception): v1 refuses it under MTP, whose draft
+    pool follows the page ids, when the flags are parsed, so before any weights load."""
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    class HF:
+        def to_dict(self):
+            return {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"}
+
+    def parse(*argv):
+        with patch("freetoken.utils.cached_load_hf_config", lambda _path: HF()):
+            return parse_args(["--model", "/models/anon", *argv])[0]
+
+    assert parse().kv_host_tokens == 0
+    assert parse("--kv-host-tokens", "2097152", "--spec-algo", "dflash").kv_host_tokens == 2097152
+    assert parse("--kv-host-tokens", "0", "--spec-algo", "mtp").kv_host_tokens == 0
+    for bad in (["--kv-host-tokens", "2097152", "--spec-algo", "mtp"], ["--kv-host-tokens", "-1"]):
+        with pytest.raises(SystemExit):
+            parse(*bad)
+
+
 def test_more_gdn_snapshot_slots_come_out_of_the_expert_cache():
     """Production sizes the expert cache from free memory (--moe-strategy offload, no cache-size
     flag) beside a fixed --num-tokens. The GDN state pool is fixed cost in that plan, so each extra

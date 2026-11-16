@@ -107,6 +107,9 @@ class EngineConfig:
     # --mamba-host-slots: GDN snapshots an idle prefix keeps in pinned host RAM once the device
     # snapshot cache needs its slot (hybrid radix only). 0 = off.
     mamba_host_slots: int = 0
+    # --kv-host-tokens: logical KV tokens beyond the device pool (two-level page pool; hybrid radix
+    # only). Bookkeeping only so far: the engine refuses a value above 0.
+    kv_host_tokens: int = 0
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the

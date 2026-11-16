@@ -26,6 +26,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import (
+    div_ceil,
     init_logger,
     load_eos_token_ids,
     load_tokenizer,
@@ -104,6 +105,7 @@ class Scheduler(SchedulerIOMixin):
             logprob_read_snapshot_donate=config.logprob_read_snapshot_donate,
             isolate_logprob_reads=config.logprob_read_isolate,
             snapshot_policy=getattr(config, "gdn_snapshot_policy", "chunk"),
+            host_pages=div_ceil(getattr(config, "kv_host_tokens", 0), config.page_size),
         )
         token_headroom = config.decode_rows_per_req - 1
         self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)

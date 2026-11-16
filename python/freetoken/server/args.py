@@ -617,6 +617,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-host-tokens",
+        type=int,
+        default=ServerArgs.kv_host_tokens,
+        help="Hybrid (GDN) models: logical KV tokens beyond the device pool, whose pages may live in "
+        "host RAM only (two-level page pool). Admission charges these logical pages for a whole "
+        "request and device pages only for its last 65536 tokens. Not with --spec-algo mtp. "
+        "Bookkeeping only so far: the engine refuses a value above 0. 0 (default) is off.",
+    )
+
+    parser.add_argument(
         "--logprob-read-isolate",
         action="store_true",
         default=ServerArgs.logprob_read_isolate,
@@ -1203,6 +1213,11 @@ def parse_args(
 
     if kwargs["mamba_host_slots"] < 0:
         parser.error("--mamba-host-slots must be 0 or more")
+    if kwargs["kv_host_tokens"] < 0:
+        parser.error("--kv-host-tokens must be 0 or more")
+    if kwargs["kv_host_tokens"] and kwargs["speculative_algorithm"] == "mtp":
+        # the MTP draft pool follows the page ids (KV host tier design R7 exception)
+        parser.error("--kv-host-tokens cannot be used with --spec-algo mtp")
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

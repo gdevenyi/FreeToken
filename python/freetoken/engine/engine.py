@@ -532,6 +532,9 @@ class Engine:
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        if config.kv_host_tokens:
+            # the scheduler keeps the page locations, but the kernels still read page ids as device slots
+            raise NotImplementedError("--kv-host-tokens: the attention kernels do not read the page location table yet")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
