@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 from dataclasses import dataclass, field
@@ -194,6 +195,15 @@ def parse_args(
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
+
+    def _snapshot_cache_ratio(value: str) -> float:
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number") from exc
+        if not math.isfinite(ratio) or ratio < 0:
+            raise argparse.ArgumentTypeError("must be a finite number >= 0")
+        return ratio
 
     def _valid_port(value: str) -> int:
         try:
@@ -572,6 +582,15 @@ def parse_args(
         "with logprobs, e.g. AnyJev label scoring) donates to the prefix cache. 'all' (default): "
         "the x64 prefill boundary and the final state; 'boundary': only the former; 'none': "
         "neither, so a burst of reads cannot evict other conversations' snapshots.",
+    )
+
+    parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=_snapshot_cache_ratio,
+        default=ServerArgs.linear_state_cache_ratio,
+        help="Hybrid (GDN) models: idle state snapshots the prefix cache can hold, as a multiple of "
+        "--max-running-requests (at least 4). Each slot is one request's whole GDN state; with "
+        "--moe-cache-auto the slots come out of the expert cache.",
     )
 
     parser.add_argument(
