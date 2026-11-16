@@ -13,6 +13,8 @@ from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
 
+from .gdn_prefill import drive_prefill
+
 
 def _pool(num_slots=16):
     g = LinearGatedDeltaGroupConfig(
@@ -248,9 +250,8 @@ def test_snapshot_placement_on_a_cold_long_prefill(monkeypatch, prompt_len, poli
     tokens before its chunk end, so the DFlash window copied with it holds its own rows, and the
     finished request resumes at the same length under both policies."""
     from freetoken import core
-    from freetoken.attention.linear import build_fla_metadata
     from freetoken.scheduler.decode import DecodeManager
-    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.prefill import PrefillManager
     from freetoken.scheduler.scheduler import Scheduler
     from freetoken.scheduler.table import TableManager
     from freetoken.scheduler.utils import PendingReq
@@ -275,28 +276,16 @@ def test_snapshot_placement_on_a_cold_long_prefill(monkeypatch, prompt_len, poli
     pc = cm.prefix_cache
     tm = TableManager(max_running_reqs=1, page_table=pt)
     pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
-    pm.pending_list = [PendingReq(0, prompt, SamplingParams(max_tokens=8))]
-    tracked, tails, tree_max, final, pending = [], [], 0, None, None
-    while pm.runnable or pending is not None:
-        batch = pm.schedule_next_batch(budget)
-        if batch is not None:
-            batch.padded_reqs = batch.reqs
-            cm.allocate_paged(batch.reqs)
-            (req,) = batch.reqs
-            if build_fla_metadata(batch, torch.device("cpu"), pool).track_dst is not None:
-                tracked.append((req.mamba_last_track_seqlen, req.device_len))
-            req.complete_one()
-        drained, pending = ([pending], batch) if overlap else ([batch], None)
-        for done in filter(None, drained):            # as Scheduler._process_last_data
-            (r,) = done.reqs
-            if isinstance(r, ChunkedReq):
-                cm.commit_chunk(r)
-            else:
-                cm.cache_req(r, finished=False)
-                final = r
-            tails.append(resume(prompt, r.cached_len))
-            tree_max = max(tree_max, pc.mamba_evictable_size + pc.mamba_protected)
-    Scheduler._free_req_resources(SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None), final)
+    tails, tree = [], []
+
+    def after_drain(r):
+        tails.append(resume(prompt, r.cached_len))
+        tree.append(pc.mamba_evictable_size + pc.mamba_protected)
+
+    run = drive_prefill(cm, pm, pool, PendingReq(0, prompt, SamplingParams(max_tokens=8)),
+                        budget=budget, overlap=overlap, on_drain=after_drain)
+    tracked, tree_max = run.tracks, max(tree)
+    Scheduler._free_req_resources(SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None), run.final)
 
     alive = sum(resume(ids, len(ids)) == ps for ids in sessions)
     # the prompt end's track. "chunk" (today): 213,000 ends on an 8-token chunk, so the chunk before
@@ -335,9 +324,8 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
     dropped, the old prompt end branches into the old generation and the new prompt. The cost: an
     edited last message resumes at the root, not at the turn before (design section 6)."""
     from freetoken import core
-    from freetoken.attention.linear import build_fla_metadata
     from freetoken.scheduler.decode import DecodeManager
-    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.prefill import PrefillManager
     from freetoken.scheduler.scheduler import Scheduler
     from freetoken.scheduler.table import TableManager
     from freetoken.scheduler.utils import PendingReq
@@ -356,26 +344,10 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
     prompt[319] = turn                                 # the system block ends at 320
     resumed, anchors, ends = [], [], []
     for k in range(turns):
-        pm.pending_list = [PendingReq(k, prompt, SamplingParams(max_tokens=256, ignore_eos=True))]
-        final, pending = None, None
-        while pm.runnable or pending is not None:
-            batch = pm.schedule_next_batch(256)
-            if batch is not None:
-                batch.padded_reqs = batch.reqs
-                cm.allocate_paged(batch.reqs)
-                if build_fla_metadata(batch, torch.device("cpu"), pool).track_dst is not None:
-                    last_track = batch.reqs[0].mamba_last_track_seqlen
-                if batch.prompt_admissions:
-                    resumed.append(batch.prompt_admissions[0][2])
-                batch.reqs[0].complete_one()
-            drained, pending = ([pending], batch) if overlap else ([batch], None)
-            for done in filter(None, drained):
-                (r,) = done.reqs
-                if isinstance(r, ChunkedReq):
-                    cm.commit_chunk(r)
-                else:
-                    cm.cache_req(r, finished=False)
-                    final = r
+        run = drive_prefill(cm, pm, pool, PendingReq(k, prompt, SamplingParams(max_tokens=256, ignore_eos=True)),
+                            budget=256, overlap=overlap)
+        final = run.final
+        resumed.append(run.cached)
         # decode; the tool-call opener closes a page, so the anchor snapshot is page-aligned
         anchor = (len(prompt) // ps + 2) * ps
         final.toolcall_anchor_len = None if diverge == "resend" else anchor
@@ -385,7 +357,7 @@ def test_snapshots_per_path_over_agent_turns(monkeypatch, policy, overlap, radix
             cm.snapshot_toolcall_anchor([final])
             final.complete_one()
         anchors.append(anchor)
-        ends.append(last_track)
+        ends.append(run.tracks[-1][0])                 # the prompt-end snapshot
         keep = {"anchor": anchor + 8, "prompt_end": len(prompt), "resend": final.input_ids.numel()}[diverge]
         conversation = final.input_ids[:keep].clone()
         Scheduler._free_req_resources(stub, final)
@@ -421,9 +393,8 @@ def test_fork_snapshot_and_pinned_roots(monkeypatch, policy, overlap, radix_look
     third session and which the cap keeps as a fork. At most 4 first-turn roots stay pinned (the
     least recently used loses its pin), and evict_mamba takes them only after every other one."""
     from freetoken import core
-    from freetoken.attention.linear import build_fla_metadata
     from freetoken.scheduler.decode import DecodeManager
-    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.prefill import PrefillManager
     from freetoken.scheduler.scheduler import Scheduler
     from freetoken.scheduler.table import TableManager
     from freetoken.scheduler.utils import PendingReq
@@ -449,26 +420,10 @@ def test_fork_snapshot_and_pinned_roots(monkeypatch, policy, overlap, radix_look
         systems.append(d)
     resumed = []
     for uid, prompt in enumerate([a, b, c, *systems]):
-        pm.pending_list = [PendingReq(uid, prompt, SamplingParams(max_tokens=4))]
-        final, pending = None, None
-        while pm.runnable or pending is not None:
-            batch = pm.schedule_next_batch(8192)
-            if batch is not None:
-                batch.padded_reqs = batch.reqs
-                cm.allocate_paged(batch.reqs)
-                build_fla_metadata(batch, torch.device("cpu"), pool)
-                if batch.prompt_admissions:
-                    resumed.append(batch.prompt_admissions[0][2])
-                batch.reqs[0].complete_one()
-            drained, pending = ([pending], batch) if overlap else ([batch], None)
-            for done in filter(None, drained):
-                (r,) = done.reqs
-                if isinstance(r, ChunkedReq):
-                    cm.commit_chunk(r)
-                else:
-                    cm.cache_req(r, finished=False)
-                    final = r
-        Scheduler._free_req_resources(stub, final)
+        run = drive_prefill(cm, pm, pool, PendingReq(uid, prompt, SamplingParams(max_tokens=4)),
+                            budget=8192, overlap=overlap)
+        resumed.append(run.cached)
+        Scheduler._free_req_resources(stub, run.final)
 
     pc = cm.prefix_cache
     # b resumes at a's root (structural) and leaves a's path at 576; c resumes at that branch point
