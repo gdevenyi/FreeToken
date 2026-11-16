@@ -23,27 +23,31 @@ K = 3
 PROMPT = 12
 
 
-def _setup():
+def _setup(page_size=1, width=64):
     group = LinearGatedDeltaGroupConfig(
         name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
         key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
     )
     pool = LinearStatePool(group=group, num_slots=16, dtype=torch.bfloat16, device=torch.device("cpu"), tp_size=1)
-    page_table = torch.zeros(4, 64, dtype=torch.int32)
-    cm = CacheManager(128, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+    page_table = torch.zeros(4, width, dtype=torch.int32)
+    cm = CacheManager(128 if page_size == 1 else 4 * width // page_size, page_size, page_table, "hybrid_radix",
+                      linear_state_pool=pool)
     tm = TableManager(max_running_reqs=4, page_table=page_table)
-    dm = DecodeManager(page_size=1, token_headroom=K)
+    dm = DecodeManager(page_size=page_size, token_headroom=K)
     pm = PrefillManager(cm, tm, dm, token_headroom=K)
 
     events = []
-    engine = SimpleNamespace(
-        commit_verify=lambda reqs, counts, out: events.append(("commit", [r.uid for r in reqs], list(counts))),
-    )
+
+    def commit_verify(reqs, counts, out):
+        events.append(("commit", [r.uid for r in reqs], list(counts)))
+        for r in reqs:  # a stand-in GDN state: the length its live slot has consumed
+            pool.recurrent_states[:, r.linear_slot_idx] = r.cached_len
 
     stub = SimpleNamespace(
-        cache_manager=cm, table_manager=tm, decode_manager=dm, prefill_manager=pm, spec=None, engine=engine,
+        cache_manager=cm, table_manager=tm, decode_manager=dm, prefill_manager=pm, spec=None,
+        engine=SimpleNamespace(commit_verify=commit_verify),
         config=SimpleNamespace(decode_rows_per_req=K + 1), device=torch.device("cpu"),
-        token_pool=torch.zeros(4, 64, dtype=torch.int32), eos_token_ids=set(), toolcall_anchor_id=None,
+        token_pool=torch.zeros(4, width, dtype=torch.int32), eos_token_ids=set(), toolcall_anchor_id=None,
         _match_stop_str=lambda _req: None,
     )
 
@@ -310,3 +314,63 @@ def test_a_one_token_read_takes_its_logprobs_from_the_prefill_sample(monkeypatch
     assert by_uid[2].top_logprobs == pytest.approx(expected[order].tolist())
     assert by_uid[1].chosen_logprob is None and not by_uid[1].finished
     assert ("draft", [int(logits[0].argmax()), token]) in events  # the draft still saw the prefill sample
+
+
+OPENER = 9
+
+
+# (prompt length, verify steps as (4 row tokens, accepted drafts), anchor, snapshot taken, KVSTATS outcome)
+ANCHOR_CASES = {
+    # the opener in the middle of an accepted block: the anchor is its position + 1, and cached_len jumps past it
+    "mid_block": (61, [([11, OPENER, 13, 14], 3), ([21, 22, 23, 24], 3)], 64, False, "jumped"),
+    # the opener second to last of the block: cached_len lands on the page-aligned anchor
+    "lands": (60, [([11, 12, OPENER, 14], 3), ([21, 22, 23, 24], 3)], 64, True, "snapshot"),
+    "lands_unaligned": (61, [([11, 12, OPENER, 14], 3), ([21, 22, 23, 24], 3)], 65, False, "unaligned"),
+    # the opener is the step's own token: the next step lands only when it accepts no draft
+    "last_then_one": (59, [([11, 12, 13, OPENER], 3), ([21, 22, 23, 24], 0), ([31, 32, 33, 34], 3)], 64, True, "snapshot"),
+    "last_then_jump": (59, [([11, 12, 13, OPENER], 3), ([21, 22, 23, 24], 3)], 64, False, "jumped"),
+}
+
+
+@pytest.mark.parametrize("case", list(ANCHOR_CASES))
+def test_toolcall_anchor_under_verify_steps(case):
+    """--enable-special-token-ckpt under DFlash or MTP: every decode step is a verify step that
+    commits 1-4 tokens. The anchor is the opener's position + 1 wherever it lands in the block; the
+    state is frozen only when cached_len equals a page-aligned anchor, and then it is the state at
+    the anchor; a step that jumps past it freezes nothing, at no other position."""
+    c0, steps, anchor, frozen, outcome = ANCHOR_CASES[case]
+    pool, cm, tm, _dm, stub, _events = _setup(page_size=64, width=256)
+    stub.toolcall_anchor_id = OPENER
+    prompt = torch.arange(100, 100 + c0, dtype=torch.int32)
+    match = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=c0))
+    req = Req(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=64, uid=1,
+              sampling_params=SamplingParams(max_tokens=64, ignore_eos=True), cache_handle=match.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    cm.lock(match.cuda_handle)
+    cm.allocate_paged([req])
+    req.complete_one()                                  # the prefill: the first output token is pending at c0
+    req.append_host(torch.tensor([7], dtype=torch.int32))
+    pool.recurrent_states[:, req.linear_slot_idx] = c0
+    seen = []
+    for tokens, emitted in steps:
+        req.widen_pending(K)                            # Scheduler._prepare_batch
+        cm.allocate_paged([req])
+        cm.snapshot_toolcall_anchor([req])              # Scheduler._forward, before the verify kernels
+        seen.append(req.mamba_last_track_seqlen)
+        out = torch.tensor([tokens])
+        output = SimpleNamespace(next_tokens_gpu=out, next_tokens_cpu=out, emitted_cpu=torch.tensor([emitted]))
+        Scheduler._drain_verify(stub, Batch(reqs=[req], phase="verify", rows_per_req=K + 1), output, [], set())
+        assert req.toolcall_anchor_len in (None, anchor)
+    cm.snapshot_toolcall_anchor([req])                  # the next step's forward
+    seen.append(req.mamba_last_track_seqlen)
+    assert req.toolcall_anchor_len == anchor
+    assert set(seen) == ({None, anchor} if frozen else {None})   # frozen at the anchor or nowhere
+    if frozen:
+        assert torch.all(pool.recurrent_states[:, req.mamba_ping_pong[1 - req.mamba_next_track_idx]] == anchor)
+    stub._free_req_resources(req)
+    hit = cm.match_req(SimpleNamespace(input_ids=req.input_ids[: anchor + 1], input_len=anchor + 1))
+    assert hit.cuda_handle.cached_len == (anchor if frozen else 0)
+    if frozen:
+        assert torch.all(pool.recurrent_states[:, hit.mamba_value] == anchor)
+    assert cm.stats.anchors == {"opener": 1, outcome: 1}   # KVSTATS: each anchor counted once
+    cm.check_integrity()

@@ -260,18 +260,34 @@ class CacheManager:
         pool = self.linear_state_pool
         for r in reqs:
             a = r.toolcall_anchor_len
+            if a is None:
+                continue
             if (
-                a is None
-                or r.mamba_ping_pong is None
+                r.mamba_ping_pong is None
                 or r.mamba_last_track_seqlen is not None
                 or r.cached_len != a
                 or align_down(a, self.page_size) != a
             ):
+                # a verify step commits up to k + 1 tokens, so cached_len can pass the anchor
+                if not r.toolcall_anchor_counted and r.cached_len >= a:
+                    self._count_anchor(r, "jumped" if r.cached_len > a else "other")
                 continue
             dst = r.mamba_ping_pong[r.mamba_next_track_idx]
             pool.copy_from(r.linear_slot_idx, dst)
             r.mamba_last_track_seqlen = a
             r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+            self._count_anchor(r, "snapshot")
+
+    def note_toolcall_opener(self, req: Req) -> None:
+        """KVSTATS: a tool-call opener set ``req.toolcall_anchor_len``."""
+        self.stats.note_anchor("opener")
+        a = req.toolcall_anchor_len
+        if self.is_hybrid and align_down(a, self.page_size) != a:
+            self._count_anchor(req, "unaligned")
+
+    def _count_anchor(self, req: Req, outcome: str) -> None:
+        req.toolcall_anchor_counted = True
+        self.stats.note_anchor(outcome)
 
     def maybe_free_swa_out_of_window(self, reqs: List[Req]) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
@@ -444,6 +460,8 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         if finished:
+            if req.toolcall_anchor_len is not None and not req.toolcall_anchor_counted:
+                self._count_anchor(req, "other")  # KVSTATS: finished before cached_len reached it
             # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
             # finished too early to chunk-commit) is a strictly shorter prefix than the live
             # donate below: insert it first and advance the dedup-free floor to its boundary

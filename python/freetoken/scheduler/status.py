@@ -11,6 +11,8 @@ from freetoken.core import Batch
 ACCEPT_BUCKETS = (32768, 131072, 262144)
 _ACCEPT_NAMES = ("<32k", "32-128k", "128-256k", ">=256k")
 REFUSAL_CAUSES = ("kv", "table", "gdn", "swa")
+# tool-call openers seen, and what became of each anchor (hybrid GDN, --enable-special-token-ckpt)
+ANCHOR_OUTCOMES = ("opener", "snapshot", "unaligned", "jumped", "other")
 
 
 @dataclass
@@ -30,6 +32,7 @@ class KVStats:
     evicted_tokens: int = 0  # the evicted nodes' lengths (a lower bound of the loss)
     cold_admits: int = 0     # no KV match at all
     refusals: dict = field(default_factory=dict)  # cause -> (events, set of uids)
+    anchors: dict = field(default_factory=dict)   # tool-call openers seen and each anchor's outcome
     accept: list = field(default_factory=lambda: [[0, 0] for _ in _ACCEPT_NAMES])  # [steps, tokens]
 
     def note_admission(self, walk_len: int, cached_len: int, evicted_len: int) -> None:
@@ -54,6 +57,11 @@ class KVStats:
         uids.add(uid)
         self.refusals[cause] = (events + 1, uids)
 
+    def note_anchor(self, kind: str) -> None:
+        if not self.enabled:
+            return
+        self.anchors[kind] = self.anchors.get(kind, 0) + 1
+
     def note_accept(self, context_len: int, committed: int) -> None:
         if not self.enabled:
             return
@@ -64,7 +72,7 @@ class KVStats:
     def line(self, tree: Mapping[str, int] | None = None, extra: str | None = None) -> str | None:
         """The window's ``KVSTATS`` line, or None when nothing happened; starts a new window."""
         tree = dict(tree or {})
-        if not (self.admits or self.refusals or any(tree.values()) or any(s for s, _ in self.accept) or extra):
+        if not (self.admits or self.refusals or self.anchors or any(tree.values()) or any(s for s, _ in self.accept) or extra):
             return None
         refuse = " ".join(
             f"{c}={self.refusals.get(c, (0, ()))[0]}/{len(self.refusals.get(c, (0, ()))[1])}" for c in REFUSAL_CAUSES
@@ -81,6 +89,7 @@ class KVStats:
             f"refuse {refuse}",
             "tree " + (" ".join(f"{k}={v}" for k, v in sorted(tree.items())) or "-"),
             f"accept {accept}",
+            "anchor " + " ".join(f"{k}={self.anchors.get(k, 0)}" for k in ANCHOR_OUTCOMES),
         ]
         if extra:
             parts.append(extra)

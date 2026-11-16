@@ -165,6 +165,7 @@ class Req:
     # reaches it (snapshot_toolcall_anchor) and donated at finish. SWA: caps the proactive
     # out-of-window eviction so the window ending here stays resumable.
     toolcall_anchor_len: int | None = None
+    toolcall_anchor_counted: bool = False            # KVSTATS: this anchor's outcome is counted (statistics only)
     # Abort arrived while this request's forward was in flight (overlap scheduling). The abort
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).

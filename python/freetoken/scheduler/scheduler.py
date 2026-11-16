@@ -536,6 +536,7 @@ class Scheduler(SchedulerIOMixin):
                 break
             if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
                 req.toolcall_anchor_len = req.input_ids.numel()
+                self.cache_manager.note_toolcall_opener(req)
         msg = DetokenizeMsg(
             uid=req.uid,
             next_tokens=committed,
