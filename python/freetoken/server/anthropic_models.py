@@ -97,6 +97,9 @@ class AnthropicMessagesRequest(BaseModel):
     # Native extended-thinking toggle: {"type": "enabled"|"disabled", "budget_tokens": N}.
     # budget_tokens is accepted but not enforced (stateless subset).
     thinking: dict[str, Any] | None = None
+    # {"effort": "low"|"medium"|"high"|"max"}: folded into the template kwargs the
+    # way the Responses API folds reasoning.effort; other keys are ignored.
+    output_config: dict[str, Any] | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
@@ -118,6 +121,7 @@ class AnthropicCountTokensRequest(BaseModel):
     messages: list[AnthropicMessage]
     system: str | list[AnthropicContentBlock] | None = None
     thinking: dict[str, Any] | None = None
+    output_config: dict[str, Any] | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
 

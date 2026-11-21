@@ -27,7 +27,7 @@ if _PY not in sys.path:
 from freetoken.message import UserMsg  # noqa: E402
 from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import anthropic_api as A  # noqa: E402
-from freetoken.server.anthropic_models import AnthropicMessagesRequest  # noqa: E402
+from freetoken.server.anthropic_models import AnthropicCountTokensRequest, AnthropicMessagesRequest  # noqa: E402
 from freetoken.server.function_call_parser import ToolCallItem  # noqa: E402
 from freetoken.server.generation import (  # noqa: E402
     ContentDelta,
@@ -729,6 +729,49 @@ def test_convert_native_thinking_toggle():
     assert off.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
     absent = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(base), {})
     assert absent.chat_template_kwargs == {}
+
+
+def test_convert_output_config_effort():
+    """output_config.effort folds in as the Responses API's reasoning.effort does."""
+    base = {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+
+    def ctk(**extra):
+        req = AnthropicMessagesRequest.model_validate({**base, **extra})
+        return A.convert_anthropic_to_genspec(req, {}).chat_template_kwargs
+
+    on = {"enable_thinking": True, "thinking_mode": "enabled"}
+    off = {"enable_thinking": False, "thinking_mode": "disabled"}
+    assert ctk(output_config={"effort": "low"}) == {**on, "reasoning_effort": "low"}
+    assert ctk(output_config={"effort": " MAX "}) == {**on, "reasoning_effort": "max"}
+    # an explicit thinking type decides on/off; "disabled" wins over any effort
+    assert ctk(output_config={"effort": "high"}, thinking={"type": "disabled"}) == off
+    assert ctk(output_config={"effort": "high"}, thinking={"type": "adaptive"}) == {**on, "reasoning_effort": "high"}
+    assert ctk(output_config={"effort": "none"}) == off
+    # no effort (or an empty one, or other output_config keys only): the old behavior
+    assert ctk(output_config={}) == {}
+    assert ctk(output_config={"effort": ""}, thinking={"type": "enabled"}) == on
+    assert ctk(output_config={"format": {"type": "json_schema"}}) == {}
+
+
+def test_output_config_effort_obeys_server_thinking_policy():
+    req = AnthropicMessagesRequest.model_validate(
+        {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
+         "output_config": {"effort": "high"}}
+    )
+    forced_off = A.convert_anthropic_to_genspec(req, {}, thinking="off").chat_template_kwargs
+    assert "reasoning_effort" not in forced_off
+    assert forced_off["enable_thinking"] is False
+
+
+def test_count_tokens_prompt_matches_messages_prompt_with_effort():
+    body = {"model": "claude-x", "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "medium"}}
+    counted = A.convert_anthropic_prompt(AnthropicCountTokensRequest.model_validate(body))
+    generated = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}))
+    assert counted == generated
+    assert counted[3]["reasoning_effort"] == "medium"
+
+
 
 
 # --------------------------------------------------------------------------- #
