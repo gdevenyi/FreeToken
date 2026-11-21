@@ -207,7 +207,9 @@ def measure_cpu_mem_bw(
     DRAM, capped at half the available RAM (dropping worker count rather than under-
     sizing a slice) so the fill can't OOM the box.
     """
-    n_threads, cores = resolve_threads_and_affinity(num_threads)
+    from freetoken.moe.cpu_executor import _tp_rank_and_size
+
+    n_threads, cores = resolve_threads_and_affinity(num_threads, *_tp_rank_and_size())
 
     total_bytes = max(min_total_bytes, n_threads * per_core_bytes)
     cap = _available_ram_bytes() // 2
@@ -1104,6 +1106,12 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                         "nvidia-smi index (default: the first visible GPU)")
     p.add_argument("--cpu-threads", type=_nonneg_int, default=0,
                    help="CPU worker threads (0 = one per physical core)")
+    p.add_argument("--tp-size", type=_positive_int, default=1,
+                   help="bench one rank of a tensor-parallel server: its expert shard (the MoE intermediate "
+                        "divided by the TP size, which the row keys) and its block of the physical cores. "
+                        "For production's split, run one bench per GPU at the same time, each with its own "
+                        "--gpu and --tp-rank, so the ranks share the host as the server's do")
+    p.add_argument("--tp-rank", type=_nonneg_int, default=0, help="the rank --tp-size benches (default 0)")
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
     p.add_argument("--pcie-mib", type=_positive_int, default=256, help="linear PCIe copy size in MiB")
     p.add_argument("--pcie-iters", type=_positive_int, default=30, help="linear PCIe copies to time")
@@ -1112,6 +1120,13 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p.add_argument("--kernel-pcie-iters", type=_positive_int, default=20,
                    help="fast_index_copy gather passes to time")
     ns = p.parse_args(argv)
+    if ns.tp_rank >= ns.tp_size:
+        p.error(f"--tp-rank {ns.tp_rank} must be below --tp-size {ns.tp_size}")
+    if ns.tp_size > 1:
+        from freetoken.distributed import set_tp_info, try_get_tp_info
+
+        if try_get_tp_info() is None:
+            set_tp_info(rank=ns.tp_rank, size=ns.tp_size)
 
     # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
     try:

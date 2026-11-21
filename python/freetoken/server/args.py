@@ -606,6 +606,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mamba-host-slots",
+        type=int,
+        default=ServerArgs.mamba_host_slots,
+        help="Hybrid (GDN) models: GDN state snapshots kept in pinned host RAM. When the device "
+        "snapshot cache needs a slot, the least recently used snapshot moves to host RAM and its "
+        "prefix keeps its KV pages; a later request on that prefix copies it back. One slot is one "
+        "whole GDN state (about 69 MB per rank on Qwen3.8-Flash-Next with DFlash). Start-up fails if "
+        "less than 32 GiB of MemAvailable would remain. 0 (default) keeps no snapshot in host RAM.",
+    )
+
+    parser.add_argument(
         "--logprob-read-isolate",
         action="store_true",
         default=ServerArgs.logprob_read_isolate,
@@ -1191,6 +1202,9 @@ def parse_args(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
         )
+
+    if kwargs["mamba_host_slots"] < 0:
+        parser.error("--mamba-host-slots must be 0 or more")
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

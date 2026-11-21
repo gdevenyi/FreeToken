@@ -137,8 +137,8 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            return MatchResult(
-                HybridCacheHandle(m.cached_len, m.node, m.kv_indices, m.walk_len), mamba_value=m.mamba_value)
+            return MatchResult(HybridCacheHandle(m.cached_len, m.node, m.kv_indices, m.walk_len),
+                               mamba_value=m.mamba_value, mamba_host=m.mamba_host)
         return self.prefix_cache.match_prefix(ids)
 
     def set_stats_enabled(self, enabled: bool) -> None:
@@ -204,6 +204,9 @@ class CacheManager:
         line = self.stats.line(tree, extra)
         if tree is not None:
             tree.clear()
+        pool = self.linear_state_pool
+        if line is not None and getattr(pool, "num_host_slots", 0):
+            line += f" | host used={pool.num_host_slots - pool.num_free_host_slots}/{pool.num_host_slots}"
         return line
 
     @property
@@ -238,13 +241,32 @@ class CacheManager:
 
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
-        (evict_mamba), returning their slots + any freed KV to the pools."""
+        (evict_mamba), returning their slots + any freed KV to the pools. With a host bank the
+        snapshots are demoted to it instead, and their nodes keep their KV."""
         while self.linear_state_pool.num_free_slots < n:
-            er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
+            er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots, self._host_alloc())
             if not er.mamba_slots:
                 break
-            self.linear_state_pool.free(er.mamba_slots)
-            self._free(er.kv_indices)
+            self._release(er)
+
+    def _host_alloc(self):
+        """The tree's host-bank allocator (None without a bank: today's behaviour)."""
+        pool = self.linear_state_pool
+        if not getattr(pool, "num_host_slots", 0):
+            return None
+        return lambda: pool.alloc_host(1)[0] if pool.num_free_host_slots else None
+
+    def _release(self, er) -> None:
+        """Return what a hybrid eviction took. A demoted snapshot's copy is enqueued before its
+        device slot is free; the engine stream waits for it before the next forward."""
+        pool = self.linear_state_pool
+        for src, dst in er.demoted:
+            pool.to_host(src, dst)
+        if er.mamba_slots:
+            pool.free(er.mamba_slots)
+        if er.host_slots:
+            pool.free_host(er.host_slots)
+        self._free(er.kv_indices)
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -482,7 +504,9 @@ class CacheManager:
             ):
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
-                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen)
+                host_freed: list[int] = []
+                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen, host_freed)
+                self._free_host(host_freed)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -498,7 +522,10 @@ class CacheManager:
             # Without a donated snapshot a node could never be resumed (match_prefix needs
             # one), so a non-donating read frees its pages instead of inserting them.
             if donate == "all" and insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len:
-                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:insert_len], req.linear_slot_idx)
+                host_freed = []
+                prefix_len, mamba_exist = self.prefix_cache.insert(
+                    keys, page_indices[:insert_len], req.linear_slot_idx, host_freed)
+                self._free_host(host_freed)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
@@ -525,7 +552,9 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
-        prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen)
+        host_freed: list[int] = []
+        prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen, host_freed)
+        self._free_host(host_freed)
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
@@ -549,8 +578,7 @@ class CacheManager:
                 self.prefix_cache.mark_prompt_end(m.node)
             # before the replacement alloc below: the thinned slot replaces the donated one, so a
             # long prefill stops taking other sessions' snapshots once its path holds the cap
-            if freed := self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP):
-                pool.free(freed)
+            self._release(self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP, self._host_alloc()))
         if not mamba_exist:                                # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
@@ -646,6 +674,10 @@ class CacheManager:
         end = div_ceil(req.cached_len, self.page_size) * self.page_size
         return self.page_table[req.table_idx, start:end]
 
+    def _free_host(self, slots: list[int]) -> None:
+        if slots:
+            self.linear_state_pool.free_host(slots)
+
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:
         """Return a finished request's GDN pool slots: both ping-pong slots, plus the live slot
         unless it was donated to the tree. Idempotent -- clears the refs so a re-entry frees
@@ -670,6 +702,12 @@ class CacheManager:
             assert pool.num_free_slots + tree_slots <= pool.num_slots - 1, (
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
+            )
+            # only the tree holds bank slots, so the count is exact at any time
+            tree_host = pc.mamba_host_evictable + pc.mamba_host_protected
+            assert pool.num_free_host_slots + tree_host == pool.num_host_slots, (
+                f"GDN host-bank leak: free({pool.num_free_host_slots}) + tree({tree_host}) != "
+                f"capacity({pool.num_host_slots})"
             )
         elif self.is_swa:
             pc = self.prefix_cache
@@ -715,6 +753,7 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+            self.linear_state_pool.reclaim_all_host_slots()
 
     @contextmanager
     def lazy_free_region(self):
@@ -748,10 +787,11 @@ class CacheManager:
             self._free_swa(ev.swa_indices)
             return ev.kv_indices
         if self.is_hybrid:
-            # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
+            # Evicting KV leaf nodes drops their GDN snapshots too (either tier) -> return the pools.
             er = self.prefix_cache.evict_full(need)
             if er.mamba_slots:
                 self.linear_state_pool.free(er.mamba_slots)
+            self._free_host(er.host_slots)
             return er.kv_indices
         return self.prefix_cache.evict(need)
 

@@ -618,7 +618,9 @@ class Engine:
             )
 
         # ======================= KV cache initialization ========================
-        new_free = self._sync_get_memory()[1]
+        # --mamba-host-slots: only the hybrid radix has a tree for a host copy to hang on
+        host_slots = config.mamba_host_slots if config.cache_type == "hybrid_radix" else 0
+        new_free = self._sync_get_memory(host_memory=host_slots > 0)[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
@@ -640,8 +642,21 @@ class Engine:
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
-            from freetoken.kvcache.linear_state_pool import LinearStatePool
+            from freetoken.kvcache.linear_state_pool import (
+                LinearStatePool,
+                check_host_bank_memory,
+                linear_state_bytes_per_req,
+            )
 
+            if host_slots:
+                per_slot = linear_state_bytes_per_req(linear_group, config.tp_info.size, self.dtype, config.slot_states)
+                # every rank decides on the same MemAvailable: the least of the ranks, read after the weights
+                # (the pinned expert banks are out of it) and before any rank pinned its bank
+                check_host_bank_memory(host_slots * per_slot * config.tp_info.size, self._host_mem_available)
+                logger.info_rank0(
+                    f"GDN host snapshot bank (--mamba-host-slots): {host_slots} x {mem_GB(per_slot)} = "
+                    f"{mem_GB(host_slots * per_slot)} pinned host RAM per rank"
+                )
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
                 num_slots=_linear_pool_num_slots(config),
@@ -649,6 +664,8 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.slot_states,
+                host_slots=host_slots,
+                engine_stream=self.stream,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
@@ -1245,16 +1262,24 @@ class Engine:
         if graph_enabled:
             _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
 
-    def _sync_get_memory(self) -> Tuple[int, int]:
-        """Get the min and max free memory across TP ranks."""
+    def _sync_get_memory(self, host_memory: bool = False) -> Tuple[int, int]:
+        """Get the min and max free memory across TP ranks. With ``host_memory`` the same all-reduce
+        also takes the least host MemAvailable of the ranks (``self._host_mem_available``)."""
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
-        free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
+        values = [free_memory, -free_memory]
+        if host_memory:
+            from freetoken.kvcache.linear_state_pool import read_mem_available
+
+            values.append(read_mem_available())
+        free_mem_tensor = torch.tensor(values, device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
         )
+        if host_memory:
+            self._host_mem_available = int(free_mem_tensor[2].item())
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:

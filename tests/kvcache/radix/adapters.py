@@ -17,7 +17,7 @@ where regressions actually die; (a)-(d) are cheap tripwires that fire earlier an
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
@@ -43,6 +43,7 @@ class MatchOut:
     indices: List[int]
     node: Any                          # opaque implementation node; the lock target
     second: Optional[int] = None       # hybrid: the GDN snapshot slot to restore from
+    host: int | None = None            # hybrid: the host-bank slot, when there is no device one
 
 
 @dataclass
@@ -50,12 +51,15 @@ class InsertOut:
     matched_len: int
     freed: List[int]                   # slots the cache itself handed back (SWA only)
     second_exists: Optional[bool] = None
+    host_freed: list[int] | None = None  # hybrid: the host copy a device donation displaced
 
 
 @dataclass
 class EvictOut:
     primary: List[int]                 # full-KV page indices removed from the tree
     second: List[int]                  # swa-freed full indices / freed GDN snapshot slots
+    host: list[int] = field(default_factory=list)      # hybrid: freed host-bank slots
+    demoted: list[tuple[int, int]] = field(default_factory=list)  # hybrid: (device, host) copies
 
 
 @dataclass
@@ -127,7 +131,8 @@ class Adapter:
                  {"length": n.length, "slots": tuple(n.value.tolist()), "ref": n.ref_count,
                   "tomb": bool(n.swa_tombstone), "swa_ref": n.swa_ref_count,
                   "swa_uuid": n.swa_uuid, "mamba": n.mamba_value,
-                  "mamba_ref": n.mamba_ref_count})
+                  "mamba_ref": n.mamba_ref_count, "host": n.mamba_host,
+                  "host_ref": n.mamba_host_ref_count})
                 for n in self.nodes()]
 
     def structure(self) -> Dict[Path, Record]:
@@ -219,14 +224,17 @@ class SWAAdapter(Adapter):
 class HybridAdapter(Adapter):
     kind = "hybrid"
     second_currency = "mamba"
+    # --mamba-host-slots: hands out a free host-bank slot, or None when the bank is full
+    host_alloc = None
 
     def match(self, ids: Sequence[int]) -> MatchOut:
         m = self.cache.match_prefix(ids_tensor(ids))
-        return MatchOut(int(m.cached_len), m.kv_indices.tolist(), m.node, m.mamba_value)
+        return MatchOut(int(m.cached_len), m.kv_indices.tolist(), m.node, m.mamba_value, m.mamba_host)
 
     def insert(self, ids, slots, *, mamba: int, **kw) -> InsertOut:
-        matched, exists = self.cache.insert(ids_tensor(ids), slots_tensor(slots), mamba)
-        return InsertOut(int(matched), [], bool(exists))
+        host_freed: list[int] = []
+        matched, exists = self.cache.insert(ids_tensor(ids), slots_tensor(slots), mamba, host_freed)
+        return InsertOut(int(matched), [], bool(exists), host_freed)
 
     def inc_lock(self, node) -> LockToken:
         self.cache.inc_lock(node)
@@ -239,16 +247,22 @@ class HybridAdapter(Adapter):
         return self._evicted(self.cache.evict_full(n))
 
     def evict_second(self, n: int) -> EvictOut:
-        return self._evicted(self.cache.evict_mamba(n))
+        return self._evicted(self.cache.evict_mamba(n, self.host_alloc))
+
+    def evict_host(self, n: int) -> EvictOut:
+        return self._evicted(self.cache.evict_host(n))
 
     @staticmethod
     def _evicted(ev) -> EvictOut:
-        return EvictOut(ev.kv_indices.tolist(), list(ev.mamba_slots))
+        return EvictOut(ev.kv_indices.tolist(), list(ev.mamba_slots), list(ev.host_slots),
+                        list(ev.demoted))
 
     def counters(self) -> Dict[str, int]:
         c = self.cache
         return {"full_evictable": c.full_evictable, "full_protected": c.full_protected,
-                "mamba_evictable": c.mamba_evictable, "mamba_protected": c.mamba_protected}
+                "mamba_evictable": c.mamba_evictable, "mamba_protected": c.mamba_protected,
+                "mamba_host_evictable": c.mamba_host_evictable,
+                "mamba_host_protected": c.mamba_host_protected}
 
 
 # --------------------------------------------------------------------------- the battery
@@ -353,8 +367,18 @@ def check_model_agreement(ad: Adapter, model: RefModel, records=None) -> None:
                                  f"running sizes disagree with the model: {diff}")
 
 
+def check_snapshot_leaves(ad: Adapter) -> None:
+    """Hybrid: an unlocked leaf keeps a snapshot on some tier -- with none it could never be resumed,
+    so its KV would only take pool space (eviction must take the leaf with its last snapshot)."""
+    for node in ad.nodes():
+        if node.is_leaf() and node.ref_count == 0 and node.mamba_value is None and node.mamba_host is None:
+            raise InvariantViolation("structure.snapshot_leaf", f"unlocked leaf {node_end_path(node)} "
+                                                                f"has no snapshot on any tier")
+
+
 def check_all(ad: Adapter, model: RefModel, kv_ledger: SlotLedger,
-              second_ledger: Optional[SlotLedger] = None) -> None:
+              second_ledger: Optional[SlotLedger] = None,
+              host_ledger: SlotLedger | None = None) -> None:
     recs = ad.records()
     check_prefix_closure(ad)
     check_counter_model(ad, recs)
@@ -363,4 +387,7 @@ def check_all(ad: Adapter, model: RefModel, kv_ledger: SlotLedger,
     if second_ledger is not None:            # GDN snapshots: their own currency, their own ledger
         check_conservation("mamba", [r["mamba"] for _, r in recs if r["mamba"] is not None],
                            second_ledger)
+        check_snapshot_leaves(ad)
+    if host_ledger is not None:              # host-bank slots: the tree owns each at most once
+        check_conservation("host", [r["host"] for _, r in recs if r["host"] is not None], host_ledger)
     check_model_agreement(ad, model, recs)
