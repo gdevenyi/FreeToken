@@ -123,7 +123,13 @@ def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     return len(spare) >= 2
 
 
-def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
+def _rank_block(cpus: list[int], rank: int, ranks: int) -> list[int]:
+    """Rank ``rank``'s contiguous share of ``cpus`` (all of them when there are fewer CPUs than ranks)."""
+    lo, hi = len(cpus) * rank // ranks, len(cpus) * (rank + 1) // ranks
+    return cpus[lo:hi] or list(cpus)
+
+
+def resolve_threads_and_affinity(requested: int, rank: int = 0, ranks: int = 1) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
@@ -131,21 +137,38 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spin-barrier degrades badly when oversubscribed). An explicit count is honored,
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
+
+    Under tensor parallelism every rank builds its own pool on the same host. With
+    ``ranks`` > 1, rank ``rank`` takes only its contiguous block of the physical cores (and,
+    for an explicit count, of the remaining logical CPUs), so the ranks' pinned workers never
+    share a core. A contiguous block keeps a rank inside one NUMA node where the CPU numbering
+    follows the sockets.
     """
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        allowed = list(range(os.cpu_count() or 1))
     reps = physical_core_cpus()
+    rest = [c for c in allowed if c not in set(reps)]
+    if ranks > 1:
+        reps, rest = _rank_block(reps, rank, ranks), _rank_block(rest, rank, ranks) if rest else []
     if requested and requested > 0:
         n = int(requested)
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-        except AttributeError:
-            allowed = list(range(os.cpu_count() or 1))
         # physical-core reps first, then the rest of the logical CPUs.
-        order = reps + [c for c in allowed if c not in set(reps)]
+        order = reps + rest
         if not order:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
         return n, core_ids
     return len(reps), list(reps)
+
+
+def _tp_rank_and_size() -> tuple[int, int]:
+    """This process's tensor-parallel rank and size, or (0, 1) when TP info is not set."""
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    return (tp.rank, tp.size) if tp is not None else (0, 1)
 
 
 def _format_label(name: str, opts: tuple) -> str:
@@ -280,7 +303,9 @@ class CpuMoeExecutor:
         # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
         self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        tp_rank, tp_size = _tp_rank_and_size()
+        nthreads, core_ids = resolve_threads_and_affinity(num_threads, tp_rank, tp_size)
+        rank_cores = len(resolve_threads_and_affinity(0, tp_rank, tp_size)[1])
         coord_core = -1
         if self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
@@ -326,7 +351,13 @@ class CpuMoeExecutor:
         self.spin_wait = _spin_wait_ok(core_ids, coord_core)
         self._ext.set_spin_wait(self.spin_wait)
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        if tp_size > 1:
+            logger.info(
+                f"cpu-moe TP rank {tp_rank}/{tp_size}: {nthreads} workers on CPUs {core_ids}"
+                + (f", coordinator on CPU {coord_core}" if coord_core >= 0 else "")
+            )
+        # this rank's physical cores (all of them without TP): the other ranks' pools own the rest
+        spare = rank_cores - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(
