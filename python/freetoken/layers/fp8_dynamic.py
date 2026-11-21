@@ -149,23 +149,32 @@ def quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def fp8_dynamic_linear(
-    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """``x @ (weight * weight_scale)^T`` in W8A8; ``weight`` [N, K] e4m3 row-major, whose ``.t()``
     is the column-major operand cuBLASLt wants (a stride change, never a copy).
 
     The activation scale is per row, so a row never depends on the other sequences of its
     batch. It is applied after the GEMM: cuBLASLt's rowwise-scaled mode is 1.4-2.9x slower
-    than the tensorwise one on sm_120."""
+    than the tensorwise one on sm_120.
+
+    ``out_dtype`` (default: ``x``'s dtype) is the output dtype. In bf16 the one-row path (scale in
+    the GEMM epilogue, one rounding) and the multi-row path (a bf16 GEMM output, then the scale,
+    two roundings) give the same row slightly different values, so a decode step at batch 1 and a
+    speculative verify row disagree by bf16 steps. fp32 output makes both paths round once."""
+    out_dtype = x.dtype if out_dtype is None else out_dtype
     *lead, k = x.shape
     x2 = x.reshape(-1, k).contiguous()
     if x2.shape[0] == 1:  # one row: per-tensor is per-row, and the scale rides in the GEMM epilogue
         x8, scale = quant_per_tensor(x2)
-        y = torch._scaled_mm(x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=x.dtype)
+        y = torch._scaled_mm(x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=out_dtype)
         return y.reshape(*lead, weight.shape[0])
     x8, row_scale = quant_per_row(x2)
     y = torch._scaled_mm(
-        x8, weight.t(), scale_a=weight_scale.new_ones(()), scale_b=weight_scale, out_dtype=x.dtype
+        x8, weight.t(), scale_a=weight_scale.new_ones(()), scale_b=weight_scale, out_dtype=out_dtype
     )
     y.mul_(row_scale)
     return y.reshape(*lead, weight.shape[0])
@@ -269,7 +278,9 @@ class Fp8ParallelLMHead(ParallelLMHead):
         self.kept_rows = head, ids
 
     def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
-        y = fp8_dynamic_linear(x, self.weight, self.weight_scale)
+        # fp32 logits: bf16 logits step by 0.125 at the magnitudes greedy decode compares, so ties are
+        # common and a decode row and a verify row of the same token can pick different argmaxes
+        y = fp8_dynamic_linear(x, self.weight, self.weight_scale, out_dtype=torch.float32)
         return y if self.bias is None else y + self.bias
 
 
