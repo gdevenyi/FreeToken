@@ -50,3 +50,15 @@ def test_more_ranks_than_cores_still_gives_every_rank_workers(monkeypatch):
     monkeypatch.setattr(cx.os, "sched_getaffinity", lambda _pid: {0})
     monkeypatch.setattr(cx, "physical_core_cpus", lambda: [0])
     assert cx.resolve_threads_and_affinity(0, 1, 2) == (1, [0])
+
+
+def test_locked_fetch_copy_threads_stay_in_their_ranks_block(host, monkeypatch):
+    # no SMT sibling free: the fallback must take this rank's free cores, never another rank's
+    from types import SimpleNamespace
+
+    from freetoken.moe import locked_fetch as lf
+
+    monkeypatch.setattr(cx, "_tp_rank_and_size", lambda: (1, 2))
+    monkeypatch.setattr(lf, "_smt_siblings", lambda cores: [])
+    ex = SimpleNamespace(core_ids=list(range(16, 28)), _coord_core=28)
+    assert lf._copy_cpus(ex, 4) == [29, 30, 31]
