@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from freetoken.kvcache.base import BaseKVCachePool
+from freetoken.kvcache.format import KVFormat
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -48,26 +49,24 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
         # llama.cpp's share callback: draft swa -> the target's last SWA layer, draft full -> its last full layer
         last_swa = max(swa_ids) if swa_ids else None
         last_full = max(full_ids) if full_ids else None
-        e_args = getattr(target_config, "gemma4_e_args", None)
+        # a KV-shared target layer owns no slab: read its source's, as the target's pool maps it
+        sources = dict(target_config.kv_shared_layers)
         self._route: list[int] = []
         for layer_id in range(draft_config.num_layers):
             layer = last_swa if draft_config.is_swa_layer(layer_id) else last_full
-            # the hop is a no-op while shared target layers copy their rows into their own slab
-            if e_args is not None and e_args.is_kv_shared(layer):
-                sources = [i for i in target_config.attention_group_for_layer(layer).layer_ids if i < e_args.first_kv_shared_layer]
-                if not sources:
-                    raise RuntimeError(
-                        f"target layer {layer} is KV-shared but its attention group has no source below the "
-                        f"sharing boundary {e_args.first_kv_shared_layer} to route draft layer {layer_id}"
-                    )
-                layer = max(sources)
-            self._route.append(layer)
+            self._route.append(sources.get(layer, layer))
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._target.k_cache(self._route[index])
 
     def v_cache(self, index: int) -> torch.Tensor:
         return self._target.v_cache(self._route[index])
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return self._target.k_scale(self._route[index])
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return self._target.v_scale(self._route[index])
 
     def store_kv(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
         raise RuntimeError(f"the read-only draft view stores nothing, but layer {layer_id} tried to write KV")
@@ -80,12 +79,21 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
         return self._target.translate_loc_from_full_to_swa(out_loc)
 
     @property
+    def full_to_swa_map(self) -> torch.Tensor:
+        """The dense full->swa slot table, which the draft's gather reads in the graph (paged SWA targets only)."""
+        return self._target.full_to_swa_index_mapping
+
+    @property
     def device(self) -> torch.device:
         return self._target.device
 
     @property
     def dtype(self) -> torch.dtype:
         return self._target.dtype
+
+    @property
+    def kv_format(self) -> KVFormat:
+        return self._target.kv_format
 
     @property
     def num_layers(self) -> int:
