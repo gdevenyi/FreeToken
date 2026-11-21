@@ -130,6 +130,26 @@ def test_fp8_linear_row_does_not_depend_on_the_other_rows():
 
 
 @requires_cuda
+def test_fp32_output_gives_a_row_the_same_value_alone_and_in_a_verify_batch():
+    """The FP8 lm_head asks for fp32: a decode step at batch 1 (one-row path, scale in the GEMM
+    epilogue) and a speculative verify row (multi-row path, scale after the GEMM) must then agree
+    to fp32 rounding. In bf16 the two paths round differently, which flips near-tied greedy argmaxes
+    between spec-off decode and spec decoding (D1, 2026-11-21)."""
+    from freetoken.layers.fp8_dynamic import fp8_dynamic_linear
+
+    torch.manual_seed(0)
+    # logits-like magnitudes (|y| about 10-30), where a bf16 step is 0.0625-0.125
+    w8, scale = _quantize_per_tensor((torch.randn(4096, 512) * 0.3).to(torch.bfloat16))
+    w8, scale = w8.cuda(), scale.cuda()
+    x = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
+    alone = fp8_dynamic_linear(x[:1], w8, scale, out_dtype=torch.float32)
+    batch = fp8_dynamic_linear(x, w8, scale, out_dtype=torch.float32)[:1]
+    assert alone.dtype == batch.dtype == torch.float32
+    # only the GEMM's accumulation order may differ: far below a bf16 step at these magnitudes
+    assert (alone - batch).abs().max().item() < 2e-3
+
+
+@requires_cuda
 def test_quant_per_tensor_zero_input_is_finite():
     from freetoken.layers.fp8_dynamic import quant_per_tensor
 
