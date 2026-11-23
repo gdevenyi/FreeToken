@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Tuple
 
 import torch
 from freetoken.core import Req
@@ -40,11 +41,41 @@ SNAPSHOT_STRIDE = 32768
 SNAPSHOT_PATH_CAP = 2  # the pinned root and the tail; the previous turn's prompt end stays on top
 
 
+class KVRestore(NamedTuple):
+    """--kv-host-tier-gb: an admitted request's host-to-device page copies, run before its first
+    forward. ``nodes`` adopted ``dev_pages`` at admission (undone if the admission is)."""
+
+    host_pages: list[int]
+    dev_pages: list[int]
+    nodes: list
+
+
+class _KVHostPages:
+    """The KV pool's host pages, as the hybrid radix tree takes them (HybridRadixCache.kv_host)."""
+
+    def __init__(self, pool) -> None:
+        self.pool = pool
+
+    @property
+    def capacity(self) -> int:
+        return self.pool.num_host_pages
+
+    @property
+    def num_free(self) -> int:
+        return self.pool.num_free_host_pages
+
+    def alloc(self, n: int) -> list[int]:
+        return self.pool.alloc_host_pages(n)
+
+    def free(self, pages: Sequence[int]) -> None:
+        self.pool.free_host_pages(pages)
+
+
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
                  logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False,
-                 snapshot_policy: str = "chunk"):
+                 snapshot_policy: str = "chunk", kv_host=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -57,6 +88,8 @@ class CacheManager:
         self.swa_pool = swa_pool
         self.sliding_window_size = sliding_window_size
         self.is_hybrid = type == "hybrid_radix"
+        # --kv-host-tier-gb: the KV pool, when it has host pages (hybrid radix only; None = no KV host tier)
+        self.kv_host = kv_host if self.is_hybrid and getattr(kv_host, "num_host_pages", 0) else None
         # GDN snapshots a finished logprob read (max_tokens=1 + logprobs) donates: "all" (the
         # x64 prefill boundary and the live final state), "boundary" (only the former), "none".
         # A burst of such reads otherwise evicts long conversations' snapshots.
@@ -119,7 +152,9 @@ class CacheManager:
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridRadixCache(device, page_size, ghosts=self.stats.enabled)
+            tree = HybridRadixCache(device, page_size, ghosts=self.stats.enabled)
+            tree.kv_host = _KVHostPages(self.kv_host) if self.kv_host is not None else None
+            return tree
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
             return SWARadixCache(device, page_size, self.sliding_window_size)
@@ -137,7 +172,7 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            return MatchResult(HybridCacheHandle(m.cached_len, m.node, m.kv_indices, m.walk_len),
+            return MatchResult(HybridCacheHandle(m.cached_len, m.node, m.kv_indices, m.walk_len, m.host_kv),
                                mamba_value=m.mamba_value, mamba_host=m.mamba_host)
         return self.prefix_cache.match_prefix(ids)
 
@@ -207,7 +242,39 @@ class CacheManager:
         pool = self.linear_state_pool
         if line is not None and getattr(pool, "num_host_slots", 0):
             line += f" | host used={pool.num_host_slots - pool.num_free_host_slots}/{pool.num_host_slots}"
+        kv = self.kv_host
+        if line is not None and kv is not None:
+            line += f" | kv host used={kv.num_host_pages - kv.num_free_host_pages}/{kv.num_host_pages}"
         return line
+
+    def restore_host_kv(self, handle: BaseCacheHandle) -> tuple[BaseCacheHandle, KVRestore | None]:
+        """--kv-host-tier-gb, at admission of a locked match: give the host-only nodes of the matched
+        path device pages now (so a later request of this pass reuses them, and the commit sees a
+        device prefix) and return the handle over the whole prefix with the copies to run before the
+        first forward. The host copies stay (the nodes are on both tiers) and the handle's lock keeps
+        them until the copies ran."""
+        if not self.is_hybrid or getattr(handle, "host_kv", None) is None:
+            return handle, None
+        from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
+
+        pc, ps = self.prefix_cache, self.page_size
+        nodes = pc.host_only_path(handle.node)
+        dev = self._page_to_token(self._allocate(sum(n.length for n in nodes) // ps))
+        host_pages, off = [], 0
+        for n in nodes:
+            host_pages += pc._token_to_page(n.host_value)
+            pc.adopt(n, dev[off : off + n.length])
+            off += n.length
+        pc.counts["kv_host_hit"] += 1  # KVSTATS only
+        pc.counts["kv_host_hit_tokens"] += off
+        full = HybridCacheHandle(handle.cached_len, handle.node, torch.cat([handle.kv_indices, dev]), handle.walk_len)
+        return full, KVRestore(host_pages, (dev[::ps] // ps).tolist(), nodes)
+
+    def undo_host_kv(self, plan: KVRestore) -> None:
+        """Reverse ``restore_host_kv`` for an admission undone in the same pass: the nodes are
+        host-only again and their device pages are free."""
+        for n in plan.nodes:
+            self._free(self.prefix_cache.unadopt(n))
 
     @property
     def available_size(self) -> int:
@@ -477,6 +544,10 @@ class CacheManager:
         (final full-sequence state, zero-copy since the req is done) and free the req's slots."""
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
+        # admission and launch run in one scheduler iteration, so a request reaches here only after
+        # the restore before its first forward ran: its adopted pages hold their KV
+        assert getattr(req, "kv_restore", None) is None, "a request left before its KV host restore ran"
+
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
@@ -703,6 +774,12 @@ class CacheManager:
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
             )
+            if self.kv_host is not None:  # only the tree holds KV host pages, as bank slots
+                kv, tree_pages = self.kv_host, pc.host_kv_tokens // self.page_size
+                assert kv.num_free_host_pages + tree_pages == kv.num_host_pages, (
+                    f"KV host page leak: free({kv.num_free_host_pages}) + tree({tree_pages}) != "
+                    f"capacity({kv.num_host_pages})"
+                )
             # only the tree holds bank slots, so the count is exact at any time
             tree_host = pc.mamba_host_evictable + pc.mamba_host_protected
             assert pool.num_free_host_slots + tree_host == pool.num_host_slots, (
@@ -788,12 +865,24 @@ class CacheManager:
             return ev.kv_indices
         if self.is_hybrid:
             # Evicting KV leaf nodes drops their GDN snapshots too (either tier) -> return the pools.
+            # With a KV host tier the nodes are demoted: copy them before their pages are reused.
             er = self.prefix_cache.evict_full(need)
+            self._copy_kv_to_host(er.kv_demoted)
             if er.mamba_slots:
                 self.linear_state_pool.free(er.mamba_slots)
             self._free_host(er.host_slots)
             return er.kv_indices
         return self.prefix_cache.evict(need)
+
+    def _copy_kv_to_host(self, demoted) -> None:
+        """Enqueue the device-to-host copies of demoted nodes. Their device pages go back to the free
+        list after this; the engine stream waits for the copies before the next forward (fence)."""
+        if not demoted:
+            return
+        ps = self.page_size
+        dev = torch.cat([d[::ps] for d, _ in demoted]) // ps
+        host = torch.cat([h[::ps] for _, h in demoted]) // ps
+        self.kv_host.pages_to_host(dev.tolist(), host.tolist())
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):

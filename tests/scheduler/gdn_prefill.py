@@ -68,29 +68,45 @@ def gdn_state(ids: torch.Tensor) -> float:
     return float(zlib.crc32(ids.numpy().tobytes()) % 1_000_003)
 
 
-def forward_writes(pool):
+def forward_writes(pool, cm=None):
     """``on_forward`` for drive_prefill: the forward leaves the live slot at the state of the whole
-    chunk and, when it tracks, the frozen ping-pong slot at the state of the tracked boundary."""
+    chunk and, when it tracks, the frozen ping-pong slot at the state of the tracked boundary. With
+    a KV host tier on ``cm`` it also writes a stand-in KV payload (token, position) into the rope rows
+    of the chunk's slots, so a restore can show that each page holds its own tokens."""
     def write(req, tracked):
         pool.recurrent_states[:, req.linear_slot_idx] = gdn_state(req.input_ids[: req.device_len])
         if tracked:
             frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
             pool.recurrent_states[:, frozen] = gdn_state(req.input_ids[: req.mamba_last_track_seqlen])
+        if cm is not None and cm.kv_host is not None:
+            slots = cm.page_table[req.table_idx, req.cached_len : req.device_len].long()
+            rope = cm.kv_host._rope_positions
+            rope[slots, 0] = req.input_ids[req.cached_len : req.device_len]
+            rope[slots, 1] = torch.arange(req.cached_len, req.device_len, dtype=torch.int32)
     return write
 
 
-def restore_and_check(pool, admitted: list):
+def restore_and_check(pool, admitted: list, cm=None):
     """``on_launch`` for drive_prefill: run the scheduler's restore, then check that the live slot of
-    each resumed request holds the state of exactly its cached prefix, from either tier."""
+    each resumed request holds the state of exactly its cached prefix, from either tier. With a KV
+    host tier on ``cm`` the page-table row of the prefix must hold the payload of its own tokens too,
+    and a KV restore from the host adds "+kv" to the kind."""
     from freetoken.scheduler.scheduler import Scheduler
 
-    stub = SimpleNamespace(engine=SimpleNamespace(linear_state_pool=pool))
+    kv = None if cm is None else cm.kv_host
+    stub = SimpleNamespace(engine=SimpleNamespace(linear_state_pool=pool, kv_cache=kv))
 
     def launch(batch):
         kinds = [("device" if r.mamba_restore_src is not None else
                   "host" if r.mamba_restore_host is not None else None) for r in batch.reqs]
+        kinds = [k if getattr(r, "kv_restore", None) is None else f"{k}+kv" for r, k in zip(batch.reqs, kinds)]
         Scheduler._restore_linear_states(stub, batch)
         for r, kind in zip(batch.reqs, kinds):
+            if kv is not None and r.cached_len == r.cache_handle.cached_len and r.cached_len > 0:
+                rows = kv._rope_positions[cm.page_table[r.table_idx, : r.cached_len].long()]
+                assert torch.equal(rows[:, 0], r.input_ids[: r.cached_len]) and torch.equal(
+                    rows[:, 1], torch.arange(r.cached_len, dtype=torch.int32)
+                ), f"{kind} restore of {r.cached_len} tokens: a page holds other tokens"
             if r.cached_len == r.cache_handle.cached_len and r.cached_len > 0 and kind is not None:
                 assert pool.recurrent_states[0, r.linear_slot_idx, 0, 0, 0].item() == gdn_state(
                     r.input_ids[: r.cached_len]), f"{kind} restore of {r.cached_len} tokens holds another state"

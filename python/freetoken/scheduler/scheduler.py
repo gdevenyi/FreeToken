@@ -755,9 +755,15 @@ class Scheduler(SchedulerIOMixin):
         # every batch: a slot a demotion freed may be written by this forward (any phase), and a
         # host copy may be read below, so both wait for the demotions' device->host copies
         pool.fence_host_copies()
+        kv = self.engine.kv_cache
+        if getattr(kv, "num_host_pages", 0):  # --kv-host-tier-gb: the same for KV pages
+            kv.fence_host_copies()
         if not batch.is_prefill:
             return
         for req in batch.reqs:
+            if req.kv_restore is not None:   # the pages the request's host-only prefix adopted
+                kv.pages_from_host(req.kv_restore.host_pages, req.kv_restore.dev_pages)
+                req.kv_restore = None
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
