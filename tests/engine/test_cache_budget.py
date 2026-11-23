@@ -798,3 +798,37 @@ def test_more_gdn_snapshot_slots_come_out_of_the_expert_cache():
     assert experts_base - experts_more in (extra // 262_144, extra // 262_144 + 1)
     with pytest.raises(AssertionError, match="cache budget too small"):
         engine._resolve_auto_moe_cache_size(Config(200.0), banks)
+
+
+def test_kv_host_tier_flag():
+    """T11: --kv-host-tier-gb (GiB of host RAM per TP rank for demoted KV pages) parses, defaults to 0
+    (off), refuses a negative or non-finite size, and is refused under MTP in v1 (the MTP draft pool
+    follows the target's page ids, and the tier does not copy it). It sizes whole host pages of the
+    KV pool and does nothing for a model without the hybrid radix cache."""
+    from unittest.mock import patch
+
+    from freetoken.engine.engine import kv_host_tier_pages
+    from freetoken.server.args import parse_args
+
+    class HF:
+        def to_dict(self):
+            return {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"}
+
+    def parse(*argv):
+        with patch("freetoken.utils.cached_load_hf_config", lambda _path: HF()):
+            return parse_args(["--model", "/models/anon", *argv])[0]
+
+    assert parse().kv_host_tier_gb == 0
+    assert parse("--kv-host-tier-gb", "80").kv_host_tier_gb == 80.0
+    assert parse("--kv-host-tier-gb", "8", "--speculative-algorithm", "dflash").kv_host_tier_gb == 8.0
+    for bad in ("-1", "nan", "inf", "lots"):
+        with pytest.raises(SystemExit):
+            parse("--kv-host-tier-gb", bad)
+    with pytest.raises(SystemExit):
+        parse("--kv-host-tier-gb", "8", "--speculative-algorithm", "mtp")
+
+    page_bytes = 449_280                                    # Qwen3.8-Flash-Next, one rank, fp8, mrope
+    hybrid = SimpleNamespace(kv_host_tier_gb=80.0, cache_type="hybrid_radix")
+    assert kv_host_tier_pages(hybrid, page_bytes) == 80 * 2**30 // page_bytes
+    assert kv_host_tier_pages(SimpleNamespace(kv_host_tier_gb=80.0, cache_type="radix"), page_bytes) == 0
+    assert kv_host_tier_pages(SimpleNamespace(kv_host_tier_gb=0.0, cache_type="hybrid_radix"), page_bytes) == 0
