@@ -499,3 +499,115 @@ def test_a_full_bank_drops_a_superseded_copy_before_an_older_leaf():
     assert s.do_match(ids(5))[0].host is not None
     assert s.do_match(ids(1))[0].cached_len == 0
     assert s.do_match(ids(1, 2))[0].host is not None
+
+
+# --------------------------------------------------------------------------- KV host tier (--kv-host-tier-gb)
+def host_kv_pages(s: Session) -> int:
+    return s.model.counters()["host_kv"] // PAGE
+
+
+def test_evict_full_demotes_kv_to_the_host_and_keeps_the_snapshots():
+    """With a KV host tier, evict_full moves an unlocked device node with no device child to the host
+    instead of freeing it: the node keeps its snapshots (here in the bank), and a match returns the
+    device pages before it, its host slots as the continuation and the same snapshot source. Its
+    parent, now above a host-only node only, goes next."""
+    s = Session(SPEC, host_slots=2, kv_host_pages=8)
+    chain, _mx, _my = two_node_tree(s)
+    x_pages = s.do_match(ids(1, 2))[0].indices
+    s.do_evict_second(2)                       # both snapshots to the bank
+    s.do_evict_full(2 * PAGE)                  # Y: a leaf, so on the device frontier
+    assert events(s)["evict_full.demote"] == 1 and full_size(s) == 2 * PAGE
+    assert host_snapshots(s) == 2 and host_kv_pages(s) == 2
+    s.check()
+    m, _ = s.do_match(chain)
+    assert (m.cached_len, m.indices, m.second) == (4 * PAGE, x_pages, None)
+    assert len(m.host_kv) == 2 * PAGE and m.host is not None
+    s.do_evict_full(2 * PAGE)                  # X: its only child is host-only now
+    assert events(s)["evict_full.demote"] == 2 and full_size(s) == 0 and host_kv_pages(s) == 4
+    s.check()
+    m, _ = s.do_match(chain)
+    assert (m.cached_len, m.indices, len(m.host_kv)) == (4 * PAGE, [], 4 * PAGE)
+
+
+def test_evict_full_demotes_only_the_device_frontier():
+    """A node with a device child is a prefix of it, so it stays on the device while any child does:
+    the leaves of a fork go first (least recently used first), then the fork point."""
+    s = Session(SPEC, kv_host_pages=8)
+    s.do_insert(ids(1))
+    s.do_request(ids(1, 2), prompt_pages=1)
+    s.do_request(ids(1, 3), prompt_pages=1)
+    for _ in range(3):
+        s.do_evict_full(PAGE)
+        s.check()
+    assert events(s)["evict_full.demote"] == 3 and full_size(s) == 0 and host_kv_pages(s) == 3
+    assert len(s.do_match(ids(1, 3))[0].host_kv) == 2 * PAGE
+
+
+def test_a_full_kv_host_tier_drops_its_lru_host_only_leaf():
+    """The host tier holds two pages. The third demotion drops the least recently used host-only leaf,
+    with its snapshot (a leaf whose KV is gone cannot be resumed)."""
+    s = Session(SPEC, kv_host_pages=2)
+    for lab in (1, 2, 3):
+        s.do_insert(ids(lab))
+    s.do_match(ids(1))                         # A is used again: B is now the least recently used
+    for _ in range(3):
+        s.do_evict_full(PAGE)
+        s.check()
+    assert events(s)["evict_full.demote"] == 3 and events(s)["kv_host.drop_leaf"] == 1
+    assert s.do_match(ids(2))[0].cached_len == 0
+    assert s.do_match(ids(1))[0].host_kv is not None and s.do_match(ids(3))[0].host_kv is not None
+
+
+def test_a_node_larger_than_the_kv_host_tier_is_freed_with_its_host_only_children():
+    """A node the host tier can never hold goes as without the tier, and the host-only nodes below it
+    go with it, so every unlocked device token stays evictable (the admission charge relies on it)."""
+    s = Session(SPEC, host_slots=1, kv_host_pages=1)
+    s.do_insert(ids(1, 2))
+    s.do_request(ids(1, 2, 3), prompt_pages=2)
+    s.do_evict_second(1)                       # X's snapshot to the bank (the LRU one)
+    s.do_evict_full(PAGE)                      # Y (one page) fits the host tier
+    s.check()
+    s.do_evict_full(2 * PAGE)                  # X (two pages) does not: X and Y go
+    assert events(s)["evict_full.kv_drop"] == 1
+    assert s.kv.in_use() == set() and s.host_kv.in_use() == set() and s.host.in_use() == set()
+    s.check()
+
+
+def test_kv_host_lru_runs_on_the_logical_clock(monkeypatch):
+    """KV demotion is a tier decision, so it must not read the wall clock (TP ranks agree on the
+    operation order, not on the time): with a clock that ties everything, the least recently
+    matched node still goes first."""
+    monkeypatch.setattr(time, "monotonic_ns", lambda: 7)
+    s = Session(SPEC, kv_host_pages=4)
+    s.do_insert(ids(1))                        # A
+    s.do_insert(ids(2))                        # B
+    s.do_match(ids(1))                         # A is used again
+    s.do_evict_full(PAGE)
+    s.check()
+    assert s.do_match(ids(2))[0].host_kv is not None and s.do_match(ids(1))[0].host_kv is None
+
+
+def test_insert_over_a_host_node_adopts_the_request_pages():
+    """T5: a request that recomputed a host-only node (here: it matched only the node above it) keeps
+    its pages there. The node adopts them, so the caller frees none of them, and its unlocked host
+    copy goes. Under a lock (a restore reads the copy) the host copy stays: the node is on both
+    tiers, and a later demotion needs no host page."""
+    s = Session(SPEC, kv_host_pages=4)
+    s.do_insert(ids(1, 2))
+    s.do_request(ids(1, 2, 3), prompt_pages=2)
+    s.do_evict_full(PAGE)                      # Y to the host
+    s.do_request(ids(1, 2, 3), prompt_pages=2)
+    assert events(s)["insert.kv_host_adopt"] == 1 and host_kv_pages(s) == 0
+    assert s.host_kv.in_use() == set() and full_size(s) == 3 * PAGE
+    s.check()
+
+    s.do_evict_full(PAGE)                      # Y to the host again
+    held = s.do_lock(ids(1, 2, 3))             # a restore of Y holds its host copy
+    got, _ = s.do_insert(ids(1, 2, 3))
+    assert got.matched_len == 2 * PAGE         # only X's span is a duplicate
+    assert events(s)["insert.kv_host_adopt"] == 2 and host_kv_pages(s) == 1
+    s.check()
+    s.do_unlock(held)
+    s.do_evict_full(PAGE)
+    assert events(s)["evict_full.demote_both"] == 1 and host_kv_pages(s) == 1
+    s.check()
