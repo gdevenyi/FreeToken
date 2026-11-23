@@ -831,6 +831,8 @@ class CacheManager:
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
             self.linear_state_pool.reclaim_all_host_slots()
+            if self.kv_host is not None:   # the KV host pages belonged to the discarded tree too
+                self.kv_host.reclaim_all_host_pages()
 
     @contextmanager
     def lazy_free_region(self):
@@ -851,13 +853,20 @@ class CacheManager:
 
     def flush(self) -> int:
         """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
+        dropped = 0
+        if self.kv_host is not None:
+            # drop the KV host tier first (host-only nodes go, nodes on both tiers keep their device
+            # pages), so the eviction below frees the device prefixes instead of demoting them
+            er = self.prefix_cache.evict_host_kv()
+            dropped = len(er.kv_indices)
+            self._release(er)
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
-        evicted = self._evict(evictable)
+        evicted = self._evict(evictable, demote=False)
         self._free(evicted)
-        return len(evicted)
+        return dropped + len(evicted)
 
-    def _evict(self, need: int) -> torch.Tensor:
+    def _evict(self, need: int, demote: bool = True) -> torch.Tensor:
         if self.is_swa:
             # Evicting KV leaf nodes drops their swa slots too -> return both pools.
             ev = self.prefix_cache.evict_full(need)
@@ -866,7 +875,7 @@ class CacheManager:
         if self.is_hybrid:
             # Evicting KV leaf nodes drops their GDN snapshots too (either tier) -> return the pools.
             # With a KV host tier the nodes are demoted: copy them before their pages are reused.
-            er = self.prefix_cache.evict_full(need)
+            er = self.prefix_cache.evict_full(need, demote=demote)
             self._copy_kv_to_host(er.kv_demoted)
             if er.mamba_slots:
                 self.linear_state_pool.free(er.mamba_slots)

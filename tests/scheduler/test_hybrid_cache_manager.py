@@ -1021,6 +1021,40 @@ def test_flush_and_rebuild_empty_the_host_bank(monkeypatch):
     assert pool.num_free_host_slots == 4
 
 
+def test_flush_and_rebuild_empty_the_kv_host_tier(monkeypatch):
+    """T9: with a KV host tier a flush drops every unlocked host copy and host-only node (it does not
+    demote the device prefixes into the tier), and a rebuild discards the tree: both return every
+    host page, and the device pool and the bank with them."""
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=8, host_slots=4, pages=64, kv_host_pages=16)
+    kv, pc = cm.kv_host, cm.prefix_cache
+
+    def fill():
+        for uid in range(3):
+            prompt = torch.arange(100 + 1_000 * uid, 300 + 1_000 * uid, dtype=torch.int32)
+            run = drive_prefill(cm, pm, pool, PendingReq(uid, prompt, SamplingParams(max_tokens=4)),
+                                budget=8192, overlap=False)
+            Scheduler._free_req_resources(stub, run.final)
+        cm.ensure_mamba_slots(pool.num_free_slots + 1)              # a snapshot to the bank
+        cm._free(cm._evict(2 * 192))                                # two prefixes' KV to the host
+        assert pc.host_kv_tokens == 2 * 192 and kv.num_free_host_pages == 16 - 6
+        cm.check_integrity()
+
+    fill()
+    with cm.lazy_free_region():
+        cm.flush()
+    assert (kv.num_free_host_pages, pc.host_kv_tokens, pc.full_evictable) == (16, 0, 0)
+    assert pool.num_free_host_slots == 4 and len(cm.free_slots) == 64
+    cm.check_integrity()
+    fill()
+    cm.rebuild(64, cm.page_table)
+    assert kv.num_free_host_pages == 16 and pool.num_free_host_slots == 4
+    assert cm.prefix_cache.kv_host is not None                      # the new tree has the tier too
+    cm.check_integrity()
+
+
 
 @pytest.mark.parametrize("policy", ["chunk", "structural"])
 def test_long_active_sessions_do_not_push_idle_sessions_out_of_the_bank(monkeypatch, policy):
