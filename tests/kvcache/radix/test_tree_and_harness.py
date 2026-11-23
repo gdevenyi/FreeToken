@@ -114,6 +114,40 @@ def test_split_at_keeps_the_original_object_as_the_suffix() -> None:
         node.split_at(node.length)
 
 
+def test_split_at_splits_the_host_copy_on_the_same_token() -> None:
+    """P2c cold tier (P2C_GAP_ANALYSIS.md T4): a node's KV can be on the device (``value``), on the
+    host (``host_value``: host slots per token, the same form as ``value``) or both. ``split_at``
+    splits each copy on the same token boundary, and the host lock covers both halves (it locks the
+    tokens a restore reads). A host-only node has ``value`` None, and both halves keep it None."""
+    key_fn = _get_key_fn(2)
+    root = _bare_node(key_fn, [], [])
+
+    both = _bare_node(key_fn, [1, 2, 3, 4, 5, 6], [11, 12, 13, 14, 15, 16], root)
+    both.set_host_value(_t([41, 42, 43, 44, 45, 46], torch.int32))
+    both.host_ref_count = 1
+    prefix = both.split_at(4)
+    assert prefix.value.tolist() == [11, 12, 13, 14] and both.value.tolist() == [15, 16]
+    assert prefix.host_value.tolist() == [41, 42, 43, 44] and both.host_value.tolist() == [45, 46]
+    assert prefix.host_ref_count == 1 and both.host_ref_count == 1
+    assert prefix.on_device and prefix.on_host and both.on_device and both.on_host
+
+    host_only = _bare_node(key_fn, [7, 8, 9, 10], [17, 18, 19, 20], root)
+    host_only.set_host_value(_t([51, 52, 53, 54], torch.int32))
+    host_only.drop_device_value()
+    assert not host_only.on_device and host_only.on_host and host_only.value is None
+    hp = host_only.split_at(2)
+    assert hp.value is None and host_only.value is None
+    assert hp.host_value.tolist() == [51, 52] and host_only.host_value.tolist() == [53, 54]
+    assert hp.length == 2 and host_only.length == 2
+
+    plain = _bare_node(key_fn, [21, 22, 23, 24], [31, 32, 33, 34], root)
+    pp = plain.split_at(2)
+    assert pp.host_value is None and plain.host_value is None and pp.host_ref_count == 0
+
+    with pytest.raises(AssertionError):  # a host copy covers every token of its node
+        plain.set_host_value(_t([1], torch.int32))
+
+
 def test_key_fn_buckets_a_whole_page_not_a_token() -> None:
     """``_get_key_fn`` is the reason the reference model is keyed by page.
 

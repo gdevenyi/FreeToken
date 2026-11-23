@@ -49,16 +49,44 @@ class RadixTreeNode:
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
+        # P2c cold tier (KV_HOST_TIER_DESIGN.md 3.2): the node's KV in the host tier. ``host_value``
+        # holds host slots per token, in the same form as ``value``. A node is on the device
+        # (value only), on both tiers, or on the host only (value None). ``host_ref_count`` locks
+        # the host copy while a restore reads it. All default off: no KV host tier, no change.
+        self._host_value: torch.Tensor | None = None
+        self.host_ref_count: int = 0
+
         # these fields should be updated later
         self._key: torch.Tensor
-        self._value: torch.Tensor
+        self._value: torch.Tensor | None
         self._length: int
 
-    def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
-        assert len(key) == len(value)
+    def set_key_value(self, key: torch.Tensor, value: torch.Tensor | None) -> None:
+        assert value is None or len(key) == len(value)
         self._key = key
         self._value = value
         self._length = len(key)
+
+    def set_host_value(self, host_value: torch.Tensor | None) -> None:
+        assert host_value is None or len(host_value) == self._length, "a host copy covers every token"
+        self._host_value = host_value
+
+    def drop_device_value(self) -> None:
+        """The node's device pages were freed; its KV is now in the host copy only."""
+        assert self._host_value is not None, "a node without a host copy cannot leave the device"
+        self._value = None
+
+    @property
+    def host_value(self) -> torch.Tensor | None:
+        return self._host_value
+
+    @property
+    def on_device(self) -> bool:
+        return self._value is not None
+
+    @property
+    def on_host(self) -> bool:
+        return self._host_value is not None
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
@@ -94,10 +122,16 @@ class RadixTreeNode:
         parent = self.parent
 
         new_node = RadixTreeNode(self.key_fn, self.timestamp)
-        new_node.set_key_value(self._key[:pos], self._value[:pos])
+        dev = self._value
+        new_node.set_key_value(self._key[:pos], None if dev is None else dev[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         new_node.host_tick = self.host_tick
+        # P2c: the host copy splits on the same token; its lock covers both halves.
+        if self._host_value is not None:
+            new_node._host_value = self._host_value[:pos]
+            self._host_value = self._host_value[pos:]
+        new_node.host_ref_count = self.host_ref_count
         # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves
         # stay within a locked window, so the swa lock copies; the window-boundary uuid migrates
         # to the root-side (prefix) node and is cleared on the suffix (matches sglang _split_node).
@@ -106,7 +140,7 @@ class RadixTreeNode:
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
 
-        self.set_key_value(self._key[pos:], self._value[pos:])
+        self.set_key_value(self._key[pos:], None if dev is None else dev[pos:])
         self.set_parent(new_node)
 
         return new_node
