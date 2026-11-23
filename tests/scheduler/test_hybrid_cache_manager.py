@@ -1038,15 +1038,31 @@ def test_long_active_sessions_do_not_push_idle_sessions_out_of_the_bank(monkeypa
 
 
 
+@pytest.mark.parametrize("kv_tier", [False, True], ids=["no_kv_tier", "kv_tier"])
 @pytest.mark.parametrize("policy", ["chunk", "structural"])
-def test_kv_pressure_takes_demoted_leaves_with_their_host_copies(monkeypatch, policy):
+def test_kv_pressure_takes_demoted_leaves_with_their_host_copies(monkeypatch, policy, kv_tier):
     """A demoted leaf keeps its KV, so with a bank the KV pool can become the limit (as the design
-    expects). KV eviction then takes the least recently used leaves and frees their host copies
-    with them; the bank stays conserved and every restore still holds its prefix's state."""
-    adm, recomputed, _, counts = _agent_replay(monkeypatch, host_slots=64, policy=policy, pages=500)
-    print(f"{policy}: KV-bound replay: recomputed {recomputed}, counts {counts}")
-    assert counts["kv_tokens"] > 0 and counts["demote"] > 0 and counts["kv_host"] > 0
-    assert any(kind == "host" for _, _, kind in adm)
+    expects). Without a KV host tier, KV eviction then takes the least recently used leaves and frees
+    their host copies with them; the bank stays conserved and every restore still holds its prefix's
+    state. With one (T8, --kv-host-tier-gb), KV eviction demotes instead: no leaf goes with its host
+    copy, and every returning session resumes at its previous prompt end with only its new tokens to
+    compute, its KV restored from the host where it was demoted (each page holding its own tokens)."""
+    turns, sessions, first, step = 3, 24, 1024, 320
+    adm, recomputed, _, counts = _agent_replay(monkeypatch, host_slots=64, policy=policy, pages=500,
+                                               kv_host_pages=800 if kv_tier else 0)
+    print(f"{policy}: KV-bound replay (kv tier {kv_tier}): recomputed {recomputed}, counts {counts}")
+    if not kv_tier:
+        assert counts["kv_tokens"] > 0 and counts["demote"] > 0 and counts["kv_host"] > 0
+        assert any(kind == "host" for _, _, kind in adm)
+        return
+    assert counts["kv_tokens"] > 0 and counts["kv_demote"] > 0 and counts.get("kv_host", 0) == 0
+    returning = [(uid, c, kind) for uid, c, kind in adm if uid >= sessions]
+    assert len(returning) == (turns - 1) * sessions
+    for uid, cached, kind in returning:
+        assert cached == first + (uid // sessions - 1) * step, (uid, cached, kind)
+    assert sum(kind.endswith("+kv") for _, _, kind in returning) > sessions // 2
+    assert any(kind == "host+kv" for _, _, kind in returning)      # host KV and host snapshot together
+    assert recomputed == sessions * (first + (turns - 1) * step)   # the first turns and the new tokens
 
 
 if __name__ == "__main__":
