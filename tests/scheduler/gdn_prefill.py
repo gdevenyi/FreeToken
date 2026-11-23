@@ -122,9 +122,11 @@ class CopiesAtTheFence:
 
     def __init__(self):
         self.queue = []
+        self.copied = 0                # copies taken, so a test can tell the copier was used
 
     def to_host(self, pairs):
         self.queue.extend(pairs)
+        self.copied += len(pairs)
 
     def from_host(self, pairs):
         for dst, src in pairs:

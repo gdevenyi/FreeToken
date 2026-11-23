@@ -697,7 +697,7 @@ def _kv_host_pool(monkeypatch, pages, ps, host_pages):
 
 
 def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False,
-                kv_host_pages=0, max_reqs=1):
+                kv_host_pages=0, max_reqs=1, kv_copies=None):
     from freetoken import core
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
@@ -708,6 +708,8 @@ def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", co
     if copies is not None:
         pool.host_copies = copies
     kv = _kv_host_pool(monkeypatch, pages, ps, kv_host_pages) if kv_host_pages else None
+    if kv is not None and kv_copies is not None:
+        kv.host_copies = kv_copies
     pt = torch.zeros(max_reqs + 1, pages * ps, dtype=torch.int32)
     cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy,
                       radix_lookahead=radix_lookahead, kv_host=kv)
@@ -816,7 +818,7 @@ def test_admission_restores_demoted_kv_pages(monkeypatch, case):
 
 
 def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False,
-                  order=None, overlap=True, pages=None):
+                  order=None, overlap=True, pages=None, kv_host_pages=0, kv_copies=None):
     """A replay-like agent load: ``sessions`` sessions take turns round-robin (or in ``order``, one
     session index per turn), each turn sending the conversation so far plus a 64-token generation
     and a 256-token tool result. One request runs at a time with 16 idle snapshot slots
@@ -830,7 +832,8 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
     order = [s for _ in range(turns) for s in range(sessions)] if order is None else order
     pages = (sessions * first + len(order) * step) // ps + 64 if pages is None else pages
     pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=1 + 3 + 16, host_slots=host_slots,
-                                     pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead)
+                                     pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead,
+                                     kv_host_pages=kv_host_pages, kv_copies=kv_copies)
     cm.turn_end_id = 7
     admitted, recomputed = [], 0
     convs = []
@@ -840,8 +843,8 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
         convs.append(c)
     for uid, s in enumerate(order):
         run = drive_prefill(cm, pm, pool, PendingReq(uid, convs[s], SamplingParams(max_tokens=4)),
-                            budget=512, overlap=overlap, on_forward=forward_writes(pool),
-                            on_launch=restore_and_check(pool, admitted))
+                            budget=512, overlap=overlap, on_forward=forward_writes(pool, cm),
+                            on_launch=restore_and_check(pool, admitted, cm))
         recomputed += len(convs[s]) - run.cached
         Scheduler._free_req_resources(stub, run.final)
         more = torch.arange(500_000 + 1_000 * uid, 500_000 + 1_000 * uid + step, dtype=torch.int32)
@@ -850,6 +853,9 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
     pc = cm.prefix_cache
     assert pool.num_free_host_slots + pc.mamba_host_evictable == pool.num_host_slots
     pool.fence_host_copies()
+    kv = cm.kv_host
+    if kv is not None:
+        kv.fence_host_copies()
     (probe,) = pool.alloc(1)
     tree, stack = [], [pc.root]
     while stack:
@@ -866,8 +872,19 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
                     keys = (keys >> 31).to(torch.int32)              # MTP pair keys: (token, next token)
                 slot = probe if n.mamba_value is None else n.mamba_value
                 assert pool.recurrent_states[0, slot, 0, 0, 0].item() == gdn_state(keys), pc._path_len(n)
+            if kv is not None:
+                # every node's KV, on either tier, holds its own tokens: no page a demotion freed was
+                # written before its copy to the host left
+                keys = n._key if not radix_lookahead else (n._key >> 31).to(torch.int32)
+                end = pc._path_len(n)
+                want = torch.stack([keys, torch.arange(end - n.length, end, dtype=torch.int32)], 1)
+                if n.on_device:
+                    assert torch.equal(kv._rope_positions[n.value.long()][:, :2], want), end
+                if n.on_host:
+                    h = n.host_value.long()
+                    assert torch.equal(kv._host_pages["rope"][h // 64, h % 64][:, :2], want), end
             tree.append((pc._path_len(n), -1 if n.mamba_value is None else n.mamba_value,
-                         -1 if n.mamba_host is None else n.mamba_host))
+                         -1 if n.mamba_host is None else n.mamba_host, n.on_device, n.on_host))
     pool.free([probe])
     return admitted, recomputed, sorted(tree), dict(pc.counts)
 
@@ -894,6 +911,23 @@ def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, po
     assert now == late
     assert now[3]["demote"] > 0 and now[3]["host_drop"] > 0         # the bank filled and gave way
     assert any(kind == "host" for _, _, kind in now[0])
+
+
+@pytest.mark.parametrize("radix_lookahead", [False, True])
+def test_two_managers_with_different_kv_copy_timing_decide_the_same(monkeypatch, radix_lookahead):
+    """T7: with a KV host tier and a KV pool too small for every session, KV demotions and restores are
+    tier decisions too: with the KV and snapshot device->host copies done at once or only at the next
+    fence, the admissions, restores, page ids and counts are identical, and every page, on either
+    tier, holds its own tokens."""
+    kw = {"host_slots": 8, "policy": "chunk", "sessions": 12, "turns": 3, "pages": 200, "kv_host_pages": 150,
+          "radix_lookahead": radix_lookahead}
+    now = _agent_replay(monkeypatch, **kw)
+    late_kv = CopiesAtTheFence()
+    late = _agent_replay(monkeypatch, copies=CopiesAtTheFence(), kv_copies=late_kv, **kw)
+    assert now == late
+    assert late_kv.copied > 0                                       # the KV copies really ran late
+    assert now[3]["kv_demote"] > 0 and now[3]["kv_host_hit"] > 0
+    assert any(kind and kind.endswith("+kv") for _, _, kind in now[0])
 
 
 @pytest.mark.parametrize("overlap", [True, False])            # no spec / DFlash and MTP (normal_loop)

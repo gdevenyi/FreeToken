@@ -248,6 +248,9 @@ class QSAKVCache(MHAKVCache):
         self._num_host_pages = n
         self._free_host_pages: list[int] = list(range(n))
         self._host_pages: dict[str, torch.Tensor] = {}
+        # A copier with the GDN host bank's interface (to_host / from_host / fence over (dst, src)
+        # views); None copies at once. TODO(T12): the pinned arena, a side stream and batched copies.
+        self.host_copies = None
         if not n:
             return
         for name, t in self._page_tensors().items():
@@ -301,17 +304,31 @@ class QSAKVCache(MHAKVCache):
     def pages_to_host(self, pages: Sequence[int], host_pages: Sequence[int]) -> None:
         """Copy device pages ``pages[i]`` into host pages ``host_pages[i]``."""
         src, dst = self._check_pairs(pages, host_pages)
+        if self.host_copies is not None:
+            self.host_copies.to_host(self._page_pairs(self._host_pages, dst, self._page_tensors(), src))
+            return
         for name, dev in self._page_tensors().items():
             self._host_pages[name][dst] = dev[src.to(dev.device)].to("cpu")
 
     def pages_from_host(self, host_pages: Sequence[int], pages: Sequence[int]) -> None:
         """Copy host pages ``host_pages[i]`` into device pages ``pages[i]``."""
         src, dst = self._check_pairs(host_pages, pages)
+        if self.host_copies is not None:
+            self.host_copies.from_host(self._page_pairs(self._page_tensors(), dst, self._host_pages, src))
+            return
         for name, dev in self._page_tensors().items():
             dev[dst.to(dev.device)] = self._host_pages[name][src].to(dev.device)
 
+    @staticmethod
+    def _page_pairs(dst_tensors, dst, src_tensors, src) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        # views, not gathers: a copier that copies later must read the page as it is then
+        return [(dst_tensors[name][d], src_tensors[name][s])
+                for name in src_tensors for d, s in zip(dst.tolist(), src.tolist())]
+
     def fence_host_copies(self) -> None:
-        """Order a freed page's next write after its host copy. v1 copies synchronously: no-op."""
+        """Order a freed page's next write after its host copy (the copier's fence; at once: no-op)."""
+        if self.host_copies is not None:
+            self.host_copies.fence()
 
 
 __all__ = ["QSAKVCache"]
