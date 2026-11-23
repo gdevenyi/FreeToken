@@ -650,6 +650,8 @@ class Engine:
         # --kv-host-tier-gb: host pages of the same shape as one KV page (attached after the check below)
         kv_host_pages, kv_page_bytes = 0, 0
         if kv_tier:
+            if config.speculative_algorithm == "mtp":  # the parser refuses it too; this covers other entry points
+                raise ValueError("--kv-host-tier-gb is not supported with --speculative-algorithm mtp")
             if not hasattr(self.kv_cache, "attach_host_pages"):
                 raise ValueError(f"--kv-host-tier-gb: {type(self.kv_cache).__name__} has no host pages (QSA pools only)")
             kv_page_bytes = self.kv_cache.unit_bytes()[0] * config.page_size

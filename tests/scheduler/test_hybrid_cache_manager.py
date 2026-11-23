@@ -817,6 +817,34 @@ def test_admission_restores_demoted_kv_pages(monkeypatch, case):
     cm.check_integrity()
 
 
+def test_one_eviction_copies_each_host_page_once(monkeypatch):
+    """A tier of 2 pages and three idle one-page prefixes, evicted in one call: the third demotion
+    drops the first demoted prefix and reuses its host page (the free list is LIFO). The copy plan
+    must name that host page once, with the live prefix as its source: a batch with a repeated
+    destination has no defined winner."""
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=12, host_slots=0, pages=16, kv_host_pages=2)
+    for uid in range(3):
+        prompt = torch.arange(100 + 1_000 * uid, 180 + 1_000 * uid, dtype=torch.int32)  # one page + 16
+        run = drive_prefill(cm, pm, pool, PendingReq(uid, prompt, SamplingParams(max_tokens=4)), budget=8192,
+                            overlap=False, on_forward=forward_writes(pool, cm))
+        Scheduler._free_req_resources(stub, run.final)
+    calls = []
+    real = cm.kv_host.pages_to_host
+    monkeypatch.setattr(cm.kv_host, "pages_to_host", lambda dev, host: (calls.append((dev, host)), real(dev, host)))
+    cm._free(cm._evict(3 * 64))
+    pc = cm.prefix_cache
+    assert pc.counts["kv_demote"] == 3 and pc.counts["kv_host_drop"] == 1
+    ((_, host),) = calls
+    assert len(host) == len(set(host)) == 2, calls
+    cm.check_integrity()
+    for n in pc._host_kv_nodes():                                   # each host copy holds its own tokens
+        keys, h = n._key, n.host_value.long()
+        assert torch.equal(cm.kv_host._host_pages["rope"][h // 64, h % 64][:, 0], keys)
+
+
 def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False,
                   order=None, overlap=True, pages=None, kv_host_pages=0, kv_copies=None):
     """A replay-like agent load: ``sessions`` sessions take turns round-robin (or in ``order``, one
@@ -884,7 +912,9 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
                     h = n.host_value.long()
                     assert torch.equal(kv._host_pages["rope"][h // 64, h % 64][:, :2], want), end
             tree.append((pc._path_len(n), -1 if n.mamba_value is None else n.mamba_value,
-                         -1 if n.mamba_host is None else n.mamba_host, n.on_device, n.on_host))
+                         -1 if n.mamba_host is None else n.mamba_host,
+                         tuple(n.value[::64].tolist()) if n.on_device else (),
+                         tuple(n.host_value[::64].tolist()) if n.on_host else ()))
     pool.free([probe])
     return admitted, recomputed, sorted(tree), dict(pc.counts)
 

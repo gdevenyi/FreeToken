@@ -889,9 +889,12 @@ class CacheManager:
         if not demoted:
             return
         ps = self.page_size
-        dev = torch.cat([d[::ps] for d, _ in demoted]) // ps
-        host = torch.cat([h[::ps] for _, h in demoted]) // ps
-        self.kv_host.pages_to_host(dev.tolist(), host.tolist())
+        dev = (torch.cat([d[::ps] for d, _ in demoted]) // ps).tolist()
+        host = (torch.cat([h[::ps] for _, h in demoted]) // ps).tolist()
+        # a node demoted early in one eviction can be dropped later in it and its host page reused
+        # (LIFO): the last pair of a host page is the live one, and a batch must not repeat a destination
+        last = dict(zip(host, dev))
+        self.kv_host.pages_to_host(list(last.values()), list(last))
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
