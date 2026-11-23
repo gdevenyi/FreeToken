@@ -304,3 +304,16 @@ def test_host_bank_refuses_to_leave_less_than_32_gib(available_gib, ok):
     else:
         with pytest.raises(RuntimeError, match="MemAvailable"):
             check_host_bank_memory(request, mem_available=available_gib * 2**30)
+
+
+def test_host_memory_check_counts_the_kv_tier_with_the_bank():
+    """T10: the KV host tier (--kv-host-tier-gb) and the GDN bank share the 32 GiB floor: each alone
+    fits 44 GiB of MemAvailable, both together do not, and the refusal names both flags."""
+    from freetoken.kvcache.linear_state_pool import check_host_bank_memory
+
+    bank, kv, available = 2 * 4 * 2**30, 2 * 4 * 2**30, 44 * 2**30   # 2 local ranks x 4 GiB each
+    check_host_bank_memory(bank, mem_available=available)
+    check_host_bank_memory(0, mem_available=available, kv_tier_bytes=kv)
+    with pytest.raises(RuntimeError, match="--kv-host-tier-gb") as err:
+        check_host_bank_memory(bank, mem_available=available, kv_tier_bytes=kv)
+    assert "--mamba-host-slots" in str(err.value)
