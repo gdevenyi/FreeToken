@@ -217,3 +217,147 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+# --- P2c cold tier: host copies of whole KV pages (KV_HOST_TIER_DESIGN.md 3.1; P2C_GAP_ANALYSIS.md T1, T2) ---
+# The pool keeps a host arena of whole pages, with the same interface as the GDN host bank
+# (linear_state_pool: alloc_host / free_host / to_host / from_host / fence_host_copies).
+# A page travels with every per-page tensor: the K/V codes, their scales, the page's slab rows
+# (slot // index_ratio) and, on mrope models, its rope rows. The pending ring and the scratch
+# rows are per request, not per page, so they never travel.
+
+
+def _tier_pool(num_pages=4, page_size=16, *, fmt=None, mrope=True):
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
+
+    return QSAKVCache(
+        num_kv_heads=2, num_layers=8, head_dim=64, num_pages=num_pages, page_size=page_size,
+        dtype=torch.bfloat16, device=DEV, index_head_dim=32, num_index_layers=4, index_ratio=4,
+        num_req_slots=3, layer_ids=(1, 3, 5, 7), mrope=mrope,
+        kv_format=FP8_PER_TOKEN_HEAD if fmt is None else fmt,
+    )
+
+
+def _page_views(pool, page):
+    """Every per-page tensor of one page (what a host copy must carry), as views into the pool."""
+    ps, r = pool._page_size, pool.index_ratio
+    views = [pool._kv_buffer[:, :, page]]
+    if pool._scale_buffer is not None:
+        views.append(pool._scale_buffer[:, :, page * ps:(page + 1) * ps])
+    views.append(pool._cmp_k_buffer[:, page * ps // r:(page + 1) * ps // r])
+    if pool._rope_positions is not None:
+        views.append(pool._rope_positions[page * ps:(page + 1) * ps])
+    return views
+
+
+def _fill_random(pool, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    for t in (pool._kv_buffer, pool._scale_buffer, pool._cmp_k_buffer, pool._pending_ring, pool._rope_positions):
+        if t is None:
+            continue
+        if t.element_size() == 1 or not t.is_floating_point():
+            raw = t.view(torch.uint8) if t.element_size() == 1 else t
+            raw.copy_(torch.randint(0, 120 if t.element_size() == 1 else 1000, raw.shape, generator=g, dtype=raw.dtype))
+        else:
+            t.copy_(torch.randn(t.shape, generator=g).to(t.dtype))
+
+
+def _snapshot(pool):
+    return {name: (t.clone() if t is not None else None) for name, t in (
+        ("kv", pool._kv_buffer), ("scale", pool._scale_buffer), ("slab", pool._cmp_k_buffer),
+        ("ring", pool._pending_ring), ("rope", pool._rope_positions))}
+
+
+@pytest.mark.parametrize("mrope", [True, False])
+def test_host_page_round_trip_carries_every_per_page_tensor(mrope):
+    """T1: a page copied to the host and restored into ANOTHER page id holds every per-page tensor
+    of the original; other pages, the scratch rows and the pending ring do not change."""
+    pool = _tier_pool(mrope=mrope)
+    pool.attach_host_pages(3)
+    assert (pool.num_host_pages, pool.num_free_host_pages) == (3, 3)
+    assert pool.host_bytes_per_page() == pool.unit_bytes()[0] * pool._page_size
+    _fill_random(pool)
+    original = [v.clone() for v in _page_views(pool, 1)]
+    before = _snapshot(pool)
+
+    (h,) = pool.alloc_host_pages(1)
+    pool.pages_to_host([1], [h])
+    pool.fence_host_copies()
+    for v in _page_views(pool, 1):
+        v.zero_()
+    pool.pages_from_host([h], [2])
+
+    for got, want in zip(_page_views(pool, 2), original, strict=True):
+        assert torch.equal(got, want)
+    for page in (0, 3):  # untouched pages
+        for got, want in zip(_page_views(pool, page), [v for v in _page_views_of(before, pool, page)], strict=True):
+            assert torch.equal(got, want)
+    scratch = pool.cmp_scratch_base
+    assert torch.equal(pool._cmp_k_buffer[:, scratch:], before["slab"][:, scratch:])
+    assert torch.equal(pool._pending_ring, before["ring"])
+
+    pool.free_host_pages([h])
+    assert pool.num_free_host_pages == 3
+
+
+def _page_views_of(snap, pool, page):
+    """_page_views over a _snapshot dict instead of the live pool."""
+    ps, r = pool._page_size, pool.index_ratio
+    views = [snap["kv"][:, :, page]]
+    if snap["scale"] is not None:
+        views.append(snap["scale"][:, :, page * ps:(page + 1) * ps])
+    views.append(snap["slab"][:, page * ps // r:(page + 1) * ps // r])
+    if snap["rope"] is not None:
+        views.append(snap["rope"][page * ps:(page + 1) * ps])
+    return views
+
+
+def test_host_pages_copy_in_batches_with_any_mapping():
+    """T1: one call moves several pages; host page i receives device page i of the list, in list order."""
+    pool = _tier_pool(num_pages=6)
+    pool.attach_host_pages(4)
+    _fill_random(pool, seed=1)
+    want = {p: [v.clone() for v in _page_views(pool, p)] for p in (0, 4, 5)}
+    hosts = pool.alloc_host_pages(3)
+    pool.pages_to_host([5, 0, 4], hosts)
+    pool.fence_host_copies()
+    pool.pages_from_host(hosts, [1, 2, 3])  # 5 -> 1, 0 -> 2, 4 -> 3
+    for src, dst in ((5, 1), (0, 2), (4, 3)):
+        for got, exp in zip(_page_views(pool, dst), want[src], strict=True):
+            assert torch.equal(got, exp)
+
+
+def test_host_page_allocation_limits():
+    pool = _tier_pool()
+    pool.attach_host_pages(2)
+    pool.alloc_host_pages(2)
+    with pytest.raises(RuntimeError):
+        pool.alloc_host_pages(1)
+    pool.reclaim_all_host_pages()
+    assert pool.num_free_host_pages == 2
+    with pytest.raises(ValueError):
+        pool.pages_to_host([0, 1], [0])  # one host page for two device pages
+
+
+def test_no_host_pages_by_default():
+    pool = _tier_pool()
+    assert (pool.num_host_pages, pool.num_free_host_pages, pool.host_bytes_per_page()) == (0, 0, 0)
+
+
+def test_host_pages_follow_a_rebuild():
+    """T2: after rebuild the host arena keeps its size, every host page is free again (its contents
+    belonged to the old pool), and a round trip works on the new device tensors."""
+    pool = _tier_pool(num_pages=4)
+    pool.attach_host_pages(2)
+    per_page = pool.host_bytes_per_page()
+    pool.alloc_host_pages(2)
+    pool.rebuild(6)
+    assert (pool.num_host_pages, pool.num_free_host_pages, pool.host_bytes_per_page()) == (2, 2, per_page)
+    _fill_random(pool, seed=2)
+    want = [v.clone() for v in _page_views(pool, 5)]
+    (h,) = pool.alloc_host_pages(1)
+    pool.pages_to_host([5], [h])
+    pool.fence_host_copies()
+    pool.pages_from_host([h], [0])
+    for got, exp in zip(_page_views(pool, 0), want, strict=True):
+        assert torch.equal(got, exp)

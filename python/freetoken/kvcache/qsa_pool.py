@@ -153,6 +153,10 @@ class QSAKVCache(MHAKVCache):
         self._rope_positions = None
         super().rebuild(num_pages)
         self._zero_kv_slabs()
+        # The host arena keeps its size (a page's shape does not depend on the page count), but
+        # its contents belonged to the old pool: every host page is free again.
+        if self.num_host_pages:
+            self.reclaim_all_host_pages()
         try:
             self._alloc_index_tiers(num_pages)
         except Exception:
@@ -231,6 +235,83 @@ class QSAKVCache(MHAKVCache):
     @property
     def num_req_slots(self) -> int:
         return self._num_req_slots
+
+    # --- P2c cold tier: host copies of whole pages (KV_HOST_TIER_DESIGN.md 3.1) ---
+    # Same interface as the GDN host bank (linear_state_pool: alloc_host / free_host / to_host /
+    # from_host / fence_host_copies). A host page holds every per-page tensor of one device page:
+    # the K/V codes, their scales, the page's slab rows (slot // index_ratio) and, on mrope models,
+    # its rope rows. The pending ring and the scratch rows are per request and never travel.
+    # v1 copies synchronously; the async side stream and the pinned arena come with the CUDA path.
+
+    def attach_host_pages(self, num_host_pages: int, *, pin_memory: bool = False) -> None:
+        n = max(0, int(num_host_pages))
+        self._num_host_pages = n
+        self._free_host_pages: list[int] = list(range(n))
+        self._host_pages: dict[str, torch.Tensor] = {}
+        if not n:
+            return
+        for name, t in self._page_tensors().items():
+            shape = (n,) + tuple(t.shape[1:])
+            self._host_pages[name] = torch.zeros(shape, dtype=t.dtype, device="cpu", pin_memory=pin_memory)
+
+    def _page_tensors(self) -> dict[str, torch.Tensor]:
+        """Device tensors with the page id as dim 0 (views; no copy)."""
+        _, layers, pages, ps, heads, _elem = self._kv_buffer.shape
+        out = {"kv": self._kv_buffer.movedim(2, 0)}
+        if self._scale_buffer is not None:
+            sd = self._scale_buffer.shape[-1]
+            out["scale"] = self._scale_buffer.view(2, layers, pages, ps, heads, sd).movedim(2, 0)
+        rows = ps // self._index_ratio
+        out["slab"] = self._cmp_k_buffer[:, : self._cmp_scratch_base].view(
+            self._num_index_layers, pages, rows, self._index_head_dim
+        ).movedim(1, 0)
+        if self._rope_positions is not None:
+            out["rope"] = self._rope_positions.view(pages, ps, 3)
+        return out
+
+    @property
+    def num_host_pages(self) -> int:
+        return getattr(self, "_num_host_pages", 0)
+
+    @property
+    def num_free_host_pages(self) -> int:
+        return len(getattr(self, "_free_host_pages", ()))
+
+    def host_bytes_per_page(self) -> int:
+        host = getattr(self, "_host_pages", {})
+        return sum(t[0].numel() * t.element_size() for t in host.values())
+
+    def alloc_host_pages(self, n: int = 1) -> list[int]:
+        if n > self.num_free_host_pages:
+            raise RuntimeError(f"KV host tier exhausted: need {n}, have {self.num_free_host_pages}")
+        return [self._free_host_pages.pop() for _ in range(n)]
+
+    def free_host_pages(self, host_pages: Sequence[int]) -> None:
+        self._free_host_pages.extend(int(h) for h in host_pages)
+
+    def reclaim_all_host_pages(self) -> None:
+        self._free_host_pages = list(range(self.num_host_pages))
+
+    @staticmethod
+    def _check_pairs(a: Sequence[int], b: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(a) != len(b):
+            raise ValueError(f"page lists differ in length: {len(a)} and {len(b)}")
+        return torch.as_tensor(list(a), dtype=torch.long), torch.as_tensor(list(b), dtype=torch.long)
+
+    def pages_to_host(self, pages: Sequence[int], host_pages: Sequence[int]) -> None:
+        """Copy device pages ``pages[i]`` into host pages ``host_pages[i]``."""
+        src, dst = self._check_pairs(pages, host_pages)
+        for name, dev in self._page_tensors().items():
+            self._host_pages[name][dst] = dev[src.to(dev.device)].to("cpu")
+
+    def pages_from_host(self, host_pages: Sequence[int], pages: Sequence[int]) -> None:
+        """Copy host pages ``host_pages[i]`` into device pages ``pages[i]``."""
+        src, dst = self._check_pairs(host_pages, pages)
+        for name, dev in self._page_tensors().items():
+            dev[dst.to(dev.device)] = self._host_pages[name][src].to(dev.device)
+
+    def fence_host_copies(self) -> None:
+        """Order a freed page's next write after its host copy. v1 copies synchronously: no-op."""
 
 
 __all__ = ["QSAKVCache"]
