@@ -146,6 +146,23 @@ def test_terminal_replies_carry_scheduler_timings_over_the_wire():
     assert plain.timings is None
 
 
+def test_kld_chunk_request_and_its_rows_survive_the_wire():
+    spec = {"path": "/scratch/base.kld", "chunk": 3, "slice_rows": 16, "bos_token_id": None}
+    msg = TokenizeMsg(uid=1, text="", input_ids=[695, 283], sampling_params=SamplingParams(max_tokens=1, kld=spec))
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert decoded.sampling_params.kld == spec
+    user = BaseBackendMsg.decoder(UserMsg(uid=1, input_ids=torch.tensor([695, 283], dtype=torch.int32),
+                                          sampling_params=decoded.sampling_params).encoder())
+    assert user.sampling_params.kld == spec
+    rows = {"chunk": 3, "error": None, "kld": [0.01, 0.2], "nll": [1.5, 2.0], "nll_base": [1.4, 2.1],
+            "same_top": [1, 0], "p_diff": [0.01, -0.02]}
+    det = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(DetokenizeMsg(uid=1, next_tokens=[5], finished=True, kld=rows)))
+    assert det.kld == rows
+    out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(UserReply(uid=1, incremental_output="", finished=True, kld=rows)))
+    assert out.kld == rows
+    assert BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(UserReply(uid=1, incremental_output="x", finished=False))).kld is None
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --

@@ -414,6 +414,8 @@ class Scheduler(SchedulerIOMixin):
                         # client's terminal reply.
                         continue
                     msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                    if msg.finished and getattr(self, "_kld_jobs", None):
+                        msg.kld = self._finish_kld(req.uid)
                     if req.sampling_params.logprobs:
                         _attach_logprobs(msg, output, i, req.sampling_params.top_logprobs)
                     req.stats.stamp_token(now)
@@ -671,6 +673,8 @@ class Scheduler(SchedulerIOMixin):
                 # min_tokens: the sampler masks these ids while the output is shorter.
                 sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
                 sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
+            if sp.kld is not None and not self._admit_kld(msg):
+                return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -683,6 +687,8 @@ class Scheduler(SchedulerIOMixin):
             # in-flight concurrency.
             while len(tombstones) > 65_536:
                 tombstones.pop(next(iter(tombstones)))
+            if (kld_jobs := getattr(self, "_kld_jobs", None)) is not None:
+                kld_jobs.pop(msg.uid, None)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if (
@@ -764,6 +770,59 @@ class Scheduler(SchedulerIOMixin):
             elif req.mamba_restore_host is not None:
                 pool.from_host(req.mamba_restore_host, req.linear_slot_idx)
                 req.mamba_restore_host = None
+
+    def _admit_kld(self, msg: UserMsg) -> bool:
+        """A KLD chunk request (--enable-kld-endpoint): check it alike on every rank; refuse it with an error reply."""
+        from freetoken.benchmark.kld import check_kld_request, new_chunk_result
+
+        sp = msg.sampling_params
+        try:
+            if not getattr(self.config, "kld_endpoint", False):
+                raise ValueError("kld: the server was not started with --enable-kld-endpoint")
+            if not self.cache_manager.is_hybrid:
+                # only the hybrid manager frees a non-donating request's pages instead of caching them
+                raise ValueError("kld: needs a hybrid (GDN) prefix cache")
+            if msg.mm_items or sp.max_tokens != 1:
+                raise ValueError("kld: a chunk is a text-only prompt with max_tokens=1")
+            base = check_kld_request(sp.kld, msg.input_ids.tolist(), self.config.model_config.vocab_size)
+        except ValueError as exc:
+            self.send_result([ErrorReplyMsg(uid=msg.uid, error=str(exc))])
+            return False
+        jobs = getattr(self, "_kld_jobs", None)
+        if jobs is None:
+            jobs = self._kld_jobs = {}
+        jobs[msg.uid] = (base, new_chunk_result(int(sp.kld["chunk"])))
+        return True
+
+    def _attach_kld(self, batch: Batch) -> None:
+        """Hand the lm_head a KldCapture when this pass is a KLD chunk's whole cold prefill."""
+        from freetoken.benchmark.kld import KldCapture, capture_targets
+
+        for req in batch.reqs:
+            job = self._kld_jobs.get(req.uid)
+            if job is None or job[1]["error"] is not None:
+                continue
+            base, result = job
+            if len(batch.reqs) != 1 or req.cached_len != 0 or req.extend_len != base.n_ctx:
+                result["error"] = (
+                    f"kld: chunk {result['chunk']} did not prefill cold in one pass (batch of {len(batch.reqs)}, "
+                    f"cached {req.cached_len}, extend {req.extend_len} of {base.n_ctx} tokens)"
+                )
+                continue
+            batch.kld = KldCapture(
+                base, result["chunk"], capture_targets(base, req.input_ids),
+                slice_rows=int(req.sampling_params.kld["slice_rows"]),
+                primary=self.config.tp_info.is_primary(), result=result,
+            )
+
+    def _finish_kld(self, uid: int) -> dict | None:
+        job = self._kld_jobs.pop(uid, None)
+        if job is None:
+            return None
+        base, result = job
+        if result["error"] is None and len(result["kld"]) != base.n_rows:
+            result["error"] = f"kld: {len(result['kld'])} of {base.n_rows} rows scored"
+        return result
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
@@ -1007,6 +1066,8 @@ class Scheduler(SchedulerIOMixin):
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0][:: batch.rows_per_req].view(-1)
         attn_backend.prepare_metadata(batch)
+        if batch.is_prefill and getattr(self, "_kld_jobs", None):
+            self._attach_kld(batch)
         return ForwardInput(
             batch=batch,
             sample_args=sample_args,

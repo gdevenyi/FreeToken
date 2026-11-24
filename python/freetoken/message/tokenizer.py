@@ -62,6 +62,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # plus every intermediate reply when sampling_params.timings_per_token was set;
     # None on other intermediate replies, errors and aborts.
     timings: dict | None = None
+    # A KLD chunk request's per-row statistics (freetoken.benchmark.kld), on its terminal reply only.
+    kld: dict | None = None
 
 
 @dataclass

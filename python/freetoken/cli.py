@@ -67,6 +67,7 @@ def _print_bench_help(file: TextIO) -> None:
 
 Subcommands:
   bw   Benchmark CPU vs PCIe bandwidth and pick the MoE backend (hybrid/offload)
+  kld  KL divergence of a server (--enable-kld-endpoint) against a llama.cpp base file
 
 Use "ft bench <subcommand> --help" for subcommand-specific options.""",
         file=file,
@@ -85,6 +86,10 @@ def _run_bench(argv: list[str]) -> int:
         from freetoken.moe.benchbw import main
 
         return main(argv[1:], prog="ft bench bw")
+    if sub == "kld":
+        from freetoken.benchmark.kld import main
+
+        return main(argv[1:], prog="ft bench kld")
     print(f"unknown ft bench subcommand: {sub}", file=sys.stderr)
     _print_bench_help(sys.stderr)
     return 2

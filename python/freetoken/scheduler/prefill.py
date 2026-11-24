@@ -83,7 +83,7 @@ class PrefillAdder:
 
         # TODO: consider host cache match case (it needs the same replay cap)
         replay = self.cache_manager.prefix_replay_tokens
-        if self.isolate_logprob_reads and req.sampling_params.is_logprob_read:
+        if req.sampling_params.isolated(self.isolate_logprob_reads):
             max_len = 0  # a resumed prefill differs numerically from a cold one
         else:
             max_len = max(0, req.input_len - replay) if replay else None
@@ -378,7 +378,7 @@ class PrefillManager:
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
             # break, not continue: the slicing below assumes the admitted requests are a prefix
-            read = self.isolate_logprob_reads and pending_req.sampling_params.is_logprob_read
+            read = pending_req.sampling_params.isolated(self.isolate_logprob_reads)
             if read and reqs:
                 break  # a read never shares a pass
             if req := adder.try_add_one(pending_req):

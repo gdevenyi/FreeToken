@@ -627,6 +627,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--enable-kld-endpoint",
+        action="store_true",
+        dest="kld_endpoint",
+        default=ServerArgs.kld_endpoint,
+        help="Serve POST /v1/internal/kld (client: ft bench kld): the server runs each chunk of a "
+        "llama.cpp --kl-divergence-base file as one cold prefill that neither resumes from nor "
+        "feeds the prefix cache, and returns the full-vocabulary KL divergence, top-1 agreement "
+        "and NLL of every scored row. The endpoint reads any path the server can read: enable "
+        "it only on a trusted listener. Off by default.",
+    )
+
+    parser.add_argument(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,

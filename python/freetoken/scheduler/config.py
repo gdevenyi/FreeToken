@@ -22,6 +22,8 @@ class SchedulerConfig(EngineConfig):
     logprob_read_snapshot_donate: str = "all"
     # logprob reads prefill alone and bypass the prefix cache, so their logprobs do not depend on other traffic
     logprob_read_isolate: bool = False
+    # POST /v1/internal/kld: score KL-divergence base chunks through the served model (benchmark/kld.py)
+    kld_endpoint: bool = False
     # hybrid GDN: where prefills donate state snapshots (CacheManager): chunk | structural
     gdn_snapshot_policy: str = "chunk"
 

@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
+    from freetoken.benchmark.kld import KldCapture
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.models.blocks import FeatureSink
@@ -57,6 +58,9 @@ class SamplingParams:
     # vLLM allowed_token_ids: sampling is masked to these ids (sorted, unique). A request that
     # also asks for logprobs gets them renormalized over this set (Sampler.compute_logprobs).
     allowed_token_ids: list[int] | None = None
+    # One chunk of a KL-divergence base file ({"path", "chunk", "slice_rows", "bos_token_id"}), set
+    # only by the /v1/internal/kld endpoint (--enable-kld-endpoint); see freetoken.benchmark.kld.
+    kld: dict | None = None
 
     def client_token_ids(self) -> list[tuple[str, list[int]]]:
         """The token ids a client supplied, by request field (empty ones left out): each
@@ -72,6 +76,11 @@ class SamplingParams:
     def is_logprob_read(self) -> bool:
         """A scoring read (e.g. AnyJev label logprobs): one token whose logprobs are the answer."""
         return bool(self.logprobs) and self.max_tokens == 1
+
+    def isolated(self, isolate_logprob_reads: bool) -> bool:
+        """Prefills in a pass of its own and neither resumes from nor feeds the prefix cache: a KLD
+        chunk always, a logprob read under --logprob-read-isolate."""
+        return self.kld is not None or (isolate_logprob_reads and self.is_logprob_read)
 
     @property
     def is_greedy(self) -> bool:
@@ -277,6 +286,8 @@ class Batch:
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
     # per-row hidden states a draft model reads from this forward; None when nothing reads them
     features: "FeatureSink | None" = field(default=None, init=False)
+    # the lm_head scores every row of this cold prefill against a KLD base chunk; None otherwise
+    kld: KldCapture | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.rows_per_req is None and self.phase == "decode":
