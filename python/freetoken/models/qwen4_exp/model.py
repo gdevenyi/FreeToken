@@ -22,6 +22,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.config import fp8_dense_scale, fp8_lmhead_scale
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -42,6 +43,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
     from freetoken.layers.linear_attn import GatedDeltaNet
 
     g = config.linear_attention_group()
+    dynamic_fp8 = use_fp8_dense(config, f"{prefix}.in_proj_qkvz")
     return GatedDeltaNet(
         hidden_size=config.hidden_size,
         num_k_heads=g.num_key_heads,
@@ -55,7 +57,8 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         quant_config=config.quant,
         prefix=prefix,
         out_heads_tiled=config.qwen4_args.gdn_out_heads_tiled,
-        dynamic_fp8=use_fp8_dense(config, f"{prefix}.in_proj_qkvz"),
+        dynamic_fp8=dynamic_fp8,
+        fp8_channel=dynamic_fp8 and fp8_dense_scale() == "channel",
     )
 
 
@@ -173,7 +176,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self._config = config
         self.model = Qwen4ExpModel(config)
         if use_fp8_lmhead(config):
-            self.lm_head = Fp8ParallelLMHead(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size)
+            self.lm_head = Fp8ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                channel=fp8_lmhead_scale() == "channel",
+            )
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,

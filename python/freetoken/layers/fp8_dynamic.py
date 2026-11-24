@@ -1,6 +1,7 @@
-"""Load-time per-tensor FP8 dense linear (W8A8 through cuBLASLt ``torch._scaled_mm``).
+"""Load-time FP8 dense linear (W8A8 through cuBLASLt ``torch._scaled_mm``).
 
-The weight is e4m3 ``[out_local, in_local]`` with one fp32 ``weight_scale`` (shape ``()``),
+The weight is e4m3 ``[out_local, in_local]`` with one fp32 ``weight_scale`` (shape ``()``, the
+default) or one per output row (shape ``[out_local]``, ``FREETOKEN_FP8_DENSE_SCALE=channel``),
 produced by the model's weight reader from the bf16 checkpoint tensor (after TP sharding).
 The activation is quantized per call with a dynamic per-row scale (``quant_per_row``, applied
 after the GEMM). ``quant_per_tensor`` is the older per-tensor cast: one Triton launch (a
@@ -148,6 +149,48 @@ def quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return out, scale
 
 
+@triton.jit
+def _scale_rows_cols_kernel(y_ptr, row_ptr, col_ptr, n, BLOCK_N: tl.constexpr):
+    """``y[m, j] *= row[m] * col[j]`` in place, in fp32, one rounding to ``y``'s dtype."""
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < n
+    y = tl.load(y_ptr + row * n + offs, mask=mask, other=0.0).to(tl.float32)
+    c = tl.load(col_ptr + offs, mask=mask, other=0.0)
+    y = y * tl.load(row_ptr + row) * c
+    tl.store(y_ptr + row * n + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def scale_rows_cols_(
+    y: torch.Tensor, row_scale: torch.Tensor, col_scale: torch.Tensor
+) -> torch.Tensor:
+    """In place ``y *= row_scale * col_scale[None, :]`` (fp32 math, one launch, no host sync);
+    ``y`` contiguous ``[M, N]``, ``row_scale`` fp32 ``[M, 1]``, ``col_scale`` fp32 ``[N]``."""
+    m, n = y.shape
+    if m:
+        _scale_rows_cols_kernel[(m, triton.cdiv(n, 1024))](
+            y, row_scale, col_scale, n, BLOCK_N=1024, num_warps=4
+        )
+    return y
+
+
+def _fp8_channel_linear(
+    x2: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Per-output-channel weight scale: the GEMM runs tensorwise with unit scales (the cuBLASLt mode the
+    per-tensor path uses), then one pass applies ``row_scale[m] * weight_scale[n]``. One code path for
+    any row count, so a decode row and a verify row differ only by the GEMM's accumulation order.
+    The cost is the multi-row per-tensor path's: same launches (row quant, unit-scale fill, GEMM, scale
+    pass), same output bytes. Against the per-tensor one-row path (quant, GEMM) it adds two launches."""
+    x8, row_scale = quant_per_row(x2)
+    one = weight_scale.new_ones(())
+    y = torch._scaled_mm(x8, weight.t(), scale_a=one, scale_b=one, out_dtype=out_dtype)
+    return scale_rows_cols_(y, row_scale, weight_scale)
+
+
 def fp8_dynamic_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -164,10 +207,14 @@ def fp8_dynamic_linear(
     ``out_dtype`` (default: ``x``'s dtype) is the output dtype. In bf16 the one-row path (scale in
     the GEMM epilogue, one rounding) and the multi-row path (a bf16 GEMM output, then the scale,
     two roundings) give the same row slightly different values, so a decode step at batch 1 and a
-    speculative verify row disagree by bf16 steps. fp32 output makes both paths round once."""
+    speculative verify row disagree by bf16 steps. fp32 output makes both paths round once.
+
+    A ``weight_scale`` of shape ``[N]`` (one per output row) takes :func:`_fp8_channel_linear`."""
     out_dtype = x.dtype if out_dtype is None else out_dtype
     *lead, k = x.shape
     x2 = x.reshape(-1, k).contiguous()
+    if weight_scale.ndim == 1:
+        return _fp8_channel_linear(x2, weight, weight_scale, out_dtype).reshape(*lead, weight.shape[0])
     if x2.shape[0] == 1:  # one row: per-tensor is per-row, and the scale rides in the GEMM epilogue
         x8, scale = quant_per_tensor(x2)
         y = torch._scaled_mm(x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=out_dtype)
@@ -181,9 +228,10 @@ def fp8_dynamic_linear(
 
 
 class Fp8DynamicLinear(BaseOP):
-    """Per-tensor FP8 linear over the local shard; ``all_reduce`` adds the TP sum (row-parallel)."""
+    """FP8 linear over the local shard; ``all_reduce`` adds the TP sum (row-parallel).
+    ``channel``: one weight scale per local output row instead of one per tensor."""
 
-    def __init__(self, local_isize: int, local_osize: int, *, all_reduce: bool = False):
+    def __init__(self, local_isize: int, local_osize: int, *, all_reduce: bool = False, channel: bool = False):
         assert local_isize % 16 == 0 and local_osize % 16 == 0, (
             local_isize,
             local_osize,
@@ -191,7 +239,7 @@ class Fp8DynamicLinear(BaseOP):
         self.local_input_size = local_isize
         self.local_output_size = local_osize
         self.weight = torch.empty(local_osize, local_isize, dtype=FP8)
-        self.weight_scale = torch.empty((), dtype=torch.float32)
+        self.weight_scale = torch.empty((local_osize,) if channel else (), dtype=torch.float32)
         self._comm = (
             DistributedCommunicator() if all_reduce and get_tp_info().size > 1 else None
         )
@@ -212,27 +260,30 @@ class Fp8DynamicColMerged(Fp8DynamicLinear):
         input_size: int,
         output_sizes: List[int],
         local_output_sizes: List[int] | None = None,
+        *,
+        channel: bool = False,
     ):
         tp = get_tp_info()
         if local_output_sizes is None:
             local_output_sizes = [div_even(size, tp.size) for size in output_sizes]
         self.output_sizes = list(output_sizes)
         self.local_output_sizes = list(local_output_sizes)
-        super().__init__(input_size, sum(local_output_sizes))
+        super().__init__(input_size, sum(local_output_sizes), channel=channel)
 
 
 class Fp8DynamicRowParallel(Fp8DynamicLinear):
     """Drop-in for ``LinearOProj`` / ``LinearRowParallel``: the input dim is sharded, the
     all-reduce runs after the local GEMM (each rank scales its own shard)."""
 
-    def __init__(self, input_size: int, output_size: int):
+    def __init__(self, input_size: int, output_size: int, *, channel: bool = False):
         super().__init__(
-            div_even(input_size, get_tp_info().size), output_size, all_reduce=True
+            div_even(input_size, get_tp_info().size), output_size, all_reduce=True, channel=channel
         )
 
 
 class Fp8ParallelLMHead(ParallelLMHead):
-    """``ParallelLMHead`` whose vocab shard is a per-tensor e4m3 weight (FREETOKEN_FP8_LMHEAD=1).
+    """``ParallelLMHead`` whose vocab shard is an e4m3 weight (FREETOKEN_FP8_LMHEAD=1), with one scale per
+    tensor or, with ``channel`` (FREETOKEN_FP8_LMHEAD_SCALE=channel), one per vocab row.
 
     Only the GEMM changes; the all_gather in ``logits`` is untouched. Untied embeddings only: a tied head shares the bf16 embedding table.
     """
@@ -244,21 +295,25 @@ class Fp8ParallelLMHead(ParallelLMHead):
         *,
         tp_size: int | None = None,
         tp_rank: int | None = None,
+        channel: bool = False,
     ):
         super().__init__(num_embeddings, embedding_dim, tp_size=tp_size, tp_rank=tp_rank)
         self.weight = torch.empty(self.num_embeddings_tp, embedding_dim, dtype=FP8)
-        self.weight_scale = torch.empty((), dtype=torch.float32)
+        self.weight_scale = torch.empty((self.num_embeddings_tp,) if channel else (), dtype=torch.float32)
 
     def keep_rows(self, ids: torch.Tensor, quant_config=None) -> None:
         from freetoken.utils import div_ceil
 
         ids = ids[torch.arange(div_ceil(ids.numel(), 128) * 128) % ids.numel()]
         rows = ids.numel()
+        channel = self.weight_scale.ndim == 1
         with torch.device("meta"):
-            head = Fp8ParallelLMHead(rows, self.embedding_dim, tp_size=1, tp_rank=0)
+            head = Fp8ParallelLMHead(rows, self.embedding_dim, tp_size=1, tp_rank=0, channel=channel)
         device = self.weight.device
         ids = ids.to(device)
-        if self.tp_size == 1:
+        if channel:
+            self._keep_rows_channel(head, ids, rows)
+        elif self.tp_size == 1:
             head.weight = self.weight.index_select(0, ids)
             head.weight_scale = self.weight_scale.clone()
         else:
@@ -277,6 +332,30 @@ class Fp8ParallelLMHead(ParallelLMHead):
             head.weight_scale = scale.reshape(())
         self.kept_rows = head, ids
 
+    def _keep_rows_channel(
+        self, head: Fp8ParallelLMHead, ids: torch.Tensor, rows: int
+    ) -> None:
+        """Per-row scales: keep each row's e4m3 codes and scale as they are (no requant). At TP > 1 every
+        kept row lives on one rank, so the all-reduce of (codes, zeros) is exact; e4m3 is exact in bf16."""
+        if self.tp_size == 1:
+            head.weight = self.weight.index_select(0, ids)
+            head.weight_scale = self.weight_scale.index_select(0, ids)
+            return
+        start, count = self.vocab_range
+        in_shard = (ids >= start) & (ids < start + count)
+        local_ids = ids[in_shard] - start
+        codes = torch.zeros(
+            rows, self.embedding_dim, dtype=torch.bfloat16, device=ids.device
+        )
+        scales = torch.zeros(rows, dtype=torch.float32, device=ids.device)
+        if local_ids.numel():
+            codes[in_shard] = self.weight.index_select(0, local_ids).to(torch.bfloat16)
+            scales[in_shard] = self.weight_scale.index_select(0, local_ids)
+        codes = self._comm.all_reduce(codes)
+        scales = self._comm.all_reduce(scales)
+        head.weight = codes.to(FP8)
+        head.weight_scale = scales
+
     def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
         # fp32 logits: bf16 logits step by 0.125 at the magnitudes greedy decode compares, so ties are
         # common and a decode row and a verify row of the same token can pick different argmaxes
@@ -294,4 +373,5 @@ __all__ = [
     "fp8_dynamic_linear",
     "quant_per_row",
     "quant_per_tensor",
+    "scale_rows_cols_",
 ]
