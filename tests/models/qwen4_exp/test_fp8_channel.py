@@ -339,6 +339,46 @@ def test_ops_declare_a_per_row_scale_in_channel_mode_and_a_scalar_by_default(tp1
     )  # the default is per tensor
 
 
+@pytest.mark.parametrize("channel", [False, True])
+def test_ops_and_lm_head_load_the_reader_output(tp1, channel):
+    """The reader's tensors go through each op's own load_state_dict (ParallelLMHead has its own), with
+    the dtype cast the engine applies (to the buffer dtype), and land unchanged."""
+    from freetoken.layers.fp8_dynamic import (
+        Fp8DynamicColMerged,
+        Fp8DynamicRowParallel,
+        Fp8ParallelLMHead,
+    )
+
+    torch.manual_seed(12)
+    ops = {
+        "x.self_attn.qkv_proj.weight": Fp8DynamicColMerged(
+            32, [64, 16, 16], channel=channel
+        ),
+        "x.self_attn.o_proj.weight": Fp8DynamicRowParallel(64, 32, channel=channel),
+        "lm_head.weight": Fp8ParallelLMHead(80, 32, channel=channel),
+    }
+    for name, op in ops.items():
+        rows, cols = op.weight.shape
+        t = (torch.randn(rows, cols) * 0.02).to(torch.bfloat16)
+        lm = name == "lm_head.weight"
+        kw = {
+            "dense": not lm,
+            "lm_head": lm,
+            "dense_channel": channel,
+            "lmhead_channel": channel,
+        }
+        out = dict(_fp8_dense(name, t, _cfg(), 1, **kw))
+        want = op.state_dict()
+        sd = {k: out[name[: -len("weight")] + k] for k in ("weight", "weight_scale")}
+        sd = {k: v.to(want[k].dtype) for k, v in sd.items()}
+        op.load_state_dict(dict(sd))
+        assert op.weight.dtype is FP8 and op.weight_scale.shape == (
+            (rows,) if channel else ()
+        )
+        assert torch.equal(op.weight.view(torch.uint8), sd["weight"].view(torch.uint8))
+        assert torch.equal(op.weight_scale, sd["weight_scale"])
+
+
 def _torch_quant_per_row(x: torch.Tensor):
     xf = x.float()
     s = (xf.abs().amax(dim=1, keepdim=True) / E4M3_MAX).clamp_min(1e-12)

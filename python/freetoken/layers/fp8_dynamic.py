@@ -183,8 +183,8 @@ def _fp8_channel_linear(
     """Per-output-channel weight scale: the GEMM runs tensorwise with unit scales (the cuBLASLt mode the
     per-tensor path uses), then one pass applies ``row_scale[m] * weight_scale[n]``. One code path for
     any row count, so a decode row and a verify row differ only by the GEMM's accumulation order.
-    The cost is the multi-row per-tensor path's: same launches, same output bytes (one more launch
-    than the per-tensor one-row path)."""
+    The cost is the multi-row per-tensor path's: same launches (row quant, unit-scale fill, GEMM, scale
+    pass), same output bytes. Against the per-tensor one-row path (quant, GEMM) it adds two launches."""
     x8, row_scale = quant_per_row(x2)
     one = weight_scale.new_ones(())
     y = torch._scaled_mm(x8, weight.t(), scale_a=one, scale_b=one, out_dtype=out_dtype)
