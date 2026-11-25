@@ -94,3 +94,46 @@ def test_lut4_ple_quantize_load_and_gather_roundtrip(tmp_path):
     ref_valid = ref_full.index_select(0, valid_ids)
     rel_err = torch.linalg.norm(got_valid - ref_valid) / torch.linalg.norm(ref_valid)
     assert float(rel_err.item()) < 0.14
+
+
+def test_quantize_ple_gguf_streams_bf16_to_lut4_shards(tmp_path, monkeypatch):
+    mod = _load_quantizer_module()
+
+    torch.manual_seed(99)
+    total_rows, head_dim, split_parts = 512, 160, 4
+    ref = (torch.randn(total_rows, head_dim) * 0.08).to(torch.bfloat16)
+    raw_file = tmp_path / "fake_ple.gguf_file"
+    header_pad = b"GGUF_FAKE_HEADER" * 4  # 64-byte offset
+    raw_file.write_bytes(header_pad + bytes(ref.contiguous().view(torch.uint8).numpy()))
+
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    fake_info = SimpleNamespace(
+        path=str(raw_file),
+        offset=len(header_pad),
+        ne=(head_dim, total_rows),
+        ggml_type=GGMLQuantizationType.BF16,
+        nbytes=total_rows * head_dim * 2,
+    )
+    import freetoken.models.qwen4_exp.gguf as q4_gguf
+
+    monkeypatch.setattr(q4_gguf, "check_ple_table", lambda *_a, **_kw: fake_info)
+
+    out_dir = tmp_path / "ple_lut4_from_gguf"
+    stats = mod.quantize_ple_gguf(
+        raw_file,
+        out_dir,
+        head_dim=head_dim,
+        split_parts=split_parts,
+        group_size=32,
+        chunk_rows=128,
+        sample_rows_per_shard=64,
+    )
+    assert stats["shards"] == split_parts
+    assert stats["total_rows"] == total_rows
+    assert float(stats["rel_rmse"]) < 0.13
+
+    args = SimpleNamespace(split_ngram_parts=split_parts, ngram_head_dim=head_dim)
+    table = load_ple_table_lut4(str(out_dir), args, pin=False, shm_dir=str(tmp_path))
+    assert table.bank.tensor.shape == (total_rows, 90)
+    assert table.weight_lut is not None and table.weight_lut.shape == (16,)

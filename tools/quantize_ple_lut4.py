@@ -230,7 +230,7 @@ def quantize_ple_gguf(
     out_dir: str | Path,
     *,
     head_dim: int = 160,
-    split_parts: int = 32,
+    split_parts: int = 128,
     group_size: int = 32,
     chunk_rows: int = 262_144,
     sample_rows_per_shard: int = 8_192,
@@ -342,10 +342,10 @@ def quantize_ple_gguf(
 
 def _infer_ple_geometry(model_dir: str | None) -> tuple[int, int]:
     if not model_dir:
-        return 160, 32
+        return 160, 128
     cfg_path = Path(model_dir) / "config.json"
     if not cfg_path.is_file():
-        return 160, 32
+        return 160, 128
     raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     tc = raw.get("text_config", raw)
     ple_dim = int(tc.get("ple_embed_dim", 2560))
@@ -353,7 +353,7 @@ def _infer_ple_geometry(model_dir: str | None) -> tuple[int, int]:
     heads_per = int(tc.get("heads_per_ngram", 8))
     num_heads = (ngram_size - 1) * heads_per
     head_dim = ple_dim // num_heads
-    split_parts = int(tc.get("split_ngram_parts", 32))
+    split_parts = int(tc.get("split_ngram_parts", 128))
     return head_dim, split_parts
 
 
