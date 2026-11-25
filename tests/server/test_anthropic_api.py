@@ -27,7 +27,10 @@ if _PY not in sys.path:
 from freetoken.message import UserMsg  # noqa: E402
 from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import anthropic_api as A  # noqa: E402
-from freetoken.server.anthropic_models import AnthropicCountTokensRequest, AnthropicMessagesRequest  # noqa: E402
+from freetoken.server.anthropic_models import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)  # noqa: E402
 from freetoken.server.function_call_parser import ToolCallItem  # noqa: E402
 from freetoken.server.generation import (  # noqa: E402
     ContentDelta,
@@ -48,7 +51,9 @@ def _collect_events(events, model="claude-x", uid=1, cache_report=False):
 
     async def run():
         out = []
-        async for frame in A.anthropic_event_stream(_aiter(events), model, uid, cache_report=cache_report):
+        async for frame in A.anthropic_event_stream(
+            _aiter(events), model, uid, cache_report=cache_report
+        ):
             etype = None
             data = None
             for line in frame.split("\n"):
@@ -77,7 +82,10 @@ def test_convert_request_system_text_tools():
                 {
                     "name": "get_weather",
                     "description": "get weather",
-                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
                 }
             ],
             "tool_choice": {"type": "auto"},
@@ -107,7 +115,12 @@ def test_convert_request_tool_use_and_result_roundtrip():
                     "role": "assistant",
                     "content": [
                         {"type": "text", "text": "let me check"},
-                        {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "get_weather",
+                            "input": {"city": "SF"},
+                        },
                     ],
                 },
                 {
@@ -179,9 +192,13 @@ def test_convert_thinking_toggle_broadcasts_every_spelling():
     on = {"enable_thinking": True, "thinking_mode": "enabled"}
     off = {"enable_thinking": False, "thinking_mode": "disabled"}
     for parser in ("minimax_m3", "qwen3", "minimax", None):
-        spec = A.convert_anthropic_to_genspec(_req("enabled"), {}, reasoning_parser=parser)
+        spec = A.convert_anthropic_to_genspec(
+            _req("enabled"), {}, reasoning_parser=parser
+        )
         assert spec.chat_template_kwargs == on, parser
-        spec = A.convert_anthropic_to_genspec(_req("disabled"), {}, reasoning_parser=parser)
+        spec = A.convert_anthropic_to_genspec(
+            _req("disabled"), {}, reasoning_parser=parser
+        )
         assert spec.chat_template_kwargs == off, parser
 
 
@@ -194,7 +211,10 @@ def test_convert_thinking_only_assistant_message_keeps_empty_content():
             "max_tokens": 64,
             "messages": [
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [{"type": "thinking", "thinking": "partial"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "partial"}],
+                },
                 {"role": "user", "content": "continue"},
             ],
         }
@@ -216,11 +236,25 @@ def test_convert_thinking_replay_in_tool_loop():
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "thinking", "thinking": "need the tool", "signature": ""},
-                        {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
+                        {
+                            "type": "thinking",
+                            "thinking": "need the tool",
+                            "signature": "",
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "get_weather",
+                            "input": {},
+                        },
                     ],
                 },
-                {"role": "user", "content": [{"type": "tool_result", "id": "toolu_1", "content": "72F"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "id": "toolu_1", "content": "72F"}
+                    ],
+                },
             ],
         }
     )
@@ -267,7 +301,10 @@ def test_convert_merges_only_leading_system_messages():
                 {"role": "system", "content": "leading sys"},
                 {"role": "system", "content": [{"type": "text", "text": "second sys"}]},
                 {"role": "user", "content": "hello"},
-                {"role": "system", "content": [{"type": "text", "text": "turn reminder"}]},
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "turn reminder"}],
+                },
                 {"role": "assistant", "content": "hi"},
                 {"role": "system", "content": ""},
                 {"role": "system", "content": "next reminder"},
@@ -297,18 +334,31 @@ def test_appending_system_reminder_preserves_converted_prefix(system, count_toke
             {"role": "user", "content": "inspect the source"},
             {"role": "assistant", "content": "I found the function"},
         ],
-        "tools": [{"name": "read", "input_schema": {"type": "object", "properties": {}}}],
+        "tools": [
+            {"name": "read", "input_schema": {"type": "object", "properties": {}}}
+        ],
     }
     if system is not None:
         data["system"] = system
     if not count_tokens:
         data["max_tokens"] = 64
-    request_type = AnthropicCountTokensRequest if count_tokens else AnthropicMessagesRequest
-    first, first_tools, _, _ = A.convert_anthropic_prompt(request_type.model_validate(data))
-    data["messages"].append({"role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"})
-    second, second_tools, _, _ = A.convert_anthropic_prompt(request_type.model_validate(data))
+    request_type = (
+        AnthropicCountTokensRequest if count_tokens else AnthropicMessagesRequest
+    )
+    first, first_tools, _, _ = A.convert_anthropic_prompt(
+        request_type.model_validate(data)
+    )
+    data["messages"].append(
+        {"role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"}
+    )
+    second, second_tools, _, _ = A.convert_anthropic_prompt(
+        request_type.model_validate(data)
+    )
     assert second[:-1] == first
-    assert second[-1] == {"role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"}
+    assert second[-1] == {
+        "role": "system",
+        "content": "<total_tokens>1000 tokens left</total_tokens>",
+    }
     assert second_tools == first_tools
 
 
@@ -319,7 +369,9 @@ def test_full_response_text_and_tool():
     result = GenResult(
         reasoning="",
         content="calling tool",
-        tool_calls=[ToolCallItem(tool_index=0, name="get_weather", parameters='{"city": "SF"}')],
+        tool_calls=[
+            ToolCallItem(tool_index=0, name="get_weather", parameters='{"city": "SF"}')
+        ],
         finish_reason="tool_calls",
         prompt_tokens=11,
         completion_tokens=5,
@@ -444,7 +496,11 @@ def test_stream_reasoning_as_thinking_block():
         "message_stop",
     ]
     blocks = [e[1] for e in collected if e[0] == "content_block_start"]
-    assert blocks[0]["content_block"] == {"type": "thinking", "thinking": "", "signature": ""}
+    assert blocks[0]["content_block"] == {
+        "type": "thinking",
+        "thinking": "",
+        "signature": "",
+    }
     assert blocks[0]["index"] == 0
     assert blocks[1]["content_block"]["type"] == "text"
     assert blocks[1]["index"] == 1
@@ -457,7 +513,9 @@ def test_stream_reasoning_as_thinking_block():
 def test_stream_tool_call():
     args = '{"city": "SF"}'
     events = [
-        ToolCallsDelta([ToolCallItem(tool_index=0, name="get_weather", parameters=args)]),
+        ToolCallsDelta(
+            [ToolCallItem(tool_index=0, name="get_weather", parameters=args)]
+        ),
         GenDone("tool_calls", 7, 3),
     ]
     collected = _collect_events(events)
@@ -494,7 +552,11 @@ def test_stream_message_start_reports_the_admitted_prompt_usage(cache_report):
     from freetoken.server.generation import PromptAdmitted
 
     collected = _collect_events(
-        [PromptAdmitted(1200, 1024), ContentDelta("hi"), GenDone("stop", 1200, 5, cached_tokens=1024)],
+        [
+            PromptAdmitted(1200, 1024),
+            ContentDelta("hi"),
+            GenDone("stop", 1200, 5, cached_tokens=1024),
+        ],
         cache_report=cache_report,
     )
     types = [e[0] for e in collected]
@@ -502,7 +564,11 @@ def test_stream_message_start_reports_the_admitted_prompt_usage(cache_report):
     start = collected[0][1]["message"]["usage"]
     delta = next(d for t, d in collected if t == "message_delta")["usage"]
     assert start == {**delta, "output_tokens": 0}
-    expected = {"input_tokens": 176, "cache_read_input_tokens": 1024} if cache_report else {"input_tokens": 1200}
+    expected = (
+        {"input_tokens": 176, "cache_read_input_tokens": 1024}
+        if cache_report
+        else {"input_tokens": 1200}
+    )
     assert start == {**expected, "output_tokens": 0}
 
 
@@ -538,7 +604,9 @@ def test_generate_events_announces_prompt_admission():
     fake = FakeState([("", False, 1200, 0), ("hi", True, 0, 1)])
     fake.cached = 1024
     spec = A.convert_anthropic_to_genspec(
-        AnthropicMessagesRequest(model="m", max_tokens=8, messages=[{"role": "user", "content": "x"}]),
+        AnthropicMessagesRequest(
+            model="m", max_tokens=8, messages=[{"role": "user", "content": "x"}]
+        ),
         {},
     )
 
@@ -608,7 +676,11 @@ def test_route_nonstream_text():
     client = _client(fake)
     r = client.post(
         "/v1/messages",
-        json={"model": "claude-x", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]},
+        json={
+            "model": "claude-x",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -649,7 +721,11 @@ def test_route_stream_text():
                     data = json.loads(raw)
         if etype:
             etypes.append(etype)
-        if etype == "content_block_delta" and data and data["delta"].get("type") == "text_delta":
+        if (
+            etype == "content_block_delta"
+            and data
+            and data["delta"].get("type") == "text_delta"
+        ):
             text += data["delta"]["text"]
         if etype == "message_start":
             assert data["message"]["usage"]["input_tokens"] == 5
@@ -666,7 +742,9 @@ def test_stream_request_error_is_invalid_request_not_internal():
     from freetoken.server.generation import GenerationError
 
     async def boom():
-        raise GenerationError("prompt is too long: 8181 tokens > 7223 maximum", "context_length_exceeded")
+        raise GenerationError(
+            "prompt is too long: 8181 tokens > 7223 maximum", "context_length_exceeded"
+        )
         yield  # noqa: unreachable — makes this an async generator
 
     async def run():
@@ -695,7 +773,9 @@ def test_stream_request_error_is_invalid_request_not_internal():
 def test_stream_tool_block_closes_before_following_text():
     args = '{"city": "SF"}'
     events = [
-        ToolCallsDelta([ToolCallItem(tool_index=0, name="get_weather", parameters=args)]),
+        ToolCallsDelta(
+            [ToolCallItem(tool_index=0, name="get_weather", parameters=args)]
+        ),
         ContentDelta("done"),
         GenDone("tool_calls", 7, 3),
     ]
@@ -735,22 +815,44 @@ def test_full_response_includes_thinking_block():
 
 
 def test_convert_native_thinking_toggle():
-    base = {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+    base = {
+        "model": "claude-x",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
     on = A.convert_anthropic_to_genspec(
-        AnthropicMessagesRequest.model_validate({**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}), {}
+        AnthropicMessagesRequest.model_validate(
+            {**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}
+        ),
+        {},
     )
-    assert on.chat_template_kwargs == {"enable_thinking": True, "thinking_mode": "enabled"}
+    assert on.chat_template_kwargs == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+    }
     off = A.convert_anthropic_to_genspec(
-        AnthropicMessagesRequest.model_validate({**base, "thinking": {"type": "disabled"}}), {}
+        AnthropicMessagesRequest.model_validate(
+            {**base, "thinking": {"type": "disabled"}}
+        ),
+        {},
     )
-    assert off.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
-    absent = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(base), {})
+    assert off.chat_template_kwargs == {
+        "enable_thinking": False,
+        "thinking_mode": "disabled",
+    }
+    absent = A.convert_anthropic_to_genspec(
+        AnthropicMessagesRequest.model_validate(base), {}
+    )
     assert absent.chat_template_kwargs == {}
 
 
 def test_convert_output_config_effort():
     """output_config.effort folds in as the Responses API's reasoning.effort does."""
-    base = {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+    base = {
+        "model": "claude-x",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
 
     def ctk(**extra):
         req = AnthropicMessagesRequest.model_validate({**base, **extra})
@@ -762,7 +864,10 @@ def test_convert_output_config_effort():
     assert ctk(output_config={"effort": " MAX "}) == {**on, "reasoning_effort": "max"}
     # an explicit thinking type decides on/off; "disabled" wins over any effort
     assert ctk(output_config={"effort": "high"}, thinking={"type": "disabled"}) == off
-    assert ctk(output_config={"effort": "high"}, thinking={"type": "adaptive"}) == {**on, "reasoning_effort": "high"}
+    assert ctk(output_config={"effort": "high"}, thinking={"type": "adaptive"}) == {
+        **on,
+        "reasoning_effort": "high",
+    }
     assert ctk(output_config={"effort": "none"}) == off
     # no effort (or an empty one, or other output_config keys only): the old behavior
     assert ctk(output_config={}) == {}
@@ -779,15 +884,25 @@ def test_output_config_effort_obeys_server_thinking_policy():
             "output_config": {"effort": "high"},
         }
     )
-    forced_off = A.convert_anthropic_to_genspec(req, {}, thinking="off").chat_template_kwargs
+    forced_off = A.convert_anthropic_to_genspec(
+        req, {}, thinking="off"
+    ).chat_template_kwargs
     assert "reasoning_effort" not in forced_off
     assert forced_off["enable_thinking"] is False
 
 
 def test_count_tokens_prompt_matches_messages_prompt_with_effort():
-    body = {"model": "claude-x", "messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": "medium"}}
-    counted = A.convert_anthropic_prompt(AnthropicCountTokensRequest.model_validate(body))
-    generated = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}))
+    body = {
+        "model": "claude-x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {"effort": "medium"},
+    }
+    counted = A.convert_anthropic_prompt(
+        AnthropicCountTokensRequest.model_validate(body)
+    )
+    generated = A.convert_anthropic_prompt(
+        AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64})
+    )
     assert counted == generated
     assert counted[3]["reasoning_effort"] == "medium"
 
@@ -807,7 +922,9 @@ class _FakeTokenizeManager:
         self.msgs.extend(msgs)
         return [
             UserMsg(
-                uid=m.uid, input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32), sampling_params=m.sampling_params
+                uid=m.uid,
+                input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32),
+                sampling_params=m.sampling_params,
             )
             for m in msgs
         ]
@@ -828,7 +945,10 @@ _COUNT_BODY = {
         {
             "name": "get_weather",
             "description": "get weather",
-            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
         }
     ],
     "thinking": {"type": "enabled", "budget_tokens": 1024},
@@ -856,7 +976,9 @@ def test_count_tokens_route():
 
 def test_count_tokens_empty_messages_400():
     client, _ = _count_client(_FakeTokenizeManager())
-    r = client.post("/v1/messages/count_tokens", json={"model": "claude-x", "messages": []})
+    r = client.post(
+        "/v1/messages/count_tokens", json={"model": "claude-x", "messages": []}
+    )
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
 
@@ -876,11 +998,20 @@ def test_inline_system_override_reaches_counting_and_generation(policy):
     client = _client(fake)
     body = {
         **_COUNT_BODY,
-        "messages": [{"role": "user", "content": "question"}, {"role": "system", "content": "instruction"}],
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "system", "content": "instruction"},
+        ],
     }
     assert client.post("/v1/messages/count_tokens", json=body).status_code == 200
-    assert client.post("/v1/messages", json={**body, "max_tokens": 32}).status_code == 200
-    assert manager.msgs[0].inline_system_policy == submitted[0].inline_system_policy == policy
+    assert (
+        client.post("/v1/messages", json={**body, "max_tokens": 32}).status_code == 200
+    )
+    assert (
+        manager.msgs[0].inline_system_policy
+        == submitted[0].inline_system_policy
+        == policy
+    )
     assert manager.msgs[0].text == submitted[0].text
     assert submitted[0].text[0]["content"] == body["system"]
 
@@ -934,7 +1065,9 @@ def test_count_tokens_template_render_error_400():
 def test_count_tokens_inline_system_placement_error_is_400():
     from freetoken.tokenizer.inline_system import InlineSystemError
 
-    client, _ = _count_client(_RaisingManager(InlineSystemError("missing tool results")))
+    client, _ = _count_client(
+        _RaisingManager(InlineSystemError("missing tool results"))
+    )
     r = client.post("/v1/messages/count_tokens", json=_COUNT_BODY)
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
@@ -957,7 +1090,12 @@ def test_count_tokens_excluded_from_request_ring():
     # A real /v1/messages request IS tracked, proving the exclusion is scoped to the subpath.
     client2 = _client(FakeState([("hi", True, 3, 1)]))
     client2.post(
-        "/v1/messages", json={"model": "claude-x", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        "/v1/messages",
+        json={
+            "model": "claude-x",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
     )
     assert request_ring.requests_count() == 1
     request_ring.reset()
@@ -971,7 +1109,14 @@ def test_count_tokens_image_only_message_400():
         "/v1/messages/count_tokens",
         json={
             "model": "claude-x",
-            "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "x"}}]}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "url", "url": "x"}}
+                    ],
+                }
+            ],
         },
     )
     assert r.status_code == 400
@@ -980,10 +1125,14 @@ def test_count_tokens_image_only_message_400():
 
 def test_tool_choice_none_hides_tools():
     body = {**_COUNT_BODY, "tool_choice": {"type": "none"}}
-    _, template_tools, parser_tools, _ = A.convert_anthropic_prompt(A.AnthropicCountTokensRequest.model_validate(body))
+    _, template_tools, parser_tools, _ = A.convert_anthropic_prompt(
+        A.AnthropicCountTokensRequest.model_validate(body)
+    )
     assert template_tools is None
     assert parser_tools is None
-    spec = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}), {})
+    spec = A.convert_anthropic_to_genspec(
+        AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}), {}
+    )
     assert spec.template_tools is None
     assert not spec.parse_tools
 
@@ -998,7 +1147,10 @@ def test_validation_error_uses_anthropic_envelope():
     assert body["error"]["type"] == "invalid_request_error"
     assert "messages" in body["error"]["message"]
     # /v1/messages inherits the same envelope
-    r = client.post("/v1/messages", json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]})
+    r = client.post(
+        "/v1/messages",
+        json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
     # non-Anthropic routes keep FastAPI's default 422 shape
@@ -1037,7 +1189,10 @@ def test_frontend_tokenizer_concurrent_first_build_dedupes():
             recv_tokenizer=None,
         )
         results = []
-        threads = [_threading.Thread(target=lambda: results.append(fm.frontend_tokenizer())) for _ in range(4)]
+        threads = [
+            _threading.Thread(target=lambda: results.append(fm.frontend_tokenizer()))
+            for _ in range(4)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -1062,15 +1217,33 @@ def test_tool_result_carries_the_wire_tool_use_id():
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "toolu_a", "name": "w", "input": {"c": "SF"}},
-                        {"type": "tool_use", "id": "toolu_b", "name": "w", "input": {"c": "NY"}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_a",
+                            "name": "w",
+                            "input": {"c": "SF"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_b",
+                            "name": "w",
+                            "input": {"c": "NY"},
+                        },
                     ],
                 },
                 {
                     "role": "user",
                     "content": [  # answered out of call order, as real clients may send them
-                        {"type": "tool_result", "tool_use_id": "toolu_b", "content": "60F"},
-                        {"type": "tool_result", "tool_use_id": "toolu_a", "content": "72F"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_b",
+                            "content": "60F",
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_a",
+                            "content": "72F",
+                        },
                     ],
                 },
             ],
@@ -1078,7 +1251,10 @@ def test_tool_result_carries_the_wire_tool_use_id():
     )
     spec = A.convert_anthropic_to_genspec(req, {})
     results = [m for m in spec.messages if m["role"] == "tool"]
-    assert [(m["tool_call_id"], m["content"]) for m in results] == [("toolu_b", "60F"), ("toolu_a", "72F")]
+    assert [(m["tool_call_id"], m["content"]) for m in results] == [
+        ("toolu_b", "60F"),
+        ("toolu_a", "72F"),
+    ]
 
 
 def test_count_tokens_reads_the_real_manager_return_contract():
@@ -1108,7 +1284,12 @@ def test_tool_result_image_moves_to_the_following_user_turn():
         "max_tokens": 16,
         "messages": [
             {"role": "user", "content": "take a screenshot"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}
+                ],
+            },
             {
                 "role": "user",
                 "content": [
@@ -1117,7 +1298,14 @@ def test_tool_result_image_moves_to_the_following_user_turn():
                         "tool_use_id": "toolu_1",
                         "content": [
                             {"type": "text", "text": "shot taken"},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            },
                         ],
                     },
                     {"type": "text", "text": "<system-reminder>look</system-reminder>"},
@@ -1125,8 +1313,14 @@ def test_tool_result_image_moves_to_the_following_user_turn():
             },
         ],
     }
-    messages, _, _, _ = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
-    assert messages[-2] == {"role": "tool", "tool_call_id": "toolu_1", "content": "shot taken"}
+    messages, _, _, _ = A.convert_anthropic_prompt(
+        AnthropicMessagesRequest.model_validate(body)
+    )
+    assert messages[-2] == {
+        "role": "tool",
+        "tool_call_id": "toolu_1",
+        "content": "shot taken",
+    }
     assert messages[-1] == {
         "role": "user",
         "content": [
@@ -1154,7 +1348,14 @@ def test_tool_result_image_outside_a_user_message_is_rejected():
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
                         "content": [
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            }
                         ],
                     }
                 ],
@@ -1171,7 +1372,12 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "max_tokens": 16,
         "messages": [
             {"role": "user", "content": "take a screenshot"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}
+                ],
+            },
             {
                 "role": "user",
                 "content": [
@@ -1179,18 +1385,29 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
                         "content": [
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            }
                         ],
                     }
                 ],
             },
         ],
     }
-    messages, _, _, _ = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+    messages, _, _, _ = A.convert_anthropic_prompt(
+        AnthropicMessagesRequest.model_validate(body)
+    )
     assert messages[-2] == {"role": "tool", "tool_call_id": "toolu_1", "content": ""}
     assert messages[-1] == {
         "role": "user",
-        "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
+        "content": [
+            {"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}
+        ],
     }
 
 
@@ -1206,7 +1423,10 @@ def test_claude_code_billing_header_cch_token_is_stripped_from_system_prompt():
                     "type": "text",
                     "text": "x-anthropic-billing-header: cc_version=2.1.42; cc_entrypoint=cli; cch=9a0b1c2d3e4f;\n",
                 },
-                {"type": "text", "text": "You are Claude Code. Keep cch=deadbeef; in code examples."},
+                {
+                    "type": "text",
+                    "text": "You are Claude Code. Keep cch=deadbeef; in code examples.",
+                },
             ],
             "messages": [{"role": "user", "content": "check cch=1234abcd; in parser"}],
         }
@@ -1233,3 +1453,47 @@ def test_claude_code_billing_header_cch_token_is_stripped_from_system_prompt():
         ),
     }
     assert m1[1] == {"role": "user", "content": "check cch=1234abcd; in parser"}
+
+
+def test_convert_adaptive_thinking_without_effort_enables_thinking():
+    req = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 32,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "solve"}],
+        }
+    )
+    spec = A.convert_anthropic_to_genspec(req, {})
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+    }
+
+
+def test_stream_overloaded_generation_error_relays_classified_sse_error():
+    from freetoken.server.generation import GenerationError
+
+    async def overloaded():
+        raise GenerationError("scheduler queue saturated\r\x00retry", "overloaded")
+        yield  # noqa: unreachable
+
+    async def run():
+        out = []
+        async for frame in A.anthropic_event_stream(overloaded(), "claude-x", 7):
+            etype = data = None
+            for line in frame.split("\n"):
+                if line.startswith("event:"):
+                    etype = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line.split(":", 1)[1].strip())
+            if etype:
+                out.append((etype, data))
+        return out
+
+    events = asyncio.run(run())
+    assert events[-1][0] == "error"
+    err = events[-1][1]["error"]
+    assert err["type"] == "overloaded_error"
+    assert "\x00" not in err["message"] and "\r" not in err["message"]
+    assert "scheduler queue saturated" in err["message"]

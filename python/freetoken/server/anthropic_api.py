@@ -71,7 +71,9 @@ STOP_REASON_MAP = {
 }
 
 
-def _anthropic_stop(finish_reason: str | None, matched_stop: str | None) -> tuple[str | None, str | None]:
+def _anthropic_stop(
+    finish_reason: str | None, matched_stop: str | None
+) -> tuple[str | None, str | None]:
     """(stop_reason, stop_sequence). A stop-string hit is reported as 'stop_sequence'
     with the matched string, otherwise the finish_reason is mapped normally."""
     if matched_stop is not None:
@@ -90,12 +92,20 @@ def register_anthropic_routes(
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
         if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+            detail = (
+                "model is still loading"
+                if mstate == "loading"
+                else "cache rebuild in progress"
+            )
             return _anthropic_error_response(503, "overloaded_error", detail)
-        return await handle_anthropic_messages(req, request, state, get_model_sampling())
+        return await handle_anthropic_messages(
+            req, request, state, get_model_sampling()
+        )
 
     @app.post("/v1/messages/count_tokens")
-    async def v1_messages_count_tokens(req: AnthropicCountTokensRequest, request: Request):
+    async def v1_messages_count_tokens(
+        req: AnthropicCountTokensRequest, request: Request
+    ):
         log_request("/v1/messages/count_tokens", req, request)
         return await handle_anthropic_count_tokens(req, get_state())
 
@@ -105,7 +115,9 @@ def register_anthropic_routes(
         # default 422 {"detail": [...]} is unreadable to them. Scoped to /v1/messages*
         # so the OpenAI-protocol routes keep their existing wire behavior.
         if request.url.path.startswith("/v1/messages"):
-            return _anthropic_error_response(400, "invalid_request_error", _validation_error_message(exc))
+            return _anthropic_error_response(
+                400, "invalid_request_error", _validation_error_message(exc)
+            )
         return await request_validation_exception_handler(request, exc)
 
 
@@ -120,8 +132,13 @@ async def handle_anthropic_messages(
             req,
             model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
-            default_max_tokens=(getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS),
-            inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
+            default_max_tokens=(
+                getattr(state.config, "max_output_tokens", None)
+                or DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            inline_system_policy=getattr(
+                state.config, "anthropic_inline_system", "auto"
+            ),
             thinking=getattr(state.config, "thinking", None),
         )
         uid = await submit_generation(spec, state)
@@ -146,16 +163,29 @@ async def handle_anthropic_messages(
             generate_full(uid, spec, state, source="/v1/messages"), request, state, uid
         )
     except GenerationError as exc:
-        return _anthropic_error_response(400, "invalid_request_error", str(exc))
+        status_code, err_type = _classify_generation_error(exc)
+        return _anthropic_error_response(
+            status_code, err_type, _sanitize_error_message(str(exc))
+        )
+    except Exception as exc:  # noqa: BLE001 — preserve Anthropic JSON error envelope
+        return _anthropic_error_response(
+            500, "api_error", _sanitize_error_message(str(exc))
+        )
     if result is None:
-        return _anthropic_error_response(499, "api_error", "client disconnected before the response was ready")
-    response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
+        return _anthropic_error_response(
+            499, "api_error", "client disconnected before the response was ready"
+        )
+    response = anthropic_full_response(
+        result, req.model, uid, cache_report=cache_report
+    )
     return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
 async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state: Any):
     if not req.messages:
-        return _anthropic_error_response(400, "invalid_request_error", "messages: at least one message is required")
+        return _anthropic_error_response(
+            400, "invalid_request_error", "messages: at least one message is required"
+        )
     # Client-input validation (400) is kept strictly separate from tokenizer execution (500):
     # a checkpoint whose chat template raises ValueError is a server fault, not a bad request,
     # so it must not fall into the convert/empty-prompt ValueError branch.
@@ -170,21 +200,27 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     if not messages:
         # Non-empty on the wire but nothing survived conversion (e.g. image-only blocks on
         # this text-only server) — a client error, not a tokenizer fault.
-        return _anthropic_error_response(400, "invalid_request_error", "messages: no tokenizable content")
+        return _anthropic_error_response(
+            400, "invalid_request_error", "messages: no tokenizable content"
+        )
     try:
         n_tokens = await count_prompt_tokens(
             messages,
             template_tools,
             ctk,
             state,
-            inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
+            inline_system_policy=getattr(
+                state.config, "anthropic_inline_system", "auto"
+            ),
         )
     except GenerationError as exc:
         # The chat template could not render this conversation (bad role ordering, an unmatched
         # tool_result, ...) — a client error, exactly as /v1/messages classifies the same failure.
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     except Exception as exc:  # noqa: BLE001 — tokenizer init / other failure -> server error
-        return _anthropic_error_response(500, "api_error", f"token counting failed: {exc}")
+        return _anthropic_error_response(
+            500, "api_error", f"token counting failed: {exc}"
+        )
     response = AnthropicCountTokensResponse(input_tokens=n_tokens)
     return JSONResponse(content=response.model_dump())
 
@@ -213,7 +249,12 @@ def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
     thinking: str | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]] | None,
+    list[dict[str, Any]] | None,
+    dict[str, Any],
+]:
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
@@ -225,7 +266,9 @@ def convert_anthropic_prompt(
             system_texts.append(strip_anthropic_billing_cch(req.system))
         else:
             system_texts.append(
-                strip_anthropic_billing_cch("".join(b.text for b in req.system if b.type == "text" and b.text))
+                strip_anthropic_billing_cch(
+                    "".join(b.text for b in req.system if b.type == "text" and b.text)
+                )
             )
 
     other: list[dict[str, Any]] = []
@@ -279,8 +322,12 @@ def convert_anthropic_prompt(
                     content_parts.extend(images)
                 else:
                     if images:
-                        raise ValueError("images inside a tool_result are only accepted in a user message")
-                    content_parts.append({"type": "text", "text": f"Tool result: {text}"})
+                        raise ValueError(
+                            "images inside a tool_result are only accepted in a user message"
+                        )
+                    content_parts.append(
+                        {"type": "text", "text": f"Tool result: {text}"}
+                    )
 
         openai_msg: dict[str, Any] = {"role": msg.role}
         if thinking_parts:
@@ -319,7 +366,11 @@ def convert_anthropic_prompt(
     if req.tool_choice and req.tool_choice.type == "none":
         template_tools, parser_tools = None, None
     else:
-        selected = req.tool_choice.name if (req.tool_choice and req.tool_choice.type == "tool") else None
+        selected = (
+            req.tool_choice.name
+            if (req.tool_choice and req.tool_choice.type == "tool")
+            else None
+        )
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
     # Native extended-thinking toggle -> template kwargs, broadcast in every
@@ -327,7 +378,11 @@ def convert_anthropic_prompt(
     # inert for templates that read a different knob, e.g. M3's thinking_mode).
     # output_config.effort folds in as the Responses API's reasoning.effort does;
     # an explicit thinking type still decides on/off ("disabled" wins over effort).
-    from .model_meta import effort_toggle_kwargs, thinking_override_kwargs, thinking_toggle_kwargs
+    from .model_meta import (
+        effort_toggle_kwargs,
+        thinking_override_kwargs,
+        thinking_toggle_kwargs,
+    )
 
     ctk: dict[str, Any] = {}
     thinking_type = req.thinking.get("type") if isinstance(req.thinking, dict) else None
@@ -335,14 +390,20 @@ def convert_anthropic_prompt(
     effort = output_config.get("effort")
     if isinstance(effort, str) and effort.strip():
         ctk = effort_toggle_kwargs(effort, ctk, thinking_type=thinking_type)
-    elif thinking_type == "enabled":
-        ctk = thinking_toggle_kwargs(True)
     elif thinking_type == "disabled":
         ctk = thinking_toggle_kwargs(False)
+    elif isinstance(thinking_type, str) and thinking_type.strip():
+        # Open thinking mode ("enabled", "adaptive", etc.) enables thinking unless explicitly "disabled".
+        ctk = thinking_toggle_kwargs(True)
     ctk = thinking_override_kwargs(thinking, ctk)
 
     # late system reminders stay in place: the tokenizer folds them instead (prefix reuse)
-    return render_messages(messages, hoist_system=False), template_tools, parser_tools, ctk
+    return (
+        render_messages(messages, hoist_system=False),
+        template_tools,
+        parser_tools,
+        ctk,
+    )
 
 
 def convert_anthropic_to_genspec(
@@ -381,7 +442,9 @@ def _content_text(content) -> str:
         return ""
     if isinstance(content, str):
         return content
-    return "".join(b.text for b in content if getattr(b, "type", None) == "text" and b.text)
+    return "".join(
+        b.text for b in content if getattr(b, "type", None) == "text" and b.text
+    )
 
 
 def _image_part(source: dict[str, Any] | None) -> dict[str, Any]:
@@ -424,7 +487,11 @@ def anthropic_full_response(
 ) -> AnthropicMessagesResponse:
     content: list[AnthropicContentBlock] = []
     if result.reasoning:
-        content.append(AnthropicContentBlock(type="thinking", thinking=result.reasoning, signature=""))
+        content.append(
+            AnthropicContentBlock(
+                type="thinking", thinking=result.reasoning, signature=""
+            )
+        )
     content.append(AnthropicContentBlock(type="text", text=result.content or ""))
     for index, call in enumerate(result.tool_calls):
         content.append(
@@ -435,14 +502,21 @@ def anthropic_full_response(
                 input=_parse_json_args(call.parameters),
             )
         )
-    stop_reason, stop_sequence = _anthropic_stop(result.finish_reason, result.matched_stop)
+    stop_reason, stop_sequence = _anthropic_stop(
+        result.finish_reason, result.matched_stop
+    )
     return AnthropicMessagesResponse(
         id=f"msg_{public_request_id(uid)}",
         content=content,
         model=model,
         stop_reason=stop_reason,
         stop_sequence=stop_sequence,
-        usage=_anthropic_usage(result.prompt_tokens, result.completion_tokens, result.cached_tokens, cache_report),
+        usage=_anthropic_usage(
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.cached_tokens,
+            cache_report,
+        ),
     )
 
 
@@ -470,7 +544,9 @@ async def anthropic_event_stream(
     driven by GenDone (always present), so there is no usage-chunk dependency.
     """
     block_index = 0
-    block_open: str | None = None  # "text" | "thinking" (tool_use blocks open+close atomically)
+    block_open: str | None = (
+        None  # "text" | "thinking" (tool_use blocks open+close atomically)
+    )
 
     def _open_text() -> str:
         nonlocal block_open
@@ -490,7 +566,9 @@ async def anthropic_event_stream(
             AnthropicStreamEvent(
                 type="content_block_start",
                 index=block_index,
-                content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
+                content_block=AnthropicContentBlock(
+                    type="thinking", thinking="", signature=""
+                ),
             )
         )
 
@@ -510,7 +588,9 @@ async def anthropic_event_stream(
                     )
                 )
             )
-        frames.append(_event(AnthropicStreamEvent(type="content_block_stop", index=block_index)))
+        frames.append(
+            _event(AnthropicStreamEvent(type="content_block_stop", index=block_index))
+        )
         block_open = None
         block_index += 1
         return frames
@@ -536,7 +616,9 @@ async def anthropic_event_stream(
     # usage; anything that must go out first (a keepalive, an error) sends it with zeros.
     zero_usage = AnthropicUsage(input_tokens=0, output_tokens=0)
 
-    def _open_tool(name: str | None, ordinal: int | None, stable: bool = True) -> list[str]:
+    def _open_tool(
+        name: str | None, ordinal: int | None, stable: bool = True
+    ) -> list[str]:
         nonlocal block_open, tool_args_sent, tool_ordinal, tool_stable
         frames: list[str] = []
         if block_open:
@@ -580,7 +662,11 @@ async def anthropic_event_stream(
         async for ev in events:
             if isinstance(ev, PromptAdmitted):
                 if not started:
-                    yield _message_start(_anthropic_usage(ev.prompt_tokens, 0, ev.cached_tokens, cache_report))
+                    yield _message_start(
+                        _anthropic_usage(
+                            ev.prompt_tokens, 0, ev.cached_tokens, cache_report
+                        )
+                    )
                 continue
             if not started:
                 yield _message_start(zero_usage)
@@ -656,12 +742,21 @@ async def anthropic_event_stream(
                 if block_open:
                     for f in _stop_block():
                         yield f
-                stop_reason, stop_sequence = _anthropic_stop(ev.finish_reason, ev.matched_stop)
+                stop_reason, stop_sequence = _anthropic_stop(
+                    ev.finish_reason, ev.matched_stop
+                )
                 yield _event(
                     AnthropicStreamEvent(
                         type="message_delta",
-                        delta=AnthropicDelta(stop_reason=stop_reason, stop_sequence=stop_sequence),
-                        usage=_anthropic_usage(ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report),
+                        delta=AnthropicDelta(
+                            stop_reason=stop_reason, stop_sequence=stop_sequence
+                        ),
+                        usage=_anthropic_usage(
+                            ev.prompt_tokens,
+                            ev.completion_tokens,
+                            ev.cached_tokens,
+                            cache_report,
+                        ),
                     )
                 )
                 yield _event(AnthropicStreamEvent(type="message_stop"))
@@ -670,9 +765,8 @@ async def anthropic_event_stream(
         if not started:
             yield _message_start(zero_usage)
     except GenerationError as exc:
-        # Request-side failure (template rejection / over-length prompt). Match the
-        # non-streaming path's classification so Claude Code treats it as a client error
-        # rather than a server fault to retry.
+        # Request-side failure (template rejection / over-length prompt) or classified capacity/engine fault.
+        _, err_type = _classify_generation_error(exc)
         if not started:
             yield _message_start(zero_usage)
         if block_open:
@@ -681,7 +775,9 @@ async def anthropic_event_stream(
         yield _event(
             AnthropicStreamEvent(
                 type="error",
-                error=AnthropicError(type="invalid_request_error", message=str(exc)),
+                error=AnthropicError(
+                    type=err_type, message=_sanitize_error_message(str(exc))
+                ),
             )
         )
     except Exception as exc:  # noqa: BLE001 — surface as an Anthropic error event
@@ -693,7 +789,9 @@ async def anthropic_event_stream(
         yield _event(
             AnthropicStreamEvent(
                 type="error",
-                error=AnthropicError(type="internal_error", message=str(exc)),
+                error=AnthropicError(
+                    type="internal_error", message=_sanitize_error_message(str(exc))
+                ),
             )
         )
 
@@ -734,8 +832,32 @@ def _validation_error_message(exc: RequestValidationError) -> str:
         return "invalid request"
 
 
-def _anthropic_error_response(status_code: int, err_type: str, message: str) -> JSONResponse:
+def _sanitize_error_message(message: str) -> str:
+    """Strip CR/NUL control characters so multiline or raw error messages never break SSE framing."""
+    return (
+        message.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        or "error"
+    )
+
+
+def _classify_generation_error(exc: GenerationError) -> tuple[int, str]:
+    """Map ``GenerationError.code`` to ``(http_status, anthropic_error_type)``."""
+    code = (getattr(exc, "code", None) or "").strip().lower()
+    if code in {"overloaded", "server_busy", "capacity_exceeded"}:
+        return 529, "overloaded_error"
+    if code in {"rate_limit", "rate_limit_exceeded"}:
+        return 429, "rate_limit_error"
+    if code in {"internal_error", "engine_error"}:
+        return 500, "api_error"
+    return 400, "invalid_request_error"
+
+
+def _anthropic_error_response(
+    status_code: int, err_type: str, message: str
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content=AnthropicErrorResponse(error=AnthropicError(type=err_type, message=message)).model_dump(),
+        content=AnthropicErrorResponse(
+            error=AnthropicError(type=err_type, message=message)
+        ).model_dump(),
     )
