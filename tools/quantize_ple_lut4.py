@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 import safetensors
@@ -216,10 +217,157 @@ def quantize_ple_directory(
     return {"shards": len(shards), "total_rows": total_rows, "rel_rmse": rel_rmse}
 
 
+def _drop_page_cache(fd: int, offset: int, length: int) -> None:
+    if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+        try:
+            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+
+
+def quantize_ple_gguf(
+    gguf_path: str | Path,
+    out_dir: str | Path,
+    *,
+    head_dim: int = 160,
+    split_parts: int = 32,
+    group_size: int = 32,
+    chunk_rows: int = 262_144,
+    sample_rows_per_shard: int = 8_192,
+) -> dict[str, float | int]:
+    """Stream-quantize a lossless BF16 PLE GGUF (`per_layer_token_embd.weight`) into ``lut4-gptq`` shards.
+
+    Uses ``os.pread`` + ``POSIX_FADV_DONTNEED`` so reading a 95.4 GiB GGUF does not pollute host page cache.
+    """
+    from freetoken.models.qwen4_exp.gguf import check_ple_table
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    info = check_ple_table(str(gguf_path), head_dim=head_dim)
+    if info.ggml_type != GGMLQuantizationType.BF16:
+        raise ValueError(f"Expected BF16 PLE GGUF, got ggml_type={info.ggml_type}")
+    cols, total_rows = info.ne
+    if cols != head_dim or total_rows % split_parts != 0:
+        raise ValueError(
+            f"GGUF shape {(total_rows, cols)} incompatible with head_dim={head_dim}, split_parts={split_parts}"
+        )
+    shard_rows = total_rows // split_parts
+    row_bytes = cols * 2
+    dst_dir = Path(out_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    fd = os.open(info.path, os.O_RDONLY)
+    try:
+        sampled: list[torch.Tensor] = []
+        for part in range(split_parts):
+            take = min(shard_rows, sample_rows_per_shard)
+            # Read a contiguous prefix of `take` rows per shard to avoid random seeks.
+            nbytes = take * row_bytes
+            off = info.offset + part * shard_rows * row_bytes
+            raw = os.pread(fd, nbytes, off)
+            _drop_page_cache(fd, off, nbytes)
+            sub = (
+                torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+                .view(take, cols)
+                .to(torch.float32)
+            )
+            sampled.append(sub)
+        lut = fit_lut16_codebook(torch.cat(sampled, dim=0), group_size=group_size)
+        del sampled
+
+        weight_map: dict[str, str] = {}
+        sq_err = 0.0
+        sq_ref = 0.0
+        for part in range(split_parts):
+            packed_out = torch.empty((shard_rows, cols // 2), dtype=torch.uint8)
+            scale_out = torch.empty(
+                (shard_rows, cols // group_size), dtype=torch.float16
+            )
+            shard_base = info.offset + part * shard_rows * row_bytes
+            for r0 in range(0, shard_rows, chunk_rows):
+                r1 = min(shard_rows, r0 + chunk_rows)
+                nbytes = (r1 - r0) * row_bytes
+                off = shard_base + r0 * row_bytes
+                raw = os.pread(fd, nbytes, off)
+                _drop_page_cache(fd, off, nbytes)
+                chunk = (
+                    torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+                    .view(r1 - r0, cols)
+                    .to(torch.float32)
+                )
+                pk, sc = quantize_rows_lut4(chunk, lut, group_size=group_size)
+                packed_out[r0:r1].copy_(pk)
+                scale_out[r0:r1].copy_(sc)
+                if r0 == 0:
+                    lo = (pk & 0x0F).long()
+                    hi = ((pk >> 4) & 0x0F).long()
+                    nib = torch.stack((lo, hi), dim=-1).reshape(r1 - r0, cols)
+                    rec = (
+                        lut[nib].view(r1 - r0, cols // group_size, group_size)
+                        * sc.to(torch.float32).unsqueeze(-1)
+                    ).reshape(r1 - r0, cols)
+                    sq_err += float(((chunk - rec) ** 2).sum().item())
+                    sq_ref += float((chunk**2).sum().item())
+            out_name = f"ple-lut4-{part:05d}-of-{split_parts:05d}.safetensors"
+            out_path = dst_dir / out_name
+            pfx = f"model.layers.1.ple.ple_embedding.ngram_embedding.shard_{part}"
+            tensors = {
+                f"{pfx}.weight_packed": packed_out,
+                f"{pfx}.weight_scale": scale_out,
+                f"{pfx}.weight_lut": lut.clone(),
+            }
+            save_file(tensors, str(out_path))
+            out_fd = os.open(str(out_path), os.O_RDONLY)
+            try:
+                _drop_page_cache(out_fd, 0, 0)
+            finally:
+                os.close(out_fd)
+            for tname in tensors:
+                weight_map[tname] = out_name
+            print(
+                f"[ple-lut4] wrote shard {part + 1}/{split_parts}: {out_name}",
+                flush=True,
+            )
+    finally:
+        os.close(fd)
+
+    (dst_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"metadata": {"format": "lut4-gptq"}, "weight_map": weight_map}, indent=2
+        ),
+        encoding="utf-8",
+    )
+    rel_rmse = math.sqrt(sq_err / max(sq_ref, 1e-12))
+    return {"shards": split_parts, "total_rows": total_rows, "rel_rmse": rel_rmse}
+
+
+def _infer_ple_geometry(model_dir: str | None) -> tuple[int, int]:
+    if not model_dir:
+        return 160, 32
+    cfg_path = Path(model_dir) / "config.json"
+    if not cfg_path.is_file():
+        return 160, 32
+    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    tc = raw.get("text_config", raw)
+    ple_dim = int(tc.get("ple_embed_dim", 2560))
+    ngram_size = int(tc.get("ngram_size", 3))
+    heads_per = int(tc.get("heads_per_ngram", 8))
+    num_heads = (ngram_size - 1) * heads_per
+    head_dim = ple_dim // num_heads
+    split_parts = int(tc.get("split_ngram_parts", 32))
+    return head_dim, split_parts
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--model-dir", required=True, help="Source checkpoint directory with PLE shards"
+        "--model-dir",
+        default=None,
+        help="Source checkpoint directory (with PLE shards or config.json when --ple-gguf is used)",
+    )
+    ap.add_argument(
+        "--ple-gguf",
+        default=None,
+        help="Optional lossless BF16 PLE GGUF file (avoids FP8->LUT4 double quantization)",
     )
     ap.add_argument(
         "--out-dir",
@@ -233,12 +381,25 @@ def main() -> None:
     )
     args = ap.parse_args()
     torch.set_num_threads(max(1, args.threads))
-    stats = quantize_ple_directory(
-        args.model_dir,
-        args.out_dir,
-        group_size=args.group_size,
-        chunk_rows=args.chunk_rows,
-    )
+    if args.ple_gguf:
+        head_dim, split_parts = _infer_ple_geometry(args.model_dir)
+        stats = quantize_ple_gguf(
+            args.ple_gguf,
+            args.out_dir,
+            head_dim=head_dim,
+            split_parts=split_parts,
+            group_size=args.group_size,
+            chunk_rows=args.chunk_rows,
+        )
+    elif args.model_dir:
+        stats = quantize_ple_directory(
+            args.model_dir,
+            args.out_dir,
+            group_size=args.group_size,
+            chunk_rows=args.chunk_rows,
+        )
+    else:
+        ap.error("Provide either --ple-gguf or --model-dir")
     print(json.dumps(stats, indent=2))
 
 
