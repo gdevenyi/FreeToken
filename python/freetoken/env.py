@@ -84,6 +84,8 @@ class EnvClassSingleton:
     KVSTATS_INTERVAL = EnvFloat(60.0)
     # every N decode/verify steps, copy the QSA selection to the host for the KVSTATS line; 0 = off (no work)
     QSA_SELECTION_STATS = EnvInt(0)
+    # max persisting L2 cache window in MiB pinned over the CUDA graph activation pool on sm_80/sm_89+ GPUs (>=16 MiB L2 cap); 0 = off
+    L2_PERSIST_MB = EnvInt(32)
 
     def __new__(cls):
         # single instance

@@ -130,6 +130,12 @@ def load_profile(path: str | Path, num_layers: int, num_experts: int, model_path
     model = str(data.get("model", ""))
     if model and model_path and not any(n.lower().startswith(model.lower()) for n in _model_names(model_path)):
         logger.warning_rank0(f"MoE pool profile {path} was taken on {model!r}, not on {model_path}")
+    if "expert_counts" not in data:
+        from freetoken.moe.hot_rankings import HotExpertRankings
+
+        rankings = HotExpertRankings.from_dict(data, source_path=str(path))
+        if rankings is not None:
+            return rankings.to_pseudo_counts(num_layers, num_experts)
     counts = torch.tensor(data["expert_counts"], dtype=torch.float64)
     if tuple(counts.shape) != (num_layers, num_experts):
         raise ValueError(

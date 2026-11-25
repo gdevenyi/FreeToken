@@ -1191,6 +1191,15 @@ class Engine:
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
         if self.elastic_pool is not None:
             self.elastic_pool.bind_moe_cache(cache)
+        from freetoken.moe.hot_rankings import HotExpertRankings
+
+        hot_rankings = HotExpertRankings.discover(config.model_path)
+        if hot_rankings is not None:
+            cache.hot_rankings = hot_rankings
+            seeded = cache.seed_hot_experts()
+            logger.info_rank0(
+                f"MoE hot-expert rankings loaded from {hot_rankings.source_path}: pre-seeded {seeded} GPU cache slots"
+            )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.

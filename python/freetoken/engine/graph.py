@@ -244,6 +244,25 @@ class GraphRunner:
         self.graph_pool = pool
 
         self._reset_moe_offload_cache()
+        if self.moe_offload_cache is not None and hasattr(self.moe_offload_cache, "seed_hot_experts"):
+            self.moe_offload_cache.seed_hot_experts()
+        if ENV.L2_PERSIST_MB > 0 and self.device.type == "cuda":
+            from freetoken.kernel.l2_persist import (
+                find_graph_pool_window,
+                set_stream_persisting_l2_window,
+            )
+
+            dev_idx = 0 if self.device.index is None else int(self.device.index)
+            win = find_graph_pool_window(self.graph_pool, dev_idx)
+            if win is not None:
+                pinned_bytes = set_stream_persisting_l2_window(
+                    self.stream, win[0], win[1], max_window_mb=int(ENV.L2_PERSIST_MB)
+                )
+                if pinned_bytes > 0:
+                    logger.info_rank0(
+                        f"Pinned persisting L2 cache window: {pinned_bytes / (1 << 20):.2f} MiB "
+                        f"(graph pool segment {win[1] / (1 << 20):.2f} MiB)"
+                    )
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
@@ -283,6 +302,10 @@ class GraphRunner:
         # Dropping the references is the load-bearing step; without it a runtime rebuild's
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
+        if self.device.type == "cuda":
+            from freetoken.kernel.l2_persist import clear_stream_persisting_l2_window
+
+            clear_stream_persisting_l2_window(self.stream)
         self.graph_map = {}
         self.buffer = None
         self._out = None

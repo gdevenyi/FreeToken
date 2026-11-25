@@ -174,6 +174,8 @@ class OffloadMoeCache:
     pool_sizes: list[int] | None = None
     # Optional custom GPU bank allocator used by ElasticKvMoePool (VMM-backed tail slots).
     bank_allocator: object | None = None
+    # Optional HotExpertRankings attached by the engine for boot/rebuild warm slot seeding.
+    hot_rankings: object | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0, "crf": 1}
@@ -802,6 +804,7 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        self.seed_hot_experts()
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
@@ -1226,6 +1229,76 @@ class OffloadMoeCache:
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
         self.expert_crf.zero_()
+
+    def seed_hot_experts(self) -> int:
+        """Pre-populate unreserved GPU cache slots from ``hot_rankings`` so startup and rebuilds
+        begin warm without waiting for cold PCIe demand fetches."""
+        rankings = self.hot_rankings
+        if rankings is None or not self.banks:
+            return 0
+        seeded_total = 0
+        crf_unit = 1 << 20
+        for p, pool_size in enumerate(self.pool_sizes):
+            start = self._pool_stable_from[p] if self.prefill_overlap else 0
+            end = min(pool_size, max(0, self.active_cache_size - self.pool_bases[p]))
+            avail = max(0, end - start)
+            if avail <= 0:
+                continue
+            layers = [
+                l
+                for l in range(self.num_layers)
+                if self.pool_of_layer[l] == p
+                and l not in self.cpu_layer_ids
+                and l not in self._unpinned_layers
+            ]
+            if not layers:
+                continue
+            caps = rankings.plan_layer_capacities(layers, avail, self.num_experts)
+            id_of_slot_p, usage_p = self._pool_id_of_slot[p], self._pool_usage[p]
+            bank_views_p = self._pool_bank_views[p]
+            cursor = start
+            for l in layers:
+                k_hot = min(caps.get(l, 0), end - cursor)
+                if k_hot <= 0:
+                    continue
+                chosen = rankings.select_for_layer(l, self.num_experts, k_hot)
+                if not chosen:
+                    continue
+                k_hot = len(chosen)
+                chosen_cpu = torch.tensor(chosen, dtype=torch.long)
+                chosen_dev = chosen_cpu.to(device=self.device, dtype=torch.int32)
+                slots_dev = torch.arange(
+                    cursor, cursor + k_hot, dtype=torch.int32, device=self.device
+                )
+                for (per_layer, _), cache_view in zip(self.banks, bank_views_p):
+                    if cache_view.numel() == 0:
+                        continue
+                    cache_view[cursor : cursor + k_hot].copy_(
+                        per_layer[l].index_select(0, chosen_cpu)
+                    )
+                id_of_slot_p[cursor : cursor + k_hot] = (
+                    l * self.num_experts + chosen_dev
+                )
+                self.slot_for_id[l].index_copy_(0, chosen_dev.long(), slots_dev)
+                # Higher rank -> slightly higher initial priority so cold tail slots evict first.
+                ranks_inv = torch.arange(
+                    k_hot, 0, -1, dtype=torch.int64, device=self.device
+                )
+                if self.cache_policy == "crf":
+                    crf_f = (ranks_inv.float() / max(1, k_hot)) + 0.0625
+                    self.expert_crf[l].index_copy_(
+                        0, chosen_dev.long(), crf_f.to(self.expert_crf.dtype)
+                    )
+                    usage_p[cursor : cursor + k_hot] = (
+                        crf_f * float(crf_unit)
+                    ).to(usage_p.dtype)
+                else:
+                    usage_p[cursor : cursor + k_hot] = ranks_inv
+                cursor += k_hot
+                seeded_total += k_hot
+        if seeded_total > 0 and self.cache_policy != "crf":
+            self.step.fill_(self.num_experts + 1)
+        return seeded_total
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
