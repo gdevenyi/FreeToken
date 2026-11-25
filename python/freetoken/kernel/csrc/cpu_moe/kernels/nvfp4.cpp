@@ -54,6 +54,8 @@ struct W4a8Act {
 };
 
 using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const W4a8Act&, int);
+using nvi8dot4_fn = void (*)(const uint8_t* const[4], const uint8_t* const[4], const float[4],
+                             const W4a8Act&, int, float[4]);
 using nvi8quant_fn = void (*)(const bf16_t*, int, int8_t*, float*, int32_t*);
 
 #if CPU_MOE_X86
@@ -244,6 +246,83 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
   return (hsum256(_mm256_add_ps(acc0, acc1)) + tail) * (0.5f * kE4m3ViaF16 * global);
 }
 
+CPU_MOE_TARGET("avx2,fma,f16c,avxvnni")
+void dot2_nvfp4_i8_vnni(const uint8_t* pk0, const uint8_t* pk1, const uint8_t* sc0,
+                        const uint8_t* sc1, float gl0, float gl1, const W4a8Act& a, int K,
+                        float& o0, float& o1) {
+  const __m256i lut = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(kE2M1x2u)));
+  const __m256i lanes_lo = _mm256_set_epi32(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m256i lanes_hi = _mm256_set_epi32(7, 7, 6, 6, 5, 5, 4, 4);
+  const int nb = K / 16, pf = w4a8_pf(nb);
+  __m256 a0_0 = _mm256_setzero_ps(), a1_0 = _mm256_setzero_ps();
+  __m256 a0_1 = _mm256_setzero_ps(), a1_1 = _mm256_setzero_ps();
+  __m256i lo, hi;
+  int b = 0;
+  for (; b + 8 <= nb; b += 8) {
+    const int8_t* q = a.q + (size_t)b * 16;
+    const int32_t* c = a.corr + (size_t)b * 2;
+    const __m256i c0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c));
+    const __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + 8));
+    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+    const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 64));
+    const __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 32));
+    const __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 96));
+
+    const uint8_t* p0 = pk0 + (size_t)b * 8;
+    const uint8_t* p1 = pk1 + (size_t)b * 8;
+    if (pf > 0) {
+      _mm_prefetch(reinterpret_cast<const char*>(p0 + (size_t)pf * 8), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(p1 + (size_t)pf * 8), _MM_HINT_T0);
+    }
+    __m256 s = w4a8_scales256(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(sc0 + b)), a.scale + b);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0)), lut, lo, hi);
+    __m256i d = w4a8_dot256_vnni(c0, lo, q0, hi, q1);
+    a0_0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(s, lanes_lo), a0_0);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0 + 32)), lut, lo, hi);
+    d = w4a8_dot256_vnni(c1, lo, q2, hi, q3);
+    a1_0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(s, lanes_hi), a1_0);
+
+    s = w4a8_scales256(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(sc1 + b)), a.scale + b);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1)), lut, lo, hi);
+    d = w4a8_dot256_vnni(c0, lo, q0, hi, q1);
+    a0_1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(s, lanes_lo), a0_1);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + 32)), lut, lo, hi);
+    d = w4a8_dot256_vnni(c1, lo, q2, hi, q3);
+    a1_1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(s, lanes_hi), a1_1);
+  }
+  if (b + 4 <= nb) {
+    const int n = nb - b;
+    const int8_t* q = a.q + (size_t)b * 16;
+    float as8[8] = {a.scale[b], a.scale[b + 1], a.scale[b + 2], a.scale[b + 3]};
+    const __m256i c0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.corr + (size_t)b * 2));
+    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+    const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 8 * n));
+    int s4_0, s4_1;
+    std::memcpy(&s4_0, sc0 + b, 4);
+    std::memcpy(&s4_1, sc1 + b, 4);
+    __m256 s = w4a8_scales256(_mm_cvtsi32_si128(s4_0), as8);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pk0 + (size_t)b * 8)), lut, lo, hi);
+    __m256i d = w4a8_dot256_vnni(c0, lo, q0, hi, q1);
+    a0_0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(s, lanes_lo), a0_0);
+
+    s = w4a8_scales256(_mm_cvtsi32_si128(s4_1), as8);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pk1 + (size_t)b * 8)), lut, lo, hi);
+    d = w4a8_dot256_vnni(c0, lo, q0, hi, q1);
+    a0_1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(s, lanes_lo), a0_1);
+    b += 4;
+  }
+  const float k = 0.5f * kE4m3ViaF16;
+  o0 = (hsum256(_mm256_add_ps(a0_0, a1_0)) + w4a8_blocks_scalar(pk0, sc0, a, b, nb)) * (k * gl0);
+  o1 = (hsum256(_mm256_add_ps(a0_1, a1_1)) + w4a8_blocks_scalar(pk1, sc1, a, b, nb)) * (k * gl1);
+}
+
+CPU_MOE_TARGET("avx2,fma,f16c,avxvnni")
+void dot4_nvfp4_i8_vnni(const uint8_t* const pk4[4], const uint8_t* const sc4[4],
+                        const float gl4[4], const W4a8Act& a, int K, float out4[4]) {
+  dot2_nvfp4_i8_vnni(pk4[0], pk4[1], sc4[0], sc4[1], gl4[0], gl4[1], a, K, out4[0], out4[1]);
+  dot2_nvfp4_i8_vnni(pk4[2], pk4[3], sc4[2], sc4[3], gl4[2], gl4[3], a, K, out4[2], out4[3]);
+}
+
 CPU_MOE_TARGET("avx2")
 inline int hsum_epi32_256(__m256i v) {
   __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
@@ -358,6 +437,91 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
   return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1)) * (0.5f * kE4m3ViaF16 * global);
 }
 
+// 4-row register-blocked AVX512-VNNI W4A8 dot: reuses each 256-K chunk of quantized activations,
+// corrections, and activation scales across 4 output rows in ZMM registers (24 / 32 ZMMs, 0 spills,
+// 4x fewer activation/corr/scale loads, 0-ULP bit-identical per row to dot_nvfp4_i8_avx512vnni).
+CPU_MOE_TARGET("avx512f,avx512bw,avx512vl,avx512vnni")
+void dot4_nvfp4_i8_avx512vnni(const uint8_t* const pk4[4], const uint8_t* const sc4[4],
+                              const float gl4[4], const W4a8Act& a, int K, float out4[4]) {
+  const __m512i lut = _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i*>(kE2M1x2u)));
+  const __m512i lanes_lo = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i lanes_hi = _mm512_add_epi32(lanes_lo, _mm512_set1_epi32(8));
+  const __m256i f16m = _mm256_set1_epi16(kE4m3F16Mask);
+  const int nb = K / 16, pf = w4a8_pf(nb);
+  __m512 acc0_0 = _mm512_setzero_ps(), acc1_0 = _mm512_setzero_ps();
+  __m512 acc0_1 = _mm512_setzero_ps(), acc1_1 = _mm512_setzero_ps();
+  __m512 acc0_2 = _mm512_setzero_ps(), acc1_2 = _mm512_setzero_ps();
+  __m512 acc0_3 = _mm512_setzero_ps(), acc1_3 = _mm512_setzero_ps();
+  __m512i lo, hi;
+  int b = 0;
+  for (; b + 16 <= nb; b += 16) {
+    const int8_t* q = a.q + (size_t)b * 16;
+    const int32_t* c = a.corr + (size_t)b * 2;
+    const __m512 asc = _mm512_loadu_ps(a.scale + b);
+    const __m512i c0 = _mm512_loadu_si512(c);
+    const __m512i c1 = _mm512_loadu_si512(c + 16);
+    const __m512i q0 = _mm512_loadu_si512(q);
+    const __m512i q1 = _mm512_loadu_si512(q + 64);
+    const __m512i q2 = _mm512_loadu_si512(q + 128);
+    const __m512i q3 = _mm512_loadu_si512(q + 192);
+
+#define NVFP4_DOT4_STEP(idx, a0, a1)                                                                   \
+  do {                                                                                                 \
+    const uint8_t* pk = pk4[idx] + (size_t)b * 8;                                                      \
+    if (pf > 0) {                                                                                      \
+      _mm_prefetch(reinterpret_cast<const char*>(pk + (size_t)pf * 8), _MM_HINT_T0);                   \
+      _mm_prefetch(reinterpret_cast<const char*>(pk + (size_t)pf * 8 + 64), _MM_HINT_T0);              \
+    }                                                                                                  \
+    __m256i h = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sc4[idx] + b))); \
+    h = _mm256_and_si256(_mm256_slli_epi16(h, 7), f16m);                                               \
+    const __m512 sc = _mm512_mul_ps(_mm512_cvtph_ps(h), asc);                                          \
+    w4a8_split512(_mm512_loadu_si512(pk), lut, lo, hi);                                                \
+    __m512i d = w4a8_dot512_vnni(c0, lo, q0, hi, q1);                                                  \
+    a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d), _mm512_permutexvar_ps(lanes_lo, sc), a0);              \
+    w4a8_split512(_mm512_loadu_si512(pk + 64), lut, lo, hi);                                           \
+    d = w4a8_dot512_vnni(c1, lo, q2, hi, q3);                                                          \
+    a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d), _mm512_permutexvar_ps(lanes_hi, sc), a1);              \
+  } while (0)
+
+    NVFP4_DOT4_STEP(0, acc0_0, acc1_0);
+    NVFP4_DOT4_STEP(1, acc0_1, acc1_1);
+    NVFP4_DOT4_STEP(2, acc0_2, acc1_2);
+    NVFP4_DOT4_STEP(3, acc0_3, acc1_3);
+#undef NVFP4_DOT4_STEP
+  }
+  for (; b < nb; b += 8) {
+    const int n = std::min(8, nb - b);
+    const __mmask64 mb = n == 8 ? ~0ULL : (1ULL << (8 * n)) - 1;
+    const __mmask16 ms = (__mmask16)((1u << n) - 1);
+    const int8_t* q = a.q + (size_t)b * 16;
+    const __m512 asc = _mm512_maskz_loadu_ps(ms, a.scale + b);
+    const __m512i c = _mm512_maskz_loadu_epi32((__mmask16)((1u << (2 * n)) - 1), a.corr + (size_t)b * 2);
+    const __m512i q0 = _mm512_maskz_loadu_epi8(mb, q);
+    const __m512i q1 = _mm512_maskz_loadu_epi8(mb, q + 8 * n);
+
+#define NVFP4_DOT4_TAIL(idx, a0)                                                          \
+  do {                                                                                    \
+    __m256i h = _mm256_cvtepi8_epi16(_mm_maskz_loadu_epi8(ms, sc4[idx] + b));             \
+    h = _mm256_and_si256(_mm256_slli_epi16(h, 7), f16m);                                  \
+    const __m512 sc = _mm512_mul_ps(_mm512_cvtph_ps(h), asc);                             \
+    w4a8_split512(_mm512_maskz_loadu_epi8(mb, pk4[idx] + (size_t)b * 8), lut, lo, hi);    \
+    const __m512i d = w4a8_dot512_vnni(c, lo, q0, hi, q1);                                \
+    a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d), _mm512_permutexvar_ps(lanes_lo, sc), a0); \
+  } while (0)
+
+    NVFP4_DOT4_TAIL(0, acc0_0);
+    NVFP4_DOT4_TAIL(1, acc0_1);
+    NVFP4_DOT4_TAIL(2, acc0_2);
+    NVFP4_DOT4_TAIL(3, acc0_3);
+#undef NVFP4_DOT4_TAIL
+  }
+  const float k = 0.5f * kE4m3ViaF16;
+  out4[0] = _mm512_reduce_add_ps(_mm512_add_ps(acc0_0, acc1_0)) * (k * gl4[0]);
+  out4[1] = _mm512_reduce_add_ps(_mm512_add_ps(acc0_1, acc1_1)) * (k * gl4[1]);
+  out4[2] = _mm512_reduce_add_ps(_mm512_add_ps(acc0_2, acc1_2)) * (k * gl4[2]);
+  out4[3] = _mm512_reduce_add_ps(_mm512_add_ps(acc0_3, acc1_3)) * (k * gl4[3]);
+}
+
 CPU_MOE_TARGET("avx512f,avx512bw,avx512vl")
 void quant_i8_avx512(const bf16_t* x, int K, int8_t* q, float* scale, int32_t* corr) {
   const __m128i even_odd = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
@@ -401,19 +565,28 @@ nvdot_fn select_nvdot() {
 }
 
 struct W4a8Kernel {
-  nvi8dot_fn dot;
-  nvi8quant_fn quant;
-  const char* isa;
+  nvi8dot_fn dot = nullptr;
+  nvi8dot4_fn dot4 = nullptr;
+  nvi8quant_fn quant = nullptr;
+  const char* isa = "";
 };
 
 // Best W4A8 (int8-activation) nvfp4 dot for the picked ISA tier, or a null dot if that tier has no VNNI (caller keeps the faithful fp32 nvdot path).
 W4a8Kernel select_nvi8dot() {
 #if CPU_MOE_X86
   const IsaTier t = pick_isa();
+  const char* no_dot4 = getenv("FREETOKEN_CPU_MOE_NO_DOT4");
+  const bool use_dot4 = !(no_dot4 && no_dot4[0] && no_dot4[0] != '0');
 #if defined(CPU_MOE_HAS_AVX512VNNI)
-  if (t >= ISA_AVX512 && cpu_has_avx512vnni()) return {dot_nvfp4_i8_avx512vnni, quant_i8_avx512, "+avx512vnni(nvfp4-w4a8)"};
+  if (t >= ISA_AVX512 && cpu_has_avx512vnni()) {
+    return {dot_nvfp4_i8_avx512vnni, use_dot4 ? dot4_nvfp4_i8_avx512vnni : nullptr, quant_i8_avx512,
+            "+avx512vnni(nvfp4-w4a8)"};
+  }
 #endif
-  if (t >= ISA_AVX2 && cpu_has_avxvnni()) return {dot_nvfp4_i8_vnni, quant_i8_avx2, "+vnni(nvfp4-w4a8)"};
+  if (t >= ISA_AVX2 && cpu_has_avxvnni()) {
+    return {dot_nvfp4_i8_vnni, use_dot4 ? dot4_nvfp4_i8_vnni : nullptr, quant_i8_avx2,
+            "+vnni(nvfp4-w4a8)"};
+  }
 #endif
   return {};
 }
@@ -497,7 +670,33 @@ class Nvfp4Format final : public MoeFormat {
     const float* global = static_cast<const float*>(tbl_at(gu_global_, layer));
     if (w4a8_.dot != nullptr) {
       const W4a8Act act = xq_.at(tok);
-      gated_rows(p, i0, i1, w_in, g, [&](int row) {
+      int i = i0;
+      if (w4a8_.dot4 != nullptr) {
+        const size_t pk_stride = (size_t)(H / 2), sc_stride = (size_t)(H / 16);
+        const size_t base = (size_t)e * (2 * p.I);
+        for (; i + 2 <= i1; i += 2) {
+          const size_t g0 = base + i, g1 = g0 + 1;
+          const size_t u0 = base + p.I + i, u1 = u0 + 1;
+          const uint8_t* pk4[4] = {
+              packed + g0 * pk_stride,
+              packed + g1 * pk_stride,
+              packed + u0 * pk_stride,
+              packed + u1 * pk_stride,
+          };
+          const uint8_t* sc4[4] = {
+              scale + g0 * sc_stride,
+              scale + g1 * sc_stride,
+              scale + u0 * sc_stride,
+              scale + u1 * sc_stride,
+          };
+          const float gl4[4] = {global[g0], global[g1], global[u0], global[u1]};
+          float out4[4];
+          w4a8_.dot4(pk4, sc4, gl4, act, H, out4);
+          g[i] = gated_epilogue(p, out4[0], out4[2], w_in);
+          g[i + 1] = gated_epilogue(p, out4[1], out4[3], w_in);
+        }
+      }
+      gated_rows(p, i, i1, w_in, g, [&](int row) {
         const size_t r = (size_t)e * (2 * p.I) + row;
         return w4a8_.dot(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16), global[r], act, H);
       });
@@ -517,7 +716,31 @@ class Nvfp4Format final : public MoeFormat {
     const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(down_, layer));
     const uint8_t* scale = static_cast<const uint8_t*>(tbl_at(dn_scale_, layer));
     const float* global = static_cast<const float*>(tbl_at(dn_global_, layer));
-    for (int h = h0; h < h1; ++h) {
+    int h = h0;
+    if (w4a8_.dot4 != nullptr) {
+      const size_t pk_stride = (size_t)(I / 2), sc_stride = (size_t)(I / 16);
+      for (; h + 4 <= h1; h += 4) {
+        for (int j = 0; j < n; ++j) {
+          const size_t r = (size_t)routes[j].r;
+          const size_t row = (size_t)routes[j].e * p.H + h;
+          const uint8_t* pk4[4] = {
+              packed + row * pk_stride,
+              packed + (row + 1) * pk_stride,
+              packed + (row + 2) * pk_stride,
+              packed + (row + 3) * pk_stride,
+          };
+          const uint8_t* sc4[4] = {
+              scale + row * sc_stride,
+              scale + (row + 1) * sc_stride,
+              scale + (row + 2) * sc_stride,
+              scale + (row + 3) * sc_stride,
+          };
+          const float gl4[4] = {global[row], global[row + 1], global[row + 2], global[row + 3]};
+          w4a8_.dot4(pk4, sc4, gl4, gq_.at(r), I, out + j * kRowBlock + (h - h0));
+        }
+      }
+    }
+    for (; h < h1; ++h) {
       for (int j = 0; j < n; ++j) {
         const size_t r = (size_t)routes[j].r;
         const size_t row = (size_t)routes[j].e * p.H + h;

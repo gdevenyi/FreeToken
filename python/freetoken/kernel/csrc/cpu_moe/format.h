@@ -75,29 +75,31 @@ struct DownRoute {
   const bf16_t* g;
 };
 
+inline bf16_t gated_epilogue(const MoeParams& p, float gate, float up, float w_in) {
+  gate *= w_in;
+  up *= w_in;
+  if (p.act == ACT_SWIGLUOAI || p.act == ACT_SWIGLU_CLAMP) {
+    // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
+    // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
+    // (GLM-5.3) does not. lim == +inf: no clamp.
+    const float up_bias = p.act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
+    const float lim = p.swiglu_limit, alpha = p.swiglu_alpha;
+    if (gate > lim) gate = lim;
+    if (up > lim) up = lim;
+    else if (up < -lim) up = -lim;
+    const float glu = gate / (1.0f + std::exp(-gate * alpha));
+    return f32_to_bf16(glu * (up + up_bias));
+  }
+  return f32_to_bf16(act_apply(p.act, gate) * up);
+}
+
 // g[i] for i in [i0, i1) from the gate row i and the up row I + i; dot(row) is the row's GEMV.
 // ACT_SWIGLUOAI and ACT_SWIGLU_CLAMP clamp both inputs; the other kinds go through act_apply.
 template <class RowDot>
 inline void gated_rows(const MoeParams& p, int i0, int i1, float w_in, bf16_t* g, RowDot dot) {
-  const bool clamped = p.act == ACT_SWIGLUOAI || p.act == ACT_SWIGLU_CLAMP;
-  const float up_bias = p.act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
-  const float lim = p.swiglu_limit, alpha = p.swiglu_alpha;
   for (int i = i0; i < i1; ++i) {
     // gate = row i, up = row I+i
-    float gate = dot(i) * w_in;
-    float up = dot(p.I + i) * w_in;
-    if (clamped) {
-      // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
-      // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
-      // (GLM-5.3) does not. lim == +inf: no clamp.
-      if (gate > lim) gate = lim;
-      if (up > lim) up = lim;
-      else if (up < -lim) up = -lim;
-      const float glu = gate / (1.0f + std::exp(-gate * alpha));
-      g[i] = f32_to_bf16(glu * (up + up_bias));
-    } else {
-      g[i] = f32_to_bf16(act_apply(p.act, gate) * up);
-    }
+    g[i] = gated_epilogue(p, dot(i), dot(p.I + i), w_in);
   }
 }
 
