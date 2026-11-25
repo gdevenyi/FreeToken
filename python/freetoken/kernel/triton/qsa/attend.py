@@ -149,8 +149,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 KV_FMT,
             )
         scale_rows = safe_page * PAGE_SIZE + page_offset
-        key_scales = kv_row_scale(k_scale_ptr + scale_rows * stride_k_scale + kv_head, valid, KV_FMT)
-        value_scales = kv_row_scale(v_scale_ptr + scale_rows * stride_v_scale + kv_head, valid, KV_FMT)
+        key_scales = kv_row_scale(
+            k_scale_ptr + scale_rows * stride_k_scale + kv_head, valid, KV_FMT
+        )
+        value_scales = kv_row_scale(
+            v_scale_ptr + scale_rows * stride_v_scale + kv_head, valid, KV_FMT
+        )
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -231,7 +235,9 @@ def _qsa_merge_splitk_kernel(
     dim_offsets = tl.arange(0, HEAD_DIM)
     split_mask = split_offsets < NUM_SPLITS
     lse = tl.load(
-        partial_lse_ptr + (split_offsets.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS + head,
+        partial_lse_ptr
+        + (split_offsets.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
+        + head,
         mask=split_mask,
         other=-float("inf"),
     )
@@ -242,7 +248,10 @@ def _qsa_merge_splitk_kernel(
     denominator = tl.sum(weights, axis=0)
     partial_output = tl.load(
         partial_output_ptr
-        + ((split_offsets[:, None].to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS + head)
+        + (
+            (split_offsets[:, None].to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
+            + head
+        )
         * HEAD_DIM
         + dim_offsets[None, :],
         mask=split_mask[:, None],
@@ -285,7 +294,13 @@ def qsa_sparse_paged_attention(
     if not kv_format.quantized:
         assert q.dtype == k_cache.dtype == v_cache.dtype
     k_scale_arg, v_scale_arg, stride_k_scale, stride_v_scale = kv_scale_args(
-        kv_format, k_cache, v_cache, k_scale, v_scale, q, shape=(k_cache.shape[0] * k_cache.shape[1], k_cache.shape[2])
+        kv_format,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        q,
+        shape=(k_cache.shape[0] * k_cache.shape[1], k_cache.shape[2]),
     )
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
@@ -303,9 +318,13 @@ def qsa_sparse_paged_attention(
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
 
+    from freetoken.models.config import verify_invariant_enabled
+
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
+    if verify_invariant_enabled() and q.shape[0] <= 64:
+        block_n, target_splits, partial_warps = 16, 8, 4
+    elif base_programs <= small_profile_limit:
         block_n, target_splits, partial_warps = 16, 64, 4
     elif base_programs < 32:
         block_n, target_splits, partial_warps = 16, 32, 4
@@ -325,7 +344,9 @@ def qsa_sparse_paged_attention(
         _props = torch.cuda.get_device_properties(q.device)
         _lds_budget = getattr(_props, "shared_memory_per_block", 64 * 1024) or 64 * 1024
         _kv_bytes = q.element_size()
-        while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _lds_budget:
+        while (
+            block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _lds_budget
+        ):
             block_n //= 2
 
     if kv_format.quantized:

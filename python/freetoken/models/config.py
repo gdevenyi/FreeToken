@@ -68,6 +68,12 @@ def fp32_router_enabled() -> bool:
     return os.getenv("FREETOKEN_FP32_ROUTER", "0").strip().lower() in _ENV_TRUE
 
 
+def verify_invariant_enabled() -> bool:
+    """Force batch-size-invariant numerical paths across 1-row decode and speculative verify
+    (Issue #948, opt-in, default OFF). ``FREETOKEN_VERIFY_INVARIANT=1``."""
+    return os.getenv("FREETOKEN_VERIFY_INVARIANT", "0").strip().lower() in _ENV_TRUE
+
+
 def moe_ep_enabled(flag: bool = False) -> bool:
     """Disjoint Expert Parallelism across the TP group for routed MoE experts (opt-in, default OFF).
     When enabled at ``TP > 1``, rank ``r`` owns routed experts ``[r * (E // TP), (r + 1) * (E // TP))``

@@ -8,6 +8,7 @@ slot index (``cache_indices``), so it matches the LinearStatePool layout exactly
 Convention mirrors sglang's ``causal_conv1d.py`` sgl_kernel path. silu is applied
 inside the kernel; the conv state is updated in place (no separate scatter).
 """
+
 from __future__ import annotations
 
 import torch
@@ -16,11 +17,11 @@ _PAD_SLOT_ID = -1
 
 
 def causal_conv1d_varlen(
-    x: torch.Tensor,            # [conv_dim, total_tokens] (channels-first, last dim contiguous)
-    weight: torch.Tensor,       # [conv_dim, kernel]
+    x: torch.Tensor,  # [conv_dim, total_tokens] (channels-first, last dim contiguous)
+    weight: torch.Tensor,  # [conv_dim, kernel]
     conv_states: torch.Tensor,  # [num_slots, conv_dim, kernel-1] (updated in place)
-    cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
-    cache_indices: torch.Tensor,    # [batch] int32 slot id per request
+    cu_seqlens: torch.Tensor,  # [batch+1] int32 prefix sums of per-request lengths
+    cache_indices: torch.Tensor,  # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
@@ -41,39 +42,48 @@ def causal_conv1d_varlen(
     if x.stride(-1) != 1:
         x = x.contiguous()
     causal_conv1d_fwd(
-        x, weight, None, conv_states,
-        cu_seqlens.to(torch.int32), cache_indices.to(torch.int32),
-        has_initial_state, True, _PAD_SLOT_ID,
+        x,
+        weight,
+        None,
+        conv_states,
+        cu_seqlens.to(torch.int32),
+        cache_indices.to(torch.int32),
+        has_initial_state,
+        True,
+        _PAD_SLOT_ID,
     )
     return x
 
 
 def causal_conv1d_verify(
-    x: torch.Tensor,                # [batch, conv_dim, seqlen] (any strides)
-    conv_state: torch.Tensor,       # [num_slots, conv_dim, kernel-1] (rolled in place)
-    weight: torch.Tensor,           # [conv_dim, kernel]
-    conv_state_indices: torch.Tensor,          # [batch] int32 slot id per request
-    intermediate_conv_window: torch.Tensor,    # [rows, steps, conv_dim, kernel-1], row = batch row
+    x: torch.Tensor,  # [batch, conv_dim, seqlen] (any strides)
+    conv_state: torch.Tensor,  # [num_slots, conv_dim, kernel-1] (rolled in place)
+    weight: torch.Tensor,  # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,  # [batch] int32 slot id per request
+    intermediate_conv_window: torch.Tensor,  # [rows, steps, conv_dim, kernel-1], row = batch row
 ) -> torch.Tensor:
     """Speculative-verify conv; triton only, as sgl_kernel's update keeps no per-token window."""
     from freetoken.kernel.triton.causal_conv1d_triton import (
         causal_conv1d_verify as triton_causal_conv1d_verify,
     )
 
-    return triton_causal_conv1d_verify(x, conv_state, weight, conv_state_indices, intermediate_conv_window)
+    return triton_causal_conv1d_verify(
+        x, conv_state, weight, conv_state_indices, intermediate_conv_window
+    )
 
 
 def causal_conv1d_decode(
-    x: torch.Tensor,                # [batch, conv_dim] (one token per request)
-    conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
-    weight: torch.Tensor,           # [conv_dim, kernel]
+    x: torch.Tensor,  # [batch, conv_dim] (one token per request)
+    conv_state: torch.Tensor,  # [num_slots, conv_dim, state_len>=kernel-1] (in place)
+    weight: torch.Tensor,  # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32 slot id per request
 ) -> torch.Tensor:
     """Single-token (decode) causal conv update with silu; shifts+appends the new
     token into ``conv_state[conv_state_indices]`` in place and returns silu(conv)."""
     from freetoken.kernel.backend import is_sgl_kernel_installed
+    from freetoken.models.config import verify_invariant_enabled
 
-    if not is_sgl_kernel_installed():
+    if verify_invariant_enabled() or not is_sgl_kernel_installed():
         from freetoken.kernel.triton.causal_conv1d_triton import (
             causal_conv1d_decode as triton_causal_conv1d_decode,
         )
@@ -84,7 +94,13 @@ def causal_conv1d_decode(
 
     x = x.unsqueeze(-1)
     causal_conv1d_update(
-        x, conv_state, weight, None, True, None,
-        conv_state_indices.to(torch.int32), _PAD_SLOT_ID,
+        x,
+        conv_state,
+        weight,
+        None,
+        True,
+        None,
+        conv_state_indices.to(torch.int32),
+        _PAD_SLOT_ID,
     )
     return x.squeeze(-1)

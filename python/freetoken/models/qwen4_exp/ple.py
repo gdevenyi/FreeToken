@@ -64,7 +64,9 @@ class PLETableBackend(Protocol):
     head_dim: int
     dtype: torch.dtype
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor: ...
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor: ...
 
     def prefetch(self, row_ids: torch.Tensor) -> None: ...
 
@@ -78,11 +80,15 @@ class GpuResidentTable:
         self.weight = weight
         self.scale = float(scale)
         self.num_rows, self.head_dim = weight.shape
-        self.dtype = dtype if dtype is not None else (
-            torch.bfloat16 if weight.dtype.itemsize < 2 else weight.dtype
+        self.dtype = (
+            dtype
+            if dtype is not None
+            else (torch.bfloat16 if weight.dtype.itemsize < 2 else weight.dtype)
         )
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         rows = self.weight.index_select(0, row_ids.reshape(-1)).to(self.dtype)
         if self.scale != 1.0:
             rows = rows * self.scale
@@ -99,12 +105,16 @@ class GpuResidentTable:
 class ZeroTable:
     """Dummy-weight stand-in: every lookup reads zeros (dummy checkpoints ship no table)."""
 
-    def __init__(self, num_rows: int, head_dim: int, dtype: torch.dtype = torch.bfloat16) -> None:
+    def __init__(
+        self, num_rows: int, head_dim: int, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         self.num_rows = int(num_rows)
         self.head_dim = head_dim
         self.dtype = dtype
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if out is not None:
             return out.zero_()
         return torch.zeros(
@@ -195,12 +205,16 @@ class PinnedUVATable:
         if self._device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             buf = self._graph_staging.get(rows)
             if buf is None:
-                buf = torch.empty((rows, self.head_dim), dtype=self.dtype, device=self._device)
+                buf = torch.empty(
+                    (rows, self.head_dim), dtype=self.dtype, device=self._device
+                )
                 self._graph_staging[rows] = buf
             return buf
         buf = self._staging
         if buf is None or buf.shape[0] < rows:
-            buf = torch.empty((rows, self.head_dim), dtype=self.dtype, device=self._device)
+            buf = torch.empty(
+                (rows, self.head_dim), dtype=self.dtype, device=self._device
+            )
             self._staging = buf
         return buf[:rows]
 
@@ -252,7 +266,9 @@ class PinnedUVATable:
             self._gather(row_ids, dst)
         self._pending = (row_ids, dst)
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         pending, self._pending = self._pending, None
         if pending is not None:
             # join even on a miss: the stale prefetch owns the staging buffer about to be reused
@@ -312,7 +328,9 @@ def derive_ngram_hash_constants(
     half_bound = max(1, ((1 << 63) - 1) // max(vocab_size, 1) // 2)
     base_seed = seed + _PLE_LAYER_PRIME * ple_layer_index
     multipliers = [
-        2 * (_splitmix64((base_seed + _SPLITMIX_GAMMA * (i + 1)) & _MASK64) % half_bound) + 1
+        2
+        * (_splitmix64((base_seed + _SPLITMIX_GAMMA * (i + 1)) & _MASK64) % half_bound)
+        + 1
         for i in range(ngram_size)
     ]
     sizes: List[int] = []
@@ -421,9 +439,17 @@ def build_ple_metadata(
         cu, slots, fresh = fla.cu_seqlens, fla.cache_indices.long(), None
     else:  # direct-op callers (tests) with no scheduler metadata
         pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
-        cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
-        slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
-        fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
+        cu = (
+            torch.tensor([0, *lens], dtype=torch.int64, **pin)
+            .cumsum_(0)
+            .to(device, non_blocking=True)
+        )
+        slots = torch.tensor(
+            [_state_slot(r) for r in reqs], dtype=torch.int64, **pin
+        ).to(device, non_blocking=True)
+        fresh = torch.tensor(
+            [r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin
+        ).to(device, non_blocking=True)
     context = context_pool.index_select(0, slots).long()
     if fresh is not None:
         context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
@@ -439,7 +465,9 @@ def build_ple_metadata(
     )
 
 
-def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
+def commit_ngram_context(
+    meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None
+) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
     Called ONCE per prefill or decode forward after every PLE layer ran (the layers only read the context; a verify commits through ``PLENgramVerify.commit``);
@@ -476,7 +504,9 @@ class NGramEmbedding(BaseOP):
     entry (128 checkpoint shards land in a ``PLETableBackend``); attach it with ``attach_table``.
     """
 
-    def __init__(self, args: Qwen4ExpArgs, table: PLETableBackend | None = None) -> None:
+    def __init__(
+        self, args: Qwen4ExpArgs, table: PLETableBackend | None = None
+    ) -> None:
         self.ngram_size = args.ngram_size
         self.heads_per_ngram = args.heads_per_ngram
         self.num_heads = args.num_ngram_heads
@@ -500,14 +530,18 @@ class NGramEmbedding(BaseOP):
         ctx_len = self.ngram_size - 1
         if meta.is_decode:
             # a window of exactly ngram_size columns holds every shift the hash can reach
-            return torch.cat([meta.ngram_context, ids.view(-1, 1)], dim=1), lambda t: t[:, -1]
+            return torch.cat([meta.ngram_context, ids.view(-1, 1)], dim=1), lambda t: t[
+                :, -1
+            ]
 
         num_reqs = len(meta.seq_lens)
         width = ctx_len + max(meta.seq_lens)
         cu = meta.cu_seqlens.long()
         # Pack the ragged tokens into [B, ctx+max_len] so the shift/boundary logic is one gather.
         flat_pos = torch.arange(ids.numel(), device=ids.device)
-        req = (torch.searchsorted(cu, flat_pos, right=True) - 1).clamp_(max=num_reqs - 1)
+        req = (torch.searchsorted(cu, flat_pos, right=True) - 1).clamp_(
+            max=num_reqs - 1
+        )
         col = flat_pos - cu[req] + ctx_len
         packed = ids.new_full((num_reqs, width), self.eos_token_id)
         packed[:, :ctx_len] = meta.ngram_context
@@ -520,15 +554,21 @@ class NGramEmbedding(BaseOP):
         pos = torch.arange(width, device=packed.device)
         eos_pos = torch.where(packed == self.eos_token_id, pos, -1)
         prev_eos = torch.cummax(eos_pos, dim=1).values
-        prev_eos = torch.cat([eos_pos.new_full((num_reqs, 1), -1), prev_eos[:, :-1]], dim=1)
+        prev_eos = torch.cat(
+            [eos_pos.new_full((num_reqs, 1), -1), prev_eos[:, :-1]], dim=1
+        )
         in_segment = pos.unsqueeze(0) - prev_eos - 1
 
         shifted = [packed]
         for shift in range(1, self.ngram_size):
             src = pos - shift
-            gathered = packed.gather(1, src.clamp_min(0).unsqueeze(0).expand(num_reqs, -1))
+            gathered = packed.gather(
+                1, src.clamp_min(0).unsqueeze(0).expand(num_reqs, -1)
+            )
             valid = (src.unsqueeze(0) >= 0) & (in_segment >= shift)
-            shifted.append(torch.where(valid, gathered, packed.new_full((), self.eos_token_id)))
+            shifted.append(
+                torch.where(valid, gathered, packed.new_full((), self.eos_token_id))
+            )
         return shifted
 
     def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
@@ -541,12 +581,18 @@ class NGramEmbedding(BaseOP):
             end = start + self.heads_per_ngram
             mixed = tokens[0] * self.layer_multipliers[0]
             for position in range(1, ngram):
-                mixed = torch.bitwise_xor(mixed, tokens[position] * self.layer_multipliers[position])
-            head_ids = torch.remainder(mixed.unsqueeze(-1), self.ngram_heads_vocab_sizes[start:end])
+                mixed = torch.bitwise_xor(
+                    mixed, tokens[position] * self.layer_multipliers[position]
+                )
+            head_ids = torch.remainder(
+                mixed.unsqueeze(-1), self.ngram_heads_vocab_sizes[start:end]
+            )
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
         return torch.cat(blocks, dim=-1)
 
-    def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, meta: PLEMetadata, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         return self.table.lookup(self.row_ids(meta), out)
 
 
@@ -574,7 +620,9 @@ def short_conv_reference(
     slots = meta.state_slots
     state = states.index_select(0, slots).to(x.dtype)
     if meta.fresh_slots is not None:
-        state = torch.where(meta.fresh_slots.view(-1, 1, 1), torch.zeros_like(state), state)
+        state = torch.where(
+            meta.fresh_slots.view(-1, 1, 1), torch.zeros_like(state), state
+        )
 
     outs = []
     new_state = torch.empty_like(state)
@@ -611,7 +659,12 @@ class PLELayer(BaseOP):
     """
 
     def __init__(
-        self, config: ModelConfig, layer_id: int, table: PLETableBackend | None = None, *, prefix: str = ""
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        table: PLETableBackend | None = None,
+        *,
+        prefix: str = "",
     ) -> None:
         args = config.qwen4_args
         self.args = args
@@ -624,14 +677,26 @@ class PLELayer(BaseOP):
         width = args.ple_state_width
         self.ple_embedding = NGramEmbedding(args, table)
         self.key_proj = LinearReplicated(
-            args.ple_embed_dim, width, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.key_proj"
+            args.ple_embed_dim,
+            width,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.key_proj",
         )
         self.value_proj = LinearReplicated(
-            args.ple_embed_dim, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.value_proj"
+            args.ple_embed_dim,
+            args.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.value_proj",
         )
         self.norm_key = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
-        self.norm_query = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
-        self.norm_conv = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
+        self.norm_query = GroupedPlusOneRMSNorm(
+            width, config.rms_norm_eps, self.hc_count
+        )
+        self.norm_conv = GroupedPlusOneRMSNorm(
+            width, config.rms_norm_eps, self.hc_count
+        )
         self.conv1d = _DepthwiseConv1d(width, args.ple_conv_kernel_size)
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
 
@@ -672,9 +737,21 @@ class PLELayer(BaseOP):
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
+        from freetoken.models.config import verify_invariant_enabled
+
         shape = (-1, self.hc_count, self.hidden_size)
-        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+        if verify_invariant_enabled():
+            gate_f = (key.float().view(shape) * query.float().view(shape)).sum(
+                -1, keepdim=True
+            ) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(
+                gate_f.sign() * gate_f.abs().clamp_min(1e-6).sqrt()
+            ).to(R.dtype)
+        else:
+            gate = (key.view(shape) * query.view(shape)).sum(
+                -1, keepdim=True
+            ) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
@@ -695,7 +772,9 @@ class PLELayer(BaseOP):
 
     def _conv_state_slab(self, R: torch.Tensor) -> torch.Tensor:
         pool = get_global_ctx().linear_state_pool
-        assert pool is not None, "PLE needs ctx.linear_state_pool or an explicit conv_states"
+        assert pool is not None, (
+            "PLE needs ctx.linear_state_pool or an explicit conv_states"
+        )
         assert pool.has_slot_state(PLE_CONV_STATE), (
             "ModelConfig.slot_states does not declare the PLE conv history"
         )
@@ -706,7 +785,9 @@ class PLELayer(BaseOP):
     ) -> torch.Tensor:
         state = states.index_select(0, meta.state_slots).to(dtype)
         if meta.fresh_slots is not None:
-            state = torch.where(meta.fresh_slots.view(-1, 1, 1), torch.zeros_like(state), state)
+            state = torch.where(
+                meta.fresh_slots.view(-1, 1, 1), torch.zeros_like(state), state
+            )
         return state
 
     def _short_conv(
@@ -729,7 +810,9 @@ class PLELayer(BaseOP):
         window = torch.cat([state[..., :: self.dilation], column], dim=-1).float()
         out = (window * self.conv1d.weight.squeeze(1).float()).sum(-1)
         states.index_copy_(
-            0, meta.state_slots, torch.cat([state[..., 1:], column], dim=-1).to(states.dtype)
+            0,
+            meta.state_slots,
+            torch.cat([state[..., 1:], column], dim=-1).to(states.dtype),
         )
         return F.silu(out.to(x.dtype))
 
@@ -746,7 +829,11 @@ class PLELayer(BaseOP):
         history[..., : self.state_len].copy_(self._read_state(meta, states, x.dtype))
         history[..., self.state_len :].copy_(x.view(bs, rows, -1).transpose(1, 2))
         # contiguous taps reduce in the order the decode taps do
-        window = history.unfold(2, self.state_len + 1, 1)[..., :: self.dilation].contiguous().float()
+        window = (
+            history.unfold(2, self.state_len + 1, 1)[..., :: self.dilation]
+            .contiguous()
+            .float()
+        )
         out = (window * self.conv1d.weight.squeeze(1).float().unsqueeze(1)).sum(-1)
         return F.silu(out.to(x.dtype)).transpose(1, 2).reshape(x.shape)
 
@@ -765,14 +852,23 @@ class PLELayer(BaseOP):
         state = self._read_state(meta, states, x.dtype)
         history = x.new_empty(width, x.shape[0] + num_reqs * self.state_len)
         history.index_copy_(1, state_index, state.permute(1, 0, 2).reshape(width, -1))
-        history.index_copy_(1, out_index + self.state_len, x.transpose(0, 1).contiguous())
+        history.index_copy_(
+            1, out_index + self.state_len, x.transpose(0, 1).contiguous()
+        )
 
         out = F.conv1d(
-            history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation
+            history.unsqueeze(0),
+            self.conv1d.weight,
+            groups=width,
+            dilation=self.dilation,
         ).squeeze(0)
-        new_state = history.index_select(1, next_state_index).view(width, num_reqs, self.state_len)
+        new_state = history.index_select(1, next_state_index).view(
+            width, num_reqs, self.state_len
+        )
         states.index_copy_(
-            0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
+            0,
+            meta.state_slots,
+            new_state.permute(1, 0, 2).to(states.dtype).contiguous(),
         )
         return F.silu(out.index_select(1, out_index), inplace=True).transpose(0, 1)
 
@@ -796,41 +892,73 @@ class PLELayer(BaseOP):
             packed = packed.pin_memory()
         packed = packed.to(device, non_blocking=True)
         n_out, n_state = out_index.numel(), len(lens) * state_len
-        return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
+        return (
+            packed[:n_out],
+            packed[n_out : n_out + n_state],
+            packed[n_out + n_state :],
+        )
 
 
 class PLEConvVerify:
     """``SlotVerify`` of the conv history: per PLE layer and verify row, the live history then every verify conv input."""
 
-    def __init__(self, spec, max_bs: int, rows_per_req: int, device: torch.device, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        spec,
+        max_bs: int,
+        rows_per_req: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
         self.name = spec.name
         width, self.state_len = spec.shape
         self.history = {
-            layer_id: torch.zeros(max_bs, width, self.state_len + rows_per_req, dtype=dtype, device=device)
+            layer_id: torch.zeros(
+                max_bs, width, self.state_len + rows_per_req, dtype=dtype, device=device
+            )
             for layer_id in spec.layer_ids
         }
 
     @staticmethod
     def nbytes(spec, max_bs: int, rows_per_req: int, dtype: torch.dtype) -> int:
         width, state_len = spec.shape
-        return len(spec.layer_ids) * max_bs * width * (state_len + rows_per_req) * dtype.itemsize
+        return (
+            len(spec.layer_ids)
+            * max_bs
+            * width
+            * (state_len + rows_per_req)
+            * dtype.itemsize
+        )
 
     def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
         # after n accepted rows the history is columns n .. n + state_len - 1
-        cols = (counts.unsqueeze(1) + torch.arange(self.state_len, device=counts.device)).unsqueeze(1)
+        cols = (
+            counts.unsqueeze(1) + torch.arange(self.state_len, device=counts.device)
+        ).unsqueeze(1)
         for layer_id, history in self.history.items():
             states = pool.slot_state(self.name, layer_id)
-            window = history[: slots.numel()].gather(2, cols.expand(-1, history.shape[1], -1))
+            window = history[: slots.numel()].gather(
+                2, cols.expand(-1, history.shape[1], -1)
+            )
             states.index_copy_(0, slots, window.to(states.dtype))
 
 
 class PLENgramVerify:
     """``SlotVerify`` of the n-gram context: per verify row, the live context then every verify input token."""
 
-    def __init__(self, spec, max_bs: int, rows_per_req: int, device: torch.device, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        spec,
+        max_bs: int,
+        rows_per_req: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
         self.name = spec.name
         (self.ctx_len,) = spec.shape
-        self.ids = torch.zeros(max_bs, self.ctx_len + rows_per_req, dtype=dtype, device=device)
+        self.ids = torch.zeros(
+            max_bs, self.ctx_len + rows_per_req, dtype=dtype, device=device
+        )
 
     @staticmethod
     def nbytes(spec, max_bs: int, rows_per_req: int, dtype: torch.dtype) -> int:
@@ -840,13 +968,19 @@ class PLENgramVerify:
         """Stage a verify forward's context and input tokens; the forward itself leaves the live context as it was."""
         bs = meta.state_slots.numel()
         self.ids[:bs, : self.ctx_len].copy_(meta.ngram_context)
-        rows = meta.input_ids.numel() // bs  # fewer than the scratch holds on a no-draft step
-        self.ids[:bs, self.ctx_len : self.ctx_len + rows].copy_(meta.input_ids.view(bs, rows))
+        rows = (
+            meta.input_ids.numel() // bs
+        )  # fewer than the scratch holds on a no-draft step
+        self.ids[:bs, self.ctx_len : self.ctx_len + rows].copy_(
+            meta.input_ids.view(bs, rows)
+        )
 
     def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
         context = pool.slot_state(self.name)
         cols = counts.unsqueeze(1) + torch.arange(self.ctx_len, device=counts.device)
-        context.index_copy_(0, slots, self.ids[: slots.numel()].gather(1, cols).to(context.dtype))
+        context.index_copy_(
+            0, slots, self.ids[: slots.numel()].gather(1, cols).to(context.dtype)
+        )
 
 
 __all__ = [
