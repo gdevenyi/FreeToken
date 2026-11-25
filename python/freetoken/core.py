@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Tuple
 
 import torch
 
@@ -164,6 +164,7 @@ class Req:
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     mamba_restore_host: int | None = None           # the same from the host bank (--mamba-host-slots), when the tree's copy is there
+    kv_restore: Any = None                          # --kv-host-tier-gb: the KVRestore copies before the first forward (first chunk only)
     gdn_track: bool = True                          # this prefill chunk snapshots its deepest x64 boundary (structural policy: only at a snapshot point)
     snapshot_pin: int | None = None                 # structural policy: the first turn boundary, whose snapshot is pinned
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode

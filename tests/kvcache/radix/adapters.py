@@ -44,6 +44,7 @@ class MatchOut:
     node: Any                          # opaque implementation node; the lock target
     second: Optional[int] = None       # hybrid: the GDN snapshot slot to restore from
     host: int | None = None            # hybrid: the host-bank slot, when there is no device one
+    host_kv: list[int] | None = None   # hybrid KV host tier: host slots of the host-only tail
 
 
 @dataclass
@@ -60,6 +61,7 @@ class EvictOut:
     second: List[int]                  # swa-freed full indices / freed GDN snapshot slots
     host: list[int] = field(default_factory=list)      # hybrid: freed host-bank slots
     demoted: list[tuple[int, int]] = field(default_factory=list)  # hybrid: (device, host) copies
+    kv_demoted: list = field(default_factory=list)  # hybrid KV host tier: (device slots, host slots) copies
 
 
 @dataclass
@@ -83,7 +85,9 @@ def _up(node, field: str) -> List[List[int]]:
     """One tensor field of every node from the root down to (and including) ``node``."""
     out = []
     while not node.is_root():
-        out.append(getattr(node, field).tolist())
+        v = getattr(node, field)
+        if v is not None:                  # a host-only node has no device ``value``
+            out.append(v.tolist())
         node = node.parent
     return out[::-1]
 
@@ -128,7 +132,9 @@ class Adapter:
     def records(self) -> List[Tuple[Path, Record]]:
         """One record per node keyed by its end boundary -- the shape the model also emits."""
         return [(node_end_path(n),
-                 {"length": n.length, "slots": tuple(n.value.tolist()), "ref": n.ref_count,
+                 {"length": n.length, "slots": None if n.value is None else tuple(n.value.tolist()),
+                  "ref": n.ref_count, "hkv_ref": n.host_ref_count,
+                  "hslots": None if n.host_value is None else tuple(n.host_value.tolist()),
                   "tomb": bool(n.swa_tombstone), "swa_ref": n.swa_ref_count,
                   "swa_uuid": n.swa_uuid, "mamba": n.mamba_value,
                   "mamba_ref": n.mamba_ref_count, "host": n.mamba_host,
@@ -144,7 +150,7 @@ class Adapter:
                      self.second_currency)
 
     def tree_slots(self) -> List[int]:
-        return [s for n in self.nodes() for s in n.value.tolist()]
+        return [s for n in self.nodes() if n.value is not None for s in n.value.tolist()]
 
 
 class PlainAdapter(Adapter):
@@ -229,7 +235,8 @@ class HybridAdapter(Adapter):
 
     def match(self, ids: Sequence[int]) -> MatchOut:
         m = self.cache.match_prefix(ids_tensor(ids))
-        return MatchOut(int(m.cached_len), m.kv_indices.tolist(), m.node, m.mamba_value, m.mamba_host)
+        return MatchOut(int(m.cached_len), m.kv_indices.tolist(), m.node, m.mamba_value, m.mamba_host,
+                        None if m.host_kv is None else m.host_kv.tolist())
 
     def insert(self, ids, slots, *, mamba: int, **kw) -> InsertOut:
         host_freed: list[int] = []
@@ -255,14 +262,33 @@ class HybridAdapter(Adapter):
     @staticmethod
     def _evicted(ev) -> EvictOut:
         return EvictOut(ev.kv_indices.tolist(), list(ev.mamba_slots), list(ev.host_slots),
-                        list(ev.demoted))
+                        list(ev.demoted), [(d.tolist(), h.tolist()) for d, h in ev.kv_demoted])
 
     def counters(self) -> Dict[str, int]:
         c = self.cache
         return {"full_evictable": c.full_evictable, "full_protected": c.full_protected,
                 "mamba_evictable": c.mamba_evictable, "mamba_protected": c.mamba_protected,
                 "mamba_host_evictable": c.mamba_host_evictable,
-                "mamba_host_protected": c.mamba_host_protected}
+                "mamba_host_protected": c.mamba_host_protected, "host_kv": c.host_kv_tokens}
+
+
+class KVHostPages:
+    """--kv-host-tier-gb for the harness: ``capacity`` host pages drawn from a ledger of host slots
+    (``page_size`` per page), the interface ``HybridRadixCache.kv_host`` expects."""
+
+    def __init__(self, ledger: SlotLedger, capacity: int, page_size: int) -> None:
+        self.ledger, self.capacity, self.P = ledger, capacity, page_size
+
+    @property
+    def num_free(self) -> int:
+        return self.capacity - len(self.ledger.in_use()) // self.P
+
+    def alloc(self, n: int) -> list[int]:
+        assert n <= self.num_free, f"alloc({n}) with {self.num_free} free host pages"
+        return [s // self.P for s in self.ledger.take(n * self.P)[:: self.P]]
+
+    def free(self, pages: Sequence[int]) -> None:
+        self.ledger.release([p * self.P + i for p in pages for i in range(self.P)])
 
 
 # --------------------------------------------------------------------------- the battery
@@ -331,8 +357,8 @@ def check_prefix_closure(ad: Adapter) -> None:
                  "is not registered under its own first page key"),
                 ("page_align", node.length % P == 0,
                  f"has length {node.length}, not a multiple of page_size={P}"),
-                ("key_value", len(node._key) == len(node.value),
-                 f"has {len(node._key)} key tokens but {len(node.value)} values")):
+                ("key_value", len(node._key) == len(node.value if node.value is not None else node.host_value),
+                 f"has {len(node._key)} key tokens but a value of another length")):
             if not ok:
                 raise InvariantViolation(f"structure.{tag}", f"node {node_end_path(node)} {why}")
         seen.add(id(node))
@@ -376,18 +402,33 @@ def check_snapshot_leaves(ad: Adapter) -> None:
                                                                 f"has no snapshot on any tier")
 
 
+def check_device_closure(ad: Adapter) -> None:
+    """Hybrid KV host tier: the device pages of a path form a prefix (no device node below a host-only
+    one), and every node keeps its KV on some tier."""
+    for node, parent in iter_nodes(ad.root):
+        if node.value is None and node.host_value is None:
+            raise InvariantViolation("structure.kv_tier", f"node {node_end_path(node)} has its KV on no tier")
+        if node.value is not None and not parent.is_root() and parent.value is None:
+            raise InvariantViolation("structure.device_below_host",
+                                     f"device node {node_end_path(node)} is below a host-only node")
+
+
 def check_all(ad: Adapter, model: RefModel, kv_ledger: SlotLedger,
               second_ledger: Optional[SlotLedger] = None,
-              host_ledger: SlotLedger | None = None) -> None:
+              host_ledger: SlotLedger | None = None, host_kv_ledger: SlotLedger | None = None) -> None:
     recs = ad.records()
     check_prefix_closure(ad)
     check_counter_model(ad, recs)
     check_class_integrity(ad)
-    check_conservation("kv", [s for _, r in recs for s in r["slots"]], kv_ledger)
+    check_conservation("kv", [s for _, r in recs if r["slots"] is not None for s in r["slots"]], kv_ledger)
     if second_ledger is not None:            # GDN snapshots: their own currency, their own ledger
         check_conservation("mamba", [r["mamba"] for _, r in recs if r["mamba"] is not None],
                            second_ledger)
         check_snapshot_leaves(ad)
     if host_ledger is not None:              # host-bank slots: the tree owns each at most once
         check_conservation("host", [r["host"] for _, r in recs if r["host"] is not None], host_ledger)
+    if host_kv_ledger is not None:           # KV host pages: each host slot in one node at most
+        check_conservation("host_kv", [s for _, r in recs if r["hslots"] is not None for s in r["hslots"]],
+                           host_kv_ledger)
+        check_device_closure(ad)
     check_model_agreement(ad, model, recs)

@@ -81,7 +81,6 @@ class PrefillAdder:
             stats.note_refusal("table", req.uid)
             return None
 
-        # TODO: consider host cache match case (it needs the same replay cap)
         replay = self.cache_manager.prefix_replay_tokens
         if req.sampling_params.isolated(self.isolate_logprob_reads):
             max_len = 0  # a resumed prefill differs numerically from a cold one
@@ -92,9 +91,12 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
+        # --kv-host-tier-gb: the matched span past the device pages is on the host; it takes device
+        # pages at admission (restore_host_kv), charged here and allocated at once, not reserved
+        host_kv = getattr(handle, "host_kv", None)
         estimated_size = self._kv_reservation_size(
             req.input_len + req.output_len + self.token_headroom, cached_len
-        )
+        ) + (0 if host_kv is None else len(host_kv))
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             stats.note_refusal("kv", req.uid)
@@ -129,6 +131,8 @@ class PrefillAdder:
                 stats.note_refusal("swa", req.uid)
                 return self.cache_manager.unlock(handle)
 
+        # past the last refusal: only try_add_one's undo has to reverse it
+        handle, kv_restore = self.cache_manager.restore_host_kv(handle)
         table_idx = self.table_manager.allocate()
         self.cache_manager.note_admission(req, handle)
         req.snapshot_ends, req.snapshot_pin = self.cache_manager.snapshot_plan(req, handle)
@@ -154,7 +158,7 @@ class PrefillAdder:
         restore_host = mr.mamba_host if mr.mamba_value is None else None
         if restore_host is not None:
             self.cache_manager.prefix_cache.counts["host_hit"] += 1  # KVSTATS only
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, restore_host
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, restore_host, kv_restore
 
     def _add_one_req(
         self,
@@ -169,6 +173,7 @@ class PrefillAdder:
         swa_evicted_seqlen: int = 0,
         last_track_seqlen: int | None = None,
         restore_host: int | None = None,
+        kv_restore=None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -279,6 +284,7 @@ class PrefillAdder:
             req.snapshot_pin = pending_req.snapshot_pin
         req.mamba_restore_src = restore_src
         req.mamba_restore_host = restore_host
+        req.kv_restore = kv_restore
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -302,7 +308,7 @@ class PrefillAdder:
             return chunked_req.next_chunk
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host, kv_restore = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -313,10 +319,13 @@ class PrefillAdder:
                 next_track_idx=0,
                 restore_src=restore_src,
                 restore_host=restore_host,
+                kv_restore=kv_restore,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
                 # resources -- they belong to the prior chunk's Req)
+                if kv_restore is not None:
+                    self.cache_manager.undo_host_kv(kv_restore)
                 self.cache_manager.unlock(cache_handle)
                 self.table_manager.free(table_idx)
                 if linear_slot_idx is not None:

@@ -107,6 +107,9 @@ class EngineConfig:
     # --mamba-host-slots: GDN snapshots an idle prefix keeps in pinned host RAM once the device
     # snapshot cache needs its slot (hybrid radix only). 0 = off.
     mamba_host_slots: int = 0
+    # --kv-host-tier-gb: GiB of host RAM per TP rank for the KV pages of idle prefixes once the device
+    # needs their pages (hybrid radix only; refused under MTP in v1). 0 = off.
+    kv_host_tier_gb: float = 0.0
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the

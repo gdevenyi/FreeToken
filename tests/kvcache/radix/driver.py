@@ -15,8 +15,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from .adapters import (Adapter, HybridAdapter, LockToken, PlainAdapter, SlotLedger, SWAAdapter,
-                       UnsupportedOp, check_all, node_path_slots)
+from .adapters import (Adapter, HybridAdapter, KVHostPages, LockToken, PlainAdapter, SlotLedger,
+                       SWAAdapter, UnsupportedOp, check_all, node_path_slots)
 from .model import (ExpLock, HybridModel, ModelMismatch, PreconditionError, RefModel, SWAModel)
 
 
@@ -56,7 +56,7 @@ class CacheSpec:
                     f"page_size({self.page_size}) == 0")
         return None
 
-    def build(self, host_slots: int = 0) -> Tuple[Adapter, RefModel]:
+    def build(self, host_slots: int = 0, kv_host_pages: int = 0) -> Tuple[Adapter, RefModel]:
         dev, P = torch.device("cpu"), self.page_size
         if self.kind == "plain":
             from freetoken.kvcache.radix_cache import RadixPrefixCache
@@ -68,7 +68,8 @@ class CacheSpec:
                     SWAModel(P, w))
         if self.kind == "hybrid":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridAdapter(HybridRadixCache(dev, page_size=P), P), HybridModel(P, host_slots)
+            return (HybridAdapter(HybridRadixCache(dev, page_size=P), P),
+                    HybridModel(P, host_slots, kv_host_pages))
         raise ValueError(f"unknown cache kind {self.kind!r}")
 
 
@@ -95,10 +96,15 @@ class Session:
     """Executes ops against one cache + its reference model, comparing every answer; ``check()``
     runs the whole invariant battery, which is why the scenario tests can be short."""
 
-    def __init__(self, spec: CacheSpec, host_slots: int = 0) -> None:
+    def __init__(self, spec: CacheSpec, host_slots: int = 0, kv_host_pages: int = 0) -> None:
         self.spec = spec
         self.P = spec.page_size
-        self.ad, self.model = spec.build(host_slots)
+        self.ad, self.model = spec.build(host_slots, kv_host_pages)
+        # --kv-host-tier-gb: ``kv_host_pages`` host pages that evict_full demotes KV into
+        self.host_kv: SlotLedger | None = None
+        if kv_host_pages:
+            self.host_kv = SlotLedger(7_000_064, "host_kv")   # a multiple of every page size here
+            self.ad.cache.kv_host = KVHostPages(self.host_kv, kv_host_pages, self.P)
         self.kv = SlotLedger(1_000_000, "kv")
         self.second: Optional[SlotLedger] = (
             SlotLedger(9_000_000, "mamba") if self.ad.second_currency == "mamba" else None)
@@ -109,7 +115,7 @@ class Session:
             self.ad.host_alloc = lambda: host.take(1)[0] if len(host.in_use()) < host_slots else None
 
     def check(self) -> None:
-        check_all(self.ad, self.model, self.kv, self.second, self.host)
+        check_all(self.ad, self.model, self.kv, self.second, self.host, self.host_kv)
 
     @staticmethod
     def _same(tag: str, what: str, got, want) -> None:
@@ -128,6 +134,7 @@ class Session:
                    node_path_slots(got.node), exp.indices)
         self._same("match.second", f"{q} second-currency value", got.second, exp.second)
         self._same("match.host", f"{q} host-bank slot", got.host, exp.host)
+        self._same("match.host_kv", f"{q} host KV continuation", got.host_kv, exp.host_kv)
         return got, exp
 
     def do_insert(self, ids: Sequence[int], swa_evicted: int = 0, *,
@@ -185,7 +192,7 @@ class Session:
         if which == "evict_second" and self.spec.kind == "hybrid":
             self.model.evict_second(n, got.primary, got.second, got.demoted)
         elif which == "evict_full" and self.spec.kind == "hybrid":
-            self.model.evict_full(n, got.primary, got.second, got.host)
+            self.model.evict_full(n, got.primary, got.second, got.host, got.kv_demoted)
         else:
             getattr(self.model, which)(n, got.primary, got.second)
         self.kv.release(got.primary)

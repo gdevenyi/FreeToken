@@ -617,6 +617,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-host-tier-gb",
+        type=_snapshot_cache_ratio,  # a finite number >= 0
+        default=ServerArgs.kv_host_tier_gb,
+        help="Hybrid (GDN) models: GiB of host RAM per TP rank for the KV pages of idle prefixes. When "
+        "the KV pool needs pages, the least recently used idle prefix moves its pages to host RAM "
+        "instead of losing them, and a later request on that prefix copies them back. Start-up fails if "
+        "this and --mamba-host-slots leave less than 32 GiB of MemAvailable. Not supported with "
+        "--speculative-algorithm mtp. 0 (default) keeps no KV in host RAM.",
+    )
+
+    parser.add_argument(
         "--logprob-read-isolate",
         action="store_true",
         default=ServerArgs.logprob_read_isolate,
@@ -1217,6 +1228,9 @@ def parse_args(
 
     if kwargs["mamba_host_slots"] < 0:
         parser.error("--mamba-host-slots must be 0 or more")
+    if kwargs["kv_host_tier_gb"] and kwargs["speculative_algorithm"] == "mtp":
+        # the MTP draft KV pool follows the target's page ids; the host tier does not copy it (v1)
+        parser.error("--kv-host-tier-gb is not supported with --speculative-algorithm mtp")
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

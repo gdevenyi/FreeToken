@@ -63,8 +63,9 @@ def sizes(records: Iterable[Record], currency: Optional[str]) -> Dict[str, int]:
     an incremental counter bug on either side then has nothing to hide behind.
     """
     recs = list(records)
-    out = {"full_evictable": sum(r["length"] for r in recs if r["ref"] == 0),
-           "full_protected": sum(r["length"] for r in recs if r["ref"] > 0)}
+    dev = [r for r in recs if r["slots"] is not None]      # host-only nodes hold no device pages
+    out = {"full_evictable": sum(r["length"] for r in dev if r["ref"] == 0),
+           "full_protected": sum(r["length"] for r in dev if r["ref"] > 0)}
     if currency == "swa":
         live = [r for r in recs if not r["tomb"]]
         out["swa_evictable"] = sum(r["length"] for r in live if r["swa_ref"] == 0)
@@ -76,6 +77,7 @@ def sizes(records: Iterable[Record], currency: Optional[str]) -> Dict[str, int]:
         host = [r for r in recs if r["host"] is not None]
         out["mamba_host_evictable"] = sum(1 for r in host if r["host_ref"] == 0)
         out["mamba_host_protected"] = sum(1 for r in host if r["host_ref"] > 0)
+        out["host_kv"] = sum(r["length"] for r in recs if r["hslots"] is not None)
     return out
 
 
@@ -87,7 +89,7 @@ class MGroup:
     node's end boundary; ``slots`` holds ``page_size`` slot ids per page, flattened."""
 
     __slots__ = ("paths", "slots", "stamp", "ref", "tomb", "swa_ref", "swa_uuid",
-                 "mamba", "mamba_ref", "host", "host_ref", "htick")
+                 "mamba", "mamba_ref", "host", "host_ref", "htick", "dev", "hslots", "hkv_ref")
 
     def __init__(self, paths: Sequence[Path], slots: Sequence[int], stamp: int):
         self.paths: List[Path] = list(paths)
@@ -102,6 +104,10 @@ class MGroup:
         self.host: int | None = None        # hybrid: the snapshot's host-bank slot (HOST state)
         self.host_ref = 0
         self.htick = 0                      # hybrid: logical clock of the host LRU
+        # hybrid KV host tier: ``slots`` are live only while ``dev``; ``hslots`` is the host copy
+        self.dev = True
+        self.hslots: list[int] | None = None
+        self.hkv_ref = 0
 
     length = property(lambda self: len(self.slots))
     n_pages = property(lambda self: len(self.paths))
@@ -109,7 +115,8 @@ class MGroup:
     start = property(lambda self: self.paths[0])
 
     def record(self) -> Record:
-        return {"length": self.length, "slots": tuple(self.slots), "ref": self.ref,
+        return {"length": self.length, "slots": tuple(self.slots) if self.dev else None, "ref": self.ref,
+                "hslots": None if self.hslots is None else tuple(self.hslots), "hkv_ref": self.hkv_ref,
                 "tomb": self.tomb, "swa_ref": self.swa_ref, "swa_uuid": self.swa_uuid,
                 "mamba": self.mamba, "mamba_ref": self.mamba_ref,
                 "host": self.host, "host_ref": self.host_ref}
@@ -160,12 +167,12 @@ class PageTrie:
         return out
 
     def path_slots(self, g: Optional[MGroup]) -> List[int]:
-        """Slots from the root down to (and including) ``g``."""
+        """Device slots from the root down to (and including) ``g``."""
         chain: List[MGroup] = []
         while g is not None:
             chain.append(g)
             g = self.parent_group(g)
-        return [s for node in reversed(chain) for s in node.slots]
+        return [s for node in reversed(chain) if node.dev for s in node.slots]
 
     def path_len(self, g: Optional[MGroup]) -> int:
         return 0 if g is None else len(g.end)
@@ -198,6 +205,9 @@ class PageTrie:
         pre = MGroup(g.paths[:n_pages], g.slots[: n_pages * self.P], g.stamp)
         pre.ref, pre.tomb, pre.swa_ref, pre.swa_uuid = g.ref, g.tomb, g.swa_ref, g.swa_uuid
         pre.htick = g.htick
+        pre.dev, pre.hkv_ref = g.dev, g.hkv_ref
+        if g.hslots is not None:                  # the host copy splits on the same page
+            pre.hslots, g.hslots = g.hslots[: n_pages * self.P], g.hslots[n_pages * self.P:]
         g.swa_uuid = None
         g.paths = g.paths[n_pages:]
         g.slots = g.slots[n_pages * self.P:]
@@ -229,6 +239,7 @@ class ExpMatch:
     group: Optional[MGroup]
     second: Optional[int] = None          # hybrid: the GDN snapshot slot to restore from
     host: int | None = None               # hybrid: the host-bank slot, when there is no device one
+    host_kv: list[int] | None = None      # hybrid KV host tier: host slots of the host-only tail
 
 
 @dataclass
@@ -318,10 +329,15 @@ class RefModel:
         gs = self._stamped_cover(ids)
         node = gs[-1] if gs else None
         matched = self.trie.path_len(node)
+        dup_end = self._adopt(gs, slots, matched)
         if matched != insert_len:
             node = self.trie.add_group(node, self._keys_of(ids, matched, insert_len),
                                        slots[matched:], self._tic())
-        return node, ExpInsert(matched, [], slots[reused_len:matched], slots[matched:])
+        return node, ExpInsert(dup_end, [], slots[reused_len:dup_end], slots[dup_end:])
+
+    def _adopt(self, gs: list[MGroup], slots: Sequence[int], matched: int) -> int:
+        """Where the caller's duplicate span ends (hybrid KV host tier: before adopted nodes)."""
+        return matched
 
     def insert(self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0) -> ExpInsert:
         return self._commit(ids, slots, reused_len)[1]
@@ -357,7 +373,7 @@ class RefModel:
         """Slot ids are globally unique and never reused, so a returned slot names exactly one
         node -- what lets the harness follow eviction without reading the tree."""
         for g in self.trie.groups():
-            if slot in g.slots:
+            if g.dev and slot in g.slots:
                 return g
         raise _fail(tag, f"cache freed slot {slot} which the model does not own "
                          f"(already freed, or never handed out)")
@@ -411,15 +427,16 @@ class RefModel:
         while (parent is not None and parent.ref == 0 and self.trie.is_leaf(parent)
                and self._cascadable(parent)):
             self.events[f"{label}.cascade"] += 1
-            pk = self._take(obs_kv, pk, parent, tag, f"{label} cascade")
-            got += parent.length
+            if parent.dev:                        # a host-only node frees host pages, not device ones
+                pk = self._take(obs_kv, pk, parent, tag, f"{label} cascade")
+                got += parent.length
             if parent in cands:
                 cands.remove(parent)
             parent = self.trie.remove(parent)
         return parent, pk, got
 
     def evict_full(self, n: int, obs_kv: Sequence[int], obs_second: Sequence[int] = (),
-                   obs_host: Sequence[int] = ()) -> None:
+                   obs_host: Sequence[int] = (), obs_kv_demoted: Sequence = ()) -> None:
         """The full-KV pass: unlocked LEAVES only, least recently used first."""
         tag = "model.evict"
         cands = [g for g in self.trie.groups() if g.ref == 0 and self.trie.is_leaf(g)]
@@ -692,10 +709,11 @@ class HybridModel(RefModel):
 
     second_currency = "mamba"
 
-    def __init__(self, page_size: int, host_slots: int = 0) -> None:
+    def __init__(self, page_size: int, host_slots: int = 0, kv_host_pages: int = 0) -> None:
         super().__init__(page_size)
         self.host_slots = host_slots
         self.hclk = 0
+        self.kv_host_pages = kv_host_pages    # --kv-host-tier-gb: host pages for demoted KV (0: no tier)
 
     def _stamped_cover(self, ids: Sequence[int]) -> list[MGroup]:
         gs = super()._stamped_cover(ids)
@@ -712,9 +730,27 @@ class HybridModel(RefModel):
                     self.events["match.snapshot_truncation"] += 1
                 if g.mamba is None:
                     self.events["match.host"] += 1
-                return ExpMatch(self.trie.path_len(g), self.trie.path_slots(g), g, g.mamba, g.host)
+                path = [h for h in gs[: len(gs) - i]]
+                host_kv = [s for h in path if not h.dev for s in h.hslots]
+                if host_kv:
+                    self.events["match.host_kv"] += 1
+                return ExpMatch(self.trie.path_len(g), self.trie.path_slots(g), g, g.mamba, g.host,
+                                host_kv or None)
         self.events["match.no_snapshot"] += 1
         return ExpMatch(0, [], None, None)
+
+    def _adopt(self, gs: list[MGroup], slots: Sequence[int], matched: int) -> int:
+        """Host-only nodes the caller recomputed take its slots; an unlocked host copy is dropped."""
+        start = matched
+        for g in reversed(gs):
+            if g.dev:
+                break
+            start -= g.length
+            g.slots, g.dev = list(slots[start: start + g.length]), True
+            if g.hkv_ref == 0:
+                g.hslots = None
+            self.events["insert.kv_host_adopt"] += 1
+        return start
 
     def insert(self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0,
                *, mamba: int) -> ExpInsert:
@@ -740,7 +776,17 @@ class HybridModel(RefModel):
             g.mamba_ref += 1
         if g is not None and g.host is not None:
             g.host_ref += 1
+        for h in self._path(g):
+            if h.hslots is not None:
+                h.hkv_ref += 1
         return super().inc_lock(g)
+
+    def _path(self, g: MGroup | None) -> list[MGroup]:
+        out = []
+        while g is not None:
+            out.append(g)
+            g = self.trie.parent_group(g)
+        return out
 
     def dec_lock(self, lock: ExpLock, skip_swa: bool = False) -> None:
         g = lock.group
@@ -748,6 +794,11 @@ class HybridModel(RefModel):
             g.mamba_ref -= 1
         if g is not None and g.host is not None and g.host_ref > 0:
             g.host_ref -= 1
+        for h in self._path(g):
+            if h.hslots is not None:
+                if h.hkv_ref <= 0:
+                    raise _fail("model.dec_lock", f"host KV ref underflow at node end={h.end}")
+                h.hkv_ref -= 1
         super().dec_lock(lock)
 
     # -- eviction -----------------------------------------------------------
@@ -810,7 +861,8 @@ class HybridModel(RefModel):
         victim.host = None
         if self.trie.is_leaf(victim) and victim.ref == 0 and victim.mamba is None:
             self.events["evict_host.leaf_free"] += 1
-            pk = self._take(obs_kv, pk, victim, tag, "evict_host kv")
+            if victim.dev:
+                pk = self._take(obs_kv, pk, victim, tag, "evict_host kv")
             _, pk, _ = self._cascade(self.trie.remove(victim), obs_kv, pk, cands or [], tag,
                                      "evict_host")
         else:
@@ -859,7 +911,8 @@ class HybridModel(RefModel):
                 victim.host = slot
             elif self.trie.is_leaf(victim) and victim.ref == 0:
                 self.events["evict_mamba.leaf_free"] += 1
-                pk = self._take(obs_kv, pk, victim, tag, "evict_mamba kv")
+                if victim.dev:
+                    pk = self._take(obs_kv, pk, victim, tag, "evict_mamba kv")
                 pm = self._second_free(victim, obs_mamba, pm, tag)
                 _, pk, _ = self._cascade(self.trie.remove(victim), obs_kv, pk, cands,
                                          tag, "evict_mamba")
@@ -883,3 +936,101 @@ class HybridModel(RefModel):
         for slot in obs_host:
             pk = self._drop_host(slot, obs_kv, pk, tag)
         self._drained(obs_kv, pk, tag, "evict_host kv")
+
+    # -- KV host tier (--kv-host-tier-gb) ----------------------------------
+    def _demotable(self, g: MGroup) -> bool:
+        """An unlocked device node with no device child: the device set stays closed toward the root."""
+        return (g.dev and g.ref == 0
+                and not any(self.trie.page_group[c].dev for c in self.trie.kids.get(g.end, {}).values()))
+
+    def _host_pages_in_use(self) -> int:
+        return sum(len(g.hslots) for g in self.trie.groups() if g.hslots is not None) // self.P
+
+    def _descendants(self, g: MGroup) -> list[MGroup]:
+        out, stack = [], [g]
+        while stack:
+            for c in self.trie.kids.get(stack.pop().end, {}).values():
+                out.append(self.trie.page_group[c])
+                stack.append(self.trie.page_group[c])
+        return out
+
+    def evict_full(self, n: int, obs_kv: Sequence[int], obs_second: Sequence[int] = (),
+                   obs_host: Sequence[int] = (), obs_kv_demoted: Sequence = ()) -> None:
+        if not self.kv_host_pages:
+            return super().evict_full(n, obs_kv, obs_second, obs_host)
+        tag = "model.evict_kv_host"
+        pos = {"kv": 0, "second": 0, "host": 0}
+        obs = {"kv": obs_kv, "second": obs_second, "host": obs_host}
+        pd, freed = 0, 0
+        while freed < n:
+            cands = [g for g in self.trie.groups() if self._demotable(g)]
+            if not cands:
+                break
+            # the logical clock, then the deeper node (one clock value = one walk = one path)
+            victim = min(cands, key=lambda g: (g.htick, -len(g.end)))
+            if victim.hslots is not None:
+                self.events["evict_full.demote_both"] += 1
+            else:
+                ok, casc = self._host_room(victim.n_pages, obs, pos, tag)
+                freed += casc
+                if victim not in self.trie.groups() or not self._demotable(victim):
+                    continue
+                if not ok:
+                    self.events["evict_full.kv_drop"] += 1
+                    desc = self._descendants(victim)
+                    for kind, want in (("second", [g.mamba for g in desc if g.mamba is not None]),
+                                       ("host", [g.host for g in desc if g.host is not None])):
+                        got = list(obs[kind][pos[kind]: pos[kind] + len(want)])
+                        if sorted(got) != sorted(want):
+                            raise _fail(tag, f"dropping the host nodes below end={victim.end} freed {kind} "
+                                             f"{got}, model expects {want}")
+                        pos[kind] += len(want)
+                    for g in sorted(desc, key=lambda g: -len(g.end)):
+                        self.trie.remove(g)
+                    pos["second"] = self._second_free(victim, obs_second, pos["second"], tag)
+                    pos["host"] = self._host_free(victim, obs_host, pos["host"], tag)
+                    pos["kv"] = self._take(obs_kv, pos["kv"], victim, tag, "evict_full kv")
+                    freed += victim.length
+                    _, pos["kv"], extra = self._cascade(self.trie.remove(victim), obs_kv, pos["kv"], [],
+                                                        tag, "evict_full")
+                    freed += extra
+                    continue
+                if pd >= len(obs_kv_demoted) or list(obs_kv_demoted[pd][0]) != victim.slots:
+                    raise _fail(tag, f"expected node end={victim.end} (slots {victim.slots}) to be demoted, "
+                                     f"cache reported {list(obs_kv_demoted[pd:pd + 1]) or 'nothing'}")
+                victim.hslots = list(obs_kv_demoted[pd][1])
+                if len(victim.hslots) != victim.length:
+                    raise _fail(tag, f"demotion of end={victim.end} got {len(victim.hslots)} host slots")
+                pd += 1
+                self.events["evict_full.demote"] += 1
+            pos["kv"] = self._take(obs_kv, pos["kv"], victim, tag, "evict_full kv")
+            victim.dev = False
+            freed += victim.length
+        for kind in ("kv", "second", "host"):
+            self._drained(obs[kind], pos[kind], tag, f"evict_full {kind}")
+        if pd != len(obs_kv_demoted):
+            raise _fail(tag, f"evict_full reported demotions {list(obs_kv_demoted)[pd:]} the model did not predict")
+
+    def _host_room(self, n_pages: int, obs, pos, tag: str) -> tuple[bool, int]:
+        """Drop host copies, least recently used first, until ``n_pages`` host pages are free."""
+        if n_pages > self.kv_host_pages:
+            return False, 0
+        freed = 0
+        while self.kv_host_pages - self._host_pages_in_use() < n_pages:
+            cands = [g for g in self.trie.groups() if g.hslots is not None and g.hkv_ref == 0
+                     and (g.dev or (self.trie.is_leaf(g) and g.ref == 0))]
+            if not cands:
+                return False, freed
+            # the clock, then a copy of a device node first (dropping it loses nothing), then deeper
+            victim = min(cands, key=lambda g: (g.htick, not g.dev, -len(g.end)))
+            victim.hslots = None
+            if victim.dev:
+                self.events["kv_host.drop_copy"] += 1
+                continue
+            self.events["kv_host.drop_leaf"] += 1
+            pos["second"] = self._second_free(victim, obs["second"], pos["second"], tag)
+            pos["host"] = self._host_free(victim, obs["host"], pos["host"], tag)
+            _, pos["kv"], extra = self._cascade(self.trie.remove(victim), obs["kv"], pos["kv"], [], tag,
+                                                "kv_host")
+            freed += extra
+        return True, freed

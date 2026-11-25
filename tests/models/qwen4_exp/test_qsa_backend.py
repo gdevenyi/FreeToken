@@ -396,3 +396,45 @@ def test_selection_sampler_takes_every_verify_row():
     second, _ = qsa_selection_stats(steps[1][:8], batch.positions[:8], row_uids, prev)
     assert f"samples=2 skipped=0 rows=16 tokens={first['tokens'] + second['tokens']} " in line
     assert line.endswith(f"overlap={second['overlap_hits'] / second['overlap_tokens']:.3f}/2")
+
+
+@requires_cuda
+def test_host_page_restore_into_shuffled_pages_matches_decode():
+    """T13: demoting whole QSA pages to the pinned bank-major host arena and restoring them into
+    fresh shuffled page IDs preserves K/V codes, FP8 scales, compressed index-key slabs, and mrope
+    positions bit-for-bit across subsequent decode steps."""
+    config = parsed_config(num_layers=8)
+    fixture = Fixture(config, num_pages=96)
+    fixture.pool.attach_host_pages(16)
+    layers = [fixture.layer(layer_id, seed=layer_id) for layer_id in (3, 7)]
+    ps = fixture.pool._page_size
+    length, steps = 4 * ps, 4
+    x = _inputs(fixture, [length], extra=steps)[0]
+
+    orig = fixture.req(0, 0, length)
+    batch0 = fixture.batch([orig], "prefill")
+    for attn in layers:
+        attn.forward(x[:length], batch0)
+
+    src_pages = (fixture.page_table[orig.table_idx, :length:ps] // ps).tolist()
+    hosts = fixture.pool.alloc_host_pages(len(src_pages))
+    fixture.pool.pages_to_host(src_pages, hosts)
+    fixture.pool.fence_host_copies()
+
+    dst_pages = [61, 19, 42, 55]
+    fixture.pool.pages_from_host(hosts, dst_pages)
+
+    restored = fixture.req(1, 0, length)
+    restored.cached_len = length
+    offsets = torch.arange(ps, dtype=torch.int32, device=fixture.device)
+    for idx, page in enumerate(dst_pages):
+        fixture.page_table[restored.table_idx, idx * ps : (idx + 1) * ps] = page * ps + offsets
+
+    for step in range(steps):
+        fixture.step(orig)
+        fixture.step(restored)
+        step_x = x[length + step : length + step + 1]
+        for attn in layers:
+            out_orig = attn.forward(step_x, fixture.batch([orig], "decode"))
+            out_restored = attn.forward(step_x, fixture.batch([restored], "decode"))
+            assert torch.equal(out_restored, out_orig), f"decode diverged at step {step}"

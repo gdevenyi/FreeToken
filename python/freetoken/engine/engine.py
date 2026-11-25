@@ -184,6 +184,14 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
 
 
+def kv_host_tier_pages(config, page_bytes: int) -> int:
+    """--kv-host-tier-gb as whole host pages of ``page_bytes`` (one rank's bytes of one KV page, equal
+    on every rank); 0 when the flag is off or the model has no hybrid radix cache to hang them on."""
+    if not config.kv_host_tier_gb or config.cache_type != "hybrid_radix":
+        return 0
+    return int(config.kv_host_tier_gb * 2**30) // page_bytes
+
+
 def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
     """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
     limit = min(config.max_seq_len, num_tokens)
@@ -670,7 +678,8 @@ class Engine:
         # ======================= KV cache initialization ========================
         # --mamba-host-slots: only the hybrid radix has a tree for a host copy to hang on
         host_slots = config.mamba_host_slots if config.cache_type == "hybrid_radix" else 0
-        new_free = self._sync_get_memory(host_memory=host_slots > 0)[1]
+        kv_tier = config.cache_type == "hybrid_radix" and config.kv_host_tier_gb > 0
+        new_free = self._sync_get_memory(host_memory=host_slots > 0 or kv_tier)[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
@@ -688,6 +697,15 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        # --kv-host-tier-gb: host pages of the same shape as one KV page (attached after the check below)
+        kv_host_pages, kv_page_bytes = 0, 0
+        if kv_tier:
+            if config.speculative_algorithm == "mtp":  # the parser refuses it too; this covers other entry points
+                raise ValueError("--kv-host-tier-gb is not supported with --speculative-algorithm mtp")
+            if not hasattr(self.kv_cache, "attach_host_pages"):
+                raise ValueError(f"--kv-host-tier-gb: {type(self.kv_cache).__name__} has no host pages (QSA pools only)")
+            kv_page_bytes = self.kv_cache.unit_bytes()[0] * config.page_size
+            kv_host_pages = kv_host_tier_pages(config, kv_page_bytes)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -698,11 +716,13 @@ class Engine:
                 linear_state_bytes_per_req,
             )
 
-            if host_slots:
+            if host_slots or kv_host_pages:
                 per_slot = linear_state_bytes_per_req(linear_group, config.tp_info.size, self.dtype, config.slot_states)
                 # every rank decides on the same MemAvailable: the least of the ranks, read after the weights
                 # (the pinned expert banks are out of it) and before any rank pinned its bank
-                check_host_bank_memory(host_slots * per_slot * config.tp_info.size, self._host_mem_available)
+                check_host_bank_memory(host_slots * per_slot * config.tp_info.size, self._host_mem_available,
+                                       kv_tier_bytes=kv_host_pages * kv_page_bytes * config.tp_info.size)
+            if host_slots:
                 logger.info_rank0(
                     f"GDN host snapshot bank (--mamba-host-slots): {host_slots} x {mem_GB(per_slot)} = "
                     f"{mem_GB(host_slots * per_slot)} pinned host RAM per rank"
@@ -710,6 +730,12 @@ class Engine:
             from freetoken.moe.host_banks import rank_host_affinity
 
             with rank_host_affinity():
+                if kv_host_pages:
+                    self.kv_cache.attach_host_pages(kv_host_pages, engine_stream=self.stream)
+                    logger.info_rank0(
+                        f"KV host tier (--kv-host-tier-gb): {kv_host_pages} pages x {mem_GB(kv_page_bytes)} = "
+                        f"{mem_GB(kv_host_pages * kv_page_bytes)} pinned host RAM per rank"
+                    )
                 self.linear_state_pool = LinearStatePool(
                     group=linear_group,
                     num_slots=_linear_pool_num_slots(config),

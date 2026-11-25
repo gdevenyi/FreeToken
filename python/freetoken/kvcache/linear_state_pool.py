@@ -434,15 +434,16 @@ def read_mem_available() -> int:
     raise RuntimeError("/proc/meminfo has no MemAvailable")
 
 
-def check_host_bank_memory(nbytes: int, mem_available: int | None = None) -> None:
-    """Refuse a GDN host bank of ``nbytes`` (the sum over the local TP ranks) that would leave less
-    than 32 GiB MemAvailable."""
+def check_host_bank_memory(nbytes: int, mem_available: int | None = None, kv_tier_bytes: int = 0) -> None:
+    """Refuse a GDN host bank of ``nbytes`` plus a KV host tier of ``kv_tier_bytes`` (each the sum over
+    the local TP ranks) that would leave less than 32 GiB MemAvailable."""
     available = read_mem_available() if mem_available is None else mem_available
-    if available - nbytes < HOST_BANK_MIN_AVAILABLE:
+    total = nbytes + kv_tier_bytes
+    if available - total < HOST_BANK_MIN_AVAILABLE:
         raise RuntimeError(
-            f"--mamba-host-slots asks for {nbytes / 2**30:.1f} GiB of pinned host memory with "
-            f"MemAvailable {available / 2**30:.1f} GiB: less than "
-            f"{HOST_BANK_MIN_AVAILABLE // 2**30} GiB would remain"
+            f"--mamba-host-slots ({nbytes / 2**30:.1f} GiB) and --kv-host-tier-gb ({kv_tier_bytes / 2**30:.1f} GiB) "
+            f"ask for {total / 2**30:.1f} GiB of pinned host memory with MemAvailable "
+            f"{available / 2**30:.1f} GiB: less than {HOST_BANK_MIN_AVAILABLE // 2**30} GiB would remain"
         )
 
 

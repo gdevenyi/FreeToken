@@ -685,7 +685,22 @@ def test_kvstats_counts_admission_refusals_by_cause(cause):
 
 
 # --------------------------------------------------------------------------- --mamba-host-slots (P1)
-def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False):
+def _kv_host_pool(monkeypatch, pages, ps, host_pages):
+    """--kv-host-tier-gb on the CPU: a small real QSA pool (mrope, so its int32 rope rows can carry a
+    stand-in KV payload) with ``host_pages`` host pages."""
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    monkeypatch.setattr("freetoken.kvcache.mha_pool.get_tp_info", lambda: DistributedInfo(rank=0, size=1))
+    kv = QSAKVCache(num_kv_heads=1, num_layers=2, head_dim=8, num_pages=pages + 1, page_size=ps,
+                    dtype=torch.bfloat16, device=torch.device("cpu"), index_head_dim=8, num_index_layers=1,
+                    index_ratio=4, num_req_slots=2, layer_ids=(1,), mrope=True)
+    kv.attach_host_pages(host_pages)
+    return kv
+
+
+def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", copies=None, radix_lookahead=False,
+                kv_host_pages=0, max_reqs=1, kv_copies=None):
     from freetoken import core
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
@@ -695,11 +710,14 @@ def _host_setup(monkeypatch, *, num_slots, host_slots, pages, policy="chunk", co
     pool = _pool(num_slots=num_slots, host_slots=host_slots)
     if copies is not None:
         pool.host_copies = copies
-    pt = torch.zeros(2, pages * ps, dtype=torch.int32)
+    kv = _kv_host_pool(monkeypatch, pages, ps, kv_host_pages) if kv_host_pages else None
+    if kv is not None and kv_copies is not None:
+        kv.host_copies = kv_copies
+    pt = torch.zeros(max_reqs + 1, pages * ps, dtype=torch.int32)
     cm = CacheManager(pages, ps, pt, "hybrid_radix", linear_state_pool=pool, snapshot_policy=policy,
-                      radix_lookahead=radix_lookahead)
+                      radix_lookahead=radix_lookahead, kv_host=kv)
     monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=ps, linear_state_pool=pool))
-    tm = TableManager(max_running_reqs=1, page_table=pt)
+    tm = TableManager(max_running_reqs=max_reqs, page_table=pt)
     pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
     stub = SimpleNamespace(cache_manager=cm, table_manager=tm, spec=None)
     return pool, cm, pm, stub
@@ -746,8 +764,92 @@ def test_admission_restores_a_host_snapshot(monkeypatch, abort):
     assert pool.num_free_host_slots + pc.mamba_host_evictable == pool.num_host_slots
 
 
+@pytest.mark.parametrize("case", ["restore", "undo", "two_in_one_pass"])
+def test_admission_restores_demoted_kv_pages(monkeypatch, case):
+    """T6: a prompt whose prefix KV was demoted to the host tier resumes there. Admission charges
+    device pages for the host part at once (``available_size`` falls by them), the host-only nodes
+    adopt them, the page-table row holds them, and the restore plan pairs each host page with its
+    device page; the restore before the forward fills them (each page holds its own tokens). An
+    admission undone in the same pass frees the pages and leaves the nodes on the host. A second
+    request in the same pass on the same prefix gets the first one's pages, not a second set."""
+    from freetoken.scheduler.prefill import PrefillAdder
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=12, host_slots=2, pages=16, kv_host_pages=8,
+                                     max_reqs=2)
+    prompt = torch.arange(100, 366, dtype=torch.int32)              # 266 tokens: a snapshot at 256
+    run = drive_prefill(cm, pm, pool, PendingReq(0, prompt, SamplingParams(max_tokens=4)), budget=8192,
+                        overlap=False, on_forward=forward_writes(pool, cm))
+    Scheduler._free_req_resources(stub, run.final)
+    pc = cm.prefix_cache
+    cm._free(cm._evict(256))                                        # the prefix's KV to the host
+    assert (pc.counts["kv_demote"], pc.full_evictable, pc.host_kv_tokens) == (1, 0, 256)
+    assert cm.kv_host.num_free_host_pages == 4
+    cm.check_integrity()
+    avail = cm.available_size
+
+    tails = [torch.arange(900, 950, dtype=torch.int32), torch.arange(1900, 1950, dtype=torch.int32)]
+    retries = [torch.cat([prompt[:256], t]) for t in tails[: 2 if case == "two_in_one_pass" else 1]]
+    pm.pending_list = [PendingReq(1 + i, r, SamplingParams(max_tokens=4)) for i, r in enumerate(retries)]
+    if case == "undo":
+        monkeypatch.setattr(PrefillAdder, "_add_one_req", lambda self, *a, **k: None)  # no chunk this pass
+        assert pm.schedule_next_batch(8192) is None
+        assert (pc.full_evictable, pc.full_protected, pc.host_kv_tokens) == (0, 0, 256)
+        assert cm.available_size == avail and cm.kv_host.num_free_host_pages == 4
+        cm.check_integrity()
+        assert cm.match_req(_pend(retries[0].tolist())).cuda_handle.host_kv is not None
+        return
+    batch = pm.schedule_next_batch(8192)
+    assert [a[2] for a in batch.prompt_admissions] == [256] * len(retries)
+    assert cm.available_size == avail - 256                        # one set of device pages, at admission
+    first = batch.reqs[0]
+    plan = first.kv_restore
+    rows = [cm.page_table[r.table_idx, :256:64].div(64, rounding_mode="floor").tolist() for r in batch.reqs]
+    assert len(plan.host_pages) == 4 and list(plan.dev_pages) == rows[0]
+    assert all(row == rows[0] for row in rows)                      # the second request shares the pages
+    assert all(r.kv_restore is None for r in batch.reqs[1:])
+    assert pc.full_protected == 256 and pc.host_kv_tokens == 256    # the nodes are on both tiers now
+    cm.allocate_paged(batch.reqs)
+    admitted = []
+    restore_and_check(pool, admitted, cm)(batch)
+    assert admitted[0] == (1, 256, "device+kv") and first.kv_restore is None  # the snapshot stayed on the device
+    for r in batch.reqs:
+        r.complete_one()                                            # the forward ran
+        Scheduler._free_req_resources(stub, r)
+    cm.check_integrity()
+
+
+def test_one_eviction_copies_each_host_page_once(monkeypatch):
+    """A tier of 2 pages and three idle one-page prefixes, evicted in one call: the third demotion
+    drops the first demoted prefix and reuses its host page (the free list is LIFO). The copy plan
+    must name that host page once, with the live prefix as its source: a batch with a repeated
+    destination has no defined winner."""
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=12, host_slots=0, pages=16, kv_host_pages=2)
+    for uid in range(3):
+        prompt = torch.arange(100 + 1_000 * uid, 180 + 1_000 * uid, dtype=torch.int32)  # one page + 16
+        run = drive_prefill(cm, pm, pool, PendingReq(uid, prompt, SamplingParams(max_tokens=4)), budget=8192,
+                            overlap=False, on_forward=forward_writes(pool, cm))
+        Scheduler._free_req_resources(stub, run.final)
+    calls = []
+    real = cm.kv_host.pages_to_host
+    monkeypatch.setattr(cm.kv_host, "pages_to_host", lambda dev, host: (calls.append((dev, host)), real(dev, host)))
+    cm._free(cm._evict(3 * 64))
+    pc = cm.prefix_cache
+    assert pc.counts["kv_demote"] == 3 and pc.counts["kv_host_drop"] == 1
+    ((_, host),) = calls
+    assert len(host) == len(set(host)) == 2, calls
+    cm.check_integrity()
+    for n in pc._host_kv_nodes():                                   # each host copy holds its own tokens
+        keys, h = n._key, n.host_value.long()
+        assert torch.equal(cm.kv_host._host_pages["rope"][h // 64, h % 64][:, 0], keys)
+
+
 def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copies=None, radix_lookahead=False,
-                  order=None, overlap=True, pages=None):
+                  order=None, overlap=True, pages=None, kv_host_pages=0, kv_copies=None):
     """A replay-like agent load: ``sessions`` sessions take turns round-robin (or in ``order``, one
     session index per turn), each turn sending the conversation so far plus a 64-token generation
     and a 256-token tool result. One request runs at a time with 16 idle snapshot slots
@@ -761,7 +863,8 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
     order = [s for _ in range(turns) for s in range(sessions)] if order is None else order
     pages = (sessions * first + len(order) * step) // ps + 64 if pages is None else pages
     pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=1 + 3 + 16, host_slots=host_slots,
-                                     pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead)
+                                     pages=pages, policy=policy, copies=copies, radix_lookahead=radix_lookahead,
+                                     kv_host_pages=kv_host_pages, kv_copies=kv_copies)
     cm.turn_end_id = 7
     admitted, recomputed = [], 0
     convs = []
@@ -771,8 +874,8 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
         convs.append(c)
     for uid, s in enumerate(order):
         run = drive_prefill(cm, pm, pool, PendingReq(uid, convs[s], SamplingParams(max_tokens=4)),
-                            budget=512, overlap=overlap, on_forward=forward_writes(pool),
-                            on_launch=restore_and_check(pool, admitted))
+                            budget=512, overlap=overlap, on_forward=forward_writes(pool, cm),
+                            on_launch=restore_and_check(pool, admitted, cm))
         recomputed += len(convs[s]) - run.cached
         Scheduler._free_req_resources(stub, run.final)
         more = torch.arange(500_000 + 1_000 * uid, 500_000 + 1_000 * uid + step, dtype=torch.int32)
@@ -781,6 +884,9 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
     pc = cm.prefix_cache
     assert pool.num_free_host_slots + pc.mamba_host_evictable == pool.num_host_slots
     pool.fence_host_copies()
+    kv = cm.kv_host
+    if kv is not None:
+        kv.fence_host_copies()
     (probe,) = pool.alloc(1)
     tree, stack = [], [pc.root]
     while stack:
@@ -797,8 +903,21 @@ def _agent_replay(monkeypatch, *, host_slots, policy, sessions=24, turns=3, copi
                     keys = (keys >> 31).to(torch.int32)              # MTP pair keys: (token, next token)
                 slot = probe if n.mamba_value is None else n.mamba_value
                 assert pool.recurrent_states[0, slot, 0, 0, 0].item() == gdn_state(keys), pc._path_len(n)
+            if kv is not None:
+                # every node's KV, on either tier, holds its own tokens: no page a demotion freed was
+                # written before its copy to the host left
+                keys = n._key if not radix_lookahead else (n._key >> 31).to(torch.int32)
+                end = pc._path_len(n)
+                want = torch.stack([keys, torch.arange(end - n.length, end, dtype=torch.int32)], 1)
+                if n.on_device:
+                    assert torch.equal(kv._rope_positions[n.value.long()][:, :2], want), end
+                if n.on_host:
+                    h = n.host_value.long()
+                    assert torch.equal(kv._host_pages["rope"][h // 64, h % 64][:, :2], want), end
             tree.append((pc._path_len(n), -1 if n.mamba_value is None else n.mamba_value,
-                         -1 if n.mamba_host is None else n.mamba_host))
+                         -1 if n.mamba_host is None else n.mamba_host,
+                         tuple(n.value[::64].tolist()) if n.on_device else (),
+                         tuple(n.host_value[::64].tolist()) if n.on_host else ()))
     pool.free([probe])
     return admitted, recomputed, sorted(tree), dict(pc.counts)
 
@@ -825,6 +944,23 @@ def test_two_managers_with_different_copy_timing_decide_the_same(monkeypatch, po
     assert now == late
     assert now[3]["demote"] > 0 and now[3]["host_drop"] > 0         # the bank filled and gave way
     assert any(kind == "host" for _, _, kind in now[0])
+
+
+@pytest.mark.parametrize("radix_lookahead", [False, True])
+def test_two_managers_with_different_kv_copy_timing_decide_the_same(monkeypatch, radix_lookahead):
+    """T7: with a KV host tier and a KV pool too small for every session, KV demotions and restores are
+    tier decisions too: with the KV and snapshot device->host copies done at once or only at the next
+    fence, the admissions, restores, page ids and counts are identical, and every page, on either
+    tier, holds its own tokens."""
+    kw = {"host_slots": 8, "policy": "chunk", "sessions": 12, "turns": 3, "pages": 200, "kv_host_pages": 150,
+          "radix_lookahead": radix_lookahead}
+    now = _agent_replay(monkeypatch, **kw)
+    late_kv = CopiesAtTheFence()
+    late = _agent_replay(monkeypatch, copies=CopiesAtTheFence(), kv_copies=late_kv, **kw)
+    assert now == late
+    assert late_kv.copied > 0                                       # the KV copies really ran late
+    assert now[3]["kv_demote"] > 0 and now[3]["kv_host_hit"] > 0
+    assert any(kind and kind.endswith("+kv") for _, _, kind in now[0])
 
 
 @pytest.mark.parametrize("overlap", [True, False])            # no spec / DFlash and MTP (normal_loop)
@@ -918,6 +1054,40 @@ def test_flush_and_rebuild_empty_the_host_bank(monkeypatch):
     assert pool.num_free_host_slots == 4
 
 
+def test_flush_and_rebuild_empty_the_kv_host_tier(monkeypatch):
+    """T9: with a KV host tier a flush drops every unlocked host copy and host-only node (it does not
+    demote the device prefixes into the tier), and a rebuild discards the tree: both return every
+    host page, and the device pool and the bank with them."""
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.utils import PendingReq
+
+    pool, cm, pm, stub = _host_setup(monkeypatch, num_slots=8, host_slots=4, pages=64, kv_host_pages=16)
+    kv, pc = cm.kv_host, cm.prefix_cache
+
+    def fill():
+        for uid in range(3):
+            prompt = torch.arange(100 + 1_000 * uid, 300 + 1_000 * uid, dtype=torch.int32)
+            run = drive_prefill(cm, pm, pool, PendingReq(uid, prompt, SamplingParams(max_tokens=4)),
+                                budget=8192, overlap=False)
+            Scheduler._free_req_resources(stub, run.final)
+        cm.ensure_mamba_slots(pool.num_free_slots + 1)              # a snapshot to the bank
+        cm._free(cm._evict(2 * 192))                                # two prefixes' KV to the host
+        assert pc.host_kv_tokens == 2 * 192 and kv.num_free_host_pages == 16 - 6
+        cm.check_integrity()
+
+    fill()
+    with cm.lazy_free_region():
+        cm.flush()
+    assert (kv.num_free_host_pages, pc.host_kv_tokens, pc.full_evictable) == (16, 0, 0)
+    assert pool.num_free_host_slots == 4 and len(cm.free_slots) == 64
+    cm.check_integrity()
+    fill()
+    cm.rebuild(64, cm.page_table)
+    assert kv.num_free_host_pages == 16 and pool.num_free_host_slots == 4
+    assert cm.prefix_cache.kv_host is not None                      # the new tree has the tier too
+    cm.check_integrity()
+
+
 
 @pytest.mark.parametrize("policy", ["chunk", "structural"])
 def test_long_active_sessions_do_not_push_idle_sessions_out_of_the_bank(monkeypatch, policy):
@@ -935,15 +1105,31 @@ def test_long_active_sessions_do_not_push_idle_sessions_out_of_the_bank(monkeypa
 
 
 
+@pytest.mark.parametrize("kv_tier", [False, True], ids=["no_kv_tier", "kv_tier"])
 @pytest.mark.parametrize("policy", ["chunk", "structural"])
-def test_kv_pressure_takes_demoted_leaves_with_their_host_copies(monkeypatch, policy):
+def test_kv_pressure_takes_demoted_leaves_with_their_host_copies(monkeypatch, policy, kv_tier):
     """A demoted leaf keeps its KV, so with a bank the KV pool can become the limit (as the design
-    expects). KV eviction then takes the least recently used leaves and frees their host copies
-    with them; the bank stays conserved and every restore still holds its prefix's state."""
-    adm, recomputed, _, counts = _agent_replay(monkeypatch, host_slots=64, policy=policy, pages=500)
-    print(f"{policy}: KV-bound replay: recomputed {recomputed}, counts {counts}")
-    assert counts["kv_tokens"] > 0 and counts["demote"] > 0 and counts["kv_host"] > 0
-    assert any(kind == "host" for _, _, kind in adm)
+    expects). Without a KV host tier, KV eviction then takes the least recently used leaves and frees
+    their host copies with them; the bank stays conserved and every restore still holds its prefix's
+    state. With one (T8, --kv-host-tier-gb), KV eviction demotes instead: no leaf goes with its host
+    copy, and every returning session resumes at its previous prompt end with only its new tokens to
+    compute, its KV restored from the host where it was demoted (each page holding its own tokens)."""
+    turns, sessions, first, step = 3, 24, 1024, 320
+    adm, recomputed, _, counts = _agent_replay(monkeypatch, host_slots=64, policy=policy, pages=500,
+                                               kv_host_pages=800 if kv_tier else 0)
+    print(f"{policy}: KV-bound replay (kv tier {kv_tier}): recomputed {recomputed}, counts {counts}")
+    if not kv_tier:
+        assert counts["kv_tokens"] > 0 and counts["demote"] > 0 and counts["kv_host"] > 0
+        assert any(kind == "host" for _, _, kind in adm)
+        return
+    assert counts["kv_tokens"] > 0 and counts["kv_demote"] > 0 and counts.get("kv_host", 0) == 0
+    returning = [(uid, c, kind) for uid, c, kind in adm if uid >= sessions]
+    assert len(returning) == (turns - 1) * sessions
+    for uid, cached, kind in returning:
+        assert cached == first + (uid // sessions - 1) * step, (uid, cached, kind)
+    assert sum(kind.endswith("+kv") for _, _, kind in returning) > sessions // 2
+    assert any(kind == "host+kv" for _, _, kind in returning)      # host KV and host snapshot together
+    assert recomputed == sessions * (first + (turns - 1) * step)   # the first turns and the new tokens
 
 
 if __name__ == "__main__":
