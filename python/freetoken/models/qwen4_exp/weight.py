@@ -925,7 +925,7 @@ def is_lut4_ple_path(path: str) -> bool:
 
 
 def check_ple_table_lut4(
-    path: str, *, head_dim: int, rows_needed: int | None = None
+    path: str, *, head_dim: int | None = None, rows_needed: int | None = None
 ) -> tuple[int, int]:
     """Validate ``lut4-gptq`` PLE shards at ``path`` and return ``(total_rows, group_size)``."""
     files = _ple_table_files(path) if os.path.isdir(path) else [path]
@@ -950,21 +950,23 @@ def check_ple_table_lut4(
     if not packed_shapes or set(packed_shapes) != set(scale_shapes):
         raise ValueError(f"Incomplete lut4-gptq PLE shards at {path}")
     _shard0_rows, packed_cols = packed_shapes[min(packed_shapes)]
-    if packed_cols * 2 != head_dim:
+    inferred_head_dim = packed_cols * 2
+    if head_dim is not None and inferred_head_dim != head_dim:
         raise ValueError(
             f"LUT4 PLE packed width {packed_cols} != head_dim/2 ({head_dim // 2})"
         )
+    effective_head_dim = inferred_head_dim if head_dim is None else head_dim
     _, num_groups = scale_shapes[min(scale_shapes)]
-    if num_groups <= 0 or head_dim % num_groups != 0:
+    if num_groups <= 0 or effective_head_dim % num_groups != 0:
         raise ValueError(
-            f"LUT4 PLE scale groups {num_groups} does not divide head_dim {head_dim}"
+            f"LUT4 PLE scale groups {num_groups} does not divide head_dim {effective_head_dim}"
         )
     total_rows = sum(r for r, _ in packed_shapes.values())
     if rows_needed is not None and total_rows < rows_needed:
         raise ValueError(
             f"LUT4 PLE at {path} has {total_rows} rows, model needs {rows_needed}"
         )
-    return total_rows, head_dim // num_groups
+    return total_rows, effective_head_dim // num_groups
 
 
 def load_ple_table_lut4(

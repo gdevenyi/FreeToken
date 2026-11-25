@@ -58,10 +58,22 @@ def test_lut4_ple_quantize_load_and_gather_roundtrip(tmp_path):
     assert stats["rel_rmse"] < 0.14  # 4-bit Normal Lloyd-Max theoretical floor ~0.11
 
     assert is_lut4_ple_path(str(out_dir))
+    assert check_ple_table_lut4(str(out_dir)) == (512, 32)
     total_rows, group_size = check_ple_table_lut4(
         str(out_dir), head_dim=head_dim, rows_needed=512
     )
     assert (total_rows, group_size) == (512, 32)
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    ecfg = EngineConfig(
+        model_path=str(out_dir),
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        ple_table=str(out_dir),
+    )
+    assert ecfg.ple_table == str(out_dir)
 
     qwen4_args = SimpleNamespace(split_ngram_parts=2, ngram_head_dim=head_dim)
     ple_table = load_ple_table_lut4(

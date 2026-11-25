@@ -230,8 +230,15 @@ class EngineConfig:
         if self.ple_table:
             # the header checks here, before the weights load; width and rows once the model's PLE constants exist
             from freetoken.models.qwen4_exp.gguf import check_ple_table
+            from freetoken.models.qwen4_exp.weight import (
+                check_ple_table_lut4,
+                is_lut4_ple_path,
+            )
 
-            check_ple_table(self.ple_table)
+            if is_lut4_ple_path(self.ple_table):
+                check_ple_table_lut4(self.ple_table)
+            else:
+                check_ple_table(self.ple_table)
         self._check_gguf_tp()
         if self.moe_backend is None:
             return
