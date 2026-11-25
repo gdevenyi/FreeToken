@@ -390,7 +390,11 @@ def load_expert_banks(
     ``layer_methods`` (one bound method per MoE layer) serves experts of several formats: each
     format fills its own layers and the banks merge over the union of roles (``merge_expert_banks``).
     """
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
+    from freetoken.checkpoint.ftw import (
+        is_ftw_checkpoint,
+        load_ftw_banks,
+        load_ftw_banks_to_device,
+    )
 
     mixed = is_mixed(layer_methods)
     if mixed and (resident or layer_residency is not None):
@@ -437,7 +441,7 @@ def load_expert_banks(
     # OSError on those (which would leak the banks it pre-allocated, since host banks live for
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
     # allocation) falls back to serial.
-    from freetoken.moe.host_banks import requested_residency
+    from freetoken.moe.host_banks import rank_host_affinity, requested_residency
 
     def _build(par: bool) -> ExpertBanks:
         if mixed:
@@ -451,7 +455,8 @@ def load_expert_banks(
             raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")
         return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)
 
-    with requested_residency(layer_residency) as residency_plan:
+    affinity_ctx = nullcontext() if resident else rank_host_affinity()
+    with affinity_ctx, requested_residency(layer_residency) as residency_plan:
         try:
             banks = _build(parallel)
         except NotImplementedError as exc:

@@ -7,49 +7,98 @@ import gc
 import math
 import os
 import socket
+from collections.abc import Iterable
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, NamedTuple
 
 import torch
-from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
+
+from freetoken.attention import (
+    AttnType,
+    attention_backend_info,
+    create_attention_backend,
+)
 from freetoken.attention.linear import LinearAttnBackend, gdn_slot
+from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import (
     DistributedCommunicator,
     destroy_distributed,
     enable_pynccl_distributed,
+    set_tp_cpu_group,
     set_tp_info,
 )
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
-from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
+from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache.base import CacheRebuildRejected
+from freetoken.kvcache.cache_status import _supports_swa_ratio
+from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
+from freetoken.kvcache.linear_state_pool import (
+    _linear_pool_min_slots,
+    _linear_pool_num_slots,
+    gdn_prefill_workspace_bytes,
+    state_pool_bytes,
+)
+from freetoken.layers import (
+    OffloadMoELayer,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+    iter_moe_layers,
+    iter_ops,
+    set_rope_device,
+)
+from freetoken.layers.quantization import (
+    LayerKind,
+    QuantBackend,
+    QuantKind,
+    finalize_quant,
+    set_quant_backend,
+)
 from freetoken.layers.quantization.names import name_set
-from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
+from freetoken.moe.expert_banks import (
+    attach_resident_banks,
+    load_expert_banks,
+    pin_probe_enabled,
+)
 from freetoken.moe.host_banks import PinFailed
-from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
-from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
-from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.moe.locked_fetch import (
+    attach_locked_fetch,
+    check_locked_fetch_config,
+    locked_pool_tags,
+    settle_banks,
+    staging_reserve,
+)
+from freetoken.moe.offload_cache import (
+    OffloadMoeCache,
+    attach_offload_moe_cache,
+    bank_layouts,
+    iter_offload_moe_layers,
+)
+from freetoken.moe.pool_policy import (
+    group_layers,
+    make_pools,
+    pool_of_layer,
+    resolve_profile,
+    split_slots,
+)
+from freetoken.utils import (
+    align_ceil,
+    init_logger,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec_protocol import SpecRuntime
-from freetoken.kvcache import create_kv_pool, resolve_pool_class
-from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
-from freetoken.kvcache.base import CacheRebuildRejected
-from freetoken.kvcache.cache_status import _supports_swa_ratio
-from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, gdn_prefill_workspace_bytes,
-    state_pool_bytes,
-)
 
 logger = init_logger(__name__)
 
@@ -426,13 +475,13 @@ def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
 
 
 def _make_dummy_weight_state_dict(
-    model_state: Dict[str, torch.Tensor],
+    model_state: dict[str, torch.Tensor],
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
     staged_keys: frozenset[str] = frozenset(),
-) -> Dict[str, torch.Tensor]:
-    state_dict: Dict[str, torch.Tensor] = {}
+) -> dict[str, torch.Tensor]:
+    state_dict: dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
     for key, param in model_state.items():
         if param.dtype in fp8_dtypes:
@@ -486,14 +535,14 @@ def _weight_load_context():
 
 
 def _materialize_loaded_weight_state_dict(
-    model_state: Dict[str, torch.Tensor],
-    weights: Iterable[Tuple[str, torch.Tensor]],
+    model_state: dict[str, torch.Tensor],
+    weights: Iterable[tuple[str, torch.Tensor]],
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
     staged_keys: frozenset[str] = frozenset(),
-) -> Dict[str, torch.Tensor]:
-    state_dict: Dict[str, torch.Tensor] = {}
+) -> dict[str, torch.Tensor]:
+    state_dict: dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
         if expected is None:
@@ -545,6 +594,7 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
+        set_tp_cpu_group(self.tp_cpu_group)
         self._comm = DistributedCommunicator() if config.tp_info.size > 1 else None
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
@@ -657,16 +707,19 @@ class Engine:
                     f"GDN host snapshot bank (--mamba-host-slots): {host_slots} x {mem_GB(per_slot)} = "
                     f"{mem_GB(host_slots * per_slot)} pinned host RAM per rank"
                 )
-            self.linear_state_pool = LinearStatePool(
-                group=linear_group,
-                num_slots=_linear_pool_num_slots(config),
-                dtype=self.dtype,
-                device=self.device,
-                tp_size=config.tp_info.size,
-                slot_states=config.slot_states,
-                host_slots=host_slots,
-                engine_stream=self.stream,
-            )
+            from freetoken.moe.host_banks import rank_host_affinity
+
+            with rank_host_affinity():
+                self.linear_state_pool = LinearStatePool(
+                    group=linear_group,
+                    num_slots=_linear_pool_num_slots(config),
+                    dtype=self.dtype,
+                    device=self.device,
+                    tp_size=config.tp_info.size,
+                    slot_states=config.slot_states,
+                    host_slots=host_slots,
+                    engine_stream=self.stream,
+                )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
@@ -811,7 +864,7 @@ class Engine:
 
     def _load_weight_state_dict(
         self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
             return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys, staged_keys=staged_keys)
@@ -884,7 +937,10 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            resolve_moe_cache_auto,
+        )
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
@@ -979,7 +1035,10 @@ class Engine:
         if probe:
             cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            layer_slot_bytes,
+        )
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
@@ -1262,7 +1321,7 @@ class Engine:
         if graph_enabled:
             _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
 
-    def _sync_get_memory(self, host_memory: bool = False) -> Tuple[int, int]:
+    def _sync_get_memory(self, host_memory: bool = False) -> tuple[int, int]:
         """Get the min and max free memory across TP ranks. With ``host_memory`` the same all-reduce
         also takes the least host MemAvailable of the ranks (``self._host_mem_available``)."""
         torch.cuda.synchronize(self.device)
@@ -1784,7 +1843,7 @@ class Engine:
         destroy_distributed()
 
 
-def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
+def _profile_gpu(index: int | None = None) -> tuple[str | None, str | None]:
     """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
     if not torch.cuda.is_available():
         return None, None
@@ -1792,7 +1851,7 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
     return ident["name"], ident["uuid"]
 
 
-def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
+def _is_unified_memory_gpu(index: int | None = None) -> bool:
     """True when the GPU has no separate device memory (cudaDevAttrIntegrated): host
     banks and the GPU slot cache are the same DRAM, so the offload family's pinned
     staging + slot gather are DRAM-to-DRAM copies with no PCIe link to hide behind.

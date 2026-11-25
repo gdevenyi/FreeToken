@@ -16,6 +16,7 @@ class DistributedInfo:  # should not export from here
 
 
 _TP_INFO: DistributedInfo | None = None
+_TP_CPU_GROUP = None
 
 
 def set_tp_info(rank: int, size: int) -> None:
@@ -23,6 +24,15 @@ def set_tp_info(rank: int, size: int) -> None:
     if _TP_INFO is not None:
         raise RuntimeError("TP info has been set")
     _TP_INFO = DistributedInfo(rank, size)
+
+
+def set_tp_cpu_group(group) -> None:
+    global _TP_CPU_GROUP
+    _TP_CPU_GROUP = group
+
+
+def try_get_tp_cpu_group():
+    return _TP_CPU_GROUP
 
 
 def get_tp_info() -> DistributedInfo:
@@ -35,4 +45,11 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+__all__ = [
+    "DistributedInfo",
+    "get_tp_info",
+    "set_tp_cpu_group",
+    "set_tp_info",
+    "try_get_tp_cpu_group",
+    "try_get_tp_info",
+]

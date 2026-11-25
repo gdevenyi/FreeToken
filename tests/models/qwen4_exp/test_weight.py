@@ -12,8 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
-
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
@@ -25,8 +23,16 @@ from freetoken.models.qwen4_exp.weight import (
 )
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
+from safetensors.torch import save_file
 
-from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
+from .common import (
+    LM,
+    RADIXARK_NVFP4,
+    hf_config,
+    install_quant_config,
+    meta_state_dict,
+    mixed_precision_quant,
+)
 
 H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
@@ -461,6 +467,75 @@ def test_load_ple_table_gguf_reads_every_bf16_row(tmp_path):
     _one_tensor_gguf(q8, "per_layer_token_embd.weight", int(GGMLQuantizationType.Q8_0), (32, 4), bytes(4 * 34))
     with pytest.raises(ValueError, match="disk"):
         load_ple_table_gguf(str(q8), SimpleNamespace(ngram_head_dim=32), pin=False)
+
+
+def _shared_ple_worker(rank: int, world: int, store_path: str, gguf_path: str, shm_dir: str, low_shm: bool, out_path: str) -> None:
+    import os
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from freetoken.models.qwen4_exp.weight import load_ple_table_gguf
+    from freetoken.moe import host_banks as hb
+
+    if low_shm:
+        orig_statvfs = os.statvfs
+        hb.os.statvfs = lambda p: SimpleNamespace(f_bavail=1, f_frsize=1024) if p == shm_dir else orig_statvfs(p)
+
+    store = dist.FileStore(store_path, world)
+    dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=world)
+    try:
+        got = load_ple_table_gguf(
+            gguf_path,
+            SimpleNamespace(ngram_head_dim=NGRAM_DIM),
+            pin=False,
+            piece=12_288,
+            tp_cpu_group=dist.group.WORLD,
+            shm_dir=shm_dir,
+        )
+        first_row = got.bank.tensor[0].float().tolist()
+        dist.barrier()
+        if rank == 0:
+            got.bank.tensor[0, 0] = torch.tensor(-42.0, dtype=torch.bfloat16)
+        dist.barrier()
+        probe = float(got.bank.tensor[0, 0])
+        torch.save({"first_row": first_row, "probe": probe}, f"{out_path}.{rank}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("low_shm", [False, True])
+def test_load_ple_table_gguf_shares_one_unlinked_shm_mapping_across_tp_ranks(tmp_path, low_shm):
+    import torch.multiprocessing as mp
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    table = torch.randn(257, NGRAM_DIM).to(torch.bfloat16)
+    gguf_path = tmp_path / "engram-BF16.gguf_file"
+    _one_tensor_gguf(
+        gguf_path,
+        "per_layer_token_embd.weight",
+        int(GGMLQuantizationType.BF16),
+        (NGRAM_DIM, 257),
+        table.view(torch.uint8).numpy().tobytes(),
+    )
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    store_path = str(tmp_path / "store")
+    out_path = str(tmp_path / "rank_out")
+    mp.spawn(
+        _shared_ple_worker,
+        args=(2, store_path, str(gguf_path), str(shm_dir), low_shm, out_path),
+        nprocs=2,
+        join=True,
+    )
+    assert list(shm_dir.iterdir()) == []
+    r0 = torch.load(f"{out_path}.0", weights_only=True)
+    r1 = torch.load(f"{out_path}.1", weights_only=True)
+    want = table[0].float().tolist()
+    assert r0["first_row"] == want and r1["first_row"] == want
+    if low_shm:
+        assert r0["probe"] == -42.0 and r1["probe"] != -42.0
+    else:
+        assert r0["probe"] == -42.0 and r1["probe"] == -42.0
 
 
 def test_check_ple_table_refuses_what_no_reader_serves(tmp_path):

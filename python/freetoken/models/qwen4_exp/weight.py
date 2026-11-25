@@ -15,14 +15,20 @@ import json
 import os
 import re
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Iterator
 
 import safetensors
 import torch
-from freetoken.distributed import get_tp_info
-from freetoken.models.qwen3_vl.weight import rename_vl_prefix
+from tqdm import tqdm
 
+from freetoken.distributed import get_tp_info
+from freetoken.layers.quantization import (
+    QuantConfig,
+    QuantKind,
+    QuantScheme,
+    get_quant_config,
+)
 from freetoken.models.config import (
     VISION_KEY_PREFIXES,
     fp8_dense_enabled,
@@ -30,16 +36,20 @@ from freetoken.models.config import (
     fp8_lmhead_enabled,
     fp8_lmhead_scale,
 )
-from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
+from freetoken.models.loader import iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
-from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 from freetoken.models.register import get_model_spec
-from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight, init_logger
+from freetoken.moe.host_banks import HostBank, build_shared_bank, read_range_into
+from freetoken.utils import (
+    cached_load_hf_config,
+    div_even,
+    download_hf_weight,
+    init_logger,
+)
 from freetoken.utils.progress import byte_bar
-from tqdm import tqdm
 
 from .config import parse_config, use_fp8_dense, use_fp8_lmhead
 
@@ -707,7 +717,8 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
 
 
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
-                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
+                   workers: int = 8, chunk: int = 8 << 20,
+                   tp_cpu_group=None, shm_dir: str = "/dev/shm", device=None) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
 
     The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
@@ -756,26 +767,34 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             raise ValueError("PLE table has no weight_scale")
         scale = torch.tensor(1.0, dtype=torch.bfloat16)
 
-    bank = HostBank((expected * rows, cols), dtype)
     shard_bytes = rows * cols * dtype.itemsize
-    bar = byte_bar(expected * shard_bytes, "Loading PLE table")
-    try:
-        buf = bank.memoryview()
-        for shard in range(expected):
-            path, offset, nbytes = parts[shard]
-            assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
-            bar.update(nbytes)
-    finally:
-        bar.close()
+
+    def _fill(buf: memoryview, show_bar: bool) -> None:
+        bar = byte_bar(expected * shard_bytes, "Loading PLE table") if show_bar else None
+        try:
+            for shard in range(expected):
+                path, offset, nbytes = parts[shard]
+                assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
+                read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
+                                dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
+                if bar is not None:
+                    bar.update(nbytes)
+        finally:
+            if bar is not None:
+                bar.close()
+
+    bank = build_shared_bank(
+        (expected * rows, cols), dtype, _fill,
+        tp_cpu_group=tp_cpu_group, shm_dir=shm_dir, device=device,
+    )
     if pin and torch.cuda.is_available():
         bank.pin()
     return PleTable(bank=bank, weight_scale=scale)
 
 
 def load_ple_table_gguf(path: str, qwen4_args, *, pin: bool = True,
-                        workers: int = 8, chunk: int = 8 << 20, piece: int = 4 << 30) -> PleTable:
+                        workers: int = 8, chunk: int = 8 << 20, piece: int = 4 << 30,
+                        tp_cpu_group=None, shm_dir: str = "/dev/shm", device=None) -> PleTable:
     """The ``per_layer_token_embd`` table of a one-tensor GGUF (``--ple-table``, e.g. Unsloth's lossless
     engram BF16 file) as one pinned host bank, read O_DIRECT like :func:`load_ple_table`.
 
@@ -791,17 +810,24 @@ def load_ple_table_gguf(path: str, qwen4_args, *, pin: bool = True,
                          "which --ple-backend disk serves")
     cols, rows = info.ne
     assert info.nbytes == rows * cols * 2, (info.nbytes, rows, cols)
-    bank = HostBank((rows, cols), torch.bfloat16)
-    bar = byte_bar(info.nbytes, "Loading PLE table")
-    try:
-        buf = bank.memoryview()
-        for start in range(0, info.nbytes, piece):
-            n = min(piece, info.nbytes - start)
-            read_range_into(buf, info.path, file_offset=info.offset + start, nbytes=n,
-                            dest_offset=start, workers=workers, chunk=chunk)
-            bar.update(n)
-    finally:
-        bar.close()
+
+    def _fill(buf: memoryview, show_bar: bool) -> None:
+        bar = byte_bar(info.nbytes, "Loading PLE table") if show_bar else None
+        try:
+            for start in range(0, info.nbytes, piece):
+                n = min(piece, info.nbytes - start)
+                read_range_into(buf, info.path, file_offset=info.offset + start, nbytes=n,
+                                dest_offset=start, workers=workers, chunk=chunk)
+                if bar is not None:
+                    bar.update(n)
+        finally:
+            if bar is not None:
+                bar.close()
+
+    bank = build_shared_bank(
+        (rows, cols), torch.bfloat16, _fill,
+        tp_cpu_group=tp_cpu_group, shm_dir=shm_dir, device=device,
+    )
     if pin and torch.cuda.is_available():
         bank.pin()
     return PleTable(bank=bank, weight_scale=torch.tensor(1.0, dtype=torch.bfloat16))
@@ -828,10 +854,10 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 
 __all__ = [
-    "nvfp4_expert_spec",
     "PleTable",
     "iter_mtp_expert_pieces",
     "iter_mtp_weights",
     "iter_weights",
     "load_ple_table",
+    "nvfp4_expert_spec",
 ]

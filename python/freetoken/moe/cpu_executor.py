@@ -129,6 +129,28 @@ def _rank_block(cpus: list[int], rank: int, ranks: int) -> list[int]:
     return cpus[lo:hi] or list(cpus)
 
 
+def _rank_cpus(rank: int = 0, ranks: int = 1) -> tuple[list[int], list[int]]:
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        allowed = list(range(os.cpu_count() or 1))
+    reps = physical_core_cpus()
+    rest = [c for c in allowed if c not in set(reps)]
+    if ranks > 1:
+        reps = _rank_block(reps, rank, ranks)
+        rest = _rank_block(rest, rank, ranks) if rest else []
+    return reps, rest
+
+
+def rank_affinity_cpus(rank: int = 0, ranks: int = 1) -> set[int] | None:
+    """Logical CPUs belonging to ``rank``'s contiguous socket slice when ``ranks > 1``, else ``None``."""
+    if ranks <= 1:
+        return None
+    reps, rest = _rank_cpus(rank, ranks)
+    cpus = set(reps) | set(rest)
+    return cpus or None
+
+
 def resolve_threads_and_affinity(requested: int, rank: int = 0, ranks: int = 1) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
@@ -144,14 +166,7 @@ def resolve_threads_and_affinity(requested: int, rank: int = 0, ranks: int = 1) 
     share a core. A contiguous block keeps a rank inside one NUMA node where the CPU numbering
     follows the sockets.
     """
-    try:
-        allowed = sorted(os.sched_getaffinity(0))
-    except AttributeError:
-        allowed = list(range(os.cpu_count() or 1))
-    reps = physical_core_cpus()
-    rest = [c for c in allowed if c not in set(reps)]
-    if ranks > 1:
-        reps, rest = _rank_block(reps, rank, ranks), _rank_block(rest, rank, ranks) if rest else []
+    reps, rest = _rank_cpus(rank, ranks)
     if requested and requested > 0:
         n = int(requested)
         # physical-core reps first, then the rest of the logical CPUs.
@@ -464,7 +479,9 @@ class CpuMoeExecutor:
                 # No asynchronous IO or notification: both paths can otherwise share the same bug.
                 x = hidden
                 if self._gpu_prequant:
-                    from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
+                    from freetoken.kernel.triton.dsv4.fp8_linear import (
+                        act_quant_fp8_roundtrip,
+                    )
 
                     x = torch.stack([act_quant_fp8_roundtrip(row, block=self._act_block) for row in hidden])
                 host_x, host_ids, host_w, host_add = x.cpu(), ids.cpu(), weights.cpu(), add.cpu()
@@ -595,7 +612,11 @@ class CpuMoeExecutor:
         """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float types never reach here (cpu_spec sends them to the bf16 format, whose banks load bf16).
 
         ``scaled`` adds global [E, 4] fp32, each expert's (gate, up, down, 1) NVFP4 weight_scale_2."""
-        from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
+        from freetoken.layers.quantization.ggml_types import (
+            float_dtype,
+            row_bytes,
+            type_name,
+        )
 
         gate_up, down = banks["gate_up"], banks["down"]
         H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // 2)

@@ -25,6 +25,8 @@ import os
 import queue
 import sys
 import threading
+import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
@@ -112,20 +114,27 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("_buf", "_locked", "_pinned", "addr", "nbytes", "tensor")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
-        if backing is None:
-            plan = _requested_residency
-            # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
-            born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
-            backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda"), backing
+                 *, backing: str | None = None, _shared_buf: mmap.mmap | None = None):
+        if _shared_buf is None:
+            if backing is None:
+                plan = _requested_residency
+                # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
+                born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
+                backing = "cuda" if born else "mmap"
+            assert backing in ("mmap", "cuda"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        if backing == "cuda":
+        if _shared_buf is not None:
+            assert len(_shared_buf) >= asize, (len(_shared_buf), asize)
+            self._buf = _shared_buf
+            _LIVE_BUFFERS.append(self._buf)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._pinned = False
+        elif backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
             # direct-IO readers need page alignment, but cudaHostAlloc only guarantees ~512 in practice
@@ -250,7 +259,7 @@ class _ResidencyPlan:
 
     Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
 
-    __slots__ = ("labels", "applied", "has_unpinned", "actual", "deferred")
+    __slots__ = ("actual", "applied", "deferred", "has_unpinned", "labels")
 
     def __init__(self, labels: list[str]):
         self.labels = list(labels)
@@ -430,7 +439,7 @@ class PinPipeline:
         if self._exc is not None:
             raise self._exc
 
-    def __enter__(self) -> "PinPipeline":
+    def __enter__(self) -> PinPipeline:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -565,6 +574,260 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
     return nbytes
 
 
+def parse_cpulist(spec: str) -> set[int]:
+    """Parse a Linux sysfs ``cpulist`` string such as ``'0-15,32-47\\n'`` into CPU ids."""
+    cpus: set[int] = set()
+    for part in spec.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            cpus.update(range(int(lo_s), int(hi_s) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _device_pci_bdf(device: torch.device | int | None) -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    idx = torch.cuda.current_device() if device is None else (
+        device if isinstance(device, int) else (device.index if device.type == "cuda" else None)
+    )
+    if idx is None:
+        return None
+    try:
+        props = torch.cuda.get_device_properties(idx)
+        dom = getattr(props, "pci_domain_id", None)
+        bus = getattr(props, "pci_bus_id", None)
+        dev = getattr(props, "pci_device_id", None)
+        if isinstance(bus, str) and ":" in bus:
+            parts = bus.strip().lower().split(":")
+            if len(parts) == 3 and len(parts[0]) > 4:
+                parts[0] = f"{int(parts[0], 16):04x}"
+            return ":".join(parts)
+        if all(isinstance(x, int) for x in (dom, bus, dev)):
+            return f"{dom:04x}:{bus:02x}:{dev:02x}.0"
+    except Exception:
+        pass
+    try:
+        libcudart = ctypes.CDLL("libcudart.so")
+        buf = ctypes.create_string_buffer(32)
+        if libcudart.cudaDeviceGetPCIBusId(buf, 32, int(idx)) == 0:
+            parts = buf.value.decode("ascii").strip().lower().split(":")
+            if len(parts) == 3 and len(parts[0]) > 4:
+                parts[0] = f"{int(parts[0], 16):04x}"
+            return ":".join(parts)
+    except Exception:
+        pass
+    return None
+
+
+def device_numa_cpus(device: torch.device | int | None = None, *, sysfs: str = "/sys") -> set[int] | None:
+    """Logical CPUs of ``device``'s PCIe NUMA node, restricted to the current affinity mask, or ``None``."""
+    bdf = _device_pci_bdf(device)
+    if not bdf:
+        return None
+    try:
+        with open(os.path.join(sysfs, "bus", "pci", "devices", bdf, "numa_node")) as f:
+            node = int(f.read().strip())
+        if node < 0:
+            return None
+        with open(os.path.join(sysfs, "devices", "system", "node", f"node{node}", "cpulist")) as f:
+            cpus = parse_cpulist(f.read())
+    except (OSError, ValueError):
+        return None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpus &= os.sched_getaffinity(0)
+        except OSError:
+            pass
+    return cpus or None
+
+
+@contextlib.contextmanager
+def thread_affinity(cpus: set[int] | None):
+    """Temporarily bind the current thread (and worker threads it spawns) to ``cpus``."""
+    if not cpus or not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        yield
+        return
+    try:
+        prev = os.sched_getaffinity(0)
+    except OSError:
+        yield
+        return
+    target = (cpus & prev) or set(cpus)
+    changed = False
+    if target != prev:
+        try:
+            os.sched_setaffinity(0, target)
+            changed = True
+        except OSError:
+            pass
+    try:
+        yield
+    finally:
+        if changed:
+            try:
+                os.sched_setaffinity(0, prev)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def rank_host_affinity():
+    """First-touch per-rank host banks on this TP rank's socket block (no-op at TP=1)."""
+    from freetoken.moe.cpu_executor import _tp_rank_and_size, rank_affinity_cpus
+
+    rank, ranks = _tp_rank_and_size()
+    with thread_affinity(rank_affinity_cpus(rank, ranks)):
+        yield
+
+
+def _shared_ple_enabled() -> bool:
+    return os.environ.get("FREETOKEN_SHARED_PLE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def build_shared_bank(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    fill: Callable[[memoryview, bool], None],
+    *,
+    tp_cpu_group=None,
+    shm_dir: str = "/dev/shm",
+    device: torch.device | int | None = None,
+) -> HostBank:
+    """Build one read-mostly ``HostBank`` shared across same-host TP ranks via an unlinked ``MAP_SHARED`` file.
+
+    Only each host's lowest TP rank reads from disk and faults physical pages on ``device``'s PCIe NUMA node;
+    sibling local ranks attach to the same ``shmem`` inode before the directory entry is unlinked, then each
+    rank registers its own mapping with ``cudaHostRegister``. Falls back to private per-rank banks when TP=1,
+    ``FREETOKEN_SHARED_PLE=0``, or ``shm_dir`` lacks capacity.
+    """
+    import torch.distributed as dist
+
+    from freetoken.distributed import try_get_tp_cpu_group
+
+    group = tp_cpu_group if tp_cpu_group is not None else try_get_tp_cpu_group()
+    numa_cpus = device_numa_cpus(device)
+    if not _shared_ple_enabled() or group is None or not dist.is_initialized():
+        bank = HostBank(shape, dtype)
+        with thread_affinity(numa_cpus):
+            fill(bank.memoryview(), True)
+        return bank
+
+    world = dist.get_world_size(group)
+    if world <= 1:
+        bank = HostBank(shape, dtype)
+        with thread_affinity(numa_cpus):
+            fill(bank.memoryview(), True)
+        return bank
+
+    rank = dist.get_rank(group)
+    nodename = os.uname().nodename if hasattr(os, "uname") else "localhost"
+    peers: list[tuple[int, str]] = [(0, "")] * world
+    dist.all_gather_object(peers, (rank, nodename), group=group)
+    same_host = sorted(r for r, n in peers if n == nodename)
+    leader = same_host[0]
+
+    elsize = torch.empty((), dtype=dtype).element_size()
+    nbytes = math.prod(shape) * elsize
+    asize = ((nbytes + _BLK - 1) // _BLK) * _BLK
+
+    offer: str | None = None
+    shared_buf: mmap.mmap | None = None
+    if rank == leader and len(same_host) > 1:
+        try:
+            st = os.statvfs(shm_dir)
+            if st.f_bavail * st.f_frsize >= asize + (64 << 20):
+                path = os.path.join(shm_dir, f"freetoken-ple-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                try:
+                    os.ftruncate(fd, asize)
+                    shared_buf = mmap.mmap(fd, asize, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+                except BaseException:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    raise
+                finally:
+                    os.close(fd)
+                offer = path
+        except OSError:
+            shared_buf = None
+            offer = None
+
+    offers: list[str | None] = [None] * world
+    dist.all_gather_object(offers, offer, group=group)
+    shm_path = offers[leader]
+
+    attach_err: str | None = None
+    if shm_path is not None and rank != leader:
+        try:
+            fd = os.open(shm_path, os.O_RDWR)
+            try:
+                shared_buf = mmap.mmap(fd, asize, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            finally:
+                os.close(fd)
+        except BaseException as exc:
+            attach_err = repr(exc)
+
+    try:
+        attach_errs: list[str | None] = [None] * world
+        dist.all_gather_object(attach_errs, attach_err, group=group)
+    finally:
+        if shm_path is not None and rank == leader:
+            try:
+                os.unlink(shm_path)
+            except OSError:
+                pass
+
+    host_attach_errs = [attach_errs[r] for r in same_host if attach_errs[r] is not None]
+    if host_attach_errs:
+        if shared_buf is not None:
+            shared_buf.close()
+        raise RuntimeError(f"shared host bank attach failed on {nodename}: {host_attach_errs[0]}")
+
+    if shm_path is None:
+        if len(same_host) > 1 and rank == leader:
+            logger.warning(
+                f"PLE shared host bank skipped ({shm_dir} lacks {asize / 2**30:.1f} GiB free); "
+                "falling back to per-rank anonymous host banks"
+            )
+        bank = HostBank(shape, dtype)
+        fill_err: str | None = None
+        try:
+            with thread_affinity(numa_cpus):
+                fill(bank.memoryview(), rank == 0)
+        except BaseException as exc:
+            fill_err = repr(exc)
+        fill_errs: list[str | None] = [None] * world
+        dist.all_gather_object(fill_errs, fill_err, group=group)
+        if any(fill_errs):
+            raise RuntimeError(f"host bank fill failed: {next(e for e in fill_errs if e)}")
+        return bank
+
+    assert shared_buf is not None
+    bank = HostBank(shape, dtype, _shared_buf=shared_buf)
+    fill_err = None
+    if rank == leader:
+        try:
+            with thread_affinity(numa_cpus):
+                fill(bank.memoryview(), rank == 0)
+        except BaseException as exc:
+            fill_err = repr(exc)
+    fill_errs = [None] * world
+    dist.all_gather_object(fill_errs, fill_err, group=group)
+    if any(fill_errs):
+        raise RuntimeError(f"shared host bank fill failed: {next(e for e in fill_errs if e)}")
+    logger.info_rank0(
+        f"Shared host bank across {len(same_host)} local TP ranks: {bank.nbytes / 2**30:.2f} GiB in {shm_dir}"
+    )
+    return bank
+
+
 __all__ = [
     "HostBank",
     "HostResidency",
@@ -572,8 +835,13 @@ __all__ = [
     "PinPipeline",
     "alloc_banks",
     "born_pinned_default",
+    "build_shared_bank",
+    "device_numa_cpus",
+    "parse_cpulist",
     "pin_banks",
+    "rank_host_affinity",
     "read_file_into",
     "read_range_into",
     "requested_residency",
+    "thread_affinity",
 ]
