@@ -302,6 +302,7 @@ class QSAKVCache(MHAKVCache):
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
         kv_format: KVFormat = NONE,
+        kv_buffer: torch.Tensor | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -339,8 +340,10 @@ class QSAKVCache(MHAKVCache):
             device=device,
             layer_ids=layer_ids,
             kv_format=kv_format,
+            kv_buffer=kv_buffer,
         )
-        self._zero_kv_slabs()
+        if kv_buffer is None:
+            self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
 
     def _zero_kv_slabs(self) -> None:

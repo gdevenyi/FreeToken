@@ -81,7 +81,14 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config,
+    num_pages: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    kv_buffer: torch.Tensor | None = None,
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
@@ -129,9 +136,10 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    pool_pages = kv_buffer.shape[2] if kv_buffer is not None else (num_pages + 1)
     return create_kvcache_pool(
         model_config=model_config,
-        num_pages=num_pages + 1,  # +1 for dummy page
+        num_pages=pool_pages,  # +1 for dummy page (or VMM aligned >= num_pages + 1)
         page_size=config.page_size,
         num_swa_tokens=num_swa_tokens,
         device=device,
@@ -139,6 +147,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
         kv_format=getattr(config, "kv_format", NONE),
+        kv_buffer=kv_buffer,
     )
 
 
@@ -152,6 +161,7 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     num_speculative_tokens: int = 0,
     kv_format: KVFormat = NONE,
+    kv_buffer: torch.Tensor | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -235,6 +245,7 @@ def create_kvcache_pool(
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
             kv_format=kv_format,
+            kv_buffer=kv_buffer,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

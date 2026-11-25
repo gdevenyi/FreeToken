@@ -636,6 +636,7 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self.elastic_pool = None
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -687,16 +688,23 @@ class Engine:
         # Reserve part of the GDN prefill transient (chunk states + v_new); the rest of the
         # prefill activations still live in the (1 - memory_ratio) headroom.
         available_memory -= gdn_prefill_workspace_bytes(config)
-        if self.spec is not None:
-            # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
-            spec_fixed, draft_page = self._spec_budget(config)
-            page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
-            available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
-        self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        if self.elastic_pool is not None:
+            self.num_pages = self.elastic_pool.geo.usable_kv_pages
+            kv_buf = self._wrap_elastic_kv_buffer(config)
+            self.ctx.kv_cache = self.kv_cache = create_kv_pool(
+                config, self.num_pages, device=self.device, dtype=self.dtype, kv_buffer=kv_buf
+            )
+        else:
+            if self.spec is not None:
+                # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
+                spec_fixed, draft_page = self._spec_budget(config)
+                page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
+                available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
+            self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+            self.ctx.kv_cache = self.kv_cache = create_kv_pool(
+                config, self.num_pages, device=self.device, dtype=self.dtype
+            )
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
-        )
         # --kv-host-tier-gb: host pages of the same shape as one KV page (attached after the check below)
         kv_host_pages, kv_page_bytes = 0, 0
         if kv_tier:
@@ -1127,6 +1135,9 @@ class Engine:
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
+        bank_allocator = self._maybe_init_elastic_pool(
+            config, banks, pools, pool_sizes, size_cap, split_residency=split_residency, layer_tags=layer_tags
+        )
         if len(pools) > 1:
             logger.info_rank0(
                 f"MoE slot pools: {config.moe_cache_scope}, {len(pools)} pools of {min(pool_sizes)}-{max(pool_sizes)} "
@@ -1171,12 +1182,15 @@ class Engine:
             max_slots=max_slots,
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
             pool_sizes=pool_sizes,
+            bank_allocator=bank_allocator,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         if locked_fetch:
             cache.locked_hybrid = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
+        if self.elastic_pool is not None:
+            self.elastic_pool.bind_moe_cache(cache)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
@@ -1191,6 +1205,116 @@ class Engine:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.moe_offload_cache = cache
         return cache
+
+    def _wrap_elastic_kv_buffer(self, config: EngineConfig) -> torch.Tensor:
+        from freetoken.utils import div_even
+
+        kv_specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
+        spec = kv_specs[0]
+        local_kv_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        fmt = config.kv_format
+        return self.elastic_pool.wrap_kv_buffer(
+            num_storage_layers=len(spec.layer_ids),
+            page_size=config.page_size,
+            local_kv_heads=local_kv_heads,
+            elem_dim=fmt.elem_dim(spec.head_dim),
+            elem_dtype=fmt.elem_tensor_dtype(self.dtype),
+        )
+
+    def _maybe_init_elastic_pool(
+        self,
+        config: EngineConfig,
+        banks,
+        pools: list,
+        pool_sizes: list[int],
+        size_cap: int,
+        *,
+        split_residency: bool,
+        layer_tags,
+    ):
+        from freetoken.kvcache.qsa_pool import QSAKVCache
+        from freetoken.kvcache.vmm_elastic import (
+            CudaDriverVmmBackend,
+            ElasticKvMoePool,
+            compute_elastic_geometry,
+            kv_moe_elastic_enabled,
+        )
+        from freetoken.utils import div_ceil, div_even
+
+        if not kv_moe_elastic_enabled(getattr(config, "kv_moe_elastic", False)):
+            return None
+        if self.device.type != "cuda" or self._pool_cls is not QSAKVCache:
+            logger.warning_rank0("--kv-moe-elastic requires CUDA and QSAKVCache; leaving elastic pool disabled")
+            return None
+        if len(pools) != 1 or split_residency or len(set(bank_layouts(banks.sources, layer_tags))) != 1:
+            logger.warning_rank0("--kv-moe-elastic requires unified single-layout pinned MoE banks; leaving disabled")
+            return None
+
+        if config.num_page_override is not None:
+            usable_kv_pages = config.num_page_override
+        else:
+            from freetoken.engine.cache_budget import net_cache_budget_bytes
+
+            fixed = state_pool_bytes(config) + gdn_prefill_workspace_bytes(config) + (256 << 20)
+            net_budget = net_cache_budget_bytes(
+                config.memory_ratio, self._baseline_free, self._weights_bytes, fixed
+            )
+            kv_avail = net_budget - self._moe_pool_bytes(pool_sizes)
+            if self.spec is not None:
+                spec_fixed, draft_page = self._spec_budget(config)
+                page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
+                kv_avail = fixed_bytes + (kv_avail - spec_fixed - fixed_bytes) * page_bytes // (
+                    page_bytes + draft_page
+                )
+            usable_kv_pages = self._pool_cls.solve_num_pages(config, max(0, kv_avail))
+
+        floor_tokens = max(
+            config.kv_elastic_floor_tokens,
+            config.max_forward_len + 2 * config.page_size,
+        )
+        floor_kv_pages = div_ceil(floor_tokens, config.page_size)
+        kv_specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
+        spec = kv_specs[0]
+        local_kv_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        fmt = config.kv_format
+        elem_dim = fmt.elem_dim(spec.head_dim)
+        elem_dtype = fmt.elem_tensor_dtype(self.dtype)
+        plane_page_bytes = config.page_size * local_kv_heads * elem_dim * elem_dtype.itemsize
+        num_kv_planes = 2 * len(spec.layer_ids)
+        moe_row_bytes = {
+            name: per_layer[0][0].numel() * per_layer[0].element_size()
+            for name, per_layer in banks.sources.items()
+        }
+
+        backend = CudaDriverVmmBackend(self.device)
+        geo = compute_elastic_geometry(
+            granularity=backend.granularity,
+            num_kv_planes=num_kv_planes,
+            plane_page_bytes=plane_page_bytes,
+            usable_kv_pages=usable_kv_pages,
+            floor_kv_pages=floor_kv_pages,
+            moe_row_bytes=moe_row_bytes,
+            base_moe_slots=config.moe_cache_size,
+            max_moe_slots=size_cap,
+            num_experts=config.model_config.num_experts,
+            prefill_overlap=config.moe_prefill_overlap,
+        )
+        if geo.num_elastic_kv_blocks == 0 or geo.max_extra_moe_blocks == 0:
+            logger.info_rank0(
+                f"--kv-moe-elastic: no lendable slabs (usable_kv_pages={usable_kv_pages}, floor={floor_kv_pages})"
+            )
+            return None
+
+        self.elastic_pool = ElasticKvMoePool(geo, device=self.device, backend=backend)
+        base_moe = config.moe_cache_size
+        object.__setattr__(config, "moe_cache_size", geo.va_moe_slots)
+        pool_sizes[:] = [geo.va_moe_slots]
+        logger.info_rank0(
+            f"Elastic KV/MoE VMM pool: KV mapped {self.elastic_pool.mapped_usable_kv_pages}/{usable_kv_pages} pages "
+            f"(quantum={geo.kv_quantum_pages} pages), MoE slots boosted {base_moe} -> {self.elastic_pool.active_moe_slots}/{size_cap} "
+            f"(quantum={geo.moe_quantum_slots} slots)"
+        )
+        return self.elastic_pool.make_moe_bank_allocator()
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -1865,6 +1989,11 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         if self.narrow_graph_runner is not None:
             self.narrow_graph_runner.destroy_cuda_graphs()
+        if getattr(self, "elastic_pool", None) is not None:
+            self.kv_cache = None
+            self.moe_offload_cache = None
+            self.elastic_pool.close()
+            self.elastic_pool = None
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

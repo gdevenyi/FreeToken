@@ -106,6 +106,7 @@ _BANK_BYTES_PER_EXPERT = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
+RETIRED_SLOT_USAGE = 1 << 62
 
 
 def placeholder_bank(num_experts: int) -> torch.Tensor:
@@ -171,6 +172,8 @@ class OffloadMoeCache:
     # Each layer belongs to one pool: a contiguous slot range with its own LRU scope; pool p owns slots [sum(pool_sizes[:p]), +pool_sizes[p]). Slot ids in slot_for_id are local to the pool. None = one pool for all layers.
     pool_of_layer: list[int] | None = None
     pool_sizes: list[int] | None = None
+    # Optional custom GPU bank allocator used by ElasticKvMoePool (VMM-backed tail slots).
+    bank_allocator: object | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -232,6 +235,7 @@ class OffloadMoeCache:
             device=self.device,
         )
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+        self.active_cache_size = self.cache_size
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
@@ -565,13 +569,47 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _alloc_banks(self) -> None:
+        alloc = self.bank_allocator
         for k, name in enumerate(self.bank_schema):
             if self._raw_banks:
-                self.bank_caches[name] = torch.zeros(self._bank_bytes(k, self.pool_sizes), dtype=torch.uint8, device=self.device)
+                shape = (self._bank_bytes(k, self.pool_sizes),)
+                self.bank_caches[name] = (
+                    alloc(name, shape, torch.uint8, self.device)
+                    if alloc is not None
+                    else torch.zeros(shape, dtype=torch.uint8, device=self.device)
+                )
             else:
-                dtype, shape = self.layouts[0][k]
-                self.bank_caches[name] = torch.zeros((self.cache_size, *shape), dtype=dtype, device=self.device)
+                dtype, row_shape = self.layouts[0][k]
+                shape = (self.cache_size, *row_shape)
+                self.bank_caches[name] = (
+                    alloc(name, shape, dtype, self.device)
+                    if alloc is not None
+                    else torch.zeros(shape, dtype=dtype, device=self.device)
+                )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+
+    def set_active_slots(self, active_slots: int) -> None:
+        """Dynamically retire or re-enable tail slots in ``[active_slots, cache_size)`` without
+        changing ``cache_size`` or recapturing CUDA graphs (used by ``ElasticKvMoePool``)."""
+        if len(self.pool_sizes) != 1:
+            raise ValueError("set_active_slots requires unified MoE cache scope (single pool)")
+        floor = 2 * self.num_experts if self.prefill_overlap else self.num_experts
+        if not (floor <= active_slots <= self.cache_size):
+            raise ValueError(
+                f"active_slots {active_slots} outside [{floor}, {self.cache_size}]"
+            )
+        old = self.active_cache_size
+        if active_slots < old:
+            evicted_ids = self.id_of_slot[active_slots:old]
+            valid = evicted_ids[evicted_ids >= 0].long()
+            if valid.numel() > 0:
+                self.slot_for_id.view(-1)[valid] = -1
+            self.id_of_slot[active_slots:old] = -1
+            self.usage[active_slots:old] = RETIRED_SLOT_USAGE
+        elif active_slots > old:
+            self.id_of_slot[old:active_slots] = -1
+            self.usage[old:active_slots] = 0
+        self.active_cache_size = active_slots
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -726,6 +764,7 @@ class OffloadMoeCache:
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        self.active_cache_size = cache_size
         self._slice_pools()
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         plan_slots = max(self.num_experts, cache_size)
@@ -1177,6 +1216,8 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        if self.active_cache_size < self.cache_size:
+            self.usage[self.active_cache_size :] = RETIRED_SLOT_USAGE
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)

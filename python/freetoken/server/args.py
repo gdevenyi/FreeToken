@@ -637,6 +637,23 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-moe-elastic",
+        action="store_true",
+        default=ServerArgs.kv_moe_elastic,
+        help="Dynamically lend idle KV VMM 2 MiB physical slabs above --kv-elastic-floor-tokens to "
+        "the unified MoE expert slot cache at startup, reclaiming slabs on demand (after P2c host "
+        "demotion) when active KV contexts exceed the floor.",
+    )
+
+    parser.add_argument(
+        "--kv-elastic-floor-tokens",
+        type=_positive_int,
+        default=ServerArgs.kv_elastic_floor_tokens,
+        help="Minimum KV tokens kept permanently mapped in VRAM when --kv-moe-elastic is enabled "
+        "(default 131072).",
+    )
+
+    parser.add_argument(
         "--logprob-read-isolate",
         action="store_true",
         default=ServerArgs.logprob_read_isolate,

@@ -76,11 +76,16 @@ class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
                  logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False,
-                 snapshot_policy: str = "chunk", kv_host=None):
+                 snapshot_policy: str = "chunk", kv_host=None, elastic_pool=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+        self.elastic_pool = elastic_pool
+        if elastic_pool is not None:
+            self.free_slots = elastic_pool.initial_free_kv_slots(num_pages, page_size, device)
+            self.supports_runtime_rebuild = False
+        else:
+            self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         # Hybrid GDN models drive a second currency (GDN state snapshots in LinearStatePool)
         # through a HybridRadixCache; SWA models drive a second currency (swa-pool KV slots in
         # the HybridSWAKVCache global-paged mode) through a SWARadixCache; non-hybrid models keep
@@ -146,9 +151,10 @@ class CacheManager:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
         (active requests + protected prefix; evictable prefix-cache pages are excluded)."""
         total = self.num_pages
+        unmapped = 0 if self.elastic_pool is None else self.elastic_pool.unmapped_kv_pages
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
-        return total - len(self.free_slots) - evictable // self.page_size, total
+        return total - unmapped - len(self.free_slots) - evictable // self.page_size, total
 
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
@@ -246,6 +252,9 @@ class CacheManager:
         kv = self.kv_host
         if line is not None and kv is not None:
             line += f" | kv host used={kv.num_host_pages - kv.num_free_host_pages}/{kv.num_host_pages}"
+        ep = self.elastic_pool
+        if line is not None and ep is not None:
+            line += f" | elastic kv_mapped={ep.mapped_usable_kv_pages}/{self.num_pages} moe_slots={ep.active_moe_slots}/{ep.geo.va_moe_slots}"
         return line
 
     def restore_host_kv(self, handle: BaseCacheHandle) -> tuple[BaseCacheHandle, KVRestore | None]:
@@ -278,10 +287,14 @@ class CacheManager:
             self._free(self.prefix_cache.unadopt(n))
 
     @property
+    def borrowable_kv_pages(self) -> int:
+        return 0 if self.elastic_pool is None else self.elastic_pool.unmapped_kv_pages
+
+    @property
     def available_size(self) -> int:
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
-        return evictable + len(self.free_slots) * self.page_size
+        return evictable + (len(self.free_slots) + self.borrowable_kv_pages) * self.page_size
 
     @property
     def mamba_available_size(self) -> int:
@@ -607,6 +620,8 @@ class CacheManager:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
             self._free_req_slots(req, keep_live=keep_live)
+            if "_free" not in self.__dict__:
+                self.maybe_rebalance_elastic()
             return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
@@ -807,11 +822,13 @@ class CacheManager:
         else:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        if len(self.free_slots) + cache_pages != self.num_pages:
+        unmapped = 0 if self.elastic_pool is None else self.elastic_pool.unmapped_kv_pages
+        if len(self.free_slots) + cache_pages + unmapped != self.num_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"
                 f" free_pages({len(self.free_slots)}) +"
-                f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
+                f" cache_pages({cache_pages}) +"
+                f" unmapped_pages({unmapped}) != num_pages({self.num_pages})"
             )
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
@@ -853,6 +870,37 @@ class CacheManager:
         finally:
             del self._free
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            self.maybe_rebalance_elastic()
+
+    def maybe_rebalance_elastic(self) -> None:
+        """Return idle borrowed KV blocks to ``OffloadMoeCache`` once active KV usage drops
+        below the hysteresis threshold (demoting excess unlocked prefixes to ``P2c`` host RAM)."""
+        ep = self.elastic_pool
+        if ep is None or ep.borrowed_kv_blocks == 0:
+            return
+        qp, hyst = ep.kv_quantum_pages, ep.hysteresis_pages
+        floor_pages = ep.geo.floor_kv_blocks * qp
+        if ep.mapped_usable_kv_pages - floor_pages <= hyst:
+            return
+        evictable = (
+            self.prefix_cache.full_evictable_size
+            if (self.is_hybrid or self.is_swa)
+            else self.prefix_cache.size_info.evictable_size
+        )
+        evictable_pages = evictable // self.page_size
+        active_pages = ep.mapped_usable_kv_pages - len(self.free_slots) - evictable_pages
+        reclaimable_blocks = (
+            ep.mapped_usable_kv_pages - max(active_pages + hyst, floor_pages + hyst)
+        ) // qp
+        if reclaimable_blocks <= 0:
+            return
+        want_free_pages = reclaimable_blocks * qp + hyst
+        if len(self.free_slots) < want_free_pages and evictable > 0:
+            need_evict = (want_free_pages - len(self.free_slots)) * self.page_size
+            evicted = self._evict(min(evictable, need_evict))
+            if len(evicted) > 0:
+                self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+        self.free_slots = ep.return_free_kv_blocks(self.free_slots, page_size=self.page_size)
 
     def flush(self) -> int:
         """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
@@ -867,6 +915,7 @@ class CacheManager:
                      else self.prefix_cache.size_info.evictable_size)
         evicted = self._evict(evictable, demote=False)
         self._free(evicted)
+        self.maybe_rebalance_elastic()
         return dropped + len(evicted)
 
     def _evict(self, need: int, demote: bool = True) -> torch.Tensor:
@@ -903,7 +952,16 @@ class CacheManager:
         if needed_pages > (free_pages := len(self.free_slots)):
             evicted = self._evict((needed_pages - free_pages) * self.page_size)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+            if needed_pages > len(self.free_slots) and self.elastic_pool is not None:
+                borrowed = self.elastic_pool.borrow_kv_pages(
+                    needed_pages - len(self.free_slots),
+                    device=self.device,
+                    page_size=self.page_size,
+                )
+                self.free_slots = torch.cat([self.free_slots, borrowed])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
+        if self.elastic_pool is not None and len(self.free_slots) > 1:
+            self.free_slots = self.free_slots.sort().values
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         return allocated

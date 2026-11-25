@@ -106,6 +106,7 @@ class Scheduler(SchedulerIOMixin):
             isolate_logprob_reads=config.logprob_read_isolate,
             snapshot_policy=getattr(config, "gdn_snapshot_policy", "chunk"),
             kv_host=self.engine.kv_cache,  # used only when it has host pages (--kv-host-tier-gb)
+            elastic_pool=getattr(self.engine, "elastic_pool", None),
         )
         token_headroom = config.decode_rows_per_req - 1
         self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)

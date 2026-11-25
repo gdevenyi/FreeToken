@@ -36,6 +36,7 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
         kv_format: KVFormat = NONE,
+        kv_buffer: torch.Tensor | None = None,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
@@ -55,18 +56,34 @@ class MHAKVCache(BaseKVCachePool):
                 layer_map[global_id] = dense
             self._layer_map = layer_map
         self._device = device
-        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads)
+        self._external_kv_buffer = kv_buffer is not None
+        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads, kv_buffer=kv_buffer)
 
-    def _alloc(self, num_storage_layers: int, num_pages: int, page_size: int, local_kv_heads: int) -> None:
+    def _alloc(
+        self,
+        num_storage_layers: int,
+        num_pages: int,
+        page_size: int,
+        local_kv_heads: int,
+        *,
+        kv_buffer: torch.Tensor | None = None,
+    ) -> None:
         fmt = self.kv_format
         elem_dim = fmt.elem_dim(self._head_dim)
-        # zeros: an unwritten e4m3 code can be NaN
-        new = torch.zeros if fmt.quantized else torch.empty
-        self._kv_buffer = new(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, elem_dim),
-            device=self._device,
-            dtype=fmt.elem_tensor_dtype(self._dtype),
-        )
+        want_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, elem_dim)
+        want_dtype = fmt.elem_tensor_dtype(self._dtype)
+        if kv_buffer is not None:
+            assert tuple(kv_buffer.shape) == want_shape and kv_buffer.dtype == want_dtype, (
+                kv_buffer.shape,
+                want_shape,
+                kv_buffer.dtype,
+                want_dtype,
+            )
+            self._kv_buffer = kv_buffer
+        else:
+            # zeros: an unwritten e4m3 code can be NaN
+            new = torch.zeros if fmt.quantized else torch.empty
+            self._kv_buffer = new(want_shape, device=self._device, dtype=want_dtype)
         self._scale_buffer = None
         if fmt.scale_dtype is not None:
             self._scale_buffer = torch.zeros(
