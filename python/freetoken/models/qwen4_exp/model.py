@@ -165,9 +165,13 @@ class Qwen4ExpModel(BaseOP):
 def _check_ple_override(path: str, layer) -> None:
     """A --ple-table must have this model's row width and cover every row its n-gram hash can address."""
     from .gguf import check_ple_table
+    from .weight import check_ple_table_lut4, is_lut4_ple_path
 
     emb = layer.ple_embedding
     need = int(emb.ngram_heads_offsets[-1]) + int(emb.ngram_heads_vocab_sizes[-1])
+    if is_lut4_ple_path(path):
+        check_ple_table_lut4(path, head_dim=layer.args.ngram_head_dim, rows_needed=need)
+        return
     check_ple_table(path, head_dim=layer.args.ngram_head_dim, rows_needed=need)
 
 
@@ -254,10 +258,20 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         from freetoken.models.gguf.reader import is_gguf_path
 
-        from .weight import load_ple_table, load_ple_table_gguf
+        from .weight import (
+            is_lut4_ple_path,
+            load_ple_table,
+            load_ple_table_gguf,
+            load_ple_table_lut4,
+        )
 
         if override:
-            table = load_ple_table_gguf(override, self._config.qwen4_args)
+            if is_lut4_ple_path(override):
+                table = load_ple_table_lut4(override, self._config.qwen4_args)
+            else:
+                table = load_ple_table_gguf(override, self._config.qwen4_args)
+        elif is_lut4_ple_path(engine_config.model_path):
+            table = load_ple_table_lut4(engine_config.model_path, self._config.qwen4_args)
         elif is_gguf_path(engine_config.model_path):
             raise ValueError("--ple-backend pinned preloads safetensors PLE shards or a BF16 --ple-table; "
                              "a GGUF serves its own packed table with --ple-backend disk")
@@ -266,7 +280,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
             ple.ple_embedding.attach_table(
-                PinnedUVATable(table.bank.tensor, float(table.weight_scale))
+                PinnedUVATable(
+                    table.bank.tensor,
+                    float(table.weight_scale),
+                    weight_lut=table.weight_lut,
+                    group_size=table.group_size,
+                    head_dim=table.head_dim,
+                )
             )
         return table.bank.nbytes
 

@@ -92,4 +92,113 @@ def ple_gather_rows(
     return out
 
 
-__all__ = ["ple_gather_rows"]
+@triton.jit
+def _ple_gather_lut4_kernel(
+    table_ptr,
+    lut_ptr,
+    ids_ptr,
+    out_ptr,
+    num_rows,
+    EMB_DIM: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    PACKED_BYTES: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    idx = tl.load(ids_ptr + row).to(tl.int64)
+    in_range = (idx >= 0) & (idx < num_rows)
+    idx = tl.where(in_range, idx, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < EMB_DIM
+
+    row_base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8)) + idx * ROW_BYTES
+    byte_idx = offsets >> 1
+    shift = ((offsets & 1) * 4).to(tl.uint8)
+    packed = tl.load(row_base + byte_idx, mask=mask, other=0)
+    nibble = ((packed >> shift) & 0xF).to(tl.int32)
+    code = tl.load(lut_ptr + nibble, mask=mask, other=0.0).to(tl.float32)
+
+    grp = offsets // GROUP_SIZE
+    scale_ptr = (row_base + PACKED_BYTES).to(tl.pointer_type(tl.float16))
+    grp_scale = tl.load(scale_ptr + grp, mask=mask, other=0.0).to(tl.float32)
+    values = tl.where(in_range, code * grp_scale, 0.0)
+    tl.store(
+        out_ptr + row * EMB_DIM + offsets,
+        values.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def ple_gather_lut4_cpu(
+    packed_table: torch.Tensor,
+    weight_lut: torch.Tensor,
+    embed_dim: int,
+    group_size: int,
+    row_ids: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Reference CPU gather for ``lut4-gptq`` packed ``[num_rows, packed_bytes + scale_bytes]`` rows."""
+    flat_ids = row_ids.reshape(-1).to(torch.int64)
+    n = flat_ids.numel()
+    assert out.shape == (n, embed_dim), (out.shape, n, embed_dim)
+    if n == 0:
+        return out
+    num_rows = packed_table.shape[0]
+    packed_bytes = embed_dim // 2
+    num_groups = embed_dim // group_size
+    in_range = (flat_ids >= 0) & (flat_ids < num_rows)
+    safe_ids = torch.where(in_range, flat_ids, torch.zeros_like(flat_ids))
+    rows = packed_table.index_select(0, safe_ids.cpu())
+    nib_bytes = rows[:, :packed_bytes]
+    lo = (nib_bytes & 0x0F).to(torch.long)
+    hi = ((nib_bytes >> 4) & 0x0F).to(torch.long)
+    nibbles = torch.stack((lo, hi), dim=-1).reshape(n, embed_dim)
+    lut_cpu = weight_lut.detach().to(device="cpu", dtype=torch.float32)
+    codes = lut_cpu[nibbles]
+    scales = (
+        rows[:, packed_bytes : packed_bytes + num_groups * 2]
+        .contiguous()
+        .view(torch.float16)
+        .to(torch.float32)
+    )
+    vals = (codes.view(n, num_groups, group_size) * scales.unsqueeze(-1)).reshape(
+        n, embed_dim
+    )
+    vals = torch.where(in_range.cpu().unsqueeze(-1), vals, torch.zeros_like(vals))
+    out.copy_(vals.to(dtype=out.dtype, device=out.device))
+    return out
+
+
+def ple_gather_lut4_rows(
+    table_ptr: int,
+    weight_lut: torch.Tensor,
+    num_rows: int,
+    embed_dim: int,
+    group_size: int,
+    row_ids: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Gather ``lut4-gptq`` rows (`[80B nibbles | 10B fp16 scales]`) over UVA into ``out``."""
+    n = row_ids.numel()
+    assert out.shape == (n, embed_dim) and out.is_contiguous(), out.shape
+    packed_bytes = embed_dim // 2
+    row_bytes = packed_bytes + (embed_dim // group_size) * 2
+    if n:
+        _ple_gather_lut4_kernel[(n,)](
+            table_ptr,
+            weight_lut,
+            row_ids,
+            out,
+            num_rows,
+            EMB_DIM=embed_dim,
+            GROUP_SIZE=group_size,
+            PACKED_BYTES=packed_bytes,
+            ROW_BYTES=row_bytes,
+            BLOCK_D=triton.next_power_of_2(embed_dim),
+            num_warps=_NUM_WARPS,
+        )
+    return out
+
+
+__all__ = ["ple_gather_lut4_cpu", "ple_gather_lut4_rows", "ple_gather_rows"]

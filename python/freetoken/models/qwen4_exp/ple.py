@@ -137,20 +137,54 @@ class PinnedUVATable:
         *,
         device: torch.device | None = None,
         prefetch: bool = True,
+        weight_lut: torch.Tensor | None = None,
+        group_size: int = 32,
+        head_dim: int | None = None,
     ) -> None:
         assert weight.device.type == "cpu" and weight.is_contiguous()
-        assert weight.dtype in (torch.float8_e4m3fn, torch.bfloat16), weight.dtype
-        from freetoken.kernel.pinned import device_ptr
-
         self.weight = weight
         self.scale = float(scale)
-        self.num_rows, self.head_dim = weight.shape
         self.dtype = torch.bfloat16
-        self._is_fp8 = weight.dtype == torch.float8_e4m3fn
-        self._device = device or torch.device("cuda", torch.cuda.current_device())
-        # WDDM maps registered host memory at a different device address; on Linux/UVA this is data_ptr
-        self._table_ptr = device_ptr(weight)
-        self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
+        self._device = (
+            device
+            if device is not None
+            else (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        )
+        if weight_lut is not None:
+            assert weight.dtype == torch.uint8 and head_dim is not None
+            assert head_dim > 0 and head_dim % 2 == 0 and head_dim % group_size == 0
+            expected_cols = head_dim // 2 + (head_dim // group_size) * 2
+            assert weight.shape[1] == expected_cols, (weight.shape, expected_cols)
+            assert weight_lut.numel() == 16, weight_lut.shape
+            self.num_rows = int(weight.shape[0])
+            self.head_dim = int(head_dim)
+            self._is_fp8 = False
+            self._is_lut4 = True
+            self._group_size = int(group_size)
+            self._weight_lut: torch.Tensor | None = weight_lut.to(
+                device=self._device, dtype=torch.float32
+            ).contiguous()
+        else:
+            assert weight.dtype in (torch.float8_e4m3fn, torch.bfloat16), weight.dtype
+            self.num_rows, self.head_dim = weight.shape
+            self._is_fp8 = weight.dtype == torch.float8_e4m3fn
+            self._is_lut4 = False
+            self._group_size = int(group_size)
+            self._weight_lut = None
+
+        if self._device.type == "cuda":
+            from freetoken.kernel.pinned import device_ptr
+
+            # WDDM maps registered host memory at a different device address; on Linux/UVA this is data_ptr
+            self._table_ptr = device_ptr(weight)
+            self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
+        else:
+            self._table_ptr = int(weight.data_ptr())
+            self._stream = None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}
         self._pending: Tuple[torch.Tensor, torch.Tensor] | None = None
@@ -158,7 +192,7 @@ class PinnedUVATable:
     def _stage(self, rows: int) -> torch.Tensor:
         # Captured graphs keep one buffer per size for good: growing the eager one would free the
         # block a replay still writes to.
-        if torch.cuda.is_current_stream_capturing():
+        if self._device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             buf = self._graph_staging.get(rows)
             if buf is None:
                 buf = torch.empty((rows, self.head_dim), dtype=self.dtype, device=self._device)
@@ -171,6 +205,30 @@ class PinnedUVATable:
         return buf[:rows]
 
     def _gather(self, row_ids: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        if self._is_lut4:
+            assert self._weight_lut is not None
+            if self._device.type != "cuda":
+                from freetoken.kernel.triton.ple import ple_gather_lut4_cpu
+
+                return ple_gather_lut4_cpu(
+                    self.weight,
+                    self._weight_lut,
+                    self.head_dim,
+                    self._group_size,
+                    row_ids.reshape(-1),
+                    dst,
+                )
+            from freetoken.kernel.triton.ple import ple_gather_lut4_rows
+
+            return ple_gather_lut4_rows(
+                self._table_ptr,
+                self._weight_lut,
+                self.num_rows,
+                self.head_dim,
+                self._group_size,
+                row_ids.reshape(-1),
+                dst,
+            )
         from freetoken.kernel.triton.ple import ple_gather_rows
 
         return ple_gather_rows(

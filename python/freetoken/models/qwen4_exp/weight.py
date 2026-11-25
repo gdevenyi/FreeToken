@@ -652,15 +652,177 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
 
 @dataclass(frozen=True)
 class PleTable:
-    """The filled n-gram table: one pinned host bank plus the checkpoint's per-tensor scale (1 for a bf16 table)."""
+    """The filled n-gram table: one pinned host bank plus per-tensor scale or 4-bit lut4 codebook."""
 
     bank: HostBank
     weight_scale: torch.Tensor  # scalar, checkpoint dtype (bf16)
+    weight_lut: torch.Tensor | None = None  # [16] float32 codebook for lut4-gptq tables
+    group_size: int = 32
+    head_dim: int | None = None
 
     @property
     def tensor(self) -> torch.Tensor:
-        """``[total_rows, ngram_head_dim]`` view of the bank in the stored dtype."""
+        """``[total_rows, cols]`` view of the bank in the stored dtype."""
         return self.bank.tensor
+
+
+_PLE_LUT4_PACKED_RE = re.compile(r"ngram_embedding\.shard_(?P<shard>\d+)\.weight_packed$")
+_PLE_LUT4_SCALE_RE = re.compile(r"ngram_embedding\.shard_(?P<shard>\d+)\.weight_scale$")
+_PLE_LUT4_LUT_RE = re.compile(r"ngram_embedding\.shard_(?P<shard>\d+)\.weight_lut$")
+
+
+def is_lut4_ple_path(path: str) -> bool:
+    """True when ``path`` is a directory or safetensors file containing ``lut4-gptq`` PLE shards."""
+    if os.path.isdir(path):
+        files = _ple_table_files(path)
+    elif os.path.isfile(path) and path.endswith(".safetensors"):
+        files = [path]
+    else:
+        return False
+    for fpath in files:
+        header, _ = _safetensors_header(fpath)
+        if any(_PLE_LUT4_PACKED_RE.search(k) for k in header if k != "__metadata__"):
+            return True
+    return False
+
+
+def check_ple_table_lut4(path: str, *, head_dim: int, rows_needed: int | None = None) -> tuple[int, int]:
+    """Validate ``lut4-gptq`` PLE shards at ``path`` and return ``(total_rows, group_size)``."""
+    files = _ple_table_files(path) if os.path.isdir(path) else [path]
+    packed_shapes: dict[int, tuple[int, int]] = {}
+    scale_shapes: dict[int, tuple[int, int]] = {}
+    for fpath in files:
+        header, _ = _safetensors_header(fpath)
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            mp = _PLE_LUT4_PACKED_RE.search(key)
+            if mp is not None:
+                if meta["dtype"] != "U8":
+                    raise ValueError(f"LUT4 PLE {key} must be U8, got {meta['dtype']}")
+                packed_shapes[int(mp.group("shard"))] = tuple(meta["shape"])
+                continue
+            ms = _PLE_LUT4_SCALE_RE.search(key)
+            if ms is not None:
+                if meta["dtype"] != "F16":
+                    raise ValueError(f"LUT4 PLE {key} must be F16, got {meta['dtype']}")
+                scale_shapes[int(ms.group("shard"))] = tuple(meta["shape"])
+    if not packed_shapes or set(packed_shapes) != set(scale_shapes):
+        raise ValueError(f"Incomplete lut4-gptq PLE shards at {path}")
+    shard0_rows, packed_cols = packed_shapes[min(packed_shapes)]
+    if packed_cols * 2 != head_dim:
+        raise ValueError(f"LUT4 PLE packed width {packed_cols} != head_dim/2 ({head_dim // 2})")
+    _, num_groups = scale_shapes[min(scale_shapes)]
+    if num_groups <= 0 or head_dim % num_groups != 0:
+        raise ValueError(f"LUT4 PLE scale groups {num_groups} does not divide head_dim {head_dim}")
+    total_rows = sum(r for r, _ in packed_shapes.values())
+    if rows_needed is not None and total_rows < rows_needed:
+        raise ValueError(f"LUT4 PLE at {path} has {total_rows} rows, model needs {rows_needed}")
+    return total_rows, head_dim // num_groups
+
+
+def load_ple_table_lut4(
+    path: str,
+    qwen4_args,
+    *,
+    pin: bool = True,
+    tp_cpu_group=None,
+    shm_dir: str = "/dev/shm",
+    device=None,
+) -> PleTable:
+    """Load ``lut4-gptq`` PLE shards (`weight_packed` U8 + `weight_scale` F16 + `weight_lut` F32)
+    into one shared ``/dev/shm`` host bank of ``[total_rows, packed_cols + scale_bytes]`` uint8."""
+    files = _ple_table_files(path) if os.path.isdir(path) else [path]
+    packed_files: dict[int, tuple[str, str]] = {}
+    scale_files: dict[int, tuple[str, str]] = {}
+    lut_tensor: torch.Tensor | None = None
+    for fpath in files:
+        header, _ = _safetensors_header(fpath)
+        for key in header:
+            if key == "__metadata__":
+                continue
+            mp = _PLE_LUT4_PACKED_RE.search(key)
+            if mp is not None:
+                packed_files[int(mp.group("shard"))] = (fpath, key)
+                continue
+            ms = _PLE_LUT4_SCALE_RE.search(key)
+            if ms is not None:
+                scale_files[int(ms.group("shard"))] = (fpath, key)
+                continue
+            ml = _PLE_LUT4_LUT_RE.search(key)
+            if ml is not None:
+                with safetensors.safe_open(fpath, framework="pt", device="cpu") as sf:
+                    cur_lut = sf.get_tensor(key).to(torch.float32).reshape(-1)
+                if cur_lut.numel() != 16:
+                    raise ValueError(f"LUT4 PLE {key} must have 16 entries, got {cur_lut.numel()}")
+                if lut_tensor is not None and not torch.allclose(lut_tensor, cur_lut):
+                    raise ValueError(f"Inconsistent LUT4 PLE codebook in {key}")
+                lut_tensor = cur_lut
+
+    expected = int(qwen4_args.split_ngram_parts)
+    if sorted(packed_files) != list(range(expected)) or sorted(scale_files) != list(range(expected)):
+        raise ValueError(
+            f"LUT4 PLE needs shards 0..{expected - 1}, found packed={sorted(packed_files)[:8]}"
+        )
+    if lut_tensor is None:
+        raise ValueError(f"LUT4 PLE at {path} has no weight_lut tensor")
+
+    head_dim = int(qwen4_args.ngram_head_dim)
+    p0_path, p0_key = packed_files[0]
+    s0_path, s0_key = scale_files[0]
+    h_p0, _ = _safetensors_header(p0_path)
+    h_s0, _ = _safetensors_header(s0_path)
+    shard_rows, packed_cols = h_p0[p0_key]["shape"]
+    s_rows, num_groups = h_s0[s0_key]["shape"]
+    if packed_cols * 2 != head_dim or s_rows != shard_rows or head_dim % num_groups != 0:
+        raise ValueError(
+            f"Invalid LUT4 PLE shard shapes: packed={(shard_rows, packed_cols)} scale={(s_rows, num_groups)}"
+        )
+    group_size = head_dim // num_groups
+    row_bytes = packed_cols + num_groups * 2
+    total_rows = expected * shard_rows
+
+    def _fill(buf: memoryview, show_bar: bool) -> None:
+        bar = byte_bar(total_rows * row_bytes, "Loading LUT4 PLE table") if show_bar else None
+        out = torch.frombuffer(buf, dtype=torch.uint8, count=total_rows * row_bytes).view(
+            total_rows, row_bytes
+        )
+        try:
+            for shard in range(expected):
+                pf, pk = packed_files[shard]
+                sf_path, sk = scale_files[shard]
+                with safetensors.safe_open(pf, framework="pt", device="cpu") as fp:
+                    wp = fp.get_tensor(pk)
+                with safetensors.safe_open(sf_path, framework="pt", device="cpu") as fs:
+                    ws = fs.get_tensor(sk)
+                if wp.shape != (shard_rows, packed_cols) or ws.shape != (shard_rows, num_groups):
+                    raise ValueError(f"LUT4 PLE shard {shard} shape mismatch: {wp.shape}, {ws.shape}")
+                r0 = shard * shard_rows
+                out[r0 : r0 + shard_rows, :packed_cols].copy_(wp)
+                out[r0 : r0 + shard_rows, packed_cols:].copy_(ws.contiguous().view(torch.uint8))
+                if bar is not None:
+                    bar.update(shard_rows * row_bytes)
+        finally:
+            if bar is not None:
+                bar.close()
+
+    bank = build_shared_bank(
+        (total_rows, row_bytes),
+        torch.uint8,
+        _fill,
+        tp_cpu_group=tp_cpu_group,
+        shm_dir=shm_dir,
+        device=device,
+    )
+    if pin and torch.cuda.is_available():
+        bank.pin()
+    return PleTable(
+        bank=bank,
+        weight_scale=torch.tensor(1.0, dtype=torch.bfloat16),
+        weight_lut=lut_tensor,
+        group_size=group_size,
+        head_dim=head_dim,
+    )
 
 
 _PLE_ST_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "BF16": torch.bfloat16}
