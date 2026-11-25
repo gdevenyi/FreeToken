@@ -628,6 +628,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-host-restore-tokens",
+        type=int,
+        default=ServerArgs.kv_host_restore_tokens,
+        help="Hybrid (GDN) models with --kv-host-tier-gb: maximum host-KV tokens restored in one "
+        "admission pass while decode requests are running (default 131072; 0 = unlimited). The first "
+        "returning session in a pass always restores so large contexts never starve.",
+    )
+
+    parser.add_argument(
         "--logprob-read-isolate",
         action="store_true",
         default=ServerArgs.logprob_read_isolate,
@@ -1228,6 +1237,8 @@ def parse_args(
 
     if kwargs["mamba_host_slots"] < 0:
         parser.error("--mamba-host-slots must be 0 or more")
+    if kwargs["kv_host_restore_tokens"] < 0:
+        parser.error("--kv-host-restore-tokens must be 0 or more")
     if kwargs["kv_host_tier_gb"] and kwargs["speculative_algorithm"] == "mtp":
         # the MTP draft KV pool follows the target's page ids; the host tier does not copy it (v1)
         parser.error("--kv-host-tier-gb is not supported with --speculative-algorithm mtp")

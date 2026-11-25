@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Tuple
 
 import torch
 from freetoken.core import Req
+from freetoken.kernel.sm_upload import upload_step_tensor
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil
 
@@ -948,11 +949,8 @@ def _write_page_table(
     page_size: int,
 ) -> None:
     needed_tokens = len(allocated)
-    # Pinned only when there is a device to copy to asynchronously; CPU-only runs (unit tests,
-    # a CPU CI runner) would otherwise raise instead of just doing a plain host allocation.
-    pin = torch.cuda.is_available()
-    table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=pin)
-    positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=pin)
+    table_idx_host = torch.empty(needed_tokens, dtype=torch.int64)
+    positions_host = torch.empty(needed_tokens, dtype=torch.int64)
     offset = 0
     for table_idx, first_page, last_page in allocation_info:
         first_pos, last_pos = first_page * page_size, last_page * page_size
@@ -961,8 +959,8 @@ def _write_page_table(
         torch.arange(first_pos, last_pos, out=positions_host[offset : offset + length])
         offset += length
     assert offset == needed_tokens, "Mismatch in allocated tokens and filled tokens."
-    table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
-    offsets = positions_host.to(page_table.device, non_blocking=True)
+    table_idxs = upload_step_tensor(table_idx_host, page_table.device)
+    offsets = upload_step_tensor(positions_host, page_table.device)
     assert allocated.dtype == page_table.dtype, (
         f"allocated dtype {allocated.dtype} != page_table dtype {page_table.dtype}"
     )

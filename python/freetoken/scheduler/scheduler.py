@@ -11,6 +11,7 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
+from freetoken.kernel.sm_upload import upload_step_tensor
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -122,6 +123,7 @@ class Scheduler(SchedulerIOMixin):
             keep_images_whole=self._bidirectional_mm,
             token_headroom=token_headroom,
             isolate_logprob_reads=config.logprob_read_isolate,
+            kv_host_restore_tokens=getattr(config, "kv_host_restore_tokens", 131072),
         )
 
         # some alias for easy access
@@ -1088,8 +1090,8 @@ class Scheduler(SchedulerIOMixin):
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan
-            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
-            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            batch.mm_rows = upload_step_tensor(torch.tensor(rows, dtype=torch.int64), self.device)
+            batch.mm_block_ends = upload_step_tensor(torch.tensor(block_ends, dtype=torch.int32), self.device)
         if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
             # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
             lo, hi = cut[0]
@@ -1190,7 +1192,7 @@ def _attach_logprobs(msg: DetokenizeMsg, output: ForwardOutput, row: int, top: i
 def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
     needed = sum(r.extend_len for r in batch.padded_reqs)
-    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=True)
+    host = torch.empty((3, needed), dtype=torch.int32)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -1206,12 +1208,12 @@ def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             )
             out.copy_(row.unsqueeze(0).expand(3, -1))
         offset += length
-    return host.to(device, non_blocking=True)
+    return upload_step_tensor(host, device)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    indices_host = torch.empty(needed_size, dtype=torch.int32)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -1222,22 +1224,22 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             out=indices_host[offset : offset + length],
         )
         offset += length
-    return indices_host.to(device, non_blocking=True)
+    return upload_step_tensor(indices_host, device)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+    return upload_step_tensor(mapping_host, device), batch.positions.to(torch.int64)
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+    write_host = torch.tensor(write_list, dtype=torch.int64)
+    return upload_step_tensor(mapping_host, device), upload_step_tensor(write_host, device)

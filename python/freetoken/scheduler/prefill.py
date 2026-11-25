@@ -63,6 +63,9 @@ class PrefillAdder:
     token_headroom: int = 0
     # a logprob read (max_tokens=1 + logprobs) neither resumes from nor feeds the prefix cache
     isolate_logprob_reads: bool = False
+    # P3: cap total host-KV tokens restored in one pass while decodes are active (0 = unlimited)
+    restore_token_budget: int = 0
+    restored_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -94,9 +97,19 @@ class PrefillAdder:
         # --kv-host-tier-gb: the matched span past the device pages is on the host; it takes device
         # pages at admission (restore_host_kv), charged here and allocated at once, not reserved
         host_kv = getattr(handle, "host_kv", None)
+        host_tokens = 0 if host_kv is None else len(host_kv)
+        if (
+            host_tokens > 0
+            and self.restore_token_budget > 0
+            and self.restored_tokens > 0
+            and self.restored_tokens + host_tokens > self.restore_token_budget
+        ):
+            if self.cache_manager.is_hybrid:
+                self.cache_manager.prefix_cache.counts["kv_restore_defer"] += 1
+            return None
         estimated_size = self._kv_reservation_size(
             req.input_len + req.output_len + self.token_headroom, cached_len
-        ) + (0 if host_kv is None else len(host_kv))
+        ) + host_tokens
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             stats.note_refusal("kv", req.uid)
@@ -330,6 +343,8 @@ class PrefillAdder:
                 self.table_manager.free(table_idx)
                 if linear_slot_idx is not None:
                     self.cache_manager.linear_state_pool.free([linear_slot_idx, *ping_pong])
+            elif kv_restore is not None:
+                self.restored_tokens += len(kv_restore.host_pages) * self.cache_manager.page_size
             return req
 
         return None
@@ -345,6 +360,7 @@ class PrefillManager:
     token_headroom: int = 0
     # a logprob read prefills in a pass of its own (see PrefillAdder for the cache side)
     isolate_logprob_reads: bool = False
+    kv_host_restore_tokens: int = 131072
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -366,6 +382,7 @@ class PrefillManager:
             return None
 
         # estimated offset due to in-flight decode
+        restore_budget = self.kv_host_restore_tokens if self.decode_manager.runnable else 0
         adder = PrefillAdder(
             token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
@@ -375,6 +392,7 @@ class PrefillManager:
             keep_images_whole=self.keep_images_whole,
             token_headroom=self.token_headroom,
             isolate_logprob_reads=self.isolate_logprob_reads,
+            restore_token_budget=restore_budget,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

@@ -110,6 +110,9 @@ class EngineConfig:
     # --kv-host-tier-gb: GiB of host RAM per TP rank for the KV pages of idle prefixes once the device
     # needs their pages (hybrid radix only; refused under MTP in v1). 0 = off.
     kv_host_tier_gb: float = 0.0
+    # --kv-host-restore-tokens: per-pass cap on host-KV tokens restored while decodes are running,
+    # bounding PCIe H2D restore bursts per admission pass (a first restore always fits). 0 = unlimited.
+    kv_host_restore_tokens: int = 131072
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
@@ -173,6 +176,8 @@ class EngineConfig:
             raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
         if self.moe_locked_max_fetch < 1:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
+        if self.kv_host_restore_tokens < 0:
+            raise ValueError(f"kv_host_restore_tokens must be >= 0, got {self.kv_host_restore_tokens}")
         if self.online_quant_modules and not self.online_quant:
             raise ValueError("--online-quant-modules names the modules --online-quant converts; pass --online-quant too")
         if self.online_quant is not None and self.online_quant not in (known := sorted(str(k) for k in online_kinds())):
