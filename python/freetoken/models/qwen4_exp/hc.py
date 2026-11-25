@@ -10,10 +10,11 @@ back at the store, so they agree to fp32 rounding.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+
 from freetoken.kernel.triton.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -22,6 +23,8 @@ from freetoken.kernel.triton.hc import (
     hc_silu,
 )
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers.int8_g32 import Int8G32Replicated
+from freetoken.models.config import hc_int8_enabled
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -86,7 +89,9 @@ class GatedResidual(BaseOP):
     Launch budget on CUDA: ``mix`` is 3 kernels around 2 GEMMs, ``combine`` is 1.
     """
 
-    def __init__(self, config: ModelConfig, use_combine: bool = True, *, prefix: str = "") -> None:
+    def __init__(
+        self, config: ModelConfig, use_combine: bool = True, *, prefix: str = ""
+    ) -> None:
         args = config.qwen4_args
         self.hc_count = args.hc_count
         self.hidden_size = args.hidden_size
@@ -94,72 +99,120 @@ class GatedResidual(BaseOP):
         self.use_combine = use_combine
         width = args.ple_state_width
         self.hc_norm = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
+        use_hc8 = hc_int8_enabled() and (
+            config.quant is None
+            or config.quant.scheme_for(f"{prefix}.input_mix_weight_up") is None
+        )
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False,
-                output_sizes=[self.lowrank, self.hc_count + self.pad_size],
-                quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_down_block_inject",
-            )
+            if use_hc8:
+                self.input_mix_weight_down_block_inject = Int8G32Replicated(
+                    width,
+                    self.lowrank + self.hc_count + self.pad_size,
+                    output_sizes=[self.lowrank, self.hc_count + self.pad_size],
+                )
+            else:
+                self.input_mix_weight_down_block_inject = LinearReplicated(
+                    width,
+                    self.lowrank + self.hc_count + self.pad_size,
+                    has_bias=False,
+                    output_sizes=[self.lowrank, self.hc_count + self.pad_size],
+                    quant_config=config.quant,
+                    prefix=f"{prefix}.input_mix_weight_down_block_inject",
+                )
         else:
             self.pad_size = 0
-            self.input_mix_weight_down = LinearReplicated(
-                width, self.lowrank, has_bias=False,
-                quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_down",
+            if use_hc8:
+                self.input_mix_weight_down = Int8G32Replicated(width, self.lowrank)
+            else:
+                self.input_mix_weight_down = LinearReplicated(
+                    width,
+                    self.lowrank,
+                    has_bias=False,
+                    quant_config=config.quant,
+                    prefix=f"{prefix}.input_mix_weight_down",
+                )
+        if use_hc8:
+            self.input_mix_weight_up = Int8G32Replicated(self.lowrank, width)
+        else:
+            self.input_mix_weight_up = LinearReplicated(
+                self.lowrank,
+                width,
+                has_bias=False,
+                quant_config=config.quant,
+                prefix=f"{prefix}.input_mix_weight_up",
             )
-        self.input_mix_weight_up = LinearReplicated(
-            self.lowrank, width, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_up",
-        )
 
-    def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    def _down(self, rn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""
         if not self.use_combine:
             return self.input_mix_weight_down.forward(rn), None
         down = self.input_mix_weight_down_block_inject.forward(rn)
         # both slices keep unit inner stride, so the kernels read them without a copy
-        return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
+        return down[:, : self.lowrank], down[
+            :, self.lowrank : self.lowrank + self.hc_count
+        ]
 
-    def _mix_kernel(self, R: torch.Tensor, rn: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    def _mix_kernel(
+        self, R: torch.Tensor, rn: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if rn is None:
-            rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+            rn = grouped_gemma_rmsnorm(
+                R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count
+            )
         lora, s = self._down(rn)
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
 
-    def _mix_torch(self, R: torch.Tensor, rn: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    def _mix_torch(
+        self, R: torch.Tensor, rn: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if rn is None:
-            rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+            rn = grouped_plus_one_rms_norm(
+                R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count
+            )
         lora, s = self._down(rn)
         lora = F.silu(lora.float() / self.hc_count)
         gate = self.input_mix_weight_up.forward(lora.to(R.dtype))
-        mixed = torch.sigmoid(gate.float()).unflatten(-1, (self.hc_count, self.hidden_size))
+        mixed = torch.sigmoid(gate.float()).unflatten(
+            -1, (self.hc_count, self.hidden_size)
+        )
         mixed = mixed * rn.float().unflatten(-1, (self.hc_count, self.hidden_size))
         return mixed.mean(-2).to(R.dtype), s
 
-    def _combine_torch(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def _combine_torch(
+        self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor
+    ) -> torch.Tensor:
         inject = 2.0 * torch.sigmoid(s.float() / self.hc_count)
         out = R.float().unflatten(-1, (self.hc_count, self.hidden_size))
         out = out + y.float().unsqueeze(-2) * inject.unsqueeze(-1)
         return out.flatten(-2).to(R.dtype)
 
-    def mix(self, R: torch.Tensor, rn: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    def mix(
+        self, R: torch.Tensor, rn: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine).
 
         ``rn`` is the pre-normalized R from a preceding :meth:`combine_norm` (same norm weight as
         this block's ``hc_norm``), letting the caller fuse the two kernels; None recomputes it."""
         return self._mix_kernel(R, rn) if R.is_cuda else self._mix_torch(R, rn)
 
-    def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def combine(
+        self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor
+    ) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
         if R.is_cuda:
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
 
     def combine_norm(
-        self, R: torch.Tensor, y: torch.Tensor | tuple, s: torch.Tensor, next_block: "GatedResidual"
-    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        self,
+        R: torch.Tensor,
+        y: torch.Tensor | tuple,
+        s: torch.Tensor,
+        next_block: GatedResidual,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """combine() fused with ``next_block``'s hc_norm; returns (R', Rn'). CPU keeps the split path (Rn' = None).
 
         ``y`` may be an (routed, shared, gate) epilogue tuple: the shared-expert gate
@@ -170,8 +223,14 @@ class GatedResidual(BaseOP):
         if gated:
             routed, shared, gate = y
             return hc_combine_norm(
-                R, routed, s, next_block.hc_norm.weight, next_block.hc_norm.eps, self.hc_count,
-                shared=shared, gate=gate,
+                R,
+                routed,
+                s,
+                next_block.hc_norm.weight,
+                next_block.hc_norm.eps,
+                self.hc_count,
+                shared=shared,
+                gate=gate,
             )
         return hc_combine_norm(
             R, y, s, next_block.hc_norm.weight, next_block.hc_norm.eps, self.hc_count

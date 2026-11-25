@@ -4,9 +4,13 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
+from freetoken.kernel.triton.moe_shared_gate import (
+    shared_gate_mul_add,
+    shared_gate_sigmoid,
+)
 from freetoken.layers import LinearRowParallel, silu_and_mul
 from freetoken.layers.moe import OffloadMoELayer
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
@@ -48,15 +52,20 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         """
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate.forward(hidden_states)
-        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+        router_logits = self._compute_router_logits(hidden_states)
+        gate = shared_gate_sigmoid(
+            hidden_states, self.shared_expert_gate.weight.view(-1)
+        )
         se, ex = self.shared_expert, self.experts
         if (
             self._tp_size > 1
             and isinstance(se.down_proj, LinearRowParallel)
             and isinstance(ex, OffloadMoELayer)
         ):
-            shared = F.linear(silu_and_mul(se.gate_up_proj.forward(hidden_states)), se.down_proj.weight)
+            shared = F.linear(
+                silu_and_mul(se.gate_up_proj.forward(hidden_states)),
+                se.down_proj.weight,
+            )
             if get_global_ctx().batch.is_prefill:
                 routed = ex.prefill_forward(hidden_states, router_logits)
             else:
@@ -65,7 +74,11 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             return out.view(num_tokens, hidden_dim)
         shared = se.forward(hidden_states)
         routed = ex.forward(hidden_states=hidden_states, router_logits=router_logits)
-        return routed.view(num_tokens, hidden_dim), shared.view(num_tokens, hidden_dim), gate
+        return (
+            routed.view(num_tokens, hidden_dim),
+            shared.view(num_tokens, hidden_dim),
+            gate,
+        )
 
 
 __all__ = ["Qwen4ExpMoE"]

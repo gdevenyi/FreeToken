@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
-    fp8_dense_enabled,
-    fp8_lmhead_enabled,
-    mrope_layout_from_rope_params,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    fp8_dense_enabled,
+    fp8_lmhead_enabled,
+    int8_dense_enabled,
+    mrope_layout_from_rope_params,
 )
 from freetoken.models.qwen3_vl.config import parse_vision_config
 
@@ -28,7 +29,7 @@ class Qwen4ExpArgs:
     hc_count: int
     hc_lowrank: int
     # PLE n-gram embedding; layer ids are zero-based decoder layers.
-    ple_layer_ids: Tuple[int, ...]
+    ple_layer_ids: tuple[int, ...]
     ple_embed_dim: int
     ple_conv_kernel_size: int
     ngram_size: int
@@ -79,7 +80,7 @@ PLE_CONV_STATE = "ple_conv"
 PLE_NGRAM_STATE = "ple_ngram_ctx"
 
 
-def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
+def ple_slot_states(args: Qwen4ExpArgs) -> tuple[SlotStateSpec, ...]:
     """Per-request PLE state riding the linear-state slots (see LinearStatePool.slot_states)."""
     if not args.ple_layer_ids:
         return ()
@@ -131,6 +132,13 @@ def use_fp8_dense(config: ModelConfig, fused_module: str) -> bool:
     return config.quant is None or config.quant.scheme_for(fused_module) is None
 
 
+def use_int8_dense(config: ModelConfig, fused_module: str) -> bool:
+    """Whether a mixer runs as load-time symmetric ``int8 g32`` W8A16 (``C4b``)."""
+    if config.attn_quant != "int8_g32":
+        return False
+    return config.quant is None or config.quant.scheme_for(fused_module) is None
+
+
 def use_fp8_lmhead(config: ModelConfig) -> bool:
     """Whether the lm_head is load-time per-tensor FP8; the model builder and the weight reader must get one answer, or ``lm_head.weight_scale`` fails a strict load.
 
@@ -145,8 +153,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
     head_dim = (
-        getattr(text, "head_dim", None)
-        or text.hidden_size // text.num_attention_heads
+        getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads
     )
     num_kv_heads = getattr(text, "num_key_value_heads", text.num_attention_heads)
 
@@ -170,21 +177,31 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    # synthetic, for a checkpoint that ships these modules unquantized: use_fp8_dense applies it per mixer
-    attn_quant = "fp8_dynamic" if fp8_dense_enabled() else "none"
+    # synthetic, for a checkpoint that ships these modules unquantized: int8_g32 (C4b) takes precedence over fp8_dynamic when opted in
+    attn_quant = (
+        "int8_g32"
+        if int8_dense_enabled()
+        else ("fp8_dynamic" if fp8_dense_enabled() else "none")
+    )
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
     # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
-    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name(
+        "model.language_model.layers.0.mlp.experts.0.gate_proj"
+    )
     expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
-    ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
+    ple_layer_ids = tuple(
+        int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ())
+    )
     for lid in ple_layer_ids:
         if layer_types[lid] != "linear_attention":
-            raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
+            raise ValueError(
+                f"PLE must sit on a linear_attention layer, got layer {lid}"
+            )
 
     vision_config = parse_vision_config(hf_config)
     full_rotary = RotaryConfig(
@@ -282,7 +299,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         moe_enabled=num_experts > 0,
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
-        architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
+        architectures=getattr(
+            hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]
+        ),
         vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
@@ -293,4 +312,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "parse_config",
+    "ple_slot_states",
+]

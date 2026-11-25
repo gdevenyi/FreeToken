@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, ClassVar, Sequence
+from collections.abc import Sequence
+from typing import Any, ClassVar
 
 from freetoken.utils import init_logger
 
@@ -26,7 +27,9 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
         kernel = candidates[names.index(requested)]()
         reason = kernel.unusable_reason(cfg)
         if reason:
-            raise KernelSelectionError(f"kernel {requested!r} was requested but cannot run here: {reason}")
+            raise KernelSelectionError(
+                f"kernel {requested!r} was requested but cannot run here: {reason}"
+            )
         return kernel
     skipped: list[str] = []
     fallback = None
@@ -39,7 +42,9 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
         if kernel.worth_it(cfg):
             if skipped:
                 # every layer selects its own kernel
-                logger.info_once("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
+                logger.info_once(
+                    "kernel %s selected; skipped %s", kernel.name, "; ".join(skipped)
+                )
             return kernel
         if fallback is None:
             fallback = kernel
@@ -69,6 +74,7 @@ class QuantMethod(ABC):
     def scheme(self):
         return self.cfg.scheme
 
+
 def finalize_quant(root: Any) -> int:
     """Call ``quant_method.finalize(layer)`` on every layer under ``root``; returns the count."""
     from freetoken.layers.base import iter_ops
@@ -78,5 +84,8 @@ def finalize_quant(root: Any) -> int:
         method = getattr(op, "quant_method", None)
         if method is not None:
             method.finalize(op)
+            count += 1
+        elif hasattr(op, "finalize_quant"):
+            op.finalize_quant()
             count += 1
     return count

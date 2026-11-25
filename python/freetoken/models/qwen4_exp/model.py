@@ -15,23 +15,23 @@ immediate combine::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.models.config import fp8_dense_scale, fp8_lmhead_scale
+from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .config import PLE_NGRAM_STATE, use_fp8_dense, use_fp8_lmhead
+from .config import PLE_NGRAM_STATE, use_fp8_dense, use_fp8_lmhead, use_int8_dense
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
-from freetoken.models.blocks import embed_input_ids
-from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -44,6 +44,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
 
     g = config.linear_attention_group()
     dynamic_fp8 = use_fp8_dense(config, f"{prefix}.in_proj_qkvz")
+    int8_dense = use_int8_dense(config, f"{prefix}.in_proj_qkvz")
     return GatedDeltaNet(
         hidden_size=config.hidden_size,
         num_k_heads=g.num_key_heads,
@@ -59,6 +60,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         out_heads_tiled=config.qwen4_args.gdn_out_heads_tiled,
         dynamic_fp8=dynamic_fp8,
         fp8_channel=dynamic_fp8 and fp8_dense_scale() == "channel",
+        int8_dense=int8_dense,
     )
 
 
@@ -69,18 +71,30 @@ class Qwen4ExpDecoderLayer(BaseOP):
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
-            self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
+            self.linear_attn = build_linear_mixer(
+                config, layer_id, f"{prefix}.linear_attn"
+            )
         else:
-            self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
+            self.self_attn = Qwen4ExpAttention(
+                config, layer_id, prefix=f"{prefix}.self_attn"
+            )
         self.mlp = Qwen4ExpMoE(config, layer_id, prefix=f"{prefix}.mlp")
-        self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
-        self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
+        self.attn_hyper_connection = GatedResidual(
+            config, prefix=f"{prefix}.attn_hyper_connection"
+        )
+        self.mlp_hyper_connection = GatedResidual(
+            config, prefix=f"{prefix}.mlp_hyper_connection"
+        )
         self.ple = (
-            PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
+            PLELayer(config, layer_id, prefix=f"{prefix}.ple")
+            if layer_id in config.qwen4_args.ple_layer_ids
+            else None
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, hidden: torch.Tensor, batch: Batch, rn: torch.Tensor | None = None):
+    def forward(
+        self, hidden: torch.Tensor, batch: Batch, rn: torch.Tensor | None = None
+    ):
         """Returns (R, mlp_out, inject) un-combined: the caller fuses the mlp combine with the
         next consumer's norm (next layer's attn mix, or the final mixer)."""
         if self.ple is not None:
@@ -90,7 +104,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
-        hidden, rn_mlp = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
+        hidden, rn_mlp = self.attn_hyper_connection.combine_norm(
+            hidden, block_output, inject, self.mlp_hyper_connection
+        )
         block_input, inject = self.mlp_hyper_connection.mix(hidden, rn=rn_mlp)
         return hidden, self.mlp.forward_parts(block_input), inject
 
@@ -106,16 +122,22 @@ class Qwen4ExpModel(BaseOP):
         )
         self.layers = OPList(
             [
-                Qwen4ExpDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                Qwen4ExpDecoderLayer(
+                    config, layer_id, prefix=f"{prefix}.layers.{layer_id}"
+                )
                 for layer_id in range(config.num_layers)
             ]
         )
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        self.hyper_connection_mixer = GatedResidual(
+            config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer"
+        )
         # plain tuple (not an OP child), so it never shows up in the state dict
-        self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        self._ple = tuple(
+            layer.ple for layer in self.layers.op_list if layer.ple is not None
+        )
 
     @property
-    def ple_layers(self) -> List[PLELayer]:
+    def ple_layers(self) -> list[PLELayer]:
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
@@ -127,7 +149,9 @@ class Qwen4ExpModel(BaseOP):
             from .ple import build_ple_metadata, commit_ngram_context
 
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
-            for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
+            for ple in (
+                self._ple
+            ):  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
         features = batch.features
         wanted = features.wanted_layers if features is not None else ()
@@ -145,13 +169,21 @@ class Qwen4ExpModel(BaseOP):
                 )
                 rn = None
             else:
-                consumer = nxt.attn_hyper_connection if nxt is not None else self.hyper_connection_mixer
-                hidden, rn = layer.mlp_hyper_connection.combine_norm(hidden, mlp_out, inject, consumer)
+                consumer = (
+                    nxt.attn_hyper_connection
+                    if nxt is not None
+                    else self.hyper_connection_mixer
+                )
+                hidden, rn = layer.mlp_hyper_connection.combine_norm(
+                    hidden, mlp_out, inject, consumer
+                )
             if i in wanted:
                 features.layer_output(i, hidden, num_streams=self.hc_count)
         if meta is not None and meta.is_verify:
             # the commit rolls the context by the accepted rows only
-            get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+            get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(
+                meta
+            )
         elif meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
@@ -190,7 +222,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 num_embeddings=config.vocab_size,
                 embedding_dim=config.hidden_size,
                 tie_word_embeddings=config.tie_word_embeddings,
-                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                tied_embedding=self.model.embed_tokens
+                if config.tie_word_embeddings
+                else None,
                 quant_config=config.quant,
                 prefix="lm_head",
             )
@@ -217,9 +251,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 )
                 emb = ple.ple_embedding
                 emb.layer_multipliers.copy_(torch.tensor(mult, dtype=torch.int64))
-                emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
+                emb.ngram_heads_vocab_sizes.copy_(
+                    torch.tensor(sizes, dtype=torch.int64)
+                )
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
-                emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+                emb.attach_table(
+                    ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim)
+                )
             return 0
 
         override = getattr(engine_config, "ple_table", None)
@@ -229,7 +267,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             from .ple_disk import DiskRowTable, resolve_row_source, source_from_gguf
 
             # one WAIT node per captured graph: the flag protocol supports a single consume
-            assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
+            assert len(ple_layers) == 1, (
+                "disk PLE backend expects exactly one PLE layer"
+            )
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
             # hash with the state-dict-loaded constants, the same source the pinned path reads
             constants = {
@@ -242,12 +282,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             }
             rows = engine_config.decode_rows_per_req
             disk_table = DiskRowTable(
-                source_from_gguf(override) if override else resolve_row_source(engine_config.model_path),
+                source_from_gguf(override)
+                if override
+                else resolve_row_source(engine_config.model_path),
                 constants,
                 # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
-                max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
+                max_graph_rows=engine_config.max_running_req * rows
+                if rows > 1
+                else max(256, engine_config.cuda_graph_max_bs or 0),
                 # an eager decode or verify step stages max_running_req * rows tokens, which can exceed a prefill chunk
-                max_eager_tokens=max(engine_config.max_extend_tokens, engine_config.max_running_req * rows),
+                max_eager_tokens=max(
+                    engine_config.max_extend_tokens,
+                    engine_config.max_running_req * rows,
+                ),
             )
             self._ple_table = disk_table
             for ple in ple_layers:
@@ -271,10 +318,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             else:
                 table = load_ple_table_gguf(override, self._config.qwen4_args)
         elif is_lut4_ple_path(engine_config.model_path):
-            table = load_ple_table_lut4(engine_config.model_path, self._config.qwen4_args)
+            table = load_ple_table_lut4(
+                engine_config.model_path, self._config.qwen4_args
+            )
         elif is_gguf_path(engine_config.model_path):
-            raise ValueError("--ple-backend pinned preloads safetensors PLE shards or a BF16 --ple-table; "
-                             "a GGUF serves its own packed table with --ple-backend disk")
+            raise ValueError(
+                "--ple-backend pinned preloads safetensors PLE shards or a BF16 --ple-table; "
+                "a GGUF serves its own packed table with --ple-backend disk"
+            )
         else:
             table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
@@ -290,18 +341,33 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         return table.bank.nbytes
 
+    def prepare_for_runtime(self) -> None:
+        """Repack any ``Int8G32Linear`` dense / ``hc8`` projections into Marlin ``uint8b128`` on CUDA."""
+        from freetoken.layers import iter_ops
+        from freetoken.layers.int8_g32 import Int8G32Linear
+
+        for op in iter_ops(self):
+            if isinstance(op, Int8G32Linear):
+                op.prepare_marlin()
+
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         # the model hands its pre-mix streams to batch.features itself
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch), export_hidden=False)
+        return self.lm_head.forward(
+            self.model.forward(batch.input_ids, batch), export_hidden=False
+        )
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if config.is_multimodal:
-            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
-            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+            assert not config.vision_config.deepstack_visual_indexes, (
+                "Qwen3.8 consumes no DeepStack features"
+            )
+            self.visual = Qwen3VLVisionModel(
+                config.vision_config, quant_config=config.quant, prefix="visual"
+            )
 
 
 __all__ = [

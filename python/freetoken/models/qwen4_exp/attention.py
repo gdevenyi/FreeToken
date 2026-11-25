@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import (
@@ -28,11 +29,12 @@ from freetoken.layers import (
     LinearReplicated,
 )
 from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
+from freetoken.layers.int8_g32 import Int8G32ColMerged, Int8G32RowParallel
 from freetoken.layers.rotary import get_rope
 from freetoken.models.config import fp8_dense_scale
 from freetoken.utils import div_even, nvtx_annotate
 
-from .config import use_fp8_dense
+from .config import use_fp8_dense, use_int8_dense
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -58,7 +60,9 @@ class QSAIndexerInputs:
 
     q: torch.Tensor  # [T, index_n_heads, index_head_dim]
     k: torch.Tensor  # [T, index_head_dim]
-    q_norm_weight: torch.Tensor  # [index_head_dim], zero-centered: scale is (1 + w), fp32
+    q_norm_weight: (
+        torch.Tensor
+    )  # [index_head_dim], zero-centered: scale is (1 + w), fp32
     k_norm_weight: torch.Tensor  # [index_head_dim], zero-centered
     eps: float
 
@@ -94,10 +98,17 @@ class Qwen4ExpIndexer(BaseOP):
         self.num_kv_heads = args.index_kv_heads
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
-        self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
+        self._split = [
+            self.num_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
+        ]
         self.index_qk_proj = LinearReplicated(
-            args.hidden_size, sum(self._split), has_bias=False, output_sizes=self._split,
-            quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
+            args.hidden_size,
+            sum(self._split),
+            has_bias=False,
+            output_sizes=self._split,
+            quant_config=config.quant,
+            prefix=f"{prefix}.index_qk_proj",
         )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
@@ -141,25 +152,47 @@ class Qwen4ExpAttention(BaseOP):
         self._local_num_kv = div_even(self.num_kv, tp.size, allow_replicate=True)
         self._local_qo_dim = self._local_num_q * self.head_dim
         self._local_kv_dim = self._local_num_kv * self.head_dim
-        self._qkv_split = [self._local_qo_dim * 2, self._local_kv_dim, self._local_kv_dim]
+        self._qkv_split = [
+            self._local_qo_dim * 2,
+            self._local_kv_dim,
+            self._local_kv_dim,
+        ]
         qkv_sizes = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        if use_fp8_dense(config, f"{prefix}.qkv_proj"):  # W8A8 through _scaled_mm, weights quantized by the loader
+        if use_int8_dense(config, f"{prefix}.qkv_proj"):
+            self.qkv_proj = Int8G32ColMerged(
+                config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split
+            )
+            self.o_proj = Int8G32RowParallel(self.qo_attn_dim, config.hidden_size)
+        elif use_fp8_dense(
+            config, f"{prefix}.qkv_proj"
+        ):  # W8A8 through _scaled_mm, weights quantized by the loader
             channel = fp8_dense_scale() == "channel"
             self.qkv_proj = Fp8DynamicColMerged(
-                config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split, channel=channel
+                config.hidden_size,
+                qkv_sizes,
+                local_output_sizes=self._qkv_split,
+                channel=channel,
             )
-            self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size, channel=channel)
+            self.o_proj = Fp8DynamicRowParallel(
+                self.qo_attn_dim, config.hidden_size, channel=channel
+            )
         else:
             self.qkv_proj = LinearColParallelMerged(
-                config.hidden_size, qkv_sizes, has_bias=False,
+                config.hidden_size,
+                qkv_sizes,
+                has_bias=False,
                 local_output_sizes=self._qkv_split,
-                quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+                quant_config=config.quant,
+                prefix=f"{prefix}.qkv_proj",
             )
             # row-parallel: this rank's attention output is its own head slice, so o_proj takes the
             # sharded input and all-reduces; at TP=1 it is exactly LinearReplicated
             self.o_proj = LinearOProj(
-                self.qo_attn_dim, config.hidden_size, has_bias=False,
-                quant_config=config.quant, prefix=f"{prefix}.o_proj",
+                self.qo_attn_dim,
+                config.hidden_size,
+                has_bias=False,
+                quant_config=config.quant,
+                prefix=f"{prefix}.o_proj",
             )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -170,7 +203,9 @@ class Qwen4ExpAttention(BaseOP):
             max_position=rotary.max_position,
             base=rotary.base,
             rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
-            mrope_section=tuple(rotary.mrope_section) if rotary.mrope_section is not None else None,
+            mrope_section=tuple(rotary.mrope_section)
+            if rotary.mrope_section is not None
+            else None,
             mrope_layout=rotary.mrope_layout,
         )
         self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
@@ -186,11 +221,18 @@ class Qwen4ExpAttention(BaseOP):
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
         q, k = self.rotary.forward(
-            batch.get_attn_positions(), q.view(-1, self._local_qo_dim), k.view(-1, self._local_kv_dim)
+            batch.get_attn_positions(),
+            q.view(-1, self._local_qo_dim),
+            k.view(-1, self._local_kv_dim),
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(
-            q.view(-1, self._local_num_q, self.head_dim), k, v, index, self.layer_id, batch
+            q.view(-1, self._local_num_q, self.head_dim),
+            k,
+            v,
+            index,
+            self.layer_id,
+            batch,
         )
         gated = o.reshape(-1, self._local_qo_dim) * torch.sigmoid(gate)
         return self.o_proj.forward(gated)
@@ -224,7 +266,8 @@ class TorchDenseQSAReference:
     def _layer_cache(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         if layer_id not in self._cache:
             self._cache[layer_id] = tuple(
-                torch.zeros(self._shape, device=self._device, dtype=self._dtype) for _ in range(2)
+                torch.zeros(self._shape, device=self._device, dtype=self._dtype)
+                for _ in range(2)
             )
         return self._cache[layer_id]
 
@@ -249,7 +292,10 @@ class TorchDenseQSAReference:
             k_cache[slot, prefix : prefix + n] = k[rows]
             v_cache[slot, prefix : prefix + n] = v[rows]
             out[rows] = self._attend(
-                q[rows], k_cache[slot, : prefix + n], v_cache[slot, : prefix + n], prefix
+                q[rows],
+                k_cache[slot, : prefix + n],
+                v_cache[slot, : prefix + n],
+                prefix,
             )
             offset += n
         return out

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Protocol, Tuple, TypeAlias
+from typing import Any, ClassVar, Literal, Protocol, TypeAlias
 
 from freetoken.attention.base import AttnType
 
@@ -50,6 +50,24 @@ def fp8_lmhead_scale() -> str:
     return _fp8_scale_mode("FREETOKEN_FP8_LMHEAD_SCALE")
 
 
+def int8_dense_enabled() -> bool:
+    """Load-time symmetric ``int8 g32`` W8A16 for QSA/GDN dense projections (``C4b``, opt-in, default OFF):
+    cuts relative weight error from ~2.65% (FP8 E4M3) to ~0.56-0.84%. ``FREETOKEN_INT8_DENSE=1``."""
+    return os.getenv("FREETOKEN_INT8_DENSE", "0").strip().lower() in _ENV_TRUE
+
+
+def hc_int8_enabled() -> bool:
+    """Load-time symmetric ``int8 g32`` W8A16 for Hyper-Connection ``down``/``up`` mixers (``hc8``,
+    opt-in, default OFF): halves the 1.27 GB replicated HC footprint. ``FREETOKEN_HC_INT8=1``."""
+    return os.getenv("FREETOKEN_HC_INT8", "0").strip().lower() in _ENV_TRUE
+
+
+def fp32_router_enabled() -> bool:
+    """Evaluate MoE router ``gate`` GEMV in FP32 before softmax/top-k (opt-in, default OFF).
+    ``FREETOKEN_FP32_ROUTER=1``."""
+    return os.getenv("FREETOKEN_FP32_ROUTER", "0").strip().lower() in _ENV_TRUE
+
+
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
@@ -61,7 +79,11 @@ def detect_expert_quant(hf_config: Any) -> str:
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return "none"
-    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    get = (
+        quant.get
+        if isinstance(quant, dict)
+        else (lambda k, d=None: getattr(quant, k, d))
+    )
     algo = get("quant_algo") or get("quant_method")
     if algo is None:
         return "none"
@@ -74,9 +96,15 @@ def detect_expert_quant(hf_config: Any) -> str:
     # llm-compressor writes "mixed-precision" at the top when the groups differ (GLM-5.3-Flash: nvfp4 routed experts, fp8 MTP experts); the real format then sits in each group
     if fmt == "mixed-precision":
         groups = get("config_groups") or {}
-        groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
+        groups = [
+            g or {} for g in (groups.values() if isinstance(groups, dict) else [])
+        ]
         # groups that target the experts decide; only a generic ["Linear"] group falls back to all of them
-        expert_groups = [g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))]
+        expert_groups = [
+            g
+            for g in groups
+            if any("experts" in str(t) for t in (g.get("targets") or []))
+        ]
         for g in expert_groups or groups:
             if "nvfp4" in str(g.get("format") or "").lower():
                 return "nvfp4"
@@ -97,7 +125,11 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return False
-    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    get = (
+        quant.get
+        if isinstance(quant, dict)
+        else (lambda k, d=None: getattr(quant, k, d))
+    )
     if str(get("quant_method") or "").lower() != "compressed-tensors":
         return False
     groups = get("config_groups") or {}
@@ -105,9 +137,12 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     # the first NVFP4 group would accept a mixed {nvfp4, mxfp4} checkpoint (and the
     # error would depend on the groups' key order).
     saw_nvfp4 = False
-    for g in (groups.values() if isinstance(groups, dict) else []):
+    for g in groups.values() if isinstance(groups, dict) else []:
         w = (g or {}).get("weights") or {}
-        if int(w.get("num_bits", 0) or 0) != 4 or str(w.get("type", "")).lower() != "float":
+        if (
+            int(w.get("num_bits", 0) or 0) != 4
+            or str(w.get("type", "")).lower() != "float"
+        ):
             continue
         # vLLM's _is_nvfp4_format gates on the same two fields.
         group_size = int(w.get("group_size", 0) or 0)
@@ -129,7 +164,7 @@ class RotaryConfig:
     rotary_dim: int
     max_position: int
     base: float
-    scaling: Dict[str, Any] | None
+    scaling: dict[str, Any] | None
     # 3-axis rope sections; None keeps the 1-D rope path, set only when the model serves vision
     mrope_section: list | None = None
     mrope_layout: str = "contiguous"  # see freetoken.layers.rotary.build_section_table
@@ -154,7 +189,7 @@ def mrope_layout_from_rope_params(rope_params: Any) -> str:
 @dataclass(frozen=True)
 class KVCacheGroupSpec:
     name: str
-    layer_ids: Tuple[int, ...]
+    layer_ids: tuple[int, ...]
     num_kv_heads: int
     head_dim: int
     sliding_window: int | None
@@ -174,7 +209,7 @@ class KVCacheGroupSpec:
     attn_type: AttnType = AttnType.FULL
     # (layer, source) pairs: layers of this group that read the source's slab and own none.
     # They are not in ``layer_ids``, so neither the pool nor the cost model gives them a slab.
-    shared_layers: Tuple[Tuple[int, int], ...] = ()
+    shared_layers: tuple[tuple[int, int], ...] = ()
 
     @property
     def num_layers(self) -> int:
@@ -188,7 +223,7 @@ class KVCacheGroupSpec:
 @dataclass(frozen=True)
 class BaseAttentionGroupConfig:
     name: str
-    layer_ids: Tuple[int, ...]
+    layer_ids: tuple[int, ...]
 
     def owns_layer(self, layer_id: int) -> bool:
         return layer_id in self.layer_ids
@@ -318,8 +353,8 @@ class SlotStateSpec:
     """
 
     name: str
-    shape: Tuple[int, ...]
-    layer_ids: Tuple[int, ...] = ()
+    shape: tuple[int, ...]
+    layer_ids: tuple[int, ...] = ()
     dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
     fill_value: float = 0.0
     # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
@@ -391,7 +426,7 @@ class ModelConfig:
     output_multiplier: float | None = None
     vision_config: Any | None = None
     image_token_id: int | None = None
-    attention_groups: Tuple[AttentionGroupConfig, ...] = ()
+    attention_groups: tuple[AttentionGroupConfig, ...] = ()
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
@@ -428,10 +463,10 @@ class ModelConfig:
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
     # (layer, source) pairs: the layer attends over the KV the source layer stored and stores none
-    kv_shared_layers: Tuple[Tuple[int, int], ...] = ()
+    kv_shared_layers: tuple[tuple[int, int], ...] = ()
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
-    slot_states: Tuple[SlotStateSpec, ...] = ()
+    slot_states: tuple[SlotStateSpec, ...] = ()
 
     @property
     def is_moe(self) -> bool:
@@ -454,7 +489,8 @@ class ModelConfig:
     def model_is_mrope(self) -> bool:
         """True when any full-attention layer uses 3-axis (t/h/w) rope positions."""
         return any(
-            getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None
+            getattr(getattr(g, "rotary_config", None), "mrope_section", None)
+            is not None
             for g in self.attention_groups
         )
 
@@ -464,7 +500,10 @@ class ModelConfig:
 
     @property
     def has_swa_attention(self) -> bool:
-        return any(isinstance(group, SWAAttentionGroupConfig) for group in self.attention_groups)
+        return any(
+            isinstance(group, SWAAttentionGroupConfig)
+            for group in self.attention_groups
+        )
 
     @property
     def has_linear_attention(self) -> bool:
@@ -513,7 +552,9 @@ class ModelConfig:
         return groups[0] if groups else None
 
     def is_swa_layer(self, layer_id: int) -> bool:
-        return isinstance(self.attention_group_for_layer(layer_id), SWAAttentionGroupConfig)
+        return isinstance(
+            self.attention_group_for_layer(layer_id), SWAAttentionGroupConfig
+        )
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return isinstance(
@@ -533,7 +574,7 @@ class ModelConfig:
             return AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4
         return _full_group_attn_type(group)
 
-    def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
+    def kv_cache_group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
         if not self.attention_groups:
             return (
                 KVCacheGroupSpec(
@@ -550,7 +591,9 @@ class ModelConfig:
         def split(group) -> dict:
             return dict(
                 layer_ids=tuple(i for i in group.layer_ids if i not in sources),
-                shared_layers=tuple((i, sources[i]) for i in group.layer_ids if i in sources),
+                shared_layers=tuple(
+                    (i, sources[i]) for i in group.layer_ids if i in sources
+                ),
             )
 
         specs: list[KVCacheGroupSpec] = []
@@ -592,12 +635,14 @@ class ModelConfig:
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4,
+                        attn_type=AttnType.DSV41
+                        if group.variant == "v41"
+                        else AttnType.DSV4,
                     )
                 )
         return tuple(specs)
 
-    def kv_cache_groups(self) -> List[Tuple[int, int, int]]:
+    def kv_cache_groups(self) -> list[tuple[int, int, int]]:
         """Return ``[(num_layers, num_kv_heads, head_dim), ...]`` per KV group.
 
         This legacy memory-accounting helper is derived from the SGLang-style

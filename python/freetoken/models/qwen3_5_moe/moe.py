@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
+
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -11,6 +13,7 @@ from freetoken.layers import (
     make_moe_layer,
     silu_and_mul,
 )
+from freetoken.models.config import fp32_router_enabled
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -20,15 +23,26 @@ class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
     def __init__(
-        self, config: ModelConfig, hidden_size: int, intermediate_size: int, *, prefix: str = ""
+        self,
+        config: ModelConfig,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        prefix: str = "",
     ):
         self.gate_up_proj = LinearColParallelMerged(
-            hidden_size, [intermediate_size, intermediate_size], has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.gate_up_proj",
+            hidden_size,
+            [intermediate_size, intermediate_size],
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = LinearRowParallel(
-            intermediate_size, hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.down_proj",
+            intermediate_size,
+            hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -42,7 +56,9 @@ class Qwen3_5DenseMLP(_SharedExpert):
     (``...layers.N.mlp.{gate_up_proj,down_proj}``)."""
 
     def __init__(self, config: ModelConfig, *, prefix: str = ""):
-        super().__init__(config, config.hidden_size, config.intermediate_size, prefix=prefix)
+        super().__init__(
+            config, config.hidden_size, config.intermediate_size, prefix=prefix
+        )
 
 
 class Qwen3_5MoE(BaseOP):
@@ -53,7 +69,9 @@ class Qwen3_5MoE(BaseOP):
     Router softmaxes over all experts, takes top-k, and renormalizes (HF semantics).
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int | None = None, *, prefix: str = ""):
+    def __init__(
+        self, config: ModelConfig, layer_id: int | None = None, *, prefix: str = ""
+    ):
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
@@ -62,12 +80,24 @@ class Qwen3_5MoE(BaseOP):
             prefix=f"{prefix}.experts",
         )
         # routers stay bf16 whatever the checkpoint quantizes
-        self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        self.gate = LinearReplicated(
+            config.hidden_size, config.num_experts, has_bias=False
+        )
         self.shared_expert = _SharedExpert(
-            config, config.hidden_size, config.shared_expert_intermediate_size,
+            config,
+            config.hidden_size,
+            config.shared_expert_intermediate_size,
             prefix=f"{prefix}.shared_expert",
         )
-        self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
+        self.shared_expert_gate = LinearReplicated(
+            config.hidden_size, 1, has_bias=False
+        )
+        self._fp32_router = fp32_router_enabled()
+
+    def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._fp32_router:
+            return F.linear(hidden_states.float(), self.gate.weight.float())
+        return self.gate.forward(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -75,11 +105,13 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = self.gate.forward(hidden_states)
+        router_logits = self._compute_router_logits(hidden_states)
         shared = self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        routed = self.experts.forward(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
         return (routed + shared).view(num_tokens, hidden_dim)
 
 
-__all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP"]
+__all__ = ["Qwen3_5DenseMLP", "Qwen3_5MoE"]

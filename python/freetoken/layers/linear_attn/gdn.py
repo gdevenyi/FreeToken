@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
+from freetoken.kernel.causal_conv1d import (
+    causal_conv1d_decode,
+    causal_conv1d_varlen,
+    causal_conv1d_verify,
+)
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
 from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.layers.quantization import QuantConfig
@@ -32,16 +37,29 @@ class GatedDeltaNet(BaseOP):
     """
 
     def __init__(
-        self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-        conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "silu",
-        *, quant_config: QuantConfig | None = None, prefix: str = "", out_heads_tiled: bool = False,
+        self,
+        hidden_size,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        conv_kernel_size,
+        rms_norm_eps,
+        layer_id,
+        output_gate: str = "silu",
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
+        out_heads_tiled: bool = False,
         dynamic_fp8: bool = False,
         fp8_channel: bool = False,
+        int8_dense: bool = False,
     ):
         self.layer_id = layer_id
         self._out_heads_tiled = out_heads_tiled
-        # load-time per-tensor FP8: splits the fusion as a quantized checkpoint does, for a checkpoint that declares no scheme here
+        # load-time per-tensor FP8 or int8 g32: splits the fusion as a quantized checkpoint does
         self._dynamic_fp8 = dynamic_fp8
+        self._int8_dense = int8_dense
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
         # hybrid-radix snapshot scatter h[h_row]->slot is a plain copy) only when the two head
@@ -67,40 +85,71 @@ class GatedDeltaNet(BaseOP):
         self._local_conv_dim = 2 * self._local_key_dim + self._local_value_dim
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
         self._split_in_proj = (
-            quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
+            quant_config is not None
+            and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
         self._in_proj_split = [
-            self._local_conv_dim, self._local_value_dim,
-            self._local_num_v_heads, self._local_num_v_heads,
+            self._local_conv_dim,
+            self._local_value_dim,
+            self._local_num_v_heads,
+            self._local_num_v_heads,
         ]
         # the two linears of a checkpoint-declared scheme are not sharded per rank
-        assert not (tp.size > 1 and self._split_in_proj), "GDN TP shards bf16 or load-time fp8 projections only"
-        if self._dynamic_fp8:
+        assert not (tp.size > 1 and self._split_in_proj), (
+            "GDN TP shards bf16 or load-time fp8 projections only"
+        )
+        if self._int8_dense:
+            from freetoken.layers.int8_g32 import Int8G32ColMerged
+
+            self.in_proj_qkvz = Int8G32ColMerged(
+                hidden_size,
+                [self.conv_dim, self.value_dim],
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
+            )
+            self.in_proj_ba = LinearColParallelMerged(
+                hidden_size,
+                [num_v_heads, num_v_heads],
+                has_bias=False,
+                local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
+            )
+        elif self._dynamic_fp8:
             self.in_proj_qkvz = Fp8DynamicColMerged(
-                hidden_size, [self.conv_dim, self.value_dim],
+                hidden_size,
+                [self.conv_dim, self.value_dim],
                 local_output_sizes=[self._local_conv_dim, self._local_value_dim],
                 channel=fp8_channel,
             )
             self.in_proj_ba = LinearColParallelMerged(
-                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                hidden_size,
+                [num_v_heads, num_v_heads],
+                has_bias=False,
                 local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
             )
         elif self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
+                hidden_size,
+                [self.conv_dim, self.value_dim],
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
-                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
+                hidden_size,
+                [num_v_heads, num_v_heads],
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_ba",
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim, num_v_heads, num_v_heads],
-                has_bias=False, local_output_sizes=self._in_proj_split,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj",
+                hidden_size,
+                [self.conv_dim, self.value_dim, num_v_heads, num_v_heads],
+                has_bias=False,
+                local_output_sizes=self._in_proj_split,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self._local_conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
@@ -111,12 +160,21 @@ class GatedDeltaNet(BaseOP):
         self.A_log = torch.empty(self._local_num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         # row-parallel: it takes this rank's v heads and all-reduces; at TP=1 it is exactly LinearReplicated
-        if self._dynamic_fp8:
-            self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size, channel=fp8_channel)
+        if self._int8_dense:
+            from freetoken.layers.int8_g32 import Int8G32RowParallel
+
+            self.out_proj = Int8G32RowParallel(self.value_dim, hidden_size)
+        elif self._dynamic_fp8:
+            self.out_proj = Fp8DynamicRowParallel(
+                self.value_dim, hidden_size, channel=fp8_channel
+            )
         else:
             self.out_proj = LinearOProj(
-                self.value_dim, hidden_size, has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.out_proj",
+                self.value_dim,
+                hidden_size,
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.out_proj",
             )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
@@ -127,22 +185,34 @@ class GatedDeltaNet(BaseOP):
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel] for the fused kernel
 
-    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state) -> torch.Tensor:
+    def _conv_prefill(
+        self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state
+    ) -> torch.Tensor:
         """Varlen causal conv (fused sgl_kernel) with silu; reads/updates each request's
         conv state in place by ``cache_indices`` slot. ``conv_in`` [total, conv_dim].
         ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
         li = pool.local_index(self.layer_id)
         x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
-        out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state)
+        out = causal_conv1d_varlen(
+            x,
+            self._conv_weight(),
+            pool.conv_states[li],
+            cu_seqlens,
+            cache_indices,
+            has_initial_state,
+        )
         return out.transpose(0, 1)  # [total, conv_dim]
 
-    def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
+    def _conv_decode(
+        self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool
+    ) -> torch.Tensor:
         """Single-token causal conv update (fused sgl_kernel) by ``table_idx`` slot;
         updates conv state in place, no host loop -> CUDA-graph capturable.
         ``conv_in`` [B, conv_dim] -> silu(conv) [B, conv_dim]."""
         li = pool.local_index(self.layer_id)
-        return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
+        return causal_conv1d_decode(
+            conv_in, pool.conv_states[li], self._conv_weight(), table_idx
+        )
 
     def _conv_verify(self, conv_in: torch.Tensor, fla, pool) -> torch.Tensor:
         """Causal conv over a verify batch's rows: rolls the live conv state as if every row were accepted and parks each row's window in ``fla.verify_scratch``."""
@@ -151,11 +221,18 @@ class GatedDeltaNet(BaseOP):
         bs = fla.cu_seqlens.numel() - 1
         # free views both ways: the conv reads any strides and writes token-major output
         x = conv_in.reshape(bs, total // bs, -1).transpose(1, 2)
-        out = causal_conv1d_verify(x, pool.conv_states[li], self._conv_weight(), fla.cache_indices, fla.verify_scratch.conv_window[li])
+        out = causal_conv1d_verify(
+            x,
+            pool.conv_states[li],
+            self._conv_weight(),
+            fla.cache_indices,
+            fla.verify_scratch.conv_window[li],
+        )
         return out.transpose(1, 2).reshape(total, -1)
 
-    def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
-                              h: torch.Tensor, fla) -> None:
+    def _write_track_snapshot(
+        self, pool, li: int, conv_in: torch.Tensor, h: torch.Tensor, fla
+    ) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
         SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
@@ -165,7 +242,9 @@ class GatedDeltaNet(BaseOP):
         rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
-        conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
+        conv_win = (
+            conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()
+        )  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -186,7 +265,7 @@ class GatedDeltaNet(BaseOP):
             batch.fla_metadata = fla
 
         nk, nv = self._local_num_k_heads, self._local_num_v_heads
-        if self._split_in_proj or self._dynamic_fp8:
+        if self._split_in_proj or self._dynamic_fp8 or self._int8_dense:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, self._in_proj_split[:2], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
@@ -209,25 +288,37 @@ class GatedDeltaNet(BaseOP):
             if verify:
                 mixed = self._conv_verify(conv_in, fla, pool)
             else:
-                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+                mixed = self._conv_decode(
+                    conv_in, fla.cache_indices, pool
+                )  # [B, conv_dim]
             qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
             q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, nk, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, nv, self.head_v_dim).to(dtype)
             core_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log, a=a, dt_bias=self.dt_bias,  # already fp32 (stored fp32)
-                softplus_beta=1.0, softplus_threshold=20.0,
-                q=q, k=k, v=v, b=b,
+                A_log=self.A_log,
+                a=a,
+                dt_bias=self.dt_bias,  # already fp32 (stored fp32)
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
                 initial_state_source=pool.recurrent_states[li],
                 initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
-                scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
-                disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
+                scale=self.head_k_dim**-0.5,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=fla.cu_seqlens,
+                disable_state_update=verify,
+                input_stash=fla.verify_scratch.input_stash(li) if verify else None,
             )[0]  # [total, num_v, V]
         else:
             from freetoken.kernel.fla import chunk_gated_delta_rule
 
             mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state
+            )
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
             q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
@@ -241,9 +332,16 @@ class GatedDeltaNet(BaseOP):
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             o, _, h = chunk_gated_delta_rule(
-                q=q, k=k, v=v, g=g, beta=beta, scale=self.head_k_dim ** -0.5,
-                initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices.to(torch.int32),
-                cu_seqlens=fla.cu_seqlens.to(torch.int64), head_first=False,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=self.head_k_dim**-0.5,
+                initial_state=pool.recurrent_states[li],
+                initial_state_indices=fla.cache_indices.to(torch.int32),
+                cu_seqlens=fla.cu_seqlens.to(torch.int64),
+                head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
             core_out = o[0]  # [total, num_v_heads, head_v_dim]
@@ -256,7 +354,11 @@ class GatedDeltaNet(BaseOP):
         if self._out_heads_tiled:
             # grouped value heads (k-head major) -> tiled (k-head minor), the column order of a GGUF ssm_out
             r = nv // nk
-            out = out.view(total, nk, r, self.head_v_dim).transpose(1, 2).reshape(total, -1)
+            out = (
+                out.view(total, nk, r, self.head_v_dim)
+                .transpose(1, 2)
+                .reshape(total, -1)
+            )
         return self.out_proj.forward(out)
 
 
