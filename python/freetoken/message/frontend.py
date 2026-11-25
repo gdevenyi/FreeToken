@@ -70,6 +70,8 @@ class UserReply(BaseFrontendMsg):
     # Where this token's text starts in the generated text, even while a stop-string
     # prefix holds it back (completions logprobs.text_offset).
     text_offset: int = 0
+    # Passthrough of DetokenizeMsg.kld (the /v1/internal/kld endpoint's per-row statistics).
+    kld: dict | None = None
 
 
 @dataclass

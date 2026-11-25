@@ -264,6 +264,7 @@ def tokenize_worker(
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                         timings=msg.timings,
+                        kld=msg.kld,
                         # a message carries logprobs only for its one committed token
                         logprobs=(
                             build_logprobs_entry(

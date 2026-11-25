@@ -29,6 +29,7 @@ from freetoken.layers import (
 )
 from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.layers.rotary import get_rope
+from freetoken.models.config import fp8_dense_scale
 from freetoken.utils import div_even, nvtx_annotate
 
 from .config import use_fp8_dense
@@ -143,10 +144,11 @@ class Qwen4ExpAttention(BaseOP):
         self._qkv_split = [self._local_qo_dim * 2, self._local_kv_dim, self._local_kv_dim]
         qkv_sizes = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         if use_fp8_dense(config, f"{prefix}.qkv_proj"):  # W8A8 through _scaled_mm, weights quantized by the loader
+            channel = fp8_dense_scale() == "channel"
             self.qkv_proj = Fp8DynamicColMerged(
-                config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split
+                config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split, channel=channel
             )
-            self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size)
+            self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size, channel=channel)
         else:
             self.qkv_proj = LinearColParallelMerged(
                 config.hidden_size, qkv_sizes, has_bias=False,

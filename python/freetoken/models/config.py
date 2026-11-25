@@ -26,6 +26,30 @@ def fp8_lmhead_enabled() -> bool:
     return os.getenv("FREETOKEN_FP8_LMHEAD", "0").strip().lower() in _ENV_TRUE
 
 
+FP8_SCALE_MODES = ("tensor", "channel")
+
+
+def _fp8_scale_mode(var: str) -> str:
+    mode = os.getenv(var, "").strip().lower() or "tensor"
+    if mode not in FP8_SCALE_MODES:
+        raise ValueError(
+            f"{var}={mode!r}: expected one of {', '.join(FP8_SCALE_MODES)}"
+        )
+    return mode
+
+
+def fp8_dense_scale() -> str:
+    """Weight-scale granularity of the load-time FP8 dense projections: ``"tensor"`` (default, one fp32
+    scale per tensor per rank) or ``"channel"`` (one per output row per rank, applied after the GEMM).
+    ``FREETOKEN_FP8_DENSE_SCALE``. The model builder and the weight reader must get one answer."""
+    return _fp8_scale_mode("FREETOKEN_FP8_DENSE_SCALE")
+
+
+def fp8_lmhead_scale() -> str:
+    """As :func:`fp8_dense_scale`, for the FP8 lm_head (one scale per vocab row). ``FREETOKEN_FP8_LMHEAD_SCALE``."""
+    return _fp8_scale_mode("FREETOKEN_FP8_LMHEAD_SCALE")
+
+
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export

@@ -465,6 +465,8 @@ class CacheManager:
             self.lock(new_handle)
 
     def _donate_policy(self, req: Req) -> str:
+        if req.sampling_params.kld is not None:
+            return "none"
         if not req.sampling_params.is_logprob_read:
             return "all"
         return "none" if self.isolate_logprob_reads else self.logprob_read_snapshot_donate

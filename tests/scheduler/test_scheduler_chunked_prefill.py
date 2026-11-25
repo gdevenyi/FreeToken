@@ -286,11 +286,12 @@ def _passes(pm, cm, prompts, budget, isolate=True):
     from freetoken.scheduler.utils import PendingReq
 
     pm.isolate_logprob_reads = isolate
-    pm.pending_list = [
-        PendingReq(uid, torch.arange(n, dtype=torch.int32),
-                   SamplingParams(max_tokens=1, logprobs=True) if read else SamplingParams(max_tokens=4))
-        for uid, n, read in prompts
-    ]
+    kinds = {
+        READ: SamplingParams(max_tokens=1, logprobs=True),
+        CHAT: SamplingParams(max_tokens=4),
+        KLD: SamplingParams(max_tokens=1, kld={"path": "unused", "chunk": 0, "slice_rows": 16}),
+    }
+    pm.pending_list = [PendingReq(uid, torch.arange(n, dtype=torch.int32), kinds[kind]) for uid, n, kind in prompts]
     passes = []
     while pm.runnable:
         batch = pm.schedule_next_batch(budget)
@@ -301,7 +302,7 @@ def _passes(pm, cm, prompts, budget, isolate=True):
     return passes
 
 
-READ, CHAT = True, False
+READ, CHAT, KLD = "read", "chat", "kld"
 
 
 @pytest.mark.parametrize(
@@ -324,6 +325,10 @@ def test_isolation_off_keeps_reads_batched():
     cm, _tm, _dm, pm = _build_managers(num_pages=64)
     prompts = [(1, 5, READ), (2, 6, READ), (3, 4, CHAT)]
     assert _passes(pm, cm, prompts, budget=32, isolate=False) == [[(1, 5), (2, 6), (3, 4)]]
+    # a KLD chunk prefills alone and cold without the flag: its rows are the measurement
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompts = [(1, 5, CHAT), (2, 6, KLD), (3, 4, CHAT)]
+    assert _passes(pm, cm, prompts, budget=32, isolate=False) == [[(1, 5)], [(2, 6)], [(3, 4)]]
 
 
 def test_isolated_chunked_read_continuations_stay_alone():

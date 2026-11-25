@@ -23,7 +23,13 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
-from freetoken.models.config import VISION_KEY_PREFIXES, fp8_dense_enabled, fp8_lmhead_enabled
+from freetoken.models.config import (
+    VISION_KEY_PREFIXES,
+    fp8_dense_enabled,
+    fp8_dense_scale,
+    fp8_lmhead_enabled,
+    fp8_lmhead_scale,
+)
 from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -328,7 +334,7 @@ def _shard_vision(name: str, t: torch.Tensor, vc, rank: int, world: int) -> torc
     return t
 
 
-# Load-time per-tensor FP8 (use_fp8_dense, layers/fp8_dynamic.py): these keep their name and gain a sibling ``weight_scale``;
+# Load-time FP8, per tensor or per channel (use_fp8_dense, fp8_dense_scale, layers/fp8_dynamic.py): these keep their name and gain a sibling ``weight_scale``;
 # GDN ``in_proj`` splits into the fp8 ``in_proj_qkvz`` and the bf16 ``in_proj_ba`` (the gate rows stay bf16, as in block-fp8 checkpoints).
 _FP8_DENSE_SUFFIXES = (
     ".self_attn.qkv_proj.weight",
@@ -347,10 +353,26 @@ def _quantize_per_tensor(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (w / scale).clamp_(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), scale.reshape(())
 
 
+def _quantize_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(e4m3 weight, fp32 scale [rows])`` with ``w ~= weight * scale[:, None]``: one scale per output row.
+
+    E4M3 rounds relative to the value (3 mantissa bits), so a row scale only helps rows whose range is far
+    below the tensor's (per-tensor scaling makes them subnormal); for normal weights the error is the same."""
+    w = w.float()
+    scale = (w.abs().amax(dim=1) / _E4M3_MAX).clamp_min(1e-12)
+    w8 = (w / scale[:, None]).clamp_(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+    return w8, scale
+
+
 def _fp8_dense(
     name: str, t: torch.Tensor, config, world: int, *, dense: bool = True, lm_head: bool = False,
+    dense_channel: bool = False, lmhead_channel: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """The (already sharded) dense tensor as the fp8_dynamic model expects it."""
+    """The (already sharded) dense tensor as the fp8_dynamic model expects it.
+
+    ``dense_channel`` / ``lmhead_channel``: one weight scale per output row of this rank's shard (see
+    ``fp8_dense_scale``); the default is one scale per tensor per rank."""
+    dense_quant = _quantize_per_channel if dense_channel else _quantize_per_tensor
     if dense and name.endswith(".linear_attn.in_proj.weight"):
         g = config.linear_attention_group()
         nk = div_even(g.num_key_heads, world, allow_replicate=True)
@@ -358,13 +380,17 @@ def _fp8_dense(
         qkvz = 2 * nk * g.key_head_dim + 2 * nv * g.value_head_dim  # [q | k | v | z] local rows
         assert t.shape[0] == qkvz + 2 * nv, (name, t.shape, qkvz, nv)
         base = name[: -len("in_proj.weight")]
-        w8, scale = _quantize_per_tensor(t[:qkvz])
+        w8, scale = dense_quant(t[:qkvz])
         yield base + "in_proj_qkvz.weight", w8
         yield base + "in_proj_qkvz.weight_scale", scale
         # clone, not contiguous(): a contiguous row slice comes back as a view, which keeps the whole bf16 in_proj resident
         yield base + "in_proj_ba.weight", t[qkvz:].clone()
-    elif (dense and name.endswith(_FP8_DENSE_SUFFIXES)) or (lm_head and name.endswith(_FP8_LMHEAD_SUFFIX)):
-        w8, scale = _quantize_per_tensor(t)
+    elif dense and name.endswith(_FP8_DENSE_SUFFIXES):
+        w8, scale = dense_quant(t)
+        yield name, w8
+        yield name[: -len("weight")] + "weight_scale", scale
+    elif lm_head and name.endswith(_FP8_LMHEAD_SUFFIX):
+        w8, scale = (_quantize_per_channel if lmhead_channel else _quantize_per_tensor)(t)
         yield name, w8
         yield name[: -len("weight")] + "weight_scale", scale
     else:
@@ -387,16 +413,24 @@ def dense_emitter(config, rank: int, world: int):
     the builder's QuantConfig) may be None only for a plain TP=1 bf16 read. The safetensors and GGUF readers share it."""
     lmhead = config is not None and use_fp8_lmhead(config)
     fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+    dense_channel = fp8 and fp8_dense_scale() == "channel"
+    lmhead_channel = lmhead and fp8_lmhead_scale() == "channel"
     if fp8:
-        logger.info("qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), FREETOKEN_FP8_DENSE=1")
+        logger.info(
+            f"qwen4_exp dense projections: load-time per-{'channel' if dense_channel else 'tensor'} FP8 "
+            "(W8A8 via _scaled_mm), FREETOKEN_FP8_DENSE=1"
+        )
     if lmhead:
-        logger.info("qwen4_exp lm_head: load-time per-tensor FP8, FREETOKEN_FP8_LMHEAD=1")
+        logger.info(f"qwen4_exp lm_head: load-time per-{'channel' if lmhead_channel else 'tensor'} FP8, FREETOKEN_FP8_LMHEAD=1")
 
     def emit(name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
         tensor = _shard(name, tensor, config, rank, world)
         dense = fp8 and _fp8_dense_applies(name, config)
         if dense or lmhead:
-            yield from _fp8_dense(name, tensor, config, world, dense=dense, lm_head=lmhead)
+            yield from _fp8_dense(
+                name, tensor, config, world, dense=dense, lm_head=lmhead,
+                dense_channel=dense_channel, lmhead_channel=lmhead_channel,
+            )
         else:
             yield name, tensor
 
@@ -537,13 +571,14 @@ def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[st
         else None
     )
     fp8 = draft_cfg is not None and draft_cfg.attn_quant == "fp8_dynamic"
+    dense_channel = fp8 and fp8_dense_scale() == "channel"
 
     def emit(raw_out_name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
         name = raw_out_name.removeprefix("mtp.")
         if draft_cfg is not None:
             tensor = _shard(name, tensor, draft_cfg, tp.rank, tp.size)
         if fp8 and _fp8_dense_applies(raw_out_name, draft_cfg):
-            yield from _fp8_dense(name, tensor, draft_cfg, tp.size, dense=True, lm_head=False)
+            yield from _fp8_dense(name, tensor, draft_cfg, tp.size, dense=True, lm_head=False, dense_channel=dense_channel)
         else:
             yield name, tensor
 

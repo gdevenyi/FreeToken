@@ -36,6 +36,7 @@ class GatedDeltaNet(BaseOP):
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "silu",
         *, quant_config: QuantConfig | None = None, prefix: str = "", out_heads_tiled: bool = False,
         dynamic_fp8: bool = False,
+        fp8_channel: bool = False,
     ):
         self.layer_id = layer_id
         self._out_heads_tiled = out_heads_tiled
@@ -79,6 +80,7 @@ class GatedDeltaNet(BaseOP):
             self.in_proj_qkvz = Fp8DynamicColMerged(
                 hidden_size, [self.conv_dim, self.value_dim],
                 local_output_sizes=[self._local_conv_dim, self._local_value_dim],
+                channel=fp8_channel,
             )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
@@ -110,7 +112,7 @@ class GatedDeltaNet(BaseOP):
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         # row-parallel: it takes this rank's v heads and all-reduces; at TP=1 it is exactly LinearReplicated
         if self._dynamic_fp8:
-            self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size)
+            self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size, channel=fp8_channel)
         else:
             self.out_proj = LinearOProj(
                 self.value_dim, hidden_size, has_bias=False,

@@ -1028,6 +1028,64 @@ async def generate(req: GenerateRequest, request: Request):
     )
 
 
+class KldRequest(BaseModel):
+    # a path on the server host; an empty chunk list returns the file's header only
+    base_path: str
+    chunks: list[int] | None = None
+    slice_rows: int = Field(16, ge=1, le=4096)
+    # only for a base run that replaced token 0 by BOS (llama.cpp, when the GGUF has add_bos)
+    bos_token_id: int | None = Field(None, ge=0)
+
+
+async def run_kld(state: Any, req: KldRequest) -> JSONResponse:
+    """Score base chunks one after another, each as its own max_tokens=1 token-id request."""
+    from freetoken.benchmark.kld import KldBase, new_chunk_result, summarize
+
+    try:
+        base = KldBase.open(req.base_path)
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": f"kld: {exc}"}, status_code=400)
+    chunks = list(range(base.n_chunk)) if req.chunks is None else req.chunks
+    if bad := [c for c in chunks if not 0 <= c < base.n_chunk]:
+        return JSONResponse({"error": f"kld: chunks {bad} outside 0..{base.n_chunk - 1}"}, status_code=400)
+    results: list[dict[str, Any]] = []
+    for chunk in chunks:
+        ids = base.tokens(chunk).tolist()
+        if req.bos_token_id is not None:
+            ids[0] = req.bos_token_id
+        spec = {"path": base.path, "chunk": chunk, "slice_rows": req.slice_rows, "bos_token_id": req.bos_token_id}
+        uid = state.new_user()
+        try:
+            await send_new_request(state, uid, TokenizeMsg(
+                uid=uid, text="", input_ids=ids,
+                sampling_params=SamplingParams(max_tokens=1, ignore_eos=True, kld=spec),
+            ))
+        except GenerationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        result, error = None, "kld: the scheduler sent no terminal reply"
+        async with contextlib.aclosing(state.wait_for_ack(uid)) as acks:
+            async for ack in acks:
+                if ack.finished:
+                    result = ack.kld if ack.error is None else None
+                    error = ack.error or "kld: the terminal reply carried no statistics"
+                    break
+        results.append(result if result is not None else {**new_chunk_result(chunk), "error": error})
+    return JSONResponse({
+        "base": base.describe(), "slice_rows": req.slice_rows, "bos_token_id": req.bos_token_id,
+        "chunks": results, "summary": summarize(results),
+    })
+
+
+@app.post("/v1/internal/kld")
+async def internal_kld(req: KldRequest):
+    state = get_global_state()
+    if not getattr(state.config, "kld_endpoint", False):
+        return JSONResponse({"error": "not found: start the server with --enable-kld-endpoint"}, status_code=404)
+    if (rejection := _maintenance_rejection(state, "score KLD chunks")) is not None:
+        return rejection
+    return await run_kld(state, req)
+
+
 def _install_shell_stop_handlers() -> None:
     """Shell mode runs uvicorn off the main thread, where its own signal capture is a no-op, so
     an external stop would kill this process and orphan the non-daemon backend workers. Flag the

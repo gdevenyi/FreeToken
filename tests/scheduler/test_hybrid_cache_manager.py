@@ -505,6 +505,8 @@ def _resume_len(cm, prompt, n):
 
 
 READ = SamplingParams(max_tokens=1, logprobs=True, top_logprobs=4, allowed_token_ids=[32, 33])
+# a /v1/internal/kld chunk: isolated whatever --logprob-read-isolate says
+KLD = SamplingParams(max_tokens=1, ignore_eos=True, kld={"path": "unused", "chunk": 0, "slice_rows": 16})
 
 
 @pytest.mark.parametrize("warm_prefix", [False, True])
@@ -546,8 +548,8 @@ def test_read_donate_keeps_pages_and_slots_whole_with_radix_lookahead(policy, is
     assert cm.prefix_cache.mamba_evictable_size == snapshots
 
 
-@pytest.mark.parametrize("isolate", [False, True])
-def test_isolated_logprob_read_ignores_and_keeps_out_of_the_prefix_cache(isolate):
+@pytest.mark.parametrize(("sp", "flag", "isolate"), [(READ, False, False), (READ, True, True), (KLD, False, True)])
+def test_isolated_logprob_read_ignores_and_keeps_out_of_the_prefix_cache(sp, flag, isolate):
     """An identical earlier read donated under "all"; an isolated read still prefills cold and stores nothing."""
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
@@ -555,11 +557,11 @@ def test_isolated_logprob_read_ignores_and_keeps_out_of_the_prefix_cache(isolate
     from freetoken.scheduler.utils import PendingReq
 
     cm, prompt = _finish_read("all", READ, num_pages=512)  # room for both reads: no eviction
-    cm.isolate_logprob_reads = isolate
+    cm.isolate_logprob_reads = flag
     tree = (cm.prefix_cache.full_evictable, cm.prefix_cache.mamba_evictable_size)
     pm = PrefillManager(cm, TableManager(max_running_reqs=2, page_table=cm.page_table),
-                        DecodeManager(page_size=1), isolate_logprob_reads=isolate)
-    pm.pending_list = [PendingReq(1, torch.tensor(prompt, dtype=torch.int32), READ)]
+                        DecodeManager(page_size=1), isolate_logprob_reads=flag)
+    pm.pending_list = [PendingReq(1, torch.tensor(prompt, dtype=torch.int32), sp)]
     batch = pm.schedule_next_batch(4096)
     (req,) = batch.reqs
     assert req.cache_handle.cached_len == batch.log_cached_tokens == (0 if isolate else 128)
@@ -574,8 +576,9 @@ def test_isolated_logprob_read_ignores_and_keeps_out_of_the_prefix_cache(isolate
     _assert_no_leak(cm, num_pages=512)
 
 
-@pytest.mark.parametrize(("policy", "isolate"), [("none", False), ("all", True), ("boundary", True)])
-def test_non_donating_read_chunk_commit_leaves_the_tree_alone(policy, isolate):
+@pytest.mark.parametrize(("policy", "isolate", "sp"), [("none", False, READ), ("all", True, READ), ("boundary", True, READ),
+                                                     ("all", False, KLD)])
+def test_non_donating_read_chunk_commit_leaves_the_tree_alone(policy, isolate, sp):
     """The prefill-commit branch donated the x64 snapshot whatever the read policy said."""
     num_pages, pool = 256, _pool()
     pt = torch.zeros(4, 256, dtype=torch.int32)
@@ -586,7 +589,7 @@ def test_non_donating_read_chunk_commit_leaves_the_tree_alone(policy, isolate):
     pt[0, :130] = cm._allocate(130)
     row = pt[0, :130].clone()
     req = Req(input_ids=torch.tensor(prompt + [7], dtype=torch.int32), table_idx=0, cached_len=130,
-              output_len=1, uid=0, sampling_params=READ, cache_handle=mr.cuda_handle)
+              output_len=1, uid=0, sampling_params=sp, cache_handle=mr.cuda_handle)
     req.linear_slot_idx, req.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
     req.mamba_next_track_idx, req.mamba_last_track_seqlen = 1, 128
     cm.lock(mr.cuda_handle)
