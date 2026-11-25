@@ -67,6 +67,69 @@ def test_qwen38_tp2_2mib_vmm_geometry_exact_quanta():
     assert geo.va_moe_slots > 15_959 + 4_200
 
 
+def test_qwen38_tp2_real_2560x320_strict_budget_conservation():
+    """Regression test for live chatdnp Qwen3.8-Flash-Next TP=2 (2560x320 NVFP4, 30,320 KV pages):
+    Without strict_budget, rounding va_kv_pages (30,321 -> 30,336) and floor_moe_blocks (15,959 -> 16,384)
+    upward allocated 16,488 x 2 MiB slabs (+566 MiB above baseline KV + MoE bytes), shrinking post-graph
+    free VRAM to 1.72 GiB and triggering a 160 MiB OOM during 8,192-token prefill chunks.
+    With strict_budget=True, physical slabs drop from 16,488 to 15,789 (-1,398 MiB, 832 MiB below baseline)
+    while still boosting active MoE residency to 22,528 / 24,576 (91.67%)."""
+    gran = 2 << 20
+    num_kv_planes = 24
+    plane_page_bytes = 64 * 1 * 256  # 16,384 B -> kv_quantum_pages = 128
+    usable_kv_pages = 30_320  # 1,940,480 tokens
+    base_moe_slots = 15_959
+    moe_row_bytes = {
+        "gate_up_packed": 640 * 1280,  # 819,200 B
+        "gate_up_scale": 640 * 160,  # 102,400 B
+        "gate_up_global": 2 * 4,  # 8 B (< 16 KiB -> non-elastic)
+        "down_packed": 2560 * 160,  # 409,600 B
+        "down_scale": 2560 * 20,  # 51,200 B -> moe_quantum_slots = 1,024
+        "down_global": 4,  # 4 B (< 16 KiB -> non-elastic)
+    }
+    unbounded = compute_elastic_geometry(
+        granularity=gran,
+        num_kv_planes=num_kv_planes,
+        plane_page_bytes=plane_page_bytes,
+        usable_kv_pages=usable_kv_pages,
+        floor_kv_pages=2_048,
+        moe_row_bytes=moe_row_bytes,
+        base_moe_slots=base_moe_slots,
+        max_moe_slots=48 * 512,
+        num_experts=512,
+        prefill_overlap=True,
+        strict_budget=False,
+    )
+    assert unbounded.va_moe_slots == 23_552
+
+    geo = compute_elastic_geometry(
+        granularity=gran,
+        num_kv_planes=num_kv_planes,
+        plane_page_bytes=plane_page_bytes,
+        usable_kv_pages=usable_kv_pages,
+        floor_kv_pages=2_048,
+        moe_row_bytes=moe_row_bytes,
+        base_moe_slots=base_moe_slots,
+        max_moe_slots=48 * 512,
+        num_experts=512,
+        prefill_overlap=True,
+        strict_budget=True,
+    )
+    elastic_row_sum = sum(moe_row_bytes[n] for n in geo.elastic_moe_banks)
+    budget_bytes = (
+        usable_kv_pages + 1
+    ) * num_kv_planes * plane_page_bytes + base_moe_slots * elastic_row_sum
+    total_kv_blocks = geo.va_kv_pages // geo.kv_quantum_pages
+    total_slabs = (
+        total_kv_blocks * geo.kv_slabs_per_block
+        + geo.floor_moe_blocks * geo.moe_slabs_per_block
+    )
+    assert total_slabs == 15_789
+    assert total_slabs * gran <= budget_bytes
+    assert geo.usable_kv_pages == 30_207  # 1,933,248 tokens (-0.37% spillover trim)
+    assert geo.va_moe_slots == 22_528  # 91.67% of all 24,576 experts resident!
+
+
 def _build_elastic_test_stack(monkeypatch, *, kv_host_pages: int = 16):
     """Build a compact CPU VMM-backed QSAKVCache + OffloadMoeCache + CacheManager stack."""
     from freetoken import core
@@ -224,7 +287,7 @@ def test_p2c_demotes_first_before_borrowing_from_moe_then_expands_and_reclaims(
        (marking retired slots with RETIRED_SLOT_USAGE, constant physical VMM slabs).
     4. Finishing active requests reclaims elastic KV blocks (demoting excess idle cache to P2c)
        and restores MoE tail slots automatically, preserving exact CacheManager.check_integrity()."""
-    backend, initial_slabs, elastic, moe, kv, lpool, cm, tm, dm, pm, stub = (
+    backend, initial_slabs, elastic, moe, kv, _lpool, cm, _tm, _dm, pm, stub = (
         _build_elastic_test_stack(monkeypatch, kv_host_pages=16)
     )
     cm.check_integrity()

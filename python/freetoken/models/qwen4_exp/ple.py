@@ -716,7 +716,7 @@ class PLELayer(BaseOP):
         states.index_copy_(
             0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
         )
-        return F.silu(out.index_select(1, out_index).transpose(0, 1))
+        return F.silu(out.index_select(1, out_index), inplace=True).transpose(0, 1)
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""

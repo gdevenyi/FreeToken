@@ -1298,6 +1298,7 @@ class Engine:
             max_moe_slots=size_cap,
             num_experts=config.model_config.num_experts,
             prefill_overlap=config.moe_prefill_overlap,
+            strict_budget=True,
         )
         if geo.num_elastic_kv_blocks == 0 or geo.max_extra_moe_blocks == 0:
             logger.info_rank0(

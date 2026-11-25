@@ -412,19 +412,12 @@ def compute_elastic_geometry(
     max_moe_slots: int,
     num_experts: int,
     prefill_overlap: bool,
+    strict_budget: bool = False,
 ) -> ElasticGeometry:
     kv_quantum_pages = math.lcm(plane_page_bytes, granularity) // plane_page_bytes
     kv_plane_quantum_bytes = kv_quantum_pages * plane_page_bytes
     kv_slabs_per_plane_block = kv_plane_quantum_bytes // granularity
     kv_slabs_per_block = num_kv_planes * kv_slabs_per_plane_block
-
-    va_kv_pages = _align_up(usable_kv_pages + 1, kv_quantum_pages)
-    elastic_end_kv_block = usable_kv_pages // kv_quantum_pages
-    floor_kv_blocks = min(
-        elastic_end_kv_block,
-        max(1, _div_ceil(max(1, floor_kv_pages), kv_quantum_pages)),
-    )
-    num_elastic_kv_blocks = max(0, elastic_end_kv_block - floor_kv_blocks)
 
     elastic_moe_banks = tuple(
         name for name, rb in moe_row_bytes.items() if rb >= _ELASTIC_MOE_MIN_ROW_BYTES
@@ -443,13 +436,60 @@ def compute_elastic_geometry(
     }
     moe_slabs_per_block = sum(moe_slabs_per_bank_block.values())
 
-    min_moe_slots = max(
-        base_moe_slots, 2 * num_experts if prefill_overlap else num_experts
-    )
-    floor_moe_blocks = _div_ceil(min_moe_slots, moe_quantum_slots)
+    hard_min_moe_slots = 2 * num_experts if prefill_overlap else num_experts
+    min_moe_slots = max(base_moe_slots, hard_min_moe_slots)
     max_cap_blocks = max_moe_slots // moe_quantum_slots
-    if floor_moe_blocks > max_cap_blocks:
-        floor_moe_blocks = max_cap_blocks
+    hard_min_moe_blocks = min(
+        max_cap_blocks, _div_ceil(hard_min_moe_slots, moe_quantum_slots)
+    )
+    floor_moe_blocks = min(max_cap_blocks, _div_ceil(min_moe_slots, moe_quantum_slots))
+
+    if strict_budget:
+        budget_bytes = (
+            usable_kv_pages + 1
+        ) * num_kv_planes * plane_page_bytes + base_moe_slots * sum(
+            moe_row_bytes[n] for n in elastic_moe_banks
+        )
+        budget_slabs = budget_bytes // granularity
+        total_kv_blocks = (
+            _align_up(usable_kv_pages + 1, kv_quantum_pages) // kv_quantum_pages
+        )
+        min_kv_blocks = max(2, _div_ceil(max(1, floor_kv_pages) + 1, kv_quantum_pages))
+        # Drop an unaligned dummy-tail KV block spillover before trimming base MoE blocks.
+        if (
+            total_kv_blocks * kv_slabs_per_block
+            + floor_moe_blocks * moe_slabs_per_block
+            > budget_slabs
+            and (usable_kv_pages + 1) % kv_quantum_pages != 0
+            and total_kv_blocks > min_kv_blocks
+        ):
+            total_kv_blocks -= 1
+            usable_kv_pages = total_kv_blocks * kv_quantum_pages - 1
+        while (
+            floor_moe_blocks > hard_min_moe_blocks
+            and total_kv_blocks * kv_slabs_per_block
+            + floor_moe_blocks * moe_slabs_per_block
+            > budget_slabs
+        ):
+            floor_moe_blocks -= 1
+        while (
+            total_kv_blocks > min_kv_blocks
+            and total_kv_blocks * kv_slabs_per_block
+            + floor_moe_blocks * moe_slabs_per_block
+            > budget_slabs
+        ):
+            total_kv_blocks -= 1
+            usable_kv_pages = min(
+                usable_kv_pages, total_kv_blocks * kv_quantum_pages - 1
+            )
+
+    va_kv_pages = _align_up(usable_kv_pages + 1, kv_quantum_pages)
+    elastic_end_kv_block = usable_kv_pages // kv_quantum_pages
+    floor_kv_blocks = min(
+        elastic_end_kv_block,
+        max(1, _div_ceil(max(1, floor_kv_pages), kv_quantum_pages)),
+    )
+    num_elastic_kv_blocks = max(0, elastic_end_kv_block - floor_kv_blocks)
 
     lent_slabs = num_elastic_kv_blocks * kv_slabs_per_block
     extra_moe_blocks = min(
@@ -457,7 +497,12 @@ def compute_elastic_geometry(
         lent_slabs // moe_slabs_per_block if moe_slabs_per_block > 0 else 0,
     )
     va_moe_blocks = floor_moe_blocks + extra_moe_blocks
-    va_moe_slots = max(min_moe_slots, va_moe_blocks * moe_quantum_slots)
+    effective_min_moe = (
+        max(hard_min_moe_slots, floor_moe_blocks * moe_quantum_slots)
+        if strict_budget
+        else min_moe_slots
+    )
+    va_moe_slots = max(effective_min_moe, va_moe_blocks * moe_quantum_slots)
     va_moe_slots = min(max_moe_slots, va_moe_slots)
 
     return ElasticGeometry(
