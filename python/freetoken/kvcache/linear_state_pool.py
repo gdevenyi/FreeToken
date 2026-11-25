@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import math
-from typing import List
 
 import torch
+
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
-from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec, SlotVerify
+from freetoken.models.config import (
+    LinearGatedDeltaGroupConfig,
+    SlotStateSpec,
+    SlotVerify,
+)
 from freetoken.utils import div_even
 
 _SSM_DTYPES = {
@@ -28,7 +32,9 @@ def _linear_local_dims(
     source of the sharding math shared by the pool allocation and the byte estimate."""
     local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
     local_v_heads = div_even(group.num_value_heads, tp_size, allow_replicate=True)
-    local_conv_dim = 2 * local_k_heads * group.key_head_dim + local_v_heads * group.value_head_dim
+    local_conv_dim = (
+        2 * local_k_heads * group.key_head_dim + local_v_heads * group.value_head_dim
+    )
     return len(group.layer_ids), local_conv_dim, local_v_heads, local_k_heads
 
 
@@ -64,7 +70,9 @@ class LinearStatePool:
         self._device = device
         self._conv_dtype = dtype
 
-        n_layers, local_conv_dim, local_v_heads, self._local_k_heads = _linear_local_dims(group, tp_size)
+        n_layers, local_conv_dim, local_v_heads, self._local_k_heads = (
+            _linear_local_dims(group, tp_size)
+        )
 
         # conv left-context: the last (kernel-1) timesteps of the conv input stream.
         self.conv_states = torch.zeros(
@@ -75,7 +83,13 @@ class LinearStatePool:
         # SSM recurrent state. fp32 by default (matches HF mamba_ssm_dtype); the dtype is
         # overridable via FREETOKEN_MAMBA_SSM_DTYPE (see ssm_state_dtype).
         self.recurrent_states = torch.zeros(
-            (n_layers, num_slots, local_v_heads, group.key_head_dim, group.value_head_dim),
+            (
+                n_layers,
+                num_slots,
+                local_v_heads,
+                group.key_head_dim,
+                group.value_head_dim,
+            ),
             dtype=ssm_state_dtype(),
             device=device,
         )
@@ -104,14 +118,38 @@ class LinearStatePool:
 
     def _slot_tensors(self) -> dict[str, torch.Tensor]:
         """Every tensor a slot holds, ``[layers, num_slots, ...]`` each (re-read: rebuild replaces them)."""
-        return {"conv": self.conv_states, "recurrent": self.recurrent_states, **self.slot_states}
+        return {
+            "conv": self.conv_states,
+            "recurrent": self.recurrent_states,
+            **self.slot_states,
+        }
 
-    def _alloc_host_bank(self, host_slots: int, engine_stream: torch.cuda.Stream | None) -> None:
+    def _alloc_host_bank(
+        self, host_slots: int, engine_stream: torch.cuda.Stream | None
+    ) -> None:
         """--mamba-host-slots: one pinned host buffer per bank slot, so registration goes in pieces
-        of one slot, holding each slot tensor's layer rows (KV host tier design 3.1, 3.7)."""
+        of one slot, holding each slot tensor's layer rows (KV host tier design 3.1, 3.7).
+        When ``FREETOKEN_GDN_HOST_Q8=1``, ``recurrent_states`` (`fp32`) is stored on host in
+        `WHT128-Q8_0` (`int8` + `bf16` scale per 32, `3.765x` smaller)."""
+        from freetoken.kernel.triton.gdn_wht_q8 import (
+            GROUPS_PER_WHT,
+            WHT_DIM,
+            can_wht128_q8,
+            gdn_host_q8_enabled,
+        )
+
         self._num_host_slots = max(0, int(host_slots))
         self._free_host_slots: list[int] = list(range(self._num_host_slots))
         self._host_views: list[dict[str, torch.Tensor]] = []
+        self._host_wht_q8 = bool(
+            self._num_host_slots > 0
+            and gdn_host_q8_enabled()
+            and can_wht128_q8(
+                tuple(self.recurrent_states.shape), self.recurrent_states.dtype
+            )
+        )
+        self._pack_staging: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._unpack_staging: tuple[torch.Tensor, torch.Tensor] | None = None
         self.host_copies: _HostCopies | None = None
         if not self._num_host_slots:
             return  # no bank: no side stream, and fence_host_copies does nothing
@@ -120,19 +158,47 @@ class LinearStatePool:
         self.host_copies = _HostCopies(self._device, engine_stream)
         layout, offset = {}, 0
         for name, t in self._slot_tensors().items():
+            if name == "recurrent" and self._host_wht_q8:
+                total_rows = (t.shape[0] * t[0, 0].numel()) // WHT_DIM
+                q_shape = (total_rows, WHT_DIM)
+                s_shape = (total_rows, GROUPS_PER_WHT)
+                q_bytes = total_rows * WHT_DIM
+                s_bytes = total_rows * GROUPS_PER_WHT * 2
+                layout["recurrent_q"] = (offset, torch.int8, q_shape)
+                offset += -(-q_bytes // 16) * 16
+                layout["recurrent_s"] = (offset, torch.bfloat16, s_shape)
+                offset += -(-s_bytes // 16) * 16
+                if self._device.type == "cuda":
+                    self._pack_staging = (
+                        torch.empty(q_shape, dtype=torch.int8, device=self._device),
+                        torch.empty(s_shape, dtype=torch.bfloat16, device=self._device),
+                    )
+                    self._unpack_staging = (
+                        torch.empty(q_shape, dtype=torch.int8, device=self._device),
+                        torch.empty(s_shape, dtype=torch.bfloat16, device=self._device),
+                    )
+                continue
             nbytes = t[:, 0].numel() * t.element_size()
             layout[name] = (offset, t.dtype, (t.shape[0], *t.shape[2:]))
-            offset += -(-nbytes // 16) * 16  # 16-byte aligned, so each dtype view is legal
+            offset += (
+                -(-nbytes // 16) * 16
+            )  # 16-byte aligned, so each dtype view is legal
         cuda = self._device.type == "cuda"
         for _ in range(self._num_host_slots):
             bank = HostBank((offset,), torch.uint8, backing=None if cuda else "mmap")
             if cuda:
                 bank.pin()  # page-locked and device-mapped: the copies are async on the copy engine
-            self._host_views.append({
-                name: bank.tensor[o : o + math.prod(shape) * torch.empty((), dtype=dt).element_size()]
-                .view(dt).view(shape)
-                for name, (o, dt, shape) in layout.items()
-            })
+            self._host_views.append(
+                {
+                    name: bank.tensor[
+                        o : o
+                        + math.prod(shape) * torch.empty((), dtype=dt).element_size()
+                    ]
+                    .view(dt)
+                    .view(shape)
+                    for name, (o, dt, shape) in layout.items()
+                }
+            )
 
     @property
     def num_host_slots(self) -> int:
@@ -149,7 +215,9 @@ class LinearStatePool:
 
     def alloc_host(self, n: int = 1) -> list[int]:
         if n > len(self._free_host_slots):
-            raise RuntimeError(f"GDN host bank exhausted: need {n}, have {len(self._free_host_slots)}")
+            raise RuntimeError(
+                f"GDN host bank exhausted: need {n}, have {len(self._free_host_slots)}"
+            )
         return [self._free_host_slots.pop() for _ in range(n)]
 
     def free_host(self, slots) -> None:
@@ -162,17 +230,63 @@ class LinearStatePool:
     def to_host(self, src: int, dst: int) -> None:
         """Copy device slot ``src`` into bank slot ``dst`` (the caller then frees ``src``). Each layer row
         is contiguous on both sides, so every copy is a plain memcpy and no temporary is made."""
-        self.host_copies.to_host([
+        if not self._host_wht_q8:
+            self.host_copies.to_host(
+                [
+                    (self._host_views[dst][name][li], t[li, src])
+                    for name, t in self._slot_tensors().items()
+                    for li in range(t.shape[0])
+                ]
+            )
+            return
+        from freetoken.kernel.triton.gdn_wht_q8 import pack_slot_wht128_q8
+
+        pairs = [
             (self._host_views[dst][name][li], t[li, src])
-            for name, t in self._slot_tensors().items() for li in range(t.shape[0])
-        ])
+            for name, t in self._slot_tensors().items()
+            if name != "recurrent"
+            for li in range(t.shape[0])
+        ]
+        hq = self._host_views[dst]["recurrent_q"]
+        hs = self._host_views[dst]["recurrent_s"]
+        if self._pack_staging is None:
+            pack_slot_wht128_q8(self.recurrent_states, src, hq, hs)
+            self.host_copies.to_host(pairs)
+            return
+        dq, ds = self._pack_staging
+        self.host_copies.to_host(
+            pairs + [(hq, dq), (hs, ds)],
+            pre_fn=lambda: pack_slot_wht128_q8(self.recurrent_states, src, dq, ds),
+        )
 
     def from_host(self, src: int, dst: int) -> None:
         """Copy bank slot ``src`` into device slot ``dst``, on the caller's (engine) stream after ``fence_host_copies``."""
-        self.host_copies.from_host([
+        if not self._host_wht_q8:
+            self.host_copies.from_host(
+                [
+                    (t[li, dst], self._host_views[src][name][li])
+                    for name, t in self._slot_tensors().items()
+                    for li in range(t.shape[0])
+                ]
+            )
+            return
+        from freetoken.kernel.triton.gdn_wht_q8 import unpack_slot_wht128_q8
+
+        pairs = [
             (t[li, dst], self._host_views[src][name][li])
-            for name, t in self._slot_tensors().items() for li in range(t.shape[0])
-        ])
+            for name, t in self._slot_tensors().items()
+            if name != "recurrent"
+            for li in range(t.shape[0])
+        ]
+        hq = self._host_views[src]["recurrent_q"]
+        hs = self._host_views[src]["recurrent_s"]
+        if self._unpack_staging is None:
+            self.host_copies.from_host(pairs)
+            unpack_slot_wht128_q8(hq, hs, self.recurrent_states, dst)
+            return
+        uq, us = self._unpack_staging
+        self.host_copies.from_host(pairs + [(uq, hq), (us, hs)])
+        unpack_slot_wht128_q8(uq, us, self.recurrent_states, dst)
 
     def fence_host_copies(self) -> None:
         """Make the caller's stream wait for every ``to_host`` so far. The scheduler calls it on the
@@ -317,7 +431,9 @@ class LinearStatePool:
         """Build the scratch for verify batches of up to ``max_bs`` requests with ``rows_per_req`` rows each, and the verify handler of every slot state; build_fla_metadata hands the GDN scratch to the GDN layers."""
         self.verify_scratch = LinearVerifyScratch(self, max_bs, rows_per_req)
         self._verify_handlers = {
-            spec.name: spec.verify(spec, max_bs, rows_per_req, self._device, self._state_dtype(spec))
+            spec.name: spec.verify(
+                spec, max_bs, rows_per_req, self._device, self._state_dtype(spec)
+            )
             for spec in self._slot_specs
             if spec.verify is not None
         }
@@ -326,11 +442,15 @@ class LinearStatePool:
         """The verify handler of slot state ``name``, for its owner's verify forward."""
         return self._verify_handlers[name]
 
-    def commit_verify(self, slots: List[int], counts: List[int]) -> None:
+    def commit_verify(self, slots: list[int], counts: list[int]) -> None:
         """Advance live slot slots[i] over verify row i's first counts[i] tokens."""
         self.verify_scratch.commit(self, slots, counts)
         if slots and self._verify_handlers:
-            index = torch.tensor([slots, counts], dtype=torch.int64, pin_memory=self._device.type == "cuda")
+            index = torch.tensor(
+                [slots, counts],
+                dtype=torch.int64,
+                pin_memory=self._device.type == "cuda",
+            )
             index = index.to(self._device, non_blocking=True)
             for handler in self._verify_handlers.values():
                 handler.commit(self, *index)
@@ -367,19 +487,27 @@ class LinearVerifyScratch:
             torch.zeros(*rows, hv, **f32),
             torch.zeros(*rows, hv, **f32),
         )
-        self.conv_window = torch.zeros((*rows, conv_dim, km1), dtype=pool.conv_states.dtype, device=device)
+        self.conv_window = torch.zeros(
+            (*rows, conv_dim, km1), dtype=pool.conv_states.dtype, device=device
+        )
 
     def input_stash(self, li: int) -> tuple:
         return tuple(t[li] for t in self.stash)
 
-    def commit(self, pool: LinearStatePool, slots: List[int], counts: List[int]) -> None:
+    def commit(
+        self, pool: LinearStatePool, slots: list[int], counts: list[int]
+    ) -> None:
         """Advance live slot slots[i] over row i's first counts[i] verified tokens (count >= 1)."""
         from freetoken.kernel.fla import gdn_state_replay
 
         if not slots:
             return
         rows = list(range(len(slots)))
-        meta = torch.tensor([rows, slots, counts], dtype=torch.int32, pin_memory=pool.recurrent_states.is_cuda)
+        meta = torch.tensor(
+            [rows, slots, counts],
+            dtype=torch.int32,
+            pin_memory=pool.recurrent_states.is_cuda,
+        )
         meta = meta.to(pool.recurrent_states.device, non_blocking=True)
         gdn_state_replay(pool.recurrent_states, self.stash, meta)
         row_idx, slot_idx, count = meta.long()
@@ -392,21 +520,31 @@ class _HostCopies:
     stream wait for all of them. A host->device copy runs on the caller's stream. CPU: plain copies.
     No decision reads the state of a copy: the copies only order streams."""
 
-    def __init__(self, device: torch.device, engine_stream: torch.cuda.Stream | None = None) -> None:
+    def __init__(
+        self, device: torch.device, engine_stream: torch.cuda.Stream | None = None
+    ) -> None:
         self.side = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.engine_stream = engine_stream
         self._pending = False
 
-    def to_host(self, pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    def to_host(
+        self, pairs: list[tuple[torch.Tensor, torch.Tensor]], *, pre_fn=None
+    ) -> None:
         if self.side is None:
+            if pre_fn is not None:
+                pre_fn()
             for dst, src in pairs:
                 dst.copy_(src)
             return
         cur = torch.cuda.current_stream()
         self.side.wait_stream(cur)
         if self.engine_stream is not None and self.engine_stream != cur:
-            self.side.wait_stream(self.engine_stream)  # the forwards that wrote the snapshot
+            self.side.wait_stream(
+                self.engine_stream
+            )  # the forwards that wrote the snapshot
         with torch.cuda.stream(self.side):
+            if pre_fn is not None:
+                pre_fn()
             for dst, src in pairs:
                 dst.copy_(src, non_blocking=True)
         self._pending = True
@@ -434,7 +572,9 @@ def read_mem_available() -> int:
     raise RuntimeError("/proc/meminfo has no MemAvailable")
 
 
-def check_host_bank_memory(nbytes: int, mem_available: int | None = None, kv_tier_bytes: int = 0) -> None:
+def check_host_bank_memory(
+    nbytes: int, mem_available: int | None = None, kv_tier_bytes: int = 0
+) -> None:
     """Refuse a GDN host bank of ``nbytes`` plus a KV host tier of ``kv_tier_bytes`` (each the sum over
     the local TP ranks) that would leave less than 32 GiB MemAvailable."""
     available = read_mem_available() if mem_available is None else mem_available
@@ -469,7 +609,44 @@ def linear_state_bytes_per_req(
     return int(total)
 
 
-__all__ = ["LinearStatePool", "check_host_bank_memory", "linear_state_bytes_per_req", "read_mem_available"]
+def linear_state_host_bytes_per_req(
+    group: LinearGatedDeltaGroupConfig,
+    tp_size: int,
+    dtype: torch.dtype,
+    slot_states: tuple[SlotStateSpec, ...] = (),
+) -> int:
+    """Host-bank bytes for one GDN snapshot slot (uses `WHT128-Q8_0` size when `FREETOKEN_GDN_HOST_Q8=1`)."""
+    from freetoken.kernel.triton.gdn_wht_q8 import (
+        can_wht128_q8,
+        gdn_host_q8_enabled,
+        wht128_q8_slot_bytes,
+    )
+
+    n_layers, local_conv_dim, local_v_heads, _ = _linear_local_dims(group, tp_size)
+    conv_elems = local_conv_dim * (group.conv_kernel_dim - 1)
+    rec_elems = local_v_heads * group.key_head_dim * group.value_head_dim
+    conv_bytes = n_layers * conv_elems * dtype.itemsize
+    rec_dtype = ssm_state_dtype()
+    if gdn_host_q8_enabled() and can_wht128_q8(
+        (n_layers, local_v_heads, group.key_head_dim, group.value_head_dim), rec_dtype
+    ):
+        rec_bytes = wht128_q8_slot_bytes(n_layers * rec_elems)
+    else:
+        rec_bytes = n_layers * rec_elems * rec_dtype.itemsize
+    total = conv_bytes + rec_bytes
+    for spec in slot_states:
+        item = (spec.dtype if spec.dtype is not None else dtype).itemsize
+        total += max(1, len(spec.layer_ids)) * math.prod(spec.shape) * item
+    return int(total)
+
+
+__all__ = [
+    "LinearStatePool",
+    "check_host_bank_memory",
+    "linear_state_bytes_per_req",
+    "linear_state_host_bytes_per_req",
+    "read_mem_available",
+]
 
 
 _GDN_CHUNK_SIZE = 64  # keep in lockstep with kernel/fla/chunk_delta_h.py CHUNK_SIZE
@@ -508,13 +685,17 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     slot_states = getattr(config, "slot_states", ())
     if linear_group is None:
         if slot_states:
-            raise ValueError("slot_states ride the linear-state slots; model has no linear group")
+            raise ValueError(
+                "slot_states ride the linear-state slots; model has no linear group"
+            )
         return 0
     slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
     per_req = linear_state_bytes_per_req(
         linear_group, config.tp_info.size, config.dtype, slot_states
     )
-    return per_req * slots + verify_scratch_bytes(config, getattr(config, "decode_rows_per_req", 1))
+    return per_req * slots + verify_scratch_bytes(
+        config, getattr(config, "decode_rows_per_req", 1)
+    )
 
 
 def verify_scratch_bytes(config, rows_per_req: int) -> int:
@@ -527,7 +708,12 @@ def verify_scratch_bytes(config, rows_per_req: int) -> int:
     stash = rows * (hk * group.key_head_dim + hv * group.value_head_dim + 2 * hv) * 4
     window = rows * conv_dim * (group.conv_kernel_dim - 1) * config.dtype.itemsize
     handlers = sum(
-        spec.verify.nbytes(spec, config.max_running_req, rows_per_req, spec.dtype if spec.dtype is not None else config.dtype)
+        spec.verify.nbytes(
+            spec,
+            config.max_running_req,
+            rows_per_req,
+            spec.dtype if spec.dtype is not None else config.dtype,
+        )
         for spec in getattr(config, "slot_states", ())
         if spec.verify is not None
     )
@@ -543,7 +729,9 @@ def _linear_pool_num_slots(config) -> int:
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
-    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+    return (
+        4 * mr + n_cache + 1
+    )  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 
 def _linear_pool_min_slots(config) -> int:

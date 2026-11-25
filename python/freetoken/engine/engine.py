@@ -102,12 +102,19 @@ from .spec_protocol import SpecRuntime
 
 logger = init_logger(__name__)
 
-def _disable_unsafe_cpu_moe_graphs(config: EngineConfig, executor, dtype, tp_cpu_group) -> None:
+
+def _disable_unsafe_cpu_moe_graphs(
+    config: EngineConfig, executor, dtype, tp_cpu_group
+) -> None:
     safe = torch.tensor([executor.graph_capture_safe(dtype)], dtype=torch.int32)
     if config.tp_info.size > 1:
-        torch.distributed.all_reduce(safe, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group)
+        torch.distributed.all_reduce(
+            safe, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group
+        )
     if not safe.item():
-        logger.warning_rank0("CPU MoE IO/handshake is not graph-safe on every TP rank for this dtype; disabling decode graphs")
+        logger.warning_rank0(
+            "CPU MoE IO/handshake is not graph-safe on every TP rank for this dtype; disabling decode graphs"
+        )
         # Clear explicit sizes too; GraphRunner gives them priority over max_bs, including on rebuild.
         object.__setattr__(config, "cuda_graph_bs", [])
         object.__setattr__(config, "cuda_graph_max_bs", 0)
@@ -120,7 +127,9 @@ def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) ->
     if not small:
         return
     # a decode step routes every row of every request, decode_rows_per_req rows each
-    limit = min(small) // (config.model_config.num_experts_per_tok * config.decode_rows_per_req)
+    limit = min(small) // (
+        config.model_config.num_experts_per_tok * config.decode_rows_per_req
+    )
     if config.max_running_req > limit:
         logger.warning_rank0(
             f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
@@ -130,7 +139,9 @@ def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) ->
     if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > limit:
         object.__setattr__(config, "cuda_graph_max_bs", limit)
     if config.cuda_graph_bs is not None:
-        object.__setattr__(config, "cuda_graph_bs", [bs for bs in config.cuda_graph_bs if bs <= limit])
+        object.__setattr__(
+            config, "cuda_graph_bs", [bs for bs in config.cuda_graph_bs if bs <= limit]
+        )
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -160,7 +171,9 @@ def _sgl_flash_attn_available() -> bool:
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
     except Exception as exc:
-        detail = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+        detail = next(
+            (line.strip() for line in str(exc).splitlines() if line.strip()), ""
+        )
         logger.warning_rank0(
             "sgl_kernel.flash_attn is unavailable; auto attention backend falls back to fi "
             f"({type(exc).__name__}: {detail})"
@@ -169,7 +182,9 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
+def _startup_kv_budget(
+    memory_ratio: float, init_free_memory: int, new_free_memory: int
+) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
     what the resident model consumed. Kept as a pure function so the composition with the
     pool families' ``solve_num_pages`` stays CPU-testable."""
@@ -195,7 +210,9 @@ def kv_host_tier_pages(config, page_bytes: int) -> int:
 def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
     """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
     limit = min(config.max_seq_len, num_tokens)
-    return limit - (config.decode_rows_per_req - 1), _page_table_width(limit, config.page_size)
+    return limit - (config.decode_rows_per_req - 1), _page_table_width(
+        limit, config.page_size
+    )
 
 
 def _required_attn_types(model_config) -> frozenset[AttnType]:
@@ -214,9 +231,12 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     return types or frozenset({AttnType.FULL})
 
 
-def _backend_parts_serve(name: str, required: frozenset[AttnType], kv_format: KVFormat = NONE) -> bool:
+def _backend_parts_serve(
+    name: str, required: frozenset[AttnType], kv_format: KVFormat = NONE
+) -> bool:
     return all(
-        required <= attention_backend_info(part).supported_types and kv_format.name in attention_backend_info(part).kv_formats
+        required <= attention_backend_info(part).supported_types
+        and kv_format.name in attention_backend_info(part).kv_formats
         for part in name.split(",")
     )
 
@@ -234,7 +254,9 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType], kv_format: KVFormat = NONE) -> str:
+def _resolve_auto_attention_backend(
+    required: frozenset[AttnType], kv_format: KVFormat = NONE
+) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
@@ -291,13 +313,23 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
             "their window frees would release slots a verify step still reads"
         )
     # at config time: the state pool that holds the handlers is built only after the weights load
-    if unverified := [s.name for s in config.model_config.slot_states if s.verify is None]:
-        raise ValueError(f"speculative decoding does not support per-request state {unverified} yet: it declares no verify handler")
+    if unverified := [
+        s.name for s in config.model_config.slot_states if s.verify is None
+    ]:
+        raise ValueError(
+            f"speculative decoding does not support per-request state {unverified} yet: it declares no verify handler"
+        )
     parts = [p.strip() for p in config.attention_backend.split(",")]
     graph = attention_backend_info(parts[-1]).uniform_extend_graph
-    if graph == "host_plan" and len(parts) == 2 and attention_backend_info(parts[0]).uniform_extend_graph == "device":
+    if (
+        graph == "host_plan"
+        and len(parts) == 2
+        and attention_backend_info(parts[0]).uniform_extend_graph == "device"
+    ):
         # verify steps run on the decode part; a prefill part that captures on device serves them better
-        logger.info_rank0(f"speculative decoding: attention backend {config.attention_backend} -> {parts[0]}")
+        logger.info_rank0(
+            f"speculative decoding: attention backend {config.attention_backend} -> {parts[0]}"
+        )
         override("attention_backend", parts[0])
     elif graph == "none":
         raise ValueError(
@@ -312,12 +344,18 @@ def _validate_kv_format(config, model_config) -> None:
         return
     pool_cls = resolve_pool_class(model_config)
     if kv_format.name not in pool_cls.kv_formats:
-        raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}"
+        )
     if config.dtype != torch.bfloat16:
-        raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}"
+        )
 
 
-def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
+def _validate_attention_backend_choice(
+    config, override, required: frozenset[AttnType]
+) -> None:
     """Config-time type x backend capability check for the resolved (or explicit)
     backend string: every comma part must serve every required type and have its
     packages/arch available. Replaces the per-model gates; in particular this is
@@ -340,7 +378,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             valid = [
                 name
                 for name in (
-                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse",
+                    "fa",
+                    "fi",
+                    "trtllm",
+                    "triton",
+                    "dsa",
+                    "dsv4_sparse",
+                    "m3_sparse",
                     "qsa_sparse",
                 )
                 if required <= attention_backend_info(name).supported_types
@@ -427,9 +471,17 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
     if config.embed_weights != "host":
         return frozenset()
     # a tied LM head reads its whole table every step, so that table stays on the GPU
-    tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
+    tied = {
+        id(op.tied_embedding)
+        for op in iter_ops(model)
+        if isinstance(op, ParallelLMHead) and op.tied_embedding is not None
+    }
     tables = {
-        id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied and not op.quant_method.online
+        id(op.weight)
+        for op in iter_ops(model)
+        if type(op) is VocabParallelEmbedding
+        and id(op) not in tied
+        and not op.quant_method.online
     }
     keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys and tied:
@@ -450,11 +502,19 @@ def _online_quant_keys(model, config: EngineConfig) -> frozenset[str]:
     if not config.online_quant:
         return frozenset()
     to_checkpoint = config.model_config.quant.name_map.to_checkpoint
-    ops = [op for op in iter_ops(model) if getattr(op, "quant_method", None) is not None and op.quant_method.online]
+    ops = [
+        op
+        for op in iter_ops(model)
+        if getattr(op, "quant_method", None) is not None and op.quant_method.online
+    ]
     names = [name for op in ops for name in to_checkpoint(op.prefix)]
-    missed = [p for p in config.online_quant_modules if not any(map(name_set((p,)), names))]
+    missed = [
+        p for p in config.online_quant_modules if not any(map(name_set((p,)), names))
+    ]
     if missed:
-        example = to_checkpoint(next(op.prefix for op in iter_ops(model) if getattr(op, "prefix", "")))[0]
+        example = to_checkpoint(
+            next(op.prefix for op in iter_ops(model) if getattr(op, "prefix", ""))
+        )[0]
         raise ValueError(
             f"--online-quant-modules: no layer --online-quant {config.online_quant} converts matches {', '.join(missed)}; "
             f"give the checkpoint's module names, e.g. {example!r}"
@@ -507,7 +567,9 @@ def _make_dummy_weight_state_dict(
             # buffers are packed payloads whose bytes mean something else entirely
             # (GGUF blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
             # keep the benign all-zeros fill below.
-            state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
+            state_dict[key] = torch.full(
+                param.shape, 127, dtype=param.dtype, device=device
+            )
         else:
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
         if key in host_keys:
@@ -582,7 +644,11 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
+        set_quant_backend(
+            _adjust_ftw_quant_backend(
+                config.model_path, QuantBackend.parse(config.quant_backend)
+            )
+        )
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
@@ -593,7 +659,9 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
-        self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        self.config = (
+            config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        )
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -605,9 +673,15 @@ class Engine:
         set_tp_cpu_group(self.tp_cpu_group)
         self._comm = DistributedCommunicator() if config.tp_info.size > 1 else None
         free_min, free_max = self._sync_get_memory()
-        init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
-        self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
-        logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+        init_free_memory = (
+            free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        )
+        self._baseline_free = (
+            free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
+        )
+        logger.info_rank0(
+            f"Free memory before loading model: {mem_GB(init_free_memory)}"
+        )
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -625,7 +699,11 @@ class Engine:
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
         # draft weights load before any pool is sized, so every free-memory read below counts them
-        self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
+        self.spec: SpecRuntime | None = (
+            _spec_runner()(config, self)
+            if config.speculative_algorithm is not None
+            else None
+        )
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -641,12 +719,17 @@ class Engine:
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
         host_embeds = [
-            op for op in iter_ops(self.model)
-            if type(op) is VocabParallelEmbedding and not op.quant_method.online and not op.weight.is_cuda
+            op
+            for op in iter_ops(self.model)
+            if type(op) is VocabParallelEmbedding
+            and not op.quant_method.online
+            and not op.weight.is_cuda
         ]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
-            logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
+            logger.info_rank0(
+                f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}"
+            )
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
@@ -667,7 +750,9 @@ class Engine:
                 f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
             )
             self._warmup_encoders()
-        elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
+        elif any(
+            getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS
+        ):
             logger.info_rank0(
                 "Multimodal disabled: --text-model-only"
                 if config.mm.text_model_only
@@ -678,12 +763,16 @@ class Engine:
 
         # ======================= KV cache initialization ========================
         # --mamba-host-slots: only the hybrid radix has a tree for a host copy to hang on
-        host_slots = config.mamba_host_slots if config.cache_type == "hybrid_radix" else 0
+        host_slots = (
+            config.mamba_host_slots if config.cache_type == "hybrid_radix" else 0
+        )
         kv_tier = config.cache_type == "hybrid_radix" and config.kv_host_tier_gb > 0
         new_free = self._sync_get_memory(host_memory=host_slots > 0 or kv_tier)[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
-        available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        available_memory = _startup_kv_budget(
+            config.memory_ratio, init_free_memory, new_free
+        )
         available_memory -= state_pool_bytes(config)
         # Reserve part of the GDN prefill transient (chunk states + v_new); the rest of the
         # prefill activations still live in the (1 - memory_ratio) headroom.
@@ -692,14 +781,20 @@ class Engine:
             self.num_pages = self.elastic_pool.geo.usable_kv_pages
             kv_buf = self._wrap_elastic_kv_buffer(config)
             self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-                config, self.num_pages, device=self.device, dtype=self.dtype, kv_buffer=kv_buf
+                config,
+                self.num_pages,
+                device=self.device,
+                dtype=self.dtype,
+                kv_buffer=kv_buf,
             )
         else:
             if self.spec is not None:
                 # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
                 spec_fixed, draft_page = self._spec_budget(config)
                 page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
-                available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
+                available_memory = fixed_bytes + (
+                    available_memory - spec_fixed - fixed_bytes
+                ) * page_bytes // (page_bytes + draft_page)
             self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
             self.ctx.kv_cache = self.kv_cache = create_kv_pool(
                 config, self.num_pages, device=self.device, dtype=self.dtype
@@ -708,10 +803,16 @@ class Engine:
         # --kv-host-tier-gb: host pages of the same shape as one KV page (attached after the check below)
         kv_host_pages, kv_page_bytes = 0, 0
         if kv_tier:
-            if config.speculative_algorithm == "mtp":  # the parser refuses it too; this covers other entry points
-                raise ValueError("--kv-host-tier-gb is not supported with --speculative-algorithm mtp")
+            if (
+                config.speculative_algorithm == "mtp"
+            ):  # the parser refuses it too; this covers other entry points
+                raise ValueError(
+                    "--kv-host-tier-gb is not supported with --speculative-algorithm mtp"
+                )
             if not hasattr(self.kv_cache, "attach_host_pages"):
-                raise ValueError(f"--kv-host-tier-gb: {type(self.kv_cache).__name__} has no host pages (QSA pools only)")
+                raise ValueError(
+                    f"--kv-host-tier-gb: {type(self.kv_cache).__name__} has no host pages (QSA pools only)"
+                )
             kv_page_bytes = self.kv_cache.unit_bytes()[0] * config.page_size
             kv_host_pages = kv_host_tier_pages(config, kv_page_bytes)
 
@@ -721,15 +822,20 @@ class Engine:
             from freetoken.kvcache.linear_state_pool import (
                 LinearStatePool,
                 check_host_bank_memory,
-                linear_state_bytes_per_req,
+                linear_state_host_bytes_per_req,
             )
 
             if host_slots or kv_host_pages:
-                per_slot = linear_state_bytes_per_req(linear_group, config.tp_info.size, self.dtype, config.slot_states)
+                per_slot = linear_state_host_bytes_per_req(
+                    linear_group, config.tp_info.size, self.dtype, config.slot_states
+                )
                 # every rank decides on the same MemAvailable: the least of the ranks, read after the weights
                 # (the pinned expert banks are out of it) and before any rank pinned its bank
-                check_host_bank_memory(host_slots * per_slot * config.tp_info.size, self._host_mem_available,
-                                       kv_tier_bytes=kv_host_pages * kv_page_bytes * config.tp_info.size)
+                check_host_bank_memory(
+                    host_slots * per_slot * config.tp_info.size,
+                    self._host_mem_available,
+                    kv_tier_bytes=kv_host_pages * kv_page_bytes * config.tp_info.size,
+                )
             if host_slots:
                 logger.info_rank0(
                     f"GDN host snapshot bank (--mamba-host-slots): {host_slots} x {mem_GB(per_slot)} = "
@@ -739,7 +845,9 @@ class Engine:
 
             with rank_host_affinity():
                 if kv_host_pages:
-                    self.kv_cache.attach_host_pages(kv_host_pages, engine_stream=self.stream)
+                    self.kv_cache.attach_host_pages(
+                        kv_host_pages, engine_stream=self.stream
+                    )
                     logger.info_rank0(
                         f"KV host tier (--kv-host-tier-gb): {kv_host_pages} pages x {mem_GB(kv_page_bytes)} = "
                         f"{mem_GB(kv_host_pages * kv_page_bytes)} pinned host RAM per rank"
@@ -775,21 +883,33 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-        self.linear_backend = LinearAttnBackend(self.device, self.linear_state_pool) if self.linear_state_pool is not None else None
+        self.linear_backend = (
+            LinearAttnBackend(self.device, self.linear_state_pool)
+            if self.linear_state_pool is not None
+            else None
+        )
         # --speculative-max-batch-size: one-row verify steps get their own backends, because a backend's capture state
         # (and the buffers its prepare_metadata stages for a replay) belongs to one rows-per-request width
-        self.attn_backend_narrow = self.linear_backend_narrow = self.narrow_graph_runner = None
+        self.attn_backend_narrow = self.linear_backend_narrow = (
+            self.narrow_graph_runner
+        ) = None
         if self.spec is not None and config.speculative_max_batch_size is not None:
-            self.attn_backend_narrow = create_attention_backend(config.attention_backend, config.model_config)
+            self.attn_backend_narrow = create_attention_backend(
+                config.attention_backend, config.model_config
+            )
             if self.linear_state_pool is not None:
-                self.linear_backend_narrow = LinearAttnBackend(self.device, self.linear_state_pool)
+                self.linear_backend_narrow = LinearAttnBackend(
+                    self.device, self.linear_state_pool
+                )
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
         # padded rows replay this request, so it carries one token per decode row
         self.dummy_req = Req(
-            input_ids=torch.zeros(config.decode_rows_per_req, dtype=torch.int32, device="cpu"),
+            input_ids=torch.zeros(
+                config.decode_rows_per_req, dtype=torch.int32, device="cpu"
+            ),
             table_idx=config.max_running_req,
             cached_len=0,
             output_len=1,
@@ -801,14 +921,19 @@ class Engine:
         # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
         if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
-        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        self.page_table[self.dummy_req.table_idx].fill_(
+            num_tokens
+        )  # point to dummy page
         # the one-row (no-draft) graphs pad with a one-token twin: _make_positions gives each padded request its own
         # extend_len rows, and a k+1-token pad would overflow a one-row batch
         self.dummy_req_narrow = None
         if self.attn_backend_narrow is not None:
             self.dummy_req_narrow = Req(
                 input_ids=torch.zeros(1, dtype=torch.int32, device="cpu"),
-                table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+                table_idx=self.dummy_req.table_idx,
+                cached_len=0,
+                output_len=1,
+                uid=-1,
                 sampling_params=None,  # type: ignore
                 cache_handle=None,  # type: ignore
             )
@@ -817,15 +942,21 @@ class Engine:
 
         # ======================= Verify state initialization ========================
         if config.decode_rows_per_req > 1 and self.linear_state_pool is not None:
-            self.linear_state_pool.attach_verify_scratch(config.max_running_req, config.decode_rows_per_req)
+            self.linear_state_pool.attach_verify_scratch(
+                config.max_running_req, config.decode_rows_per_req
+            )
         if self.spec is not None:
             self.spec.attach(self)
 
         post_free_memory = self._sync_get_memory()[0]
-        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+        logger.info_rank0(
+            f"Free memory after initialization: {mem_GB(post_free_memory)}"
+        )
 
         # ======================= Graph capture initialization ========================
-        self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
+        self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(
+            config.cuda_graph_bs, init_free_memory, aligned_max_seq_len
+        )
         if config.prefill_warmup:
             self._warmup_prefill()
 
@@ -837,8 +968,12 @@ class Engine:
         timeout = timedelta(seconds=config.distributed_timeout)
         if not config.tp_info.is_primary():
             return torch.distributed.TCPStore(
-                "127.0.0.1", config.distributed_port, config.tp_info.size,
-                is_master=False, timeout=timeout, multi_tenant=True,
+                "127.0.0.1",
+                config.distributed_port,
+                config.tp_info.size,
+                is_master=False,
+                timeout=timeout,
+                multi_tenant=True,
             )
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -848,11 +983,18 @@ class Engine:
         # TCPStore takes ownership of the fd and closes it with the store; detach so the
         # Python socket never closes that number again after it has been reused.
         return torch.distributed.TCPStore(
-            "127.0.0.1", config.distributed_port, config.tp_info.size,
-            is_master=True, timeout=timeout, multi_tenant=True, master_listen_fd=sock.detach(),
+            "127.0.0.1",
+            config.distributed_port,
+            config.tp_info.size,
+            is_master=True,
+            timeout=timeout,
+            multi_tenant=True,
+            master_listen_fd=sock.detach(),
         )
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+    def _init_communication(
+        self, config: EngineConfig
+    ) -> torch.distributed.ProcessGroup:
         store = self._make_distributed_store(config)
         use_gloo = config.tp_info.size == 1 or config.use_pynccl
         torch.distributed.init_process_group(
@@ -866,7 +1008,9 @@ class Engine:
             tp_cpu_group = torch.distributed.group.WORLD
             assert tp_cpu_group is not None
             max_bytes = (
-                config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
+                config.max_forward_len
+                * config.model_config.hidden_size
+                * self.dtype.itemsize
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
@@ -875,21 +1019,40 @@ class Engine:
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:
-        if config.active_encoders and not config.use_dummy_weight and ftw_lacks_vision(config.model_path):
+        if (
+            config.active_encoders
+            and not config.use_dummy_weight
+            and ftw_lacks_vision(config.model_path)
+        ):
             raise ValueError(
                 f"{config.model_path} holds no vision encoder tensors: it was converted by a build before this "
                 "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
                 "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
             )
-        resident = [layer for layer in iter_moe_layers(self.model) if not isinstance(layer, OffloadMoELayer)]
-        if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
-            raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
+        resident = [
+            layer
+            for layer in iter_moe_layers(self.model)
+            if not isinstance(layer, OffloadMoELayer)
+        ]
+        if (
+            resident
+            and not config.use_dummy_weight
+            and is_ftw_checkpoint(config.model_path)
+            and not ftw_tensor_names(config.model_path, "experts_bank")
+        ):
+            raise ValueError(
+                f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`"
+            )
         host_keys = _host_embedding_keys(self.model, config)
         staged_keys = _online_quant_keys(self.model, config)
         if config.online_quant:
-            logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
+            logger.info_rank0(
+                f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load"
+            )
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys, staged_keys))
+            self.model.load_state_dict(
+                self._load_weight_state_dict(config, host_keys, staged_keys)
+            )
         if config.speculative_algorithm is not None:
             _spec_runner().prepare_target(config, self.model)
         finalize_quant(self.model)
@@ -897,11 +1060,19 @@ class Engine:
             self._load_resident_experts(config, resident)
 
     def _load_weight_state_dict(
-        self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]
+        self,
+        config: EngineConfig,
+        host_keys: frozenset[str],
+        staged_keys: frozenset[str],
     ) -> dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys, staged_keys=staged_keys)
+            return _make_dummy_weight_state_dict(
+                model_state,
+                device=self.device,
+                host_keys=host_keys,
+                staged_keys=staged_keys,
+            )
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -926,9 +1097,14 @@ class Engine:
                 method=layers[0].quant_method,
                 device=self.device,
                 dummy=config.use_dummy_weight,
-                parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
+                parallel={"serial": False, "parallel": True}.get(
+                    config.expert_load, None
+                ),
                 resident=True,
-                layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
+                layer_methods=[
+                    layer.quant_method
+                    for layer in sorted(layers, key=lambda layer: layer.layer_id)
+                ],
             )
         attach_resident_banks(layers, banks)
 
@@ -965,7 +1141,9 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(
+        self, config: EngineConfig, banks, method=None, max_slots=None
+    ) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
@@ -976,8 +1154,12 @@ class Engine:
             resolve_moe_cache_auto,
         )
 
-        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        cache_per_page, fixed_cache_size, page_tokens, min_reserve = (
+            self._pool_cls.kv_cost(config)
+        )
+        fixed_cache_size += state_pool_bytes(
+            config
+        )  # sibling GDN state pool, engine-summed
         fixed_cache_size += gdn_prefill_workspace_bytes(config)  # GDN prefill transient
         spec_fixed, draft_page = self._spec_budget(config)
         fixed_cache_size += spec_fixed
@@ -1000,7 +1182,9 @@ class Engine:
                 (config.num_page_override or 0) * page_tokens,
             ),
             page_size=page_tokens,
-            max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
+            max_slots=max_slots
+            if max_slots is not None or method is None
+            else method.slot_limit(),
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -1022,34 +1206,52 @@ class Engine:
         # expert-tensor granularity. Both pin-after-fill.
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
-        expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        expert_parallel = {"serial": False, "parallel": True}.get(
+            config.expert_load, None
+        )
         check_locked_fetch_config(config)
         # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
         # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
-        probe = pin_probe_enabled(config, mixed_formats=layer_methods is not None) and _cpu_moe_executor_viable(config.model_config)
+        probe = pin_probe_enabled(
+            config, mixed_formats=layer_methods is not None
+        ) and _cpu_moe_executor_viable(config.model_config)
         if probe:
             from freetoken.moe.host_banks import HostResidency
 
             requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
             cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
         else:
-            reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
-            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
-            _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
-            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
+            reserved = self._host_tables_bytes + staging_reserve(
+                config, lambda: _bank_bytes(config, method, layer_methods)
+            )
+            cpu_layer_ids = _resolve_cpu_layers(
+                config, num_moe_layers, reserved=reserved, method=method
+            )
+            _check_pin_budget(
+                config, reserved=reserved, method=method, layer_methods=layer_methods
+            )
+            decode_target, split_residency = self._residency_split(
+                config,
+                cpu_layer_ids,
+                method,
+                capped=_pin_budget_bytes(reserved) is not None,
+            )
             requested_residency = None
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    HostResidency.LOCKED.value
+                    if i in cpu_layer_ids
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
         # read before the expert load, so a bad profile fails in seconds
         expert_counts = resolve_profile(
-            config.moe_cache_split, config.model_path,
-            config.model_config.num_moe_layers, config.model_config.num_experts,
+            config.moe_cache_split,
+            config.model_path,
+            config.model_config.num_moe_layers,
+            config.model_config.num_experts,
         )
         try:
             with _weight_load_context():
@@ -1065,10 +1267,14 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
-        banks, probed, staging = settle_banks(config, banks, probe=probe, has_locked=split_residency)
+        banks, probed, staging = settle_banks(
+            config, banks, probe=probe, has_locked=split_residency
+        )
         if probe:
             cpu_layer_ids = probed
-            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
+            decode_target, split_residency = self._residency_split(
+                config, cpu_layer_ids, method, capped=True
+            )
         from freetoken.engine.cache_budget import (
             expert_bytes_per_slot,
             layer_slot_bytes,
@@ -1077,8 +1283,16 @@ class Engine:
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
         locked_fetch = staging is not None
-        layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
-        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
+        layer_tags = (
+            locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers)
+            if locked_fetch
+            else banks.layer_tags
+        )
+        self._moe_pool_groups = group_layers(
+            config.moe_cache_scope,
+            bank_layouts(banks.sources, layer_tags),
+            self._moe_layer_slot_bytes,
+        )
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
@@ -1088,18 +1302,28 @@ class Engine:
                 "layer to decode from the GPU slot cache; they combine with --moe-cpu-layers only for locked layers under "
                 "--moe-strategy hybrid unless --moe-locked-fetch is 0"
             )
-        self._moe_expert_counts = expert_counts if len(self._moe_pool_groups) > 1 else None
+        self._moe_expert_counts = (
+            expert_counts if len(self._moe_pool_groups) > 1 else None
+        )
         if len(self._moe_pool_groups) == 1 and config.moe_cache_split != "equal":
             logger.warning_rank0(
                 f"--moe-cache-split {config.moe_cache_split} is ignored: all MoE layers share one slot pool "
                 f"(--moe-cache-scope per-layer gives each layer its own)"
             )
-        self._moe_slot_limit = _slot_limit(layer_methods) if layer_methods is not None else (method.slot_limit() if method is not None else None)
+        self._moe_slot_limit = (
+            _slot_limit(layer_methods)
+            if layer_methods is not None
+            else (method.slot_limit() if method is not None else None)
+        )
         # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
-        pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
+        pools = self._moe_pools(
+            config.decode_rows_per_req if decode_target == "gpu" else 1
+        )
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
+            size, pages, overlap = self._resolve_auto_moe_cache_size(
+                config, banks, method, max_slots=size_cap
+            )
             if config.moe_prefill_overlap and not overlap:
                 logger.info_rank0(
                     f"--moe-cache-auto: prefill overlap disabled, its {2 * config.model_config.num_experts} "
@@ -1124,19 +1348,36 @@ class Engine:
             per_slot = expert_bytes_per_slot(banks.sources)
             size = min(config.moe_cache_mem // per_slot, size_cap)
             # per_slot is a mean over layers, so with pools of different slot sizes the split can exceed the budget: shrink until it fits
-            while size > 0 and self._moe_pool_bytes(split_slots(size, pools, self._moe_expert_counts)) > config.moe_cache_mem:
+            while (
+                size > 0
+                and self._moe_pool_bytes(
+                    split_slots(size, pools, self._moe_expert_counts)
+                )
+                > config.moe_cache_mem
+            ):
                 size -= 1
-            overlap = config.moe_prefill_overlap and size >= 2 * config.model_config.num_experts
+            overlap = (
+                config.moe_prefill_overlap
+                and size >= 2 * config.model_config.num_experts
+            )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             logger.info_rank0(
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
-        _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+        _require_offload_cache_size(
+            config.moe_cache_size, config.model_config.num_experts
+        )
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         bank_allocator = self._maybe_init_elastic_pool(
-            config, banks, pools, pool_sizes, size_cap, split_residency=split_residency, layer_tags=layer_tags
+            config,
+            banks,
+            pools,
+            pool_sizes,
+            size_cap,
+            split_residency=split_residency,
+            layer_tags=layer_tags,
         )
         if len(pools) > 1:
             logger.info_rank0(
@@ -1156,7 +1397,10 @@ class Engine:
                     f"expert banks hold experts of several formats ({sorted(set(banks.layer_formats))}) but the model "
                     f"binds {method.kind} / {method.kernel.name} on every MoE layer; reconvert the checkpoint"
                 )
-            if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
+            if banks.kind is not None and (banks.kind, banks.kernel) != (
+                method.kind,
+                method.kernel.name,
+            ):
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
@@ -1188,7 +1432,12 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         if locked_fetch:
             cache.locked_hybrid = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
+        cache.set_bank_sources(
+            banks.sources,
+            layer_residency=banks.layer_residency,
+            layer_tags=layer_tags,
+            row_tail_bytes=banks.row_tail_bytes,
+        )
         if self.elastic_pool is not None:
             self.elastic_pool.bind_moe_cache(cache)
         from freetoken.moe.hot_rankings import HotExpertRankings
@@ -1218,9 +1467,13 @@ class Engine:
     def _wrap_elastic_kv_buffer(self, config: EngineConfig) -> torch.Tensor:
         from freetoken.utils import div_even
 
-        kv_specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
+        kv_specs = [
+            s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0
+        ]
         spec = kv_specs[0]
-        local_kv_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        local_kv_heads = div_even(
+            spec.num_kv_heads, config.tp_info.size, allow_replicate=True
+        )
         fmt = config.kv_format
         return self.elastic_pool.wrap_kv_buffer(
             num_storage_layers=len(spec.layer_ids),
@@ -1253,10 +1506,18 @@ class Engine:
         if not kv_moe_elastic_enabled(getattr(config, "kv_moe_elastic", False)):
             return None
         if self.device.type != "cuda" or self._pool_cls is not QSAKVCache:
-            logger.warning_rank0("--kv-moe-elastic requires CUDA and QSAKVCache; leaving elastic pool disabled")
+            logger.warning_rank0(
+                "--kv-moe-elastic requires CUDA and QSAKVCache; leaving elastic pool disabled"
+            )
             return None
-        if len(pools) != 1 or split_residency or len(set(bank_layouts(banks.sources, layer_tags))) != 1:
-            logger.warning_rank0("--kv-moe-elastic requires unified single-layout pinned MoE banks; leaving disabled")
+        if (
+            len(pools) != 1
+            or split_residency
+            or len(set(bank_layouts(banks.sources, layer_tags))) != 1
+        ):
+            logger.warning_rank0(
+                "--kv-moe-elastic requires unified single-layout pinned MoE banks; leaving disabled"
+            )
             return None
 
         if config.num_page_override is not None:
@@ -1264,7 +1525,11 @@ class Engine:
         else:
             from freetoken.engine.cache_budget import net_cache_budget_bytes
 
-            fixed = state_pool_bytes(config) + gdn_prefill_workspace_bytes(config) + (256 << 20)
+            fixed = (
+                state_pool_bytes(config)
+                + gdn_prefill_workspace_bytes(config)
+                + (256 << 20)
+            )
             net_budget = net_cache_budget_bytes(
                 config.memory_ratio, self._baseline_free, self._weights_bytes, fixed
             )
@@ -1272,9 +1537,9 @@ class Engine:
             if self.spec is not None:
                 spec_fixed, draft_page = self._spec_budget(config)
                 page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
-                kv_avail = fixed_bytes + (kv_avail - spec_fixed - fixed_bytes) * page_bytes // (
-                    page_bytes + draft_page
-                )
+                kv_avail = fixed_bytes + (
+                    kv_avail - spec_fixed - fixed_bytes
+                ) * page_bytes // (page_bytes + draft_page)
             usable_kv_pages = self._pool_cls.solve_num_pages(config, max(0, kv_avail))
 
         floor_tokens = max(
@@ -1282,13 +1547,19 @@ class Engine:
             config.max_forward_len + 2 * config.page_size,
         )
         floor_kv_pages = div_ceil(floor_tokens, config.page_size)
-        kv_specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
+        kv_specs = [
+            s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0
+        ]
         spec = kv_specs[0]
-        local_kv_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        local_kv_heads = div_even(
+            spec.num_kv_heads, config.tp_info.size, allow_replicate=True
+        )
         fmt = config.kv_format
         elem_dim = fmt.elem_dim(spec.head_dim)
         elem_dtype = fmt.elem_tensor_dtype(self.dtype)
-        plane_page_bytes = config.page_size * local_kv_heads * elem_dim * elem_dtype.itemsize
+        plane_page_bytes = (
+            config.page_size * local_kv_heads * elem_dim * elem_dtype.itemsize
+        )
         num_kv_planes = 2 * len(spec.layer_ids)
         moe_row_bytes = {
             name: per_layer[0][0].numel() * per_layer[0].element_size()
@@ -1326,7 +1597,9 @@ class Engine:
         )
         return self.elastic_pool.make_moe_bank_allocator()
 
-    def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
+    def _residency_split(
+        self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool
+    ):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
@@ -1347,7 +1620,9 @@ class Engine:
             budget = _pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
+                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(
+                    config.model_config, method
+                )
             if bank_bytes and bank_bytes > budget:
                 split_residency = True
                 logger.info_rank0(
@@ -1364,14 +1639,19 @@ class Engine:
         return decode_target, split_residency
 
     def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
-        return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
+        return sum(
+            s * self._moe_layer_slot_bytes[g[0]]
+            for g, s in zip(self._moe_pool_groups, pool_sizes)
+        )
 
     def _moe_pools(self, batch: int) -> list:
         """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
         model_config = self.config.model_config
         num_experts = model_config.num_experts
         min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
-        return make_pools(self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit)
+        return make_pools(
+            self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit
+        )
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
@@ -1390,15 +1670,25 @@ class Engine:
         cache.hybrid_max_fetch = 1
         layer_rows = self._profile_layer_rows()
         if layer_rows is None:
-            logger.warning_rank0("--moe-hybrid-max-fetch auto: the MoE layers bind no expert method to look up in the `ft bench bw` profile; using a fixed fetch cap of 1")
+            logger.warning_rank0(
+                "--moe-hybrid-max-fetch auto: the MoE layers bind no expert method to look up in the `ft bench bw` profile; using a fixed fetch cap of 1"
+            )
             return
         executor = self.cpu_moe_executor
         keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
         cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
         # locked layers fetch the fetch_plan share instead; their own log line lists it
-        groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
-        fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
+        groups = collections.Counter(
+            (labels[l], fractions[l])
+            for l in range(len(keys))
+            if l not in cache.locked_hybrid
+        )
+        fetched = [
+            f"{f:.1%} on {n} {label} layers"
+            for (label, f), n in groups.items()
+            if f is not None
+        ]
         if fetched:
             logger.info_rank0(
                 "--moe-hybrid-max-fetch auto: each decode step fetches this share of a layer's expert misses over PCIe "
@@ -1410,7 +1700,11 @@ class Engine:
                 f"--moe-hybrid-max-fetch auto: no `ft bench bw` row for {capped} MoE layers ({', '.join(missing)}) at "
                 f"{executor.num_threads} CPU threads; using a fixed fetch cap of 1 there. `ft bench bw --model <checkpoint>` benches each layer kind"
             )
-        benched_isas = {rows[key].get("cpu_moe_isa") for key, f in zip(keys, fractions) if f is not None} - {None}
+        benched_isas = {
+            rows[key].get("cpu_moe_isa")
+            for key, f in zip(keys, fractions)
+            if f is not None
+        } - {None}
         if other := sorted(benched_isas - set(executor.isa.split(","))):
             logger.warning_rank0(
                 f"--moe-hybrid-max-fetch auto: some `ft bench bw` rows were benched on CPU kernels {other}, but this executor runs "
@@ -1431,8 +1725,19 @@ class Engine:
         for m in methods:
             fmt, opts = m.cpu_spec()
             c = m.cfg
-            keys.append(layer_kind_key(fmt, opts, c.hidden, c.local_intermediate, c.top_k, self.cpu_moe_executor.num_threads))
-            labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}")
+            keys.append(
+                layer_kind_key(
+                    fmt,
+                    opts,
+                    c.hidden,
+                    c.local_intermediate,
+                    c.top_k,
+                    self.cpu_moe_executor.num_threads,
+                )
+            )
+            labels.append(
+                f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}"
+            )
         return keys, labels, rows
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
@@ -1453,13 +1758,20 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+        max_tokens = max(
+            config.max_running_req,
+            config.cuda_graph_max_bs or 0,
+            *(config.cuda_graph_bs or []),
+            1,
+        )
         max_tokens *= config.decode_rows_per_req
         # Match GraphRunner's explicit-size precedence, including an empty list.
         if config.cuda_graph_bs is not None:
             graph_enabled = bool(config.cuda_graph_bs)
         else:
-            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
+            graph_enabled = (
+                config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
+            )
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1479,7 +1791,9 @@ class Engine:
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
         if graph_enabled:
-            _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
+            _disable_unsafe_cpu_moe_graphs(
+                config, executor, self.dtype, self.tp_cpu_group
+            )
 
     def _sync_get_memory(self, host_memory: bool = False) -> tuple[int, int]:
         """Get the min and max free memory across TP ranks. With ``host_memory`` the same all-reduce
@@ -1510,7 +1824,9 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
-    def _target_moe_and_expert_bytes(self, moe_cache_size: int | None, pool_sizes: list[int] | None) -> tuple[int, int]:
+    def _target_moe_and_expert_bytes(
+        self, moe_cache_size: int | None, pool_sizes: list[int] | None
+    ) -> tuple[int, int]:
         cache = self.moe_offload_cache
         if cache is None:
             return moe_cache_size or 0, 0
@@ -1523,7 +1839,9 @@ class Engine:
         # pools of several bank layouts have different slot sizes; round up so target * bytes covers them
         return target_moe, -(-nbytes // target_moe)
 
-    def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
+    def _resize_kv_pool(
+        self, config, num_pages: int, num_swa_pages: int | None
+    ) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
         # the model's per-access pool property all keep pointing at THIS pool, which frees its old
         # buffers before allocating the new ones. mark_for_rebind re-binds per-bind scratch on the
@@ -1531,7 +1849,9 @@ class Engine:
         # scheduler's generic cache_manager.rebuild.
         if self.kv_cache.needs_rebind_on_rebuild:
             self.model.mark_for_rebind()
-        self.kv_cache.rebuild_from_config(config, num_pages, num_swa_pages=num_swa_pages)
+        self.kv_cache.rebuild_from_config(
+            config, num_pages, num_swa_pages=num_swa_pages
+        )
         self.num_pages = num_pages
 
     def _refresh_seq_state(self, config) -> None:
@@ -1550,8 +1870,13 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
     def _resize_pools(
-        self, config, moe_cache_size: int | None, num_pages: int | None,
-        num_mamba_slots: int | None, num_swa_pages: int | None, moe_pool_sizes: list[int] | None = None,
+        self,
+        config,
+        moe_cache_size: int | None,
+        num_pages: int | None,
+        num_mamba_slots: int | None,
+        num_swa_pages: int | None,
+        moe_pool_sizes: list[int] | None = None,
     ) -> None:
         """Resize the requested pools, shrinking ones first.
 
@@ -1561,25 +1886,33 @@ class Engine:
         steps = []  # (shrinks, resize)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            steps.append((
-                moe_cache_size < self.moe_offload_cache.cache_size,
-                lambda: self.moe_offload_cache.rebuild(moe_cache_size, moe_pool_sizes),
-            ))
+            steps.append(
+                (
+                    moe_cache_size < self.moe_offload_cache.cache_size,
+                    lambda: self.moe_offload_cache.rebuild(
+                        moe_cache_size, moe_pool_sizes
+                    ),
+                )
+            )
         if num_pages is not None or num_swa_pages is not None:
             # A window-only change (num_pages None) re-derives the window pool at the new pin
             # against the CURRENT page count; _resize_kv_pool sets self.num_pages either way.
             pages = num_pages if num_pages is not None else self.num_pages
-            steps.append((
-                pages < self.num_pages,
-                lambda: self._resize_kv_pool(config, pages, num_swa_pages),
-            ))
+            steps.append(
+                (
+                    pages < self.num_pages,
+                    lambda: self._resize_kv_pool(config, pages, num_swa_pages),
+                )
+            )
         if num_mamba_slots is not None:
             # Must sit between graph teardown and re-capture so the recaptured graphs bind the new
             # state tensors. +1 for the reserved padding sink: num_mamba_slots is the usable count.
-            steps.append((
-                num_mamba_slots + 1 < self.linear_state_pool.num_slots,
-                lambda: self.linear_state_pool.rebuild(num_mamba_slots + 1),
-            ))
+            steps.append(
+                (
+                    num_mamba_slots + 1 < self.linear_state_pool.num_slots,
+                    lambda: self.linear_state_pool.rebuild(num_mamba_slots + 1),
+                )
+            )
         for _, resize in sorted(steps, key=lambda step: not step[0]):
             resize()
 
@@ -1598,8 +1931,12 @@ class Engine:
         guarantee no in-flight prefill/decode.
         """
         config = self.config
-        if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
-                and num_swa_pages is None):
+        if (
+            moe_cache_size is None
+            and num_pages is None
+            and num_mamba_slots is None
+            and num_swa_pages is None
+        ):
             return
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
@@ -1615,8 +1952,14 @@ class Engine:
                 )
             try:
                 # a rebuild does not lower max_running_req again, so with GPU decode every pool must hold a full batch; hybrid caps its fetches instead
-                batch = config.max_running_req * config.decode_rows_per_req if self.moe_offload_cache.decode_target == "gpu" else 1
-                moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
+                batch = (
+                    config.max_running_req * config.decode_rows_per_req
+                    if self.moe_offload_cache.decode_target == "gpu"
+                    else 1
+                )
+                moe_pool_sizes = split_slots(
+                    moe_cache_size, self._moe_pools(batch), self._moe_expert_counts
+                )
                 self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
@@ -1662,16 +2005,28 @@ class Engine:
         target_mamba = (
             num_mamba_slots + 1
             if num_mamba_slots is not None
-            else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
+            else (
+                self.linear_state_pool.num_slots
+                if self.linear_state_pool is not None
+                else None
+            )
         )
         spec_fixed, draft_page = self._spec_budget(config)
         self.kv_cache.validate_rebuild(
-            config, num_pages=num_pages,
-            num_swa_pages=num_swa_pages, target_moe=target_moe,
-            per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            config,
+            num_pages=num_pages,
+            num_swa_pages=num_swa_pages,
+            target_moe=target_moe,
+            per_expert_bytes=per_expert_bytes,
+            baseline_free=self._baseline_free,
+            weights_bytes=self._weights_bytes,
+            current_num_pages=self.num_pages,
             extra_fixed_bytes=(
-                (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
+                (
+                    state_pool_bytes(config, target_mamba)
+                    if target_mamba is not None
+                    else 0
+                )
                 + gdn_prefill_workspace_bytes(config)
                 + spec_fixed
             ),
@@ -1688,13 +2043,18 @@ class Engine:
         # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
         # captured coverage identical (the fit-check above guarantees the graph headroom fits).
         narrow = getattr(self, "narrow_graph_runner", None)
-        prior_graph_bs = self.graph_runner.graph_bs_list + (narrow.graph_bs_list if narrow is not None else [])
+        prior_graph_bs = self.graph_runner.graph_bs_list + (
+            narrow.graph_bs_list if narrow is not None else []
+        )
         # Point of no return for the scheduler's rollback logic: from here the live graphs and
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
-        narrow_backends = (getattr(self, "attn_backend_narrow", None), getattr(self, "linear_backend_narrow", None))
+        narrow_backends = (
+            getattr(self, "attn_backend_narrow", None),
+            getattr(self, "linear_backend_narrow", None),
+        )
         for backend in (self.attn_backend, self.linear_backend, *narrow_backends):
             if backend is not None:
                 backend.reset_capture()
@@ -1711,7 +2071,14 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
-        self._resize_pools(config, moe_cache_size, num_pages, num_mamba_slots, num_swa_pages, moe_pool_sizes)
+        self._resize_pools(
+            config,
+            moe_cache_size,
+            num_pages,
+            num_mamba_slots,
+            num_swa_pages,
+            moe_pool_sizes,
+        )
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = self.page_table.shape[1]
@@ -1722,32 +2089,52 @@ class Engine:
         if self.spec is not None:
             self.spec.attach(self)
         # reuse the startup-resolved bs set (see above)
-        self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(prior_graph_bs, free_min, aligned_max_seq_len)
+        self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(
+            prior_graph_bs, free_min, aligned_max_seq_len
+        )
 
     def graph_runner_for(self, batch: Batch) -> GraphRunner:
         """The runner whose graphs serve this batch: the one-row verify family past --speculative-max-batch-size."""
-        if self.narrow_graph_runner is not None and batch.phase == "verify" and batch.rows_per_req == 1:
+        if (
+            self.narrow_graph_runner is not None
+            and batch.phase == "verify"
+            and batch.rows_per_req == 1
+        ):
             return self.narrow_graph_runner
         return self.graph_runner
 
     def backends_for(self, batch: Batch) -> tuple:
         """(attention, linear) backends that stage this batch's metadata and run its forward."""
-        if self.attn_backend_narrow is not None and batch.phase == "verify" and batch.rows_per_req == 1:
+        if (
+            self.attn_backend_narrow is not None
+            and batch.phase == "verify"
+            and batch.rows_per_req == 1
+        ):
             return self.attn_backend_narrow, self.linear_backend_narrow
         return self.attn_backend, self.linear_backend
 
-    def _make_graph_runners(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> tuple:
+    def _make_graph_runners(
+        self, cuda_graph_bs, free_memory: int, max_seq_len: int
+    ) -> tuple:
         """(main runner, one-row verify runner or None). With --speculative-max-batch-size the verify family splits by
         batch size: decode_rows_per_req rows up to the limit, one row (no drafts) above it, each on its own backends."""
         config = self.config
         gate = getattr(config, "speculative_max_batch_size", None)
         if getattr(self, "spec", None) is None or gate is None:
-            return self._make_graph_runner(cuda_graph_bs, free_memory, max_seq_len), None
+            return self._make_graph_runner(
+                cuda_graph_bs, free_memory, max_seq_len
+            ), None
         all_bs = [
-            bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
+            bs
+            for bs in _determine_cuda_graph_bs(
+                cuda_graph_bs, config.cuda_graph_max_bs, free_memory
+            )
             if bs <= config.max_running_req
         ]
-        main_bs, narrow_bs = [bs for bs in all_bs if bs <= gate], [bs for bs in all_bs if bs > gate]
+        main_bs, narrow_bs = (
+            [bs for bs in all_bs if bs <= gate],
+            [bs for bs in all_bs if bs > gate],
+        )
         if narrow_bs and gate not in main_bs:
             # the limit keeps a graph: under a limit of 3, a batch of 3 still verifies k + 1 rows and would run eagerly
             main_bs.append(gate)
@@ -1775,10 +2162,14 @@ class Engine:
             ctx_override=dict(attn_backend=self.attn_backend_narrow),
             pool=main.graph_pool,
         )
-        self.spec.capture_graphs(narrow.graph_bs_list, narrow.graph_pool, rows_per_req=1)
+        self.spec.capture_graphs(
+            narrow.graph_bs_list, narrow.graph_pool, rows_per_req=1
+        )
         return main, narrow
 
-    def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
+    def _make_graph_runner(
+        self, cuda_graph_bs, free_memory: int, max_seq_len: int
+    ) -> GraphRunner:
         """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
         config = self.config
         rows = config.decode_rows_per_req
@@ -1786,10 +2177,15 @@ class Engine:
         if rows > 1:
             # every decode step is a verify; the verify scratch has max_running_req rows
             cuda_graph_bs = [
-                bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
+                bs
+                for bs in _determine_cuda_graph_bs(
+                    cuda_graph_bs, config.cuda_graph_max_bs, free_memory
+                )
                 if bs <= config.max_running_req
             ]
-            verify = dict(rows_per_req=rows, phase="verify", batch_hook=self._prepare_verify_batch)
+            verify = dict(
+                rows_per_req=rows, phase="verify", batch_hook=self._prepare_verify_batch
+            )
         runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -1815,11 +2211,16 @@ class Engine:
 
     def commit_verify(self, reqs, counts, out: torch.Tensor) -> None:
         """Commit each verified request's first ``counts`` tokens (row i of ``out`` is reqs[i]) to the target's per-request state."""
-        if self.linear_state_pool is not None and self.linear_state_pool.verify_scratch is not None:
+        if (
+            self.linear_state_pool is not None
+            and self.linear_state_pool.verify_scratch is not None
+        ):
             self.linear_state_pool.commit_verify([gdn_slot(r) for r in reqs], counts)
         for req, n, tokens in zip(reqs, counts, out):
             if req.output_token_counts is not None:
-                req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
+                req.output_token_counts.scatter_add_(
+                    0, tokens[:n], req.output_token_counts.new_ones(n)
+                )
 
     def _spec_budget(self, config) -> tuple[int, int]:
         """(fixed bytes, draft KV bytes per page) speculative decoding adds next to the KV pool."""
@@ -1833,8 +2234,13 @@ class Engine:
         runner = self.graph_runner_for(batch)
         use_graph = runner.can_use_cuda_graph(batch)
         attn_backend, _ = self.backends_for(batch)
-        override = {} if attn_backend is self.attn_backend else dict(attn_backend=attn_backend)
-        with self.ctx.forward_batch(batch, **override), self.model.forward_host_ctx(batch, use_graph):
+        override = (
+            {} if attn_backend is self.attn_backend else dict(attn_backend=attn_backend)
+        )
+        with (
+            self.ctx.forward_batch(batch, **override),
+            self.model.forward_host_ctx(batch, use_graph),
+        ):
             logits = runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
@@ -1865,7 +2271,9 @@ class Engine:
             next_tokens_gpu = self._comm.all_reduce(next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         # after the TP all-reduce (the rows' agreed tokens), before the event that covers the copies
-        logprobs_out = self.sampler.compute_logprobs(batch_logits, next_tokens_gpu, args)
+        logprobs_out = self.sampler.compute_logprobs(
+            batch_logits, next_tokens_gpu, args
+        )
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         if spec_prefill:
@@ -1875,8 +2283,12 @@ class Engine:
             return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
         chosen_logprobs, top_ids, top_logprobs = logprobs_out
         return ForwardOutput(
-            next_tokens_gpu, next_tokens_cpu, copy_done_event,
-            chosen_logprobs_cpu=chosen_logprobs, top_ids_cpu=top_ids, top_logprobs_cpu=top_logprobs,
+            next_tokens_gpu,
+            next_tokens_cpu,
+            copy_done_event,
+            chosen_logprobs_cpu=chosen_logprobs,
+            top_ids_cpu=top_ids,
+            top_logprobs_cpu=top_logprobs,
         )
 
     def _warmup_prefill_lens(self) -> list[int]:
@@ -1900,7 +2312,10 @@ class Engine:
                 seen = set()
                 for tokens in range(2, 1024 // top_k + 1):
                     numel = tokens * top_k
-                    cell = (triton.next_power_of_2(numel), triton.next_power_of_2(min(16, max(2, numel // 32))))
+                    cell = (
+                        triton.next_power_of_2(numel),
+                        triton.next_power_of_2(min(16, max(2, numel // 32))),
+                    )
                     if cell not in seen:
                         seen.add(cell)
                         lens.add(tokens)
@@ -1912,7 +2327,11 @@ class Engine:
                 from freetoken.kernel.nvfp4_moe import prefill_bucket_lens
 
                 lens.add(threshold + 1)
-                lens.update(prefill_bucket_lens(threshold + 1, cap, top_k, mc.num_experts, self.device.index))
+                lens.update(
+                    prefill_bucket_lens(
+                        threshold + 1, cap, top_k, mc.num_experts, self.device.index
+                    )
+                )
         if cap >= 4096:
             # act_and_mul flips BLOCK_D at M >= 4096; also GDN chunk_delta_h NT bucket 1 (NT > 32)
             lens.add(4096)
@@ -1939,7 +2358,9 @@ class Engine:
         if not warmup_lens:
             return
 
-        logger.info_rank0(f"Prefill warmup over {len(warmup_lens)} lengths: {warmup_lens}")
+        logger.info_rank0(
+            f"Prefill warmup over {len(warmup_lens)} lengths: {warmup_lens}"
+        )
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
         done: list[int] = []
@@ -1960,13 +2381,20 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
-                if self.linear_state_pool is not None and self.config.cache_type == "hybrid_radix":
+                if (
+                    self.linear_state_pool is not None
+                    and self.config.cache_type == "hybrid_radix"
+                ):
                     # like dummy_req: GDN state writes land in the padding sink, not a real slot
                     warm_req.linear_slot_idx = self.linear_state_pool.padding_slot
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
-                batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
-                batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+                batch.input_ids = torch.zeros(
+                    length, dtype=torch.int32, device=self.device
+                )
+                batch.positions = torch.arange(
+                    length, dtype=torch.int32, device=self.device
+                )
                 if self.config.model_config.model_is_mrope:
                     batch.mrope_positions = (
                         batch.positions.unsqueeze(0).expand(3, -1).contiguous()
@@ -1981,7 +2409,9 @@ class Engine:
         except Exception as exc:
             if self.config.tp_info.size > 1:
                 raise
-            logger.warning_rank0(f"Prefill warmup stopped after {done}: {type(exc).__name__}: {exc}")
+            logger.warning_rank0(
+                f"Prefill warmup stopped after {done}: {type(exc).__name__}: {exc}"
+            )
         finally:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
@@ -2063,7 +2493,9 @@ def _ensure_expandable_segments() -> None:
     caller guarantees CUDA is not yet initialized). Any user-provided allocator config
     is respected and left untouched.
     """
-    if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+    if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF"
+    ):
         return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
@@ -2099,7 +2531,11 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     override("page_size", P)
     logger.info_rank0(
         f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; SWA decoder replay: {args.swa_decoder_replay}"
-        + ("" if args.swa_decoder_replay == "exact" else f" (prefix hits stop {P} tokens before the prompt end)")
+        + (
+            ""
+            if args.swa_decoder_replay == "exact"
+            else f" (prefix hits stop {P} tokens before the prompt end)"
+        )
     )
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
@@ -2108,12 +2544,16 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
         override("max_extend_tokens", extend)
     mr = config.max_running_req
     if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs > mr:
-        logger.warning_rank0(f"cuda_graph_max_bs {config.cuda_graph_max_bs} exceeds max_running_req {mr}; clamping (larger decode batches never occur).")
+        logger.warning_rank0(
+            f"cuda_graph_max_bs {config.cuda_graph_max_bs} exceeds max_running_req {mr}; clamping (larger decode batches never occur)."
+        )
         override("cuda_graph_max_bs", mr)
     if config.cuda_graph_bs is not None:
         kept = [bs for bs in config.cuda_graph_bs if bs <= mr]
         if kept != list(config.cuda_graph_bs):
-            logger.warning_rank0(f"dropping cuda_graph_bs entries above max_running_req {mr}: {[bs for bs in config.cuda_graph_bs if bs > mr]}")
+            logger.warning_rank0(
+                f"dropping cuda_graph_bs entries above max_running_req {mr}: {[bs for bs in config.cuda_graph_bs if bs > mr]}"
+            )
             override("cuda_graph_bs", kept)
 
 
@@ -2124,7 +2564,9 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     the DSV4 decode batch size.
     """
     model_config = config.model_config
-    if (dtype := getattr(config, "dtype", None)) is not None and dtype != torch.bfloat16:
+    if (
+        dtype := getattr(config, "dtype", None)
+    ) is not None and dtype != torch.bfloat16:
         raise ValueError(f"DeepSeek-V4 runs in bfloat16 only, got --dtype {dtype}")
     if getattr(config, "kv_cache_dtype", "auto") == "auto":
         override("kv_cache_dtype", FP8_DS_MLA.name)
@@ -2192,13 +2634,17 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     else:
         k = int(s)
         if not 0 <= k <= num_moe_layers:
-            raise ValueError(f"--moe-cpu-layers count {k} must be in [0, {num_moe_layers}]")
+            raise ValueError(
+                f"--moe-cpu-layers count {k} must be in [0, {num_moe_layers}]"
+            )
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
 
 
-def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
+def _resolve_cpu_layers(
+    config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None
+) -> frozenset[int]:
     """MoE layer ids whose decode runs on the CPU executor.
 
     ``--moe-strategy cpu`` -> every layer. ``--moe-strategy offload`` + ``--moe-cpu-layers``
@@ -2210,7 +2656,9 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: 
     if not spec or not is_offload_moe_strategy(config.moe_strategy):
         return frozenset()
     if spec.strip() == "auto":
-        return _auto_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
+        return _auto_cpu_layers(
+            config, num_moe_layers, reserved=reserved, method=method
+        )
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
@@ -2218,14 +2666,21 @@ def _decode_target(config: EngineConfig) -> str:
     """Where routed experts decode, from the flags alone: hybrid co-compute, the CPU executor for some or all layers, or the GPU slot cache."""
     if config.moe_strategy == "hybrid":
         return "hybrid"
-    if config.moe_strategy == "cpu" or (config.moe_cpu_layers and is_offload_moe_strategy(config.moe_strategy)):
+    if config.moe_strategy == "cpu" or (
+        config.moe_cpu_layers and is_offload_moe_strategy(config.moe_strategy)
+    ):
         return "cpu"
     return "gpu"
 
 
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
-    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    "silu",
+    "swish",
+    "gelu",
+    "gelu_tanh",
+    "gelu_pytorch_tanh",
+    "swigluoai",
     "swiglu_clamp",
 )
 
@@ -2261,7 +2716,9 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
     WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
-    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
+    elif (
+        not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower()
+    ):  # WSL kernel tag
         return None
     else:
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
@@ -2271,7 +2728,9 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
 def _bank_bytes(config: EngineConfig, method=None, layer_methods=None) -> int | None:
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-    return ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method, layer_methods)
+    return ftw_bank_bytes(config.model_path) or bank_bytes_estimate(
+        config.model_config, method, layer_methods
+    )
 
 
 def _pin_hint(reserved: int) -> str:
@@ -2283,12 +2742,16 @@ def _pin_hint(reserved: int) -> str:
     )
 
 
-def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None, layer_methods=None) -> None:
+def _check_pin_budget(
+    config: EngineConfig, *, reserved: int, method=None, layer_methods=None
+) -> None:
     """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
     budget = _pin_budget_bytes(reserved)
-    bank_bytes = _bank_bytes(config, method, layer_methods) if budget is not None else None
+    bank_bytes = (
+        _bank_bytes(config, method, layer_methods) if budget is not None else None
+    )
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
@@ -2296,7 +2759,9 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None, layer
         )
 
 
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
+def _auto_cpu_layers(
+    config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None
+) -> frozenset[int]:
     """Pick CPU (locked) MoE layers for ``--moe-cpu-layers auto``: none while the banks fit the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
@@ -2314,7 +2779,9 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int
         )
     n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
     head = (n + 1) // 2
-    ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+    ids = frozenset(range(head)) | frozenset(
+        range(num_moe_layers - (n - head), num_moe_layers)
+    )
     logger.info_rank0(
         f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
         f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
@@ -2343,7 +2810,9 @@ _DENSE_MOE_SETTINGS = {
 }
 
 
-def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> QuantBackend:
+def _adjust_ftw_quant_backend(
+    model_path: str, quant_backend: QuantBackend
+) -> QuantBackend:
     """--quant-backend with an FTW checkpoint's packed expert kernel filled in where the flag leaves that table automatic.
 
     An entry that names another kernel is refused here, before any bank is read."""
@@ -2371,11 +2840,17 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
 
 def offload_layer_methods(model) -> list | None:
     """The expert method of each offload MoE layer of ``model``, by MoE-layer id; None for models whose MoE layers carry none (GGUF)."""
-    layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
+    layers = [
+        l
+        for l in iter_offload_moe_layers(model)
+        if getattr(l, "quant_method", None) is not None
+    ]
     if not layers:
         return None
     layers.sort(key=lambda layer: layer.layer_id)
-    assert [layer.layer_id for layer in layers] == list(range(len(layers))), [layer.layer_id for layer in layers]
+    assert [layer.layer_id for layer in layers] == list(range(len(layers))), [
+        layer.layer_id for layer in layers
+    ]
     return [layer.quant_method for layer in layers]
 
 
@@ -2390,14 +2865,20 @@ def shared_offload_method(model):
     if methods is None:
         return None
     groups = method_groups(methods)
-    found = ", ".join(f"{m.kind} via {m.kernel.name}" + (f" on {len(ids)} layers" if len(groups) > 1 else "") for m, ids in groups)
+    found = ", ".join(
+        f"{m.kind} via {m.kernel.name}"
+        + (f" on {len(ids)} layers" if len(groups) > 1 else "")
+        for m, ids in groups
+    )
     logger.info_rank0(f"MoE experts: {found}")
     return groups[0][0]
 
 
 def _slot_limit(layer_methods) -> int | None:
     """The tightest slot cap of the layers' expert kernels (a pool never mixes kernels, but the limit is checked per pool against the largest)."""
-    limits = [limit for limit in (m.slot_limit() for m in layer_methods) if limit is not None]
+    limits = [
+        limit for limit in (m.slot_limit() for m in layer_methods) if limit is not None
+    ]
     return min(limits) if limits else None
 
 
@@ -2418,7 +2899,11 @@ def _meta_model(config: EngineConfig, decode_target: str):
     from freetoken.models import create_model
     from freetoken.utils.torch_utils import torch_dtype
 
-    set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
+    set_quant_backend(
+        _adjust_ftw_quant_backend(
+            config.model_path, QuantBackend.parse(config.quant_backend)
+        )
+    )
     object.__setattr__(config.model_config, "moe_strategy", config.moe_strategy)
     object.__setattr__(config.model_config, "decode_target", decode_target)
     with torch.device("meta"), torch_dtype(config.dtype):
@@ -2434,7 +2919,9 @@ def offload_expert_methods(config: EngineConfig) -> tuple:
 
     model = _meta_model(config, "gpu")
     layer_methods = offload_layer_methods(model)
-    return shared_offload_method(model), (layer_methods if is_mixed(layer_methods) else None)
+    return shared_offload_method(model), (
+        layer_methods if is_mixed(layer_methods) else None
+    )
 
 
 def meta_offload_layer_methods(config: EngineConfig, decode_target: str) -> list | None:
@@ -2551,22 +3038,32 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
-    if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
+    if _dtype == torch.float16 and getattr(
+        getattr(model_config, "quant", None), "weight_scales", False
+    ):
         # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
-        raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
+        raise ValueError(
+            "--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16."
+        )
     _validate_kv_format(config, model_config)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types, getattr(config, "kv_format", NONE)),
+            _resolve_auto_attention_backend(
+                required_attn_types, getattr(config, "kv_format", NONE)
+            ),
         )
-        logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
+        logger.info_rank0(
+            f"Auto-selected attention backend: {config.attention_backend}"
+        )
     _validate_attention_backend_choice(config, override, required_attn_types)
     if getattr(config, "speculative_algorithm", None) is not None:
         _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
-        total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
+        total_experts = (
+            config.model_config.num_moe_layers * config.model_config.num_experts
+        )
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
 
     # The CPU MoE executor supports the silu/gelu family plus the clamped
@@ -2619,11 +3116,18 @@ def _adjust_config(config: EngineConfig):
                 "(resident experts) instead of offload"
             )
             # the cache sizing flags get their own warning in the 'fused' block below
-            inert = [flag for flag, on in (
-                (f"--moe-cpu-layers={config.moe_cpu_layers}", config.moe_cpu_layers),
-                ("--moe-prefill-hit-d2d", config.moe_prefill_hit_d2d),
-                ("--disable-moe-prefill-overlap", not config.moe_prefill_overlap),
-            ) if on]
+            inert = [
+                flag
+                for flag, on in (
+                    (
+                        f"--moe-cpu-layers={config.moe_cpu_layers}",
+                        config.moe_cpu_layers,
+                    ),
+                    ("--moe-prefill-hit-d2d", config.moe_prefill_hit_d2d),
+                    ("--disable-moe-prefill-overlap", not config.moe_prefill_overlap),
+                )
+                if on
+            ]
             if inert:
                 logger.warning_rank0(
                     f"Unified-memory GPU serves MoE experts resident; ignoring {', '.join(inert)} "
@@ -2718,7 +3222,11 @@ def _adjust_config(config: EngineConfig):
             f"got {config.moe_strategy!r}"
         )
 
-    if is_moe and config.moe_cpu_layers and config.moe_strategy not in ("offload", "hybrid"):
+    if (
+        is_moe
+        and config.moe_cpu_layers
+        and config.moe_strategy not in ("offload", "hybrid")
+    ):
         # the layer split needs the offload host banks + slot cache; 'cpu' already runs every layer on CPU, 'fused' keeps experts resident on the GPU (no host banks)
         raise ValueError(
             "--moe-cpu-layers requires --moe-strategy offload or hybrid (got "
@@ -2726,7 +3234,9 @@ def _adjust_config(config: EngineConfig):
         )
 
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
-        if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
+        if not _parse_cpu_layers_spec(
+            config.moe_cpu_layers, model_config.num_moe_layers
+        ):
             override("moe_cpu_layers", None)
 
     if is_moe:
