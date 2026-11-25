@@ -33,7 +33,14 @@ class GraphCaptureBuffer:
     rows_per_req: int = 1
 
     @classmethod
-    def init(cls, bs: int, device: torch.device, dummy_loc: int, mrope: bool = False, rows_per_req: int = 1) -> GraphCaptureBuffer:
+    def init(
+        cls,
+        bs: int,
+        device: torch.device,
+        dummy_loc: int,
+        mrope: bool = False,
+        rows_per_req: int = 1,
+    ) -> GraphCaptureBuffer:
         n = bs * rows_per_req
         return GraphCaptureBuffer(
             input_ids=torch.zeros(n, dtype=torch.int32, device=device),
@@ -145,7 +152,10 @@ class GraphRunner:
             free_memory=free_memory,
         )
         # the padded rows replay the dummy request, so it must carry rows_per_req rows
-        assert rows_per_req == 1 or dummy_req.extend_len == rows_per_req, (rows_per_req, dummy_req.extend_len)
+        assert rows_per_req == 1 or dummy_req.extend_len == rows_per_req, (
+            rows_per_req,
+            dummy_req.extend_len,
+        )
         self.forward = forward
         self.attn_backend = attn_backend
         self.linear_backend = linear_backend
@@ -176,8 +186,12 @@ class GraphRunner:
         outs = out if self._out_is_tuple else (out,)
         if self._out is None:
             # the largest batch is captured first, so its outputs size the buffers
-            assert self.out_dtype is None or len(outs) == 1, "out_dtype applies to a single output"
-            self._out = [torch.empty_like(o, dtype=self.out_dtype or o.dtype) for o in outs]
+            assert self.out_dtype is None or len(outs) == 1, (
+                "out_dtype applies to a single output"
+            )
+            self._out = [
+                torch.empty_like(o, dtype=self.out_dtype or o.dtype) for o in outs
+            ]
         for buf, o in zip(self._out, outs, strict=True):
             buf[: o.shape[0]] = o
         self._out_rows[bs] = tuple(o.shape[0] for o in outs)
@@ -193,21 +207,39 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
+        self.attn_backend.init_capture_graph(
+            max_seq_len=max_seq_len,
+            bs_list=self.graph_bs_list,
+            rows_per_req=self.rows_per_req,
+        )
         if self.linear_backend is not None:
-            self.linear_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
+            self.linear_backend.init_capture_graph(
+                max_seq_len=max_seq_len,
+                bs_list=self.graph_bs_list,
+                rows_per_req=self.rows_per_req,
+            )
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
 
-        logger.info_rank0(f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}")
+        logger.info_rank0(
+            f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}"
+        )
         free_memory = get_free_memory(self.device)
-        logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
+        logger.info_rank0(
+            f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}"
+        )
 
         # capture runs the forward eagerly and stores K/V, so aim it at the dummy page as replay does for padded rows; slot 0 is a real page
         dummy_loc = int(get_global_ctx().page_table[self.dummy_req.table_idx, 0])
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, dummy_loc, mrope=self.mrope, rows_per_req=self.rows_per_req)
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs,
+            self.device,
+            dummy_loc,
+            mrope=self.mrope,
+            rows_per_req=self.rows_per_req,
+        )
         self._reset_moe_offload_cache()
 
         pbar = tqdm(
@@ -219,10 +251,16 @@ class GraphRunner:
         pool = self.graph_pool
         for bs in pbar:
             free_memory = get_free_memory(self.device)
-            pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
+            pbar.desc = (
+                f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
+            )
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.rows_per_req)
+            batch = Batch(
+                reqs=[self.dummy_req] * bs,
+                phase=self.phase,
+                rows_per_req=self.rows_per_req,
+            )
             batch.padded_reqs = batch.reqs
             if self.batch_hook is not None:
                 self.batch_hook(batch)
@@ -244,9 +282,11 @@ class GraphRunner:
         self.graph_pool = pool
 
         self._reset_moe_offload_cache()
-        if self.moe_offload_cache is not None and hasattr(self.moe_offload_cache, "seed_hot_experts"):
+        if self.moe_offload_cache is not None and hasattr(
+            self.moe_offload_cache, "seed_hot_experts"
+        ):
             self.moe_offload_cache.seed_hot_experts()
-        if ENV.L2_PERSIST_MB > 0 and self.device.type == "cuda":
+        if int(ENV.L2_PERSIST_MB.value or 0) > 0 and self.device.type == "cuda":
             from freetoken.kernel.l2_persist import (
                 find_graph_pool_window,
                 set_stream_persisting_l2_window,
@@ -256,7 +296,10 @@ class GraphRunner:
             win = find_graph_pool_window(self.graph_pool, dev_idx)
             if win is not None:
                 pinned_bytes = set_stream_persisting_l2_window(
-                    self.stream, win[0], win[1], max_window_mb=int(ENV.L2_PERSIST_MB)
+                    self.stream,
+                    win[0],
+                    win[1],
+                    max_window_mb=int(ENV.L2_PERSIST_MB.value),
                 )
                 if pinned_bytes > 0:
                     logger.info_rank0(
@@ -264,7 +307,9 @@ class GraphRunner:
                         f"(graph pool segment {win[1] / (1 << 20):.2f} MiB)"
                     )
         free_memory = get_free_memory(self.device)
-        logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        logger.info_rank0(
+            f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}"
+        )
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return (
@@ -283,7 +328,8 @@ class GraphRunner:
             self.linear_backend.prepare_for_replay(batch)
         g.replay()
         outs = tuple(
-            buf[: rows // padded * batch.size] for buf, rows in zip(self._out, self._out_rows[padded], strict=True)
+            buf[: rows // padded * batch.size]
+            for buf, rows in zip(self._out, self._out_rows[padded], strict=True)
         )
         return outs if self._out_is_tuple else outs[0]
 

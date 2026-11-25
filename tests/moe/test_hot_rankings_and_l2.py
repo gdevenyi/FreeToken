@@ -7,7 +7,9 @@ import json
 from types import SimpleNamespace
 
 import torch
+from freetoken.env import ENV
 from freetoken.kernel.l2_persist import (
+    _CudaStreamAttrValue,
     clear_stream_persisting_l2_window,
     find_graph_pool_window,
     set_stream_persisting_l2_window,
@@ -18,27 +20,45 @@ from freetoken.moe.pool_policy import load_profile
 
 
 class _FakeCudaRt:
+    """Uses real ctypes CFUNCTYPE wrappers so tests exercise exact C-ABI argtypes marshaling."""
+
     def __init__(self, *, max_persisting: int, max_window: int = 64 << 20):
         self.max_persisting = max_persisting
         self.max_window = max_window
         self.limit_set: int | None = None
         self.window_calls: list[tuple[int, int, float, int, int]] = []
 
-    def cudaGetDevice(self, ptr) -> int:
-        ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int))[0] = 0
+        self.cudaGetDevice = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int)
+        )(self._get_device)
+        self.cudaDeviceGetAttribute = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int
+        )(self._get_attr)
+        self.cudaDeviceSetLimit = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.c_int, ctypes.c_size_t
+        )(self._set_limit)
+        self.cudaStreamSetAttribute = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(_CudaStreamAttrValue),
+        )(self._stream_set_attr)
+        self.cudaGetLastError = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: 0)
+
+    def _get_device(self, ptr) -> int:
+        ptr[0] = 0
         return 0
 
-    def cudaDeviceGetAttribute(self, ptr, attr, _dev) -> int:
-        val = self.max_persisting if int(attr.value) == 108 else self.max_window
-        ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int))[0] = val
+    def _get_attr(self, ptr, attr, _dev) -> int:
+        ptr[0] = self.max_persisting if int(attr) == 108 else self.max_window
         return 0
 
-    def cudaDeviceSetLimit(self, _limit, value) -> int:
-        self.limit_set = int(value.value)
+    def _set_limit(self, _limit, value) -> int:
+        self.limit_set = int(value)
         return 0
 
-    def cudaStreamSetAttribute(self, _stream, _attr, value_ptr) -> int:
-        win = value_ptr._obj.accessPolicyWindow
+    def _stream_set_attr(self, _stream, _attr, value_ptr) -> int:
+        win = value_ptr[0].accessPolicyWindow
         self.window_calls.append(
             (
                 int(win.base_ptr or 0),
@@ -50,12 +70,10 @@ class _FakeCudaRt:
         )
         return 0
 
-    def cudaGetLastError(self) -> int:
-        return 0
-
 
 def test_persisting_l2_window_pins_sm89_and_skips_small_l2(monkeypatch):
-    fake_stream = SimpleNamespace(cuda_stream=0x12345678)
+    assert int(ENV.L2_PERSIST_MB.value or 0) == 32
+    fake_stream = SimpleNamespace(cuda_stream=0x7F12_3456_7890)
 
     # RTX 6000 Ada sm_89 (~64 MiB persisting L2 capacity, 47.7 MiB graph pool, 32 MiB cap):
     rt_ada = _FakeCudaRt(max_persisting=64 << 20, max_window=64 << 20)

@@ -50,9 +50,28 @@ def _load_cudart():
         return None
     for name in ("libcudart.so", "libcudart.so.13", "libcudart.so.12"):
         try:
-            return ctypes.CDLL(name)
+            rt = ctypes.CDLL(name)
         except OSError:
             continue
+        rt.cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        rt.cudaGetDevice.restype = ctypes.c_int
+        rt.cudaDeviceGetAttribute.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        rt.cudaDeviceGetAttribute.restype = ctypes.c_int
+        rt.cudaDeviceSetLimit.argtypes = [ctypes.c_int, ctypes.c_size_t]
+        rt.cudaDeviceSetLimit.restype = ctypes.c_int
+        rt.cudaStreamSetAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(_CudaStreamAttrValue),
+        ]
+        rt.cudaStreamSetAttribute.restype = ctypes.c_int
+        rt.cudaGetLastError.argtypes = []
+        rt.cudaGetLastError.restype = ctypes.c_int
+        return rt
     return None
 
 
@@ -107,8 +126,8 @@ def set_stream_persisting_l2_window(
     if (
         rt.cudaDeviceGetAttribute(
             ctypes.byref(max_persisting),
-            ctypes.c_int(_CUDA_DEV_ATTR_MAX_PERSISTING_L2_CACHE_SIZE),
-            dev,
+            _CUDA_DEV_ATTR_MAX_PERSISTING_L2_CACHE_SIZE,
+            int(dev.value),
         )
         != 0
     ):
@@ -121,8 +140,8 @@ def set_stream_persisting_l2_window(
     if (
         rt.cudaDeviceGetAttribute(
             ctypes.byref(max_policy_win),
-            ctypes.c_int(_CUDA_DEV_ATTR_MAX_ACCESS_POLICY_WINDOW_SIZE),
-            dev,
+            _CUDA_DEV_ATTR_MAX_ACCESS_POLICY_WINDOW_SIZE,
+            int(dev.value),
         )
         != 0
     ):
@@ -137,8 +156,8 @@ def set_stream_persisting_l2_window(
 
     if (
         rt.cudaDeviceSetLimit(
-            ctypes.c_int(_CUDA_LIMIT_PERSISTING_L2_CACHE_SIZE),
-            ctypes.c_size_t(limit_bytes),
+            _CUDA_LIMIT_PERSISTING_L2_CACHE_SIZE,
+            limit_bytes,
         )
         != 0
     ):
@@ -147,15 +166,15 @@ def set_stream_persisting_l2_window(
 
     window_bytes = min(int(num_bytes), limit_bytes)
     attr = _CudaStreamAttrValue()
-    attr.accessPolicyWindow.base_ptr = ctypes.c_void_p(int(base_ptr))
-    attr.accessPolicyWindow.num_bytes = ctypes.c_size_t(window_bytes)
-    attr.accessPolicyWindow.hitRatio = ctypes.c_float(1.0)
-    attr.accessPolicyWindow.hitProp = ctypes.c_int(_CUDA_ACCESS_PROPERTY_PERSISTING)
-    attr.accessPolicyWindow.missProp = ctypes.c_int(_CUDA_ACCESS_PROPERTY_NORMAL)
+    attr.accessPolicyWindow.base_ptr = int(base_ptr)
+    attr.accessPolicyWindow.num_bytes = int(window_bytes)
+    attr.accessPolicyWindow.hitRatio = 1.0
+    attr.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_PERSISTING
+    attr.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_NORMAL
     if (
         rt.cudaStreamSetAttribute(
-            ctypes.c_void_p(int(stream.cuda_stream)),
-            ctypes.c_int(_CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW),
+            int(stream.cuda_stream),
+            _CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
             ctypes.byref(attr),
         )
         != 0
@@ -175,14 +194,14 @@ def clear_stream_persisting_l2_window(
     if rt is None:
         return
     attr = _CudaStreamAttrValue()
-    attr.accessPolicyWindow.base_ptr = ctypes.c_void_p(0)
-    attr.accessPolicyWindow.num_bytes = ctypes.c_size_t(0)
-    attr.accessPolicyWindow.hitRatio = ctypes.c_float(0.0)
-    attr.accessPolicyWindow.hitProp = ctypes.c_int(_CUDA_ACCESS_PROPERTY_NORMAL)
-    attr.accessPolicyWindow.missProp = ctypes.c_int(_CUDA_ACCESS_PROPERTY_NORMAL)
+    attr.accessPolicyWindow.base_ptr = 0
+    attr.accessPolicyWindow.num_bytes = 0
+    attr.accessPolicyWindow.hitRatio = 0.0
+    attr.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_NORMAL
+    attr.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_NORMAL
     rt.cudaStreamSetAttribute(
-        ctypes.c_void_p(int(stream.cuda_stream)),
-        ctypes.c_int(_CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW),
+        int(stream.cuda_stream),
+        _CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
         ctypes.byref(attr),
     )
     rt.cudaGetLastError()
