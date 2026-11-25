@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -60,8 +60,40 @@ class PyNCCLDistributedImpl(DistributedImpl):
         return result
 
 
+@dataclass
+class PcieSysmemDistributedImpl(DistributedImpl):
+    """Two-tier pinned-sysmem PCIe TP=2 AllReduce with PyNCCL fallback for AllGather / oversized tensors."""
+
+    pcie_comm: Any
+    fallback: DistributedImpl
+    max_bytes: int
+
+    _SUPPORTED_DTYPES: ClassVar[tuple[torch.dtype, ...]] = (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+        torch.int32,
+    )
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if (
+            x.is_cuda
+            and x.is_contiguous()
+            and x.dtype in self._SUPPORTED_DTYPES
+            and x.nbytes <= self.max_bytes
+        ):
+            self.pcie_comm.all_reduce(x)
+            return x
+        return self.fallback.all_reduce(x)
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fallback.all_gather(x)
+
+
 class DistributedCommunicator:
-    plugins: List[DistributedImpl] = [TorchDistributedImpl()]
+    plugins: ClassVar[list[DistributedImpl]] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_reduce(x)
@@ -71,14 +103,21 @@ class DistributedCommunicator:
 
 
 def enable_pynccl_distributed(
-    tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
+    tp_info: DistributedInfo,
+    tp_cpu_group: torch.distributed.ProcessGroup,
+    max_bytes: int,
 ) -> None:
     """
-    Enable PyNCCL-based distributed communication for tensor parallelism.
+    Enable PyNCCL-based distributed communication for tensor parallelism
+    (and optional pinned-sysmem PCIe TP=2 AllReduce when FREETOKEN_PCIE_ALLREDUCE=1).
     """
     if tp_info.size == 1:
         return
-    from freetoken.kernel import init_pynccl
+    from freetoken.kernel import (
+        init_pcie_allreduce,
+        init_pynccl,
+        pcie_allreduce_enabled,
+    )
 
     comm = init_pynccl(
         tp_rank=tp_info.rank,
@@ -86,8 +125,23 @@ def enable_pynccl_distributed(
         tp_cpu_group=tp_cpu_group,
         max_size_bytes=max_bytes,
     )
+    pynccl_impl = PyNCCLDistributedImpl(comm)
+    DistributedCommunicator.plugins.append(pynccl_impl)
 
-    DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
+    if tp_info.size == 2 and pcie_allreduce_enabled():
+        pcie_comm = init_pcie_allreduce(
+            tp_rank=tp_info.rank,
+            tp_size=tp_info.size,
+            tp_cpu_group=tp_cpu_group,
+        )
+        if pcie_comm is not None:
+            DistributedCommunicator.plugins.append(
+                PcieSysmemDistributedImpl(
+                    pcie_comm=pcie_comm,
+                    fallback=pynccl_impl,
+                    max_bytes=pcie_comm.max_bytes,
+                )
+            )
 
 
 def destroy_distributed() -> None:
