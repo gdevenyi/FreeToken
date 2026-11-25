@@ -121,7 +121,11 @@ __device__ __forceinline__ void barrier_epoch_release(Signal *sig0,
     uint32_t *peer_counter = &peer_sg->start[blockIdx.x][rank];
     uint32_t *self_counter = &self_sg->start[blockIdx.x][1 - rank];
     st_flag_release(peer_counter, epoch);
+    uint32_t spins = 0;
     while (static_cast<int32_t>(ld_flag_acquire(self_counter) - epoch) < 0) {
+      if (++spins > 32u) {
+        __nanosleep(64);
+      }
     }
     self_sg->flag[blockIdx.x] = epoch;
   }
@@ -209,6 +213,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1)
         my_s[idx] = local_in[idx];
       }
     }
+    __threadfence_system();
   }
 
   barrier_epoch_release(sig0, sig1, self_sg, rank);

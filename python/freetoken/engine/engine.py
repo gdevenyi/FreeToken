@@ -1585,7 +1585,11 @@ class Engine:
             moe_row_bytes=moe_row_bytes,
             base_moe_slots=config.moe_cache_size,
             max_moe_slots=size_cap,
-            num_experts=config.model_config.num_experts,
+            num_experts=getattr(
+                config.model_config,
+                "local_num_experts",
+                config.model_config.num_experts,
+            ),
             prefill_overlap=config.moe_prefill_overlap,
             strict_budget=True,
         )

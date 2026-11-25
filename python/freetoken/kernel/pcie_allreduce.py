@@ -256,9 +256,38 @@ def init_pcie_allreduce(
         cap,
         block_cap,
     )
+    # Paired hardware self-test across Tier 1 (< 64 KiB) and Tier 2 (>= 64 KiB).
+    test_err: str | None = None
+    try:
+        dev = torch.device("cuda", dev_idx)
+        for n_elems in (128, min(cap // 2, 40960)):
+            if n_elems <= 0:
+                continue
+            val = 1.25 if tp_rank == 0 else 2.5
+            probe = torch.full((n_elems,), val, dtype=torch.bfloat16, device=dev)
+            wrapper.all_reduce(probe)
+            torch.cuda.synchronize(dev)
+            expected = torch.full((n_elems,), 3.75, dtype=torch.bfloat16, device=dev)
+            if not torch.equal(probe, expected):
+                test_err = f"self-test mismatch at n_elems={n_elems}"
+                break
+    except BaseException as exc:  # noqa: BLE001
+        test_err = repr(exc)
+
+    probe_errs: list[str | None] = [None] * tp_size
+    dist.all_gather_object(probe_errs, test_err, group=tp_cpu_group)
+    dist.barrier(group=tp_cpu_group)
+    if any(probe_errs):
+        logger.warning_rank0(
+            f"FREETOKEN_PCIE_ALLREDUCE=1 self-test failed ({probe_errs}); falling back to PyNCCL"
+        )
+        bank.unpin()
+        shared_buf.close()
+        return None
+
     logger.info_rank0(
         f"Enabled pinned-sysmem PCIe TP=2 AllReduce: arena={total_bytes / 2**20:.2f} MiB, "
-        f"cap={cap / 2**20:.2f} MiB, blocks<={block_cap}"
+        f"cap={cap / 2**20:.2f} MiB, blocks<={block_cap} (self-test PASS)"
     )
     return PcieSysmemCommunicator(
         wrapper=wrapper,

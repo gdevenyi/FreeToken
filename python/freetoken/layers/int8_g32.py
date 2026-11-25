@@ -14,6 +14,8 @@ Execution paths (selected automatically per device/runtime, zero host syncs, CUD
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -167,6 +169,15 @@ def int8_g32_triton_linear(
     return y
 
 
+@functools.cache
+def _shared_marlin_workspace(device_index: int) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils import marlin_utils
+
+    max_blocks = int(getattr(marlin_utils, "MARLIN_MAX_BLOCKS_PER_SM", 4))
+    dev = torch.device("cuda", device_index)
+    return marlin_utils.marlin_make_workspace_new(dev, max_blocks)
+
+
 def _try_pack_marlin_u8b128(
     qweight: torch.Tensor, scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
@@ -181,13 +192,11 @@ def _try_pack_marlin_u8b128(
     if k % 64 != 0:
         return None
     try:
+        from vllm import _custom_ops as ops
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            marlin_make_workspace_new,
             marlin_permute_scales,
         )
         from vllm.scalar_type import scalar_types
-
-        from vllm import _custom_ops as ops
     except Exception:  # noqa: BLE001
         return None
 
@@ -230,7 +239,12 @@ def _try_pack_marlin_u8b128(
             size_n=padded_n,
             group_size=GROUP_SIZE,
         )
-        workspace = marlin_make_workspace_new(qweight.device)
+        dev_idx = (
+            torch.cuda.current_device()
+            if qweight.device.index is None
+            else int(qweight.device.index)
+        )
+        workspace = _shared_marlin_workspace(dev_idx)
     except Exception:  # noqa: BLE001
         return None
     return marlin_qw, marlin_sc, workspace, padded_n
