@@ -85,6 +85,14 @@ def _decode_nvfp4_moe_kernel(
     n_mask = offs_n < N
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
+    if slot < 0:
+        c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+        tl.store(
+            c_ptrs,
+            tl.zeros((BLOCK_SIZE_N,), dtype=compute_type),
+            mask=(route_id < total_routes) & n_mask,
+        )
+        return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 
@@ -215,6 +223,14 @@ def _decode_nvfp4_marlin_kernel(
     n_mask = offs_n < N
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
+    if slot < 0:
+        c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+        tl.store(
+            c_ptrs,
+            tl.zeros((BLOCK_SIZE_N,), dtype=compute_type),
+            mask=(route_id < total_routes) & n_mask,
+        )
+        return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 

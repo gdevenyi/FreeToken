@@ -176,7 +176,7 @@ class OffloadMoeCache:
     bank_allocator: object | None = None
 
     def __post_init__(self) -> None:
-        policy_ids = {"lru": 0}
+        policy_ids = {"lru": 0, "crf": 1}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         if self.layer_layouts is not None:
@@ -252,6 +252,9 @@ class OffloadMoeCache:
         # fetch (most-recently active first) and bumps it for every active expert.
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
+        )
+        self.expert_crf = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.float32, device=self.device
         )
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
@@ -775,6 +778,7 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self.expert_crf.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1221,6 +1225,7 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self.expert_crf.zero_()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0

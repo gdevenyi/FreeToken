@@ -39,6 +39,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         # tp_ok: nvfp4_banks._tp_shard slices the pieces per rank, the banks use cfg.local_intermediate and the

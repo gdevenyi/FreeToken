@@ -30,6 +30,10 @@ _SMALL_PREFILL_TOKENS = int(os.getenv("FREETOKEN_MOE_SMALL_PREFILL_TOKENS", "0")
 # ids per LRU ensure in that path: the kernel's block is next_pow2(ids) x next_pow2(slots), and a
 # block much wider than decode's spills to local memory whose launch reservation can OOM
 _ENSURE_CHUNK_IDS = 32
+# When a small-prefill batch has at least this many total (token, top_k) routes, compact the
+# touched slots into [U, ...] views and run the grouped Tensor Core prefill GEMM instead of
+# launching hundreds of independent SIMT decode GEMVs (0 = always use decode GEMV).
+_SMALL_PREFILL_GROUPED_ROUTES = int(os.getenv("FREETOKEN_MOE_GROUPED_ROUTES", "160"))
 
 
 class MoELayer(BaseOP):
@@ -366,14 +370,36 @@ class OffloadMoELayer(MoELayer):
         ):
             # A short extension touches a fraction of each layer's experts, so fetch those. A streamed
             # forward zeroes staging slots this path may register, so no layer streams beside it.
+            slot_ids = self._ensure_unique(cache, topk_ids)
+            pool_views = cache.pool_bank_views(self.layer_id)
+            pool_alphas = cache.alphas_for_slots(self.layer_id)
+            if 0 < _SMALL_PREFILL_GROUPED_ROUTES <= topk_ids.numel():
+                uniq_slots, inv = torch.unique(slot_ids.reshape(-1), return_inverse=True)
+                idx = uniq_slots.long()
+                compact_views = tuple(v.index_select(0, idx) for v in pool_views)
+                compact_alphas = (
+                    None
+                    if pool_alphas is None
+                    else (pool_alphas[0].index_select(0, idx), pool_alphas[1].index_select(0, idx))
+                )
+                return self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    inv.to(torch.int32).view_as(topk_ids),
+                    views=compact_views,
+                    n=int(uniq_slots.numel()),
+                    alphas=compact_alphas,
+                    is_prefill=True,
+                )
             return self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
-                self._ensure_unique(cache, topk_ids),
-                views=cache.pool_bank_views(self.layer_id),
+                slot_ids,
+                views=pool_views,
                 n=None,
-                alphas=cache.alphas_for_slots(self.layer_id),
+                alphas=pool_alphas,
                 is_prefill=False,
             )
         if cache.prefill_overlap:
