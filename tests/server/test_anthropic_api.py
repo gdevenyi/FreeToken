@@ -53,9 +53,9 @@ def _collect_events(events, model="claude-x", uid=1, cache_report=False):
             data = None
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    etype = line[len("event:"):].strip()
+                    etype = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    raw = line[len("data:"):].strip()
+                    raw = line[len("data:") :].strip()
                     data = raw if raw == "[DONE]" else json.loads(raw)
             out.append((etype, data))
         return out
@@ -165,10 +165,12 @@ def test_convert_thinking_toggle_broadcasts_every_spelling():
     """The toggle is broadcast in every spelling templates read (enable_thinking
     bool + M3's thinking_mode); each template picks the knob it knows and Jinja
     ignores the rest, so the kwargs are family-independent."""
+
     def _req(ttype):
         return AnthropicMessagesRequest.model_validate(
             {
-                "model": "m", "max_tokens": 16,
+                "model": "m",
+                "max_tokens": 16,
                 "messages": [{"role": "user", "content": "hi"}],
                 "thinking": {"type": ttype, "budget_tokens": 1024},
             }
@@ -256,19 +258,22 @@ def test_convert_preserves_mid_conversation_system_reminders():
 
 
 def test_convert_merges_only_leading_system_messages():
-    req = AnthropicMessagesRequest.model_validate({
-        "model": "claude-x", "max_tokens": 64,
-        "system": [{"type": "text", "text": "top-level sys"}],
-        "messages": [
-            {"role": "system", "content": "leading sys"},
-            {"role": "system", "content": [{"type": "text", "text": "second sys"}]},
-            {"role": "user", "content": "hello"},
-            {"role": "system", "content": [{"type": "text", "text": "turn reminder"}]},
-            {"role": "assistant", "content": "hi"},
-            {"role": "system", "content": ""},
-            {"role": "system", "content": "next reminder"},
-        ],
-    })
+    req = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "top-level sys"}],
+            "messages": [
+                {"role": "system", "content": "leading sys"},
+                {"role": "system", "content": [{"type": "text", "text": "second sys"}]},
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": [{"type": "text", "text": "turn reminder"}]},
+                {"role": "assistant", "content": "hi"},
+                {"role": "system", "content": ""},
+                {"role": "system", "content": "next reminder"},
+            ],
+        }
+    )
     original = req.model_dump()
     spec = A.convert_anthropic_to_genspec(req, {})
     assert spec.messages == [
@@ -303,9 +308,7 @@ def test_appending_system_reminder_preserves_converted_prefix(system, count_toke
     data["messages"].append({"role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"})
     second, second_tools, _, _ = A.convert_anthropic_prompt(request_type.model_validate(data))
     assert second[:-1] == first
-    assert second[-1] == {
-        "role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"
-    }
+    assert second[-1] == {"role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"}
     assert second_tools == first_tools
 
 
@@ -336,8 +339,12 @@ def test_full_response_text_and_tool():
 
 def test_full_response_length_truncation_is_max_tokens():
     result = GenResult(
-        reasoning="", content="partial", tool_calls=[],
-        finish_reason="length", prompt_tokens=11, completion_tokens=4096,
+        reasoning="",
+        content="partial",
+        tool_calls=[],
+        finish_reason="length",
+        prompt_tokens=11,
+        completion_tokens=4096,
     )
     resp = A.anthropic_full_response(result, "claude-x", uid=9)
     assert resp.stop_reason == "max_tokens"
@@ -345,8 +352,13 @@ def test_full_response_length_truncation_is_max_tokens():
 
 def test_full_response_cache_report_flips_input_tokens():
     result = GenResult(
-        reasoning="", content="hi", tool_calls=[], finish_reason="stop",
-        prompt_tokens=11, completion_tokens=5, cached_tokens=8,
+        reasoning="",
+        content="hi",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=11,
+        completion_tokens=5,
+        cached_tokens=8,
     )
     # Flag on: Anthropic billing semantics — input_tokens excludes the cached prefix.
     resp = A.anthropic_full_response(result, "claude-x", uid=9, cache_report=True)
@@ -360,8 +372,12 @@ def test_full_response_cache_report_flips_input_tokens():
 
 def test_full_response_cache_report_zero_hit_keeps_field_absent():
     result = GenResult(
-        reasoning="", content="hi", tool_calls=[], finish_reason="stop",
-        prompt_tokens=11, completion_tokens=5,
+        reasoning="",
+        content="hi",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=11,
+        completion_tokens=5,
     )
     resp = A.anthropic_full_response(result, "claude-x", uid=9, cache_report=True)
     assert resp.usage.input_tokens == 11
@@ -417,12 +433,12 @@ def test_stream_reasoning_as_thinking_block():
     types = [e[0] for e in collected if e[0]]
     assert types == [
         "message_start",
-        "content_block_start",   # thinking block
-        "content_block_delta",   # thinking_delta
-        "content_block_delta",   # signature_delta (empty, shape compliance)
+        "content_block_start",  # thinking block
+        "content_block_delta",  # thinking_delta
+        "content_block_delta",  # signature_delta (empty, shape compliance)
         "content_block_stop",
-        "content_block_start",   # text block
-        "content_block_delta",   # text_delta
+        "content_block_start",  # text block
+        "content_block_delta",  # text_delta
         "content_block_stop",
         "message_delta",
         "message_stop",
@@ -478,8 +494,7 @@ def test_stream_message_start_reports_the_admitted_prompt_usage(cache_report):
     from freetoken.server.generation import PromptAdmitted
 
     collected = _collect_events(
-        [PromptAdmitted(1200, 1024), ContentDelta("hi"),
-         GenDone("stop", 1200, 5, cached_tokens=1024)],
+        [PromptAdmitted(1200, 1024), ContentDelta("hi"), GenDone("stop", 1200, 5, cached_tokens=1024)],
         cache_report=cache_report,
     )
     types = [e[0] for e in collected]
@@ -487,8 +502,7 @@ def test_stream_message_start_reports_the_admitted_prompt_usage(cache_report):
     start = collected[0][1]["message"]["usage"]
     delta = next(d for t, d in collected if t == "message_delta")["usage"]
     assert start == {**delta, "output_tokens": 0}
-    expected = {"input_tokens": 176, "cache_read_input_tokens": 1024} if cache_report \
-        else {"input_tokens": 1200}
+    expected = {"input_tokens": 176, "cache_read_input_tokens": 1024} if cache_report else {"input_tokens": 1200}
     assert start == {**expected, "output_tokens": 0}
 
 
@@ -508,7 +522,7 @@ def test_stream_keepalive_before_admission_sends_message_start_first(monkeypatch
     async def run():
         out = []
         async for frame in A.anthropic_event_stream(slow(), "claude-x", 1):
-            out.append(frame.split("\n")[0][len("event: "):])
+            out.append(frame.split("\n")[0][len("event: ") :])
         return out
 
     types = asyncio.run(run())
@@ -628,9 +642,9 @@ def test_route_stream_text():
         data = None
         for line in block.split("\n"):
             if line.startswith("event:"):
-                etype = line[len("event:"):].strip()
+                etype = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                raw = line[len("data:"):].strip()
+                raw = line[len("data:") :].strip()
                 if raw and raw != "[DONE]":
                     data = json.loads(raw)
         if etype:
@@ -652,8 +666,7 @@ def test_stream_request_error_is_invalid_request_not_internal():
     from freetoken.server.generation import GenerationError
 
     async def boom():
-        raise GenerationError("prompt is too long: 8181 tokens > 7223 maximum",
-                              "context_length_exceeded")
+        raise GenerationError("prompt is too long: 8181 tokens > 7223 maximum", "context_length_exceeded")
         yield  # noqa: unreachable — makes this an async generator
 
     async def run():
@@ -662,9 +675,9 @@ def test_stream_request_error_is_invalid_request_not_internal():
             etype = data = None
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    etype = line[len("event:"):].strip()
+                    etype = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    data = json.loads(line[len("data:"):].strip())
+                    data = json.loads(line[len("data:") :].strip())
             out.append((etype, data))
         return out
 
@@ -690,10 +703,10 @@ def test_stream_tool_block_closes_before_following_text():
     types = [e[0] for e in collected if e[0]]
     assert types == [
         "message_start",
-        "content_block_start",   # tool_use (index 0)
-        "content_block_delta",   # input_json_delta (complete args)
+        "content_block_start",  # tool_use (index 0)
+        "content_block_delta",  # input_json_delta (complete args)
         "content_block_stop",
-        "content_block_start",   # text (index 1)
+        "content_block_start",  # text (index 1)
         "content_block_delta",
         "content_block_stop",
         "message_delta",
@@ -708,8 +721,12 @@ def test_stream_tool_block_closes_before_following_text():
 
 def test_full_response_includes_thinking_block():
     result = GenResult(
-        reasoning="Pondered.", content="Answer.", tool_calls=[],
-        finish_reason="stop", prompt_tokens=5, completion_tokens=3,
+        reasoning="Pondered.",
+        content="Answer.",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=5,
+        completion_tokens=3,
     )
     response = A.anthropic_full_response(result, "claude-x", 1)
     assert [b.type for b in response.content] == ["thinking", "text"]
@@ -755,8 +772,12 @@ def test_convert_output_config_effort():
 
 def test_output_config_effort_obeys_server_thinking_policy():
     req = AnthropicMessagesRequest.model_validate(
-        {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
-         "output_config": {"effort": "high"}}
+        {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "high"},
+        }
     )
     forced_off = A.convert_anthropic_to_genspec(req, {}, thinking="off").chat_template_kwargs
     assert "reasoning_effort" not in forced_off
@@ -764,14 +785,11 @@ def test_output_config_effort_obeys_server_thinking_policy():
 
 
 def test_count_tokens_prompt_matches_messages_prompt_with_effort():
-    body = {"model": "claude-x", "messages": [{"role": "user", "content": "hi"}],
-            "output_config": {"effort": "medium"}}
+    body = {"model": "claude-x", "messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": "medium"}}
     counted = A.convert_anthropic_prompt(AnthropicCountTokensRequest.model_validate(body))
     generated = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}))
     assert counted == generated
     assert counted[3]["reasoning_effort"] == "medium"
-
-
 
 
 # --------------------------------------------------------------------------- #
@@ -788,7 +806,9 @@ class _FakeTokenizeManager:
 
         self.msgs.extend(msgs)
         return [
-            UserMsg(uid=m.uid, input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32), sampling_params=m.sampling_params)
+            UserMsg(
+                uid=m.uid, input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32), sampling_params=m.sampling_params
+            )
             for m in msgs
         ]
 
@@ -854,8 +874,10 @@ def test_inline_system_override_reaches_counting_and_generation(policy):
 
     fake.send_one = record
     client = _client(fake)
-    body = {**_COUNT_BODY, "messages": [
-        {"role": "user", "content": "question"}, {"role": "system", "content": "instruction"}]}
+    body = {
+        **_COUNT_BODY,
+        "messages": [{"role": "user", "content": "question"}, {"role": "system", "content": "instruction"}],
+    }
     assert client.post("/v1/messages/count_tokens", json=body).status_code == 200
     assert client.post("/v1/messages", json={**body, "max_tokens": 32}).status_code == 200
     assert manager.msgs[0].inline_system_policy == submitted[0].inline_system_policy == policy
@@ -934,8 +956,9 @@ def test_count_tokens_excluded_from_request_ring():
 
     # A real /v1/messages request IS tracked, proving the exclusion is scoped to the subpath.
     client2 = _client(FakeState([("hi", True, 3, 1)]))
-    client2.post("/v1/messages", json={"model": "claude-x", "max_tokens": 8,
-                                       "messages": [{"role": "user", "content": "hi"}]})
+    client2.post(
+        "/v1/messages", json={"model": "claude-x", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+    )
     assert request_ring.requests_count() == 1
     request_ring.reset()
 
@@ -948,9 +971,7 @@ def test_count_tokens_image_only_message_400():
         "/v1/messages/count_tokens",
         json={
             "model": "claude-x",
-            "messages": [
-                {"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "x"}}]}
-            ],
+            "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "x"}}]}],
         },
     )
     assert r.status_code == 400
@@ -959,14 +980,10 @@ def test_count_tokens_image_only_message_400():
 
 def test_tool_choice_none_hides_tools():
     body = {**_COUNT_BODY, "tool_choice": {"type": "none"}}
-    _, template_tools, parser_tools, _ = A.convert_anthropic_prompt(
-        A.AnthropicCountTokensRequest.model_validate(body)
-    )
+    _, template_tools, parser_tools, _ = A.convert_anthropic_prompt(A.AnthropicCountTokensRequest.model_validate(body))
     assert template_tools is None
     assert parser_tools is None
-    spec = A.convert_anthropic_to_genspec(
-        AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}), {}
-    )
+    spec = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate({**body, "max_tokens": 64}), {})
     assert spec.template_tools is None
     assert not spec.parse_tools
 
@@ -1020,10 +1037,7 @@ def test_frontend_tokenizer_concurrent_first_build_dedupes():
             recv_tokenizer=None,
         )
         results = []
-        threads = [
-            _threading.Thread(target=lambda: results.append(fm.frontend_tokenizer()))
-            for _ in range(4)
-        ]
+        threads = [_threading.Thread(target=lambda: results.append(fm.frontend_tokenizer())) for _ in range(4)]
         for t in threads:
             t.start()
         for t in threads:
@@ -1064,8 +1078,7 @@ def test_tool_result_carries_the_wire_tool_use_id():
     )
     spec = A.convert_anthropic_to_genspec(req, {})
     results = [m for m in spec.messages if m["role"] == "tool"]
-    assert [(m["tool_call_id"], m["content"]) for m in results] == [
-        ("toolu_b", "60F"), ("toolu_a", "72F")]
+    assert [(m["tool_call_id"], m["content"]) for m in results] == [("toolu_b", "60F"), ("toolu_a", "72F")]
 
 
 def test_count_tokens_reads_the_real_manager_return_contract():
@@ -1140,7 +1153,9 @@ def test_tool_result_image_outside_a_user_message_is_rejected():
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
-                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+                        ],
                     }
                 ],
             },
@@ -1163,7 +1178,9 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
-                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+                        ],
                     }
                 ],
             },
@@ -1175,3 +1192,44 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "role": "user",
         "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
     }
+
+
+def test_claude_code_billing_header_cch_token_is_stripped_from_system_prompt():
+    """Claude Code mutates ``cch=<hex>;`` inside ``x-anthropic-billing-header:`` on every turn;
+    stripping it preserves prefix-cache hits while keeping non-header ``cch=`` text intact."""
+    turn1 = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 32,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.42; cc_entrypoint=cli; cch=9a0b1c2d3e4f;\n",
+                },
+                {"type": "text", "text": "You are Claude Code. Keep cch=deadbeef; in code examples."},
+            ],
+            "messages": [{"role": "user", "content": "check cch=1234abcd; in parser"}],
+        }
+    )
+    turn2 = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 32,
+            "system": (
+                "x-anthropic-billing-header: cc_version=2.1.42; cc_entrypoint=cli; cch=ff0011223344;\n"
+                "You are Claude Code. Keep cch=deadbeef; in code examples."
+            ),
+            "messages": [{"role": "user", "content": "check cch=1234abcd; in parser"}],
+        }
+    )
+    m1, _, _, _ = A.convert_anthropic_prompt(turn1)
+    m2, _, _, _ = A.convert_anthropic_prompt(turn2)
+    assert m1 == m2
+    assert m1[0] == {
+        "role": "system",
+        "content": (
+            "x-anthropic-billing-header: cc_version=2.1.42; cc_entrypoint=cli;\n"
+            "You are Claude Code. Keep cch=deadbeef; in code examples."
+        ),
+    }
+    assert m1[1] == {"role": "user", "content": "check cch=1234abcd; in parser"}

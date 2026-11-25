@@ -11,6 +11,7 @@ It consumes typed events, not a re-parsed OpenAI stream.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -104,9 +105,7 @@ def register_anthropic_routes(
         # default 422 {"detail": [...]} is unreadable to them. Scoped to /v1/messages*
         # so the OpenAI-protocol routes keep their existing wire behavior.
         if request.url.path.startswith("/v1/messages"):
-            return _anthropic_error_response(
-                400, "invalid_request_error", _validation_error_message(exc)
-            )
+            return _anthropic_error_response(400, "invalid_request_error", _validation_error_message(exc))
         return await request_validation_exception_handler(request, exc)
 
 
@@ -118,11 +117,10 @@ async def handle_anthropic_messages(
 ):
     try:
         spec = convert_anthropic_to_genspec(
-            req, model_sampling,
+            req,
+            model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
-            default_max_tokens=(
-                getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
-            ),
+            default_max_tokens=(getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS),
             inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
             thinking=getattr(state.config, "thinking", None),
         )
@@ -134,7 +132,9 @@ async def handle_anthropic_messages(
     if req.stream:
         events = anthropic_event_stream(
             generate_events(uid, spec, state, source="/v1/messages"),
-            req.model, uid, cache_report=cache_report,
+            req.model,
+            uid,
+            cache_report=cache_report,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -155,15 +155,14 @@ async def handle_anthropic_messages(
 
 async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state: Any):
     if not req.messages:
-        return _anthropic_error_response(
-            400, "invalid_request_error", "messages: at least one message is required"
-        )
+        return _anthropic_error_response(400, "invalid_request_error", "messages: at least one message is required")
     # Client-input validation (400) is kept strictly separate from tokenizer execution (500):
     # a checkpoint whose chat template raises ValueError is a server fault, not a bad request,
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
         messages, template_tools, _, ctk = convert_anthropic_prompt(
-            req, reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            req,
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
             thinking=getattr(state.config, "thinking", None),
         )
     except ValueError as exc:
@@ -171,12 +170,13 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     if not messages:
         # Non-empty on the wire but nothing survived conversion (e.g. image-only blocks on
         # this text-only server) — a client error, not a tokenizer fault.
-        return _anthropic_error_response(
-            400, "invalid_request_error", "messages: no tokenizable content"
-        )
+        return _anthropic_error_response(400, "invalid_request_error", "messages: no tokenizable content")
     try:
         n_tokens = await count_prompt_tokens(
-            messages, template_tools, ctk, state,
+            messages,
+            template_tools,
+            ctk,
+            state,
             inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
         )
     except GenerationError as exc:
@@ -193,6 +193,22 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 # Request conversion: Anthropic Messages -> GenSpec (the neutral generation spec;
 # built directly, like vLLM's Responses path — no ChatCompletionRequest pivot).
 # --------------------------------------------------------------------------- #
+_CCH_TOKEN_RE = re.compile(r"\bcch=[0-9a-fA-F]+;[ \t]*")
+
+
+def strip_anthropic_billing_cch(text: str) -> str:
+    """Strip per-request ``cch=<hex>;`` tokens from ``x-anthropic-billing-header:`` lines
+    so Claude Code turns reuse the cached system-prompt prefix instead of invalidating it."""
+    if "x-anthropic-billing-header:" not in text:
+        return text
+    out: list[str] = []
+    for line in text.split("\n"):
+        if line.lstrip().startswith("x-anthropic-billing-header:"):
+            line = _CCH_TOKEN_RE.sub("", line).rstrip()
+        out.append(line)
+    return "\n".join(out)
+
+
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
@@ -206,16 +222,16 @@ def convert_anthropic_prompt(
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
-            system_texts.append(req.system)
+            system_texts.append(strip_anthropic_billing_cch(req.system))
         else:
             system_texts.append(
-                "".join(b.text for b in req.system if b.type == "text" and b.text)
+                strip_anthropic_billing_cch("".join(b.text for b in req.system if b.type == "text" and b.text))
             )
 
     other: list[dict[str, Any]] = []
     for msg in req.messages:
         if msg.role == "system":
-            text = _content_text(msg.content)
+            text = strip_anthropic_billing_cch(_content_text(msg.content))
             if not other:
                 system_texts.append(text)
             elif text:
@@ -408,9 +424,7 @@ def anthropic_full_response(
 ) -> AnthropicMessagesResponse:
     content: list[AnthropicContentBlock] = []
     if result.reasoning:
-        content.append(
-            AnthropicContentBlock(type="thinking", thinking=result.reasoning, signature="")
-        )
+        content.append(AnthropicContentBlock(type="thinking", thinking=result.reasoning, signature=""))
     content.append(AnthropicContentBlock(type="text", text=result.content or ""))
     for index, call in enumerate(result.tool_calls):
         content.append(
@@ -428,9 +442,7 @@ def anthropic_full_response(
         model=model,
         stop_reason=stop_reason,
         stop_sequence=stop_sequence,
-        usage=_anthropic_usage(
-            result.prompt_tokens, result.completion_tokens, result.cached_tokens, cache_report
-        ),
+        usage=_anthropic_usage(result.prompt_tokens, result.completion_tokens, result.cached_tokens, cache_report),
     )
 
 
@@ -463,18 +475,24 @@ async def anthropic_event_stream(
     def _open_text() -> str:
         nonlocal block_open
         block_open = "text"
-        return _event(AnthropicStreamEvent(
-            type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="text", text=""),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="content_block_start",
+                index=block_index,
+                content_block=AnthropicContentBlock(type="text", text=""),
+            )
+        )
 
     def _open_thinking() -> str:
         nonlocal block_open
         block_open = "thinking"
-        return _event(AnthropicStreamEvent(
-            type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="content_block_start",
+                index=block_index,
+                content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
+            )
+        )
 
     def _stop_block() -> list[str]:
         nonlocal block_open, block_index
@@ -483,10 +501,15 @@ async def anthropic_event_stream(
             # Real thinking blocks end with a signature_delta; emit an empty one for
             # shape compliance (this server has no signing key and never verifies
             # signatures on replayed thinking blocks).
-            frames.append(_event(AnthropicStreamEvent(
-                type="content_block_delta", index=block_index,
-                delta=AnthropicDelta(type="signature_delta", signature=""),
-            )))
+            frames.append(
+                _event(
+                    AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=block_index,
+                        delta=AnthropicDelta(type="signature_delta", signature=""),
+                    )
+                )
+            )
         frames.append(_event(AnthropicStreamEvent(type="content_block_stop", index=block_index)))
         block_open = None
         block_index += 1
@@ -497,12 +520,17 @@ async def anthropic_event_stream(
     def _message_start(usage: AnthropicUsage) -> str:
         nonlocal started
         started = True
-        return _event(AnthropicStreamEvent(
-            type="message_start",
-            message=AnthropicMessagesResponse(
-                id=f"msg_{public_request_id(uid)}", content=[], model=model, usage=usage,
-            ),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="message_start",
+                message=AnthropicMessagesResponse(
+                    id=f"msg_{public_request_id(uid)}",
+                    content=[],
+                    model=model,
+                    usage=usage,
+                ),
+            )
+        )
 
     # message_start waits for the prompt's admission so it can carry the real input/cache
     # usage; anything that must go out first (a keepalive, an error) sends it with zeros.
@@ -513,13 +541,20 @@ async def anthropic_event_stream(
         frames: list[str] = []
         if block_open:
             frames.extend(_stop_block())
-        frames.append(_event(AnthropicStreamEvent(
-            type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(
-                type="tool_use", id=_tool_use_id(name, block_index),
-                name=name, input={},
-            ),
-        )))
+        frames.append(
+            _event(
+                AnthropicStreamEvent(
+                    type="content_block_start",
+                    index=block_index,
+                    content_block=AnthropicContentBlock(
+                        type="tool_use",
+                        id=_tool_use_id(name, block_index),
+                        name=name,
+                        input={},
+                    ),
+                )
+            )
+        )
         block_open = "tool"
         tool_args_sent = ""
         tool_ordinal = ordinal
@@ -529,10 +564,13 @@ async def anthropic_event_stream(
     def _tool_args_delta(fragment: str) -> str:
         nonlocal tool_args_sent
         tool_args_sent += fragment
-        return _event(AnthropicStreamEvent(
-            type="content_block_delta", index=block_index,
-            delta=AnthropicDelta(type="input_json_delta", partial_json=fragment),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="content_block_delta",
+                index=block_index,
+                delta=AnthropicDelta(type="input_json_delta", partial_json=fragment),
+            )
+        )
 
     tool_args_sent = ""
     tool_ordinal: int | None = None
@@ -542,9 +580,7 @@ async def anthropic_event_stream(
         async for ev in events:
             if isinstance(ev, PromptAdmitted):
                 if not started:
-                    yield _message_start(
-                        _anthropic_usage(ev.prompt_tokens, 0, ev.cached_tokens, cache_report)
-                    )
+                    yield _message_start(_anthropic_usage(ev.prompt_tokens, 0, ev.cached_tokens, cache_report))
                 continue
             if not started:
                 yield _message_start(zero_usage)
@@ -561,10 +597,13 @@ async def anthropic_event_stream(
                         for f in _stop_block():
                             yield f
                     yield _open_thinking()
-                yield _event(AnthropicStreamEvent(
-                    type="content_block_delta", index=block_index,
-                    delta=AnthropicDelta(type="thinking_delta", thinking=ev.text),
-                ))
+                yield _event(
+                    AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=block_index,
+                        delta=AnthropicDelta(type="thinking_delta", thinking=ev.text),
+                    )
+                )
 
             elif isinstance(ev, ContentDelta):
                 if ev.text == "":
@@ -574,10 +613,13 @@ async def anthropic_event_stream(
                         for f in _stop_block():
                             yield f
                     yield _open_text()
-                yield _event(AnthropicStreamEvent(
-                    type="content_block_delta", index=block_index,
-                    delta=AnthropicDelta(type="text_delta", text=ev.text),
-                ))
+                yield _event(
+                    AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=block_index,
+                        delta=AnthropicDelta(type="text_delta", text=ev.text),
+                    )
+                )
 
             elif isinstance(ev, ToolCallStart):
                 for f in _open_tool(ev.name, ev.tool_index, ev.args_prefix_stable):
@@ -597,7 +639,7 @@ async def anthropic_event_stream(
                         # the final (authoritative) arguments wasn't streamed yet.
                         final = call.parameters or ""
                         if final.startswith(tool_args_sent):
-                            remainder = final[len(tool_args_sent):]
+                            remainder = final[len(tool_args_sent) :]
                             if remainder:
                                 yield _tool_args_delta(remainder)
                         for f in _stop_block():
@@ -615,13 +657,13 @@ async def anthropic_event_stream(
                     for f in _stop_block():
                         yield f
                 stop_reason, stop_sequence = _anthropic_stop(ev.finish_reason, ev.matched_stop)
-                yield _event(AnthropicStreamEvent(
-                    type="message_delta",
-                    delta=AnthropicDelta(stop_reason=stop_reason, stop_sequence=stop_sequence),
-                    usage=_anthropic_usage(
-                        ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report
-                    ),
-                ))
+                yield _event(
+                    AnthropicStreamEvent(
+                        type="message_delta",
+                        delta=AnthropicDelta(stop_reason=stop_reason, stop_sequence=stop_sequence),
+                        usage=_anthropic_usage(ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report),
+                    )
+                )
                 yield _event(AnthropicStreamEvent(type="message_stop"))
                 # Anthropic streams terminate on message_stop — no OpenAI-style
                 # `data: [DONE]` sentinel (it would be an unknown event to strict clients).
@@ -636,18 +678,24 @@ async def anthropic_event_stream(
         if block_open:
             for f in _stop_block():
                 yield f
-        yield _event(AnthropicStreamEvent(
-            type="error", error=AnthropicError(type="invalid_request_error", message=str(exc)),
-        ))
+        yield _event(
+            AnthropicStreamEvent(
+                type="error",
+                error=AnthropicError(type="invalid_request_error", message=str(exc)),
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — surface as an Anthropic error event
         if not started:
             yield _message_start(zero_usage)
         if block_open:
             for f in _stop_block():
                 yield f
-        yield _event(AnthropicStreamEvent(
-            type="error", error=AnthropicError(type="internal_error", message=str(exc)),
-        ))
+        yield _event(
+            AnthropicStreamEvent(
+                type="error",
+                error=AnthropicError(type="internal_error", message=str(exc)),
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -686,12 +734,8 @@ def _validation_error_message(exc: RequestValidationError) -> str:
         return "invalid request"
 
 
-def _anthropic_error_response(
-    status_code: int, err_type: str, message: str
-) -> JSONResponse:
+def _anthropic_error_response(status_code: int, err_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content=AnthropicErrorResponse(
-            error=AnthropicError(type=err_type, message=message)
-        ).model_dump(),
+        content=AnthropicErrorResponse(error=AnthropicError(type=err_type, message=message)).model_dump(),
     )
