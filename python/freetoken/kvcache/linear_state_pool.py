@@ -177,6 +177,29 @@ class LinearStatePool:
                         torch.empty(q_shape, dtype=torch.int8, device=self._device),
                         torch.empty(s_shape, dtype=torch.bfloat16, device=self._device),
                     )
+                    from freetoken.kernel.triton.gdn_wht_q8 import (
+                        pack_slot_wht128_q8,
+                        unpack_slot_wht128_q8,
+                    )
+
+                    # Pre-compile and verify both WHT128-Q8_0 Triton kernels at startup.
+                    warm_state = torch.zeros(
+                        (1, 1, WHT_DIM),
+                        dtype=self.recurrent_states.dtype,
+                        device=self._device,
+                    )
+                    pack_slot_wht128_q8(
+                        warm_state,
+                        0,
+                        self._pack_staging[0][:1],
+                        self._pack_staging[1][:1],
+                    )
+                    unpack_slot_wht128_q8(
+                        self._pack_staging[0][:1],
+                        self._pack_staging[1][:1],
+                        warm_state,
+                        0,
+                    )
                 continue
             nbytes = t[:, 0].numel() * t.element_size()
             layout[name] = (offset, t.dtype, (t.shape[0], *t.shape[2:]))

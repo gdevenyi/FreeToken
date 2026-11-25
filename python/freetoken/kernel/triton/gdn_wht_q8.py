@@ -70,16 +70,19 @@ def _wht128_q8_pack_slot_kernel(
     row_in_layer = offs_m - layer * rows_per_layer
     offs_k = tl.arange(0, 128)
 
-    row_ptrs = (
-        states_ptr
-        + layer[:, None] * stride_layer
-        + slot_idx * stride_slot
-        + row_in_layer[:, None] * 128
-        + offs_k[None, :]
-    )
-    x = tl.load(row_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-    h = tl.load(h_ptr + offs_k[:, None] * 128 + offs_k[None, :]).to(tl.float32)
-    y = tl.dot(x, h, allow_tf32=False)
+    y = tl.zeros((BLOCK_M, 128), dtype=tl.float32)
+    for k0 in tl.static_range(0, 128, 32):
+        offs_ki = k0 + tl.arange(0, 32)
+        row_ptrs = (
+            states_ptr
+            + layer[:, None] * stride_layer
+            + slot_idx * stride_slot
+            + row_in_layer[:, None] * 128
+            + offs_ki[None, :]
+        )
+        xk = tl.load(row_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+        hk = tl.load(h_ptr + offs_ki[:, None] * 128 + offs_k[None, :]).to(tl.float32)
+        y += tl.dot(xk, hk, allow_tf32=False)
 
     yg = tl.reshape(y, (BLOCK_M, 4, 32))
     amax = tl.max(tl.abs(yg), axis=2)
@@ -138,9 +141,15 @@ def _wht128_q8_unpack_slot_kernel(
     ).to(tl.float32)
 
     yg = tl.reshape(q_i8.to(tl.float32), (BLOCK_M, 4, 32)) * sc[:, :, None]
-    y = tl.reshape(yg, (BLOCK_M, 128))
-    h = tl.load(h_ptr + offs_k[:, None] * 128 + offs_k[None, :]).to(tl.float32)
-    x = tl.dot(y, h, allow_tf32=False)
+    x = tl.zeros((BLOCK_M, 128), dtype=tl.float32)
+    for k0 in tl.static_range(0, 128, 32):
+        offs_ki = k0 + tl.arange(0, 32)
+        g_idx = k0 // 32
+        # Extract group g_idx ([BLOCK_M, 32]) via masked sum over the 4 groups
+        g_mask = (tl.arange(0, 4) == g_idx)[None, :, None]
+        yk = tl.sum(tl.where(g_mask, yg, 0.0), axis=1)
+        hk = tl.load(h_ptr + offs_ki[:, None] * 128 + offs_k[None, :]).to(tl.float32)
+        x += tl.dot(yk, hk, allow_tf32=False)
 
     row_ptrs = (
         states_ptr
@@ -176,7 +185,7 @@ def pack_slot_wht128_q8(
     s_2d = dst_s.view(total_rows, GROUPS_PER_WHT)
 
     if recurrent_states.is_cuda and recurrent_states[0, 0].is_contiguous():
-        block_m = 64
+        block_m = 32
         grid = (triton.cdiv(total_rows, block_m),)
         _wht128_q8_pack_slot_kernel[grid](
             recurrent_states,
@@ -190,6 +199,7 @@ def pack_slot_wht128_q8(
             recurrent_states.stride(1),
             BLOCK_M=block_m,
             num_warps=4,
+            num_stages=1,
         )
         return
 
@@ -226,7 +236,7 @@ def unpack_slot_wht128_q8(
     s_2d = src_s.view(total_rows, GROUPS_PER_WHT)
 
     if recurrent_states.is_cuda and recurrent_states[0, 0].is_contiguous():
-        block_m = 64
+        block_m = 32
         grid = (triton.cdiv(total_rows, block_m),)
         _wht128_q8_unpack_slot_kernel[grid](
             q_2d,
@@ -240,6 +250,7 @@ def unpack_slot_wht128_q8(
             recurrent_states.stride(1),
             BLOCK_M=block_m,
             num_warps=4,
+            num_stages=1,
         )
         return
 
