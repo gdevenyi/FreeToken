@@ -24,8 +24,20 @@ from freetoken.kernel import backend
 from freetoken.utils import init_logger
 
 from ..registry import LayerKind, register_method
-from ..scheme import NVFP4_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from ..scheme import NVFP4_GROUP as GROUP
+from ..scheme import QuantKind
+from .base import (
+    BankSpec,
+    ExpertView,
+    MoEConfig,
+    MoEKernel,
+    MoEMethod,
+    fused_global,
+    fused_piece,
+    gated_epilogue_reason,
+    global_rows,
+    limit_or_inf,
+)
 
 logger = init_logger(__name__)
 
@@ -44,7 +56,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         # tp_ok: nvfp4_banks._tp_shard slices the pieces per rank, the banks use cfg.local_intermediate and the
         # MoE layer reduces the partial sum; marlin and b12x repack the rows and have no check against a sharded bank
-        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(
+            cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False
+        )
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
@@ -70,15 +84,48 @@ class TritonNvfp4MoEKernel(MoEKernel):
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
+        from freetoken.moe.fused_nvfp4 import (
+            fused_experts_decode_nvfp4_marlin,
+            fused_experts_nvfp4,
+        )
 
         t = view.tensors
-        banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
+        banks = (
+            t["gate_up"],
+            t["gate_up_scale"],
+            t["gate_up_global"],
+            t["down"],
+            t["down_scale"],
+            t["down_global"],
+        )
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
+        extra = {"has_inactive": True} if getattr(layer, "ep_size", 1) > 1 else {}
         if is_prefill:
-            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+            return fused_experts_nvfp4(
+                x,
+                *banks,
+                topk_weights,
+                topk_ids,
+                view.n,
+                layer.activation,
+                layer.apply_router_weight_on_input,
+                alpha,
+                limit,
+                **extra,
+            )
+        return fused_experts_decode_nvfp4_marlin(
+            x,
+            *banks,
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+            alpha,
+            limit,
+        )
 
 
 class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
@@ -96,13 +143,19 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
         if cfg.scheme is None or not cfg.scheme.has("input_scale"):
             return "the experts declare no static activation scale (W4A16 checkpoint)"
         if cfg.apply_router_weight_on_input:
-            return "the routing weight scales the input, which is quantized once per token"
+            return (
+                "the routing weight scales the input, which is quantized once per token"
+            )
         return None
 
     def worth_it(self, cfg: MoEConfig) -> bool:
         from freetoken.kernel import nvfp4_moe
 
-        return not backend.is_rocm() and torch.cuda.is_available() and nvfp4_moe.w4a4_available(torch.cuda.current_device())
+        return (
+            not backend.is_rocm()
+            and torch.cuda.is_available()
+            and nvfp4_moe.w4a4_available(torch.cuda.current_device())
+        )
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         return {
@@ -114,20 +167,44 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         super().pack(pieces, cfg, out)
         if not all(f"{p}_input" in pieces for p in ("gate", "up", "down")):
-            raise ValueError("w4a4 nvfp4 MoE kernel: the checkpoint has no expert input_scale tensors")
-        gate, up, down = (pieces[f"{p}_input"].reshape(len(pieces[f"{p}_input"]), -1)[:, 0].float() for p in ("gate", "up", "down"))
+            raise ValueError(
+                "w4a4 nvfp4 MoE kernel: the checkpoint has no expert input_scale tensors"
+            )
+        gate, up, down = (
+            pieces[f"{p}_input"].reshape(len(pieces[f"{p}_input"]), -1)[:, 0].float()
+            for p in ("gate", "up", "down")
+        )
         return {"gate_up_alpha": torch.maximum(gate, up), "down_alpha": down}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
         if not is_prefill:
-            return super().apply(layer, x, topk_weights, topk_ids, view, is_prefill=False)
+            return super().apply(
+                layer, x, topk_weights, topk_ids, view, is_prefill=False
+            )
         from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4_w4a4
 
         t = view.tensors
         assert view.alphas is not None
+        extra = {"has_inactive": True} if getattr(layer, "ep_size", 1) > 1 else {}
         return fused_experts_nvfp4_w4a4(
-            x, t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"],
-            view.alphas[0], view.alphas[1], topk_weights, topk_ids, view.n, layer.activation, float(layer.alpha), limit_or_inf(layer),
+            x,
+            t["gate_up"],
+            t["gate_up_scale"],
+            t["gate_up_global"],
+            t["down"],
+            t["down_scale"],
+            t["down_global"],
+            view.alphas[0],
+            view.alphas[1],
+            topk_weights,
+            topk_ids,
+            view.n,
+            layer.activation,
+            float(layer.alpha),
+            limit_or_inf(layer),
+            **extra,
         )
 
 
@@ -285,7 +362,9 @@ class MarlinNvfp4MoEKernel(MoEKernel):
             return "Marlin is CUDA-only and unavailable on ROCm; use triton"
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(
+            cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True
+        )
         if reason:
             return reason
         if not _marlin_symbols_ok():
@@ -309,27 +388,61 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         i, h = cfg.local_intermediate, cfg.hidden
         device = torch.device("cuda")
-        gu, gus, gug = fused_piece(pieces, "gate_up"), fused_piece(pieces, "gate_up_scale"), fused_global(pieces, i)
-        dn, dns, dng = pieces["down"], pieces["down_scale"], global_rows(pieces["down_global"], h)
+        gu, gus, gug = (
+            fused_piece(pieces, "gate_up"),
+            fused_piece(pieces, "gate_up_scale"),
+            fused_global(pieces, i),
+        )
+        dn, dns, dng = (
+            pieces["down"],
+            pieces["down_scale"],
+            global_rows(pieces["down_global"], h),
+        )
         e = gu.shape[0]
         gate_up_alpha = torch.empty(e, dtype=torch.bfloat16, device=device)
         down_alpha = torch.empty(e, dtype=torch.bfloat16, device=device)
         for k in range(e):
-            qw, sc, al = _marlin_pack_proj(gu[k].to(device), gus[k].to(device), gug[k].to(device), size_k=h, size_n=2 * i)
+            qw, sc, al = _marlin_pack_proj(
+                gu[k].to(device),
+                gus[k].to(device),
+                gug[k].to(device),
+                size_k=h,
+                size_n=2 * i,
+            )
             out["gate_up"][k].copy_(qw)
             out["gate_up_scale"][k].copy_(sc.view(FP8))
             gate_up_alpha[k] = al[0]
-            qw, sc, al = _marlin_pack_proj(dn[k].to(device), dns[k].to(device), dng[k].to(device), size_k=i, size_n=h)
+            qw, sc, al = _marlin_pack_proj(
+                dn[k].to(device),
+                dns[k].to(device),
+                dng[k].to(device),
+                size_k=i,
+                size_n=h,
+            )
             out["down"][k].copy_(qw)
             out["down_scale"][k].copy_(sc.view(FP8))
             down_alpha[k] = al[0]
         torch.cuda.synchronize(device)
         return {"gate_up_alpha": gate_up_alpha, "down_alpha": down_alpha}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
         t = view.tensors
         assert view.alphas is not None
-        return marlin_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input)
+        return marlin_fused_experts(
+            x,
+            t["gate_up"],
+            t["gate_up_scale"],
+            view.alphas[0],
+            t["down"],
+            t["down_scale"],
+            view.alphas[1],
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +630,10 @@ def b12x_fused_experts(
         source_format="modelopt",
     )
     out = torch.empty(
-        hidden_states.size(0), hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
+        hidden_states.size(0),
+        hidden_size,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     _launch_sm120_w4a16_moe(
         a=hidden_states,
@@ -553,7 +669,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
         if not backend.is_flashinfer_installed():
             return "flashinfer is not installed"
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(
+            cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True
+        )
         if reason:
             return reason
         return _b12x_unusable_reason(cc)
@@ -564,7 +682,11 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
     def slot_limit(self, cfg: MoEConfig) -> int | None:
         # the cute launcher indexes each bank with int32 element offsets
-        per_slot = max(math.prod(spec.shape) for spec in self.layout(cfg).values() if not spec.resident)
+        per_slot = max(
+            math.prod(spec.shape)
+            for spec in self.layout(cfg).values()
+            if not spec.resident
+        )
         return (2**31 - 1) // per_slot
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
@@ -580,7 +702,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
-        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import prepare_w4a16_packed_weights
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+            prepare_w4a16_packed_weights,
+        )
 
         i, h = cfg.local_intermediate, cfg.hidden
         device = torch.device("cuda")
@@ -593,7 +717,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
             gus = (gus.float() * ratio.unsqueeze(-1)).to(torch.float16)
         dng = global_rows(pieces["down_global"], h).to(device)
         if not torch.all(dng == dng[:, :1]):
-            raise ValueError("b12x pack requires a row-constant per-expert down_proj global scale")
+            raise ValueError(
+                "b12x pack requires a row-constant per-expert down_proj global scale"
+            )
         # b12x wants up|gate row order
         gu = torch.cat([gu[:, i:], gu[:, :i]], dim=1).contiguous()
         gus = torch.cat([gus[:, i:], gus[:, :i]], dim=1).contiguous()
@@ -609,18 +735,51 @@ class B12xNvfp4MoEKernel(MoEKernel):
             source_format="modelopt",
         )
         e = gu.shape[0]
-        for role, t in (("gate_up", prepared.w13), ("gate_up_scale", prepared.w13_scale), ("down", prepared.w2), ("down_scale", prepared.w2_scale)):
+        for role, t in (
+            ("gate_up", prepared.w13),
+            ("gate_up_scale", prepared.w13_scale),
+            ("down", prepared.w2),
+            ("down_scale", prepared.w2_scale),
+        ):
             bank = out[role]
-            assert t.shape[1:] == bank.shape[1:] and t.dtype == bank.dtype, (role, t.shape, t.dtype, bank.shape, bank.dtype)
+            assert t.shape[1:] == bank.shape[1:] and t.dtype == bank.dtype, (
+                role,
+                t.shape,
+                t.dtype,
+                bank.shape,
+                bank.dtype,
+            )
             bank.copy_(t[:e])
-        return {"gate_up_alpha": prepared.w13_global_scale[:e].float(), "down_alpha": prepared.w2_global_scale[:e].float()}
+        return {
+            "gate_up_alpha": prepared.w13_global_scale[:e].float(),
+            "down_alpha": prepared.w2_global_scale[:e].float(),
+        }
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
         t = view.tensors
         assert view.alphas is not None
-        return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input)
+        return b12x_fused_experts(
+            x,
+            t["gate_up"],
+            t["gate_up_scale"],
+            view.alphas[0],
+            t["down"],
+            t["down_scale"],
+            view.alphas[1],
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+        )
 
 
 @register_method(QuantKind.NVFP4, LayerKind.MOE)
 class Nvfp4MoEMethod(MoEMethod):
-    candidates = (W4a4Nvfp4MoEKernel, TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
+    candidates = (
+        W4a4Nvfp4MoEKernel,
+        TritonNvfp4MoEKernel,
+        MarlinNvfp4MoEKernel,
+        B12xNvfp4MoEKernel,
+    )

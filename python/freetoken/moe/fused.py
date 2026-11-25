@@ -2,9 +2,9 @@ import functools
 import json
 import os
 from pathlib import Path
-from typing import Dict, Tuple
 
 import torch
+
 from freetoken.utils import div_ceil
 
 
@@ -13,7 +13,7 @@ def _torch_fused_topk(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure-torch reference for the fused softmax router; tests compare the kernel against it.
 
     Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
@@ -36,7 +36,7 @@ def fused_topk(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     from freetoken.kernel.triton.moe_router import fused_topk_softmax
@@ -48,8 +48,12 @@ _SGL_ALIGN_MAX_EXPERTS = 1024
 
 
 def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    *,
+    has_inactive: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
     size for matrix multiplication.
@@ -102,8 +106,13 @@ def moe_align_block_size(
 
     # sgl_kernel's align kernel takes num_experts + 1 counters in one block and reads out of
     # bounds past 1024 of them (0.4.5 and 0.4.9). A prefill over an offload slot cache passes the
-    # slot count here (#676), which is thousands; the Triton kernel has no such limit.
-    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS:
+    # slot count here (#676), which is thousands; the Triton kernel has no such limit and also
+    # drops inactive (topk_ids < 0) routes under expert parallelism.
+    if (
+        has_inactive
+        or not is_sgl_kernel_installed()
+        or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS
+    ):
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )
@@ -116,11 +125,17 @@ def moe_align_block_size(
         max_num_tokens_padded = topk_ids.numel() * block_size
     else:
         max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
     max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
-    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
+    cumsum_buffer = torch.empty(
+        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
+    )
     sgl_moe_align_block_size(
         topk_ids,
         num_experts + 1,
@@ -140,7 +155,7 @@ def get_default_config(
     N: int,
     K: int,
     topk: int,
-) -> Dict[str, int]:
+) -> dict[str, int]:
 
     config = {
         "BLOCK_SIZE_M": 64,
@@ -164,7 +179,7 @@ def _get_tuned_moe_configs(
     config_n: int,
     device_name: str,
     triton_version: str,
-) -> Dict[int, Dict[str, int]] | None:
+) -> dict[int, dict[str, int]] | None:
     file_name = f"E={num_experts},N={config_n},device_name={device_name}.json"
     version_dir = f"triton_{triton_version.replace('.', '_')}"
     config_roots = []
@@ -183,11 +198,11 @@ def _get_tuned_moe_configs(
 
 
 def try_get_optimal_moe_config(
-    w1_shape: Tuple[int, ...],
-    w2_shape: Tuple[int, ...],
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
     top_k: int,
     M: int,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     E, N, config_n = w2_shape
     config = None
     if torch.cuda.is_available():
@@ -200,7 +215,9 @@ def try_get_optimal_moe_config(
             triton.__version__,
         )
         if configs:
-            config = dict(configs[min(configs.keys(), key=lambda batch: abs(batch - M))])
+            config = dict(
+                configs[min(configs.keys(), key=lambda batch: abs(batch - M))]
+            )
     if config is None:
         config = get_default_config(M, E, N, w1_shape[2], top_k)
     return config
@@ -218,6 +235,8 @@ def fused_experts_impl(
     act_limit: float = float("inf"),
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    *,
+    has_inactive: bool = False,
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
@@ -234,7 +253,9 @@ def fused_experts_impl(
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
     # both bias adds assume the router weight scales the expert output
-    assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
+    assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, (
+        "per-expert biases need the router weight on the output"
+    )
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -278,7 +299,7 @@ def fused_experts_impl(
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        curr_topk_ids, config["BLOCK_SIZE_M"], E
+        curr_topk_ids, config["BLOCK_SIZE_M"], E, has_inactive=has_inactive
     )
 
     fused_moe_kernel_triton(
@@ -297,8 +318,18 @@ def fused_experts_impl(
     )
     if w1_bias is not None:
         # gpt-oss: the expert's gate/up bias is added before the gated activation
-        intermediate_cache1 += w1_bias[curr_topk_ids]
-    gated_act_and_mul(activation, intermediate_cache1.view(-1, N), intermediate_cache2, alpha=act_alpha, limit=act_limit)
+        bias_ids = curr_topk_ids.clamp(min=0) if has_inactive else curr_topk_ids
+        intermediate_cache1 += w1_bias[bias_ids]
+    gated_act_and_mul(
+        activation,
+        intermediate_cache1.view(-1, N),
+        intermediate_cache2,
+        alpha=act_alpha,
+        limit=act_limit,
+    )
+    if has_inactive:
+        # intermediate_cache3 aliases cache with intermediate_cache1; inactive routes are skipped by GEMM 2
+        intermediate_cache3.zero_()
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -320,7 +351,10 @@ def fused_experts_impl(
     )
     if w2_bias is not None:
         # the down bias is weighted like the expert's output: sum_k w_k * bias_k
-        out_hidden_states[begin_token_idx:end_token_idx] += (curr_topk_weights.unsqueeze(-1) * w2_bias[curr_topk_ids]).sum(1)
+        bias_ids = curr_topk_ids.clamp(min=0) if has_inactive else curr_topk_ids
+        out_hidden_states[begin_token_idx:end_token_idx] += (
+            curr_topk_weights.unsqueeze(-1) * w2_bias[bias_ids]
+        ).sum(1)
     return out_hidden_states
 
 
@@ -355,7 +389,9 @@ def fused_experts_decode_impl(
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
     # both bias adds assume the router weight scales the expert output
-    assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
+    assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, (
+        "per-expert biases need the router weight on the output"
+    )
     M, _ = hidden_states.shape
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]
@@ -390,7 +426,13 @@ def fused_experts_decode_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    gated_act_and_mul(activation, intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2, alpha=act_alpha, limit=act_limit)
+    gated_act_and_mul(
+        activation,
+        intermediate_cache1.view(-1, gate_up_dim),
+        intermediate_cache2,
+        alpha=act_alpha,
+        limit=act_limit,
+    )
 
     intermediate_cache3 = torch.empty(
         (M, top_k, w2.shape[1]),

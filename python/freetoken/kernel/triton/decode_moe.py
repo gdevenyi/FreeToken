@@ -42,6 +42,14 @@ def fused_moe_decode_kernel(
     a_row = route_id if A_ROW_IS_ROUTE else token_id
 
     expert_id = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k)
+    if expert_id < 0:
+        c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+        tl.store(
+            c_ptrs,
+            tl.zeros((BLOCK_SIZE_N,), dtype=compute_type),
+            mask=(route_id < total_routes) & (offs_n < N),
+        )
+        return
     a_ptrs = a_ptr + a_row * stride_am + offs_k * stride_ak
     b_ptrs = (
         b_ptr
@@ -51,7 +59,7 @@ def fused_moe_decode_kernel(
     )
 
     accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k_start in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if even_Ks:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs, mask=offs_n[None, :] < N, other=0.0)
@@ -64,7 +72,9 @@ def fused_moe_decode_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
-        weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+        weight = tl.load(
+            topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k
+        )
         accumulator = accumulator * weight
 
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn

@@ -122,7 +122,9 @@ def _disable_unsafe_cpu_moe_graphs(
 
 def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
-    num_experts = config.model_config.num_experts
+    num_experts = getattr(
+        config.model_config, "local_num_experts", config.model_config.num_experts
+    )
     small = [s for s in pool_sizes if s < num_experts]
     if not small:
         return
@@ -1164,7 +1166,9 @@ class Engine:
         spec_fixed, draft_page = self._spec_budget(config)
         fixed_cache_size += spec_fixed
         cache_per_page += draft_page
-        num_experts = config.model_config.num_experts
+        num_experts = getattr(
+            config.model_config, "local_num_experts", config.model_config.num_experts
+        )
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -1246,12 +1250,20 @@ class Engine:
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
+        local_num_experts = getattr(
+            config.model_config, "local_num_experts", config.model_config.num_experts
+        )
+        ep_size, ep_offset, _ = (
+            config.model_config.ep_info(config.tp_info)
+            if hasattr(config.model_config, "ep_info")
+            else (1, 0, local_num_experts)
+        )
         # read before the expert load, so a bad profile fails in seconds
         expert_counts = resolve_profile(
             config.moe_cache_split,
             config.model_path,
             config.model_config.num_moe_layers,
-            config.model_config.num_experts,
+            local_num_experts,
         )
         try:
             with _weight_load_context():
@@ -1326,7 +1338,7 @@ class Engine:
             )
             if config.moe_prefill_overlap and not overlap:
                 logger.info_rank0(
-                    f"--moe-cache-auto: prefill overlap disabled, its {2 * config.model_config.num_experts} "
+                    f"--moe-cache-auto: prefill overlap disabled, its {2 * local_num_experts} "
                     "slot floor does not fit beside the KV reserve"
                 )
             object.__setattr__(config, "moe_cache_size", size)
@@ -1356,19 +1368,14 @@ class Engine:
                 > config.moe_cache_mem
             ):
                 size -= 1
-            overlap = (
-                config.moe_prefill_overlap
-                and size >= 2 * config.model_config.num_experts
-            )
+            overlap = config.moe_prefill_overlap and size >= 2 * local_num_experts
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             logger.info_rank0(
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
-        _require_offload_cache_size(
-            config.moe_cache_size, config.model_config.num_experts
-        )
+        _require_offload_cache_size(config.moe_cache_size, local_num_experts)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         bank_allocator = self._maybe_init_elastic_pool(
             config,
@@ -1412,7 +1419,7 @@ class Engine:
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
             num_layers=config.model_config.num_moe_layers,
-            num_experts=config.model_config.num_experts,
+            num_experts=local_num_experts,
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
@@ -1427,6 +1434,8 @@ class Engine:
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
             pool_sizes=pool_sizes,
             bank_allocator=bank_allocator,
+            ep_size=ep_size,
+            ep_offset=ep_offset,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
@@ -1647,7 +1656,9 @@ class Engine:
     def _moe_pools(self, batch: int) -> list:
         """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
         model_config = self.config.model_config
-        num_experts = model_config.num_experts
+        num_experts = getattr(
+            model_config, "local_num_experts", model_config.num_experts
+        )
         min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
         return make_pools(
             self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit
@@ -2329,7 +2340,11 @@ class Engine:
                 lens.add(threshold + 1)
                 lens.update(
                     prefill_bucket_lens(
-                        threshold + 1, cap, top_k, mc.num_experts, self.device.index
+                        threshold + 1,
+                        cap,
+                        top_k,
+                        getattr(mc, "local_num_experts", mc.num_experts),
+                        self.device.index,
                     )
                 )
         if cap >= 4096:
@@ -2806,6 +2821,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_locked_max_fetch": 8,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_ep": False,
     "expert_load": "auto",
 }
 
@@ -2897,6 +2913,7 @@ def _check_layer_formats(banks, layer_methods) -> None:
 
 def _meta_model(config: EngineConfig, decode_target: str):
     from freetoken.models import create_model
+    from freetoken.models.config import moe_ep_enabled
     from freetoken.utils.torch_utils import torch_dtype
 
     set_quant_backend(
@@ -2906,6 +2923,14 @@ def _meta_model(config: EngineConfig, decode_target: str):
     )
     object.__setattr__(config.model_config, "moe_strategy", config.moe_strategy)
     object.__setattr__(config.model_config, "decode_target", decode_target)
+    object.__setattr__(
+        config.model_config,
+        "moe_ep",
+        bool(
+            config.tp_info.size > 1
+            and (getattr(config, "moe_ep", False) or moe_ep_enabled())
+        ),
+    )
     with torch.device("meta"), torch_dtype(config.dtype):
         return create_model(config.model_config)
 
@@ -3060,10 +3085,27 @@ def _adjust_config(config: EngineConfig):
     if getattr(config, "speculative_algorithm", None) is not None:
         _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
+    if is_moe:
+        from freetoken.models.config import moe_ep_enabled
+
+        ep_requested = bool(getattr(config, "moe_ep", False) or moe_ep_enabled())
+        if ep_requested and config.tp_info.size > 1:
+            if model_config.num_experts % config.tp_info.size != 0:
+                raise ValueError(
+                    f"--moe-ep requires num_experts ({model_config.num_experts}) divisible by tp_size ({config.tp_info.size})"
+                )
+            override("moe_ep", True)
+            object.__setattr__(model_config, "moe_ep", True)
+        else:
+            override("moe_ep", False)
+            if hasattr(model_config, "moe_ep"):
+                object.__setattr__(model_config, "moe_ep", False)
+
     if config.moe_cache_rate is not None:
-        total_experts = (
-            config.model_config.num_moe_layers * config.model_config.num_experts
+        local_experts = getattr(
+            config.model_config, "local_num_experts", config.model_config.num_experts
         )
+        total_experts = config.model_config.num_moe_layers * local_experts
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
 
     # The CPU MoE executor supports the silu/gelu family plus the clamped
@@ -3201,7 +3243,9 @@ def _adjust_config(config: EngineConfig):
         # the GPU only holds the two-layer prefill double buffer. So the slot cache is
         # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
         # and --moe-cache-size / --moe-cache-auto / --moe-cache-rate do not apply.
-        num_experts = config.model_config.num_experts
+        num_experts = getattr(
+            config.model_config, "local_num_experts", config.model_config.num_experts
+        )
         if getattr(config, "moe_cache_auto", False):
             override("moe_cache_auto", False)
         override("moe_cache_mem", None)
@@ -3280,5 +3324,7 @@ def _adjust_config(config: EngineConfig):
         f"page_size={config.page_size}",
     ]
     if is_moe:
+        if getattr(config, "moe_ep", False):
+            resolved.insert(0, f"moe_ep=EP{config.tp_info.size}")
         resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")

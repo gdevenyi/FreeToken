@@ -42,15 +42,31 @@ def _fused_experts_decode_nvfp4(
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     gemm_fn(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        ic1,
+        topk_weights,
+        topk_ids,
+        apply_router_weight_on_input,
+        False,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
+    gated_act_and_mul(
+        activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit
+    )
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
-        ic2, down_packed, down_scale, down_global,
-        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
+        ic2,
+        down_packed,
+        down_scale,
+        down_global,
+        ic3,
+        topk_weights,
+        topk_ids,
+        not apply_router_weight_on_input,
+        True,
     )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
@@ -75,10 +91,19 @@ def fused_experts_decode_nvfp4_marlin(
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
         nvfp4_moe.decode_gemm_marlin,
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        down_packed, down_scale, down_global,
-        topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        down_packed,
+        down_scale,
+        down_global,
+        topk_weights,
+        topk_ids,
+        activation,
+        apply_router_weight_on_input,
+        act_alpha,
+        act_limit,
     )
 
 
@@ -101,10 +126,19 @@ def fused_experts_decode_nvfp4_serial(
     A/B benchmarking against the marlin decode path; not on the production decode path."""
     return _fused_experts_decode_nvfp4(
         nvfp4_moe.decode_gemm,
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        down_packed, down_scale, down_global,
-        topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        down_packed,
+        down_scale,
+        down_global,
+        topk_weights,
+        topk_ids,
+        activation,
+        apply_router_weight_on_input,
+        act_alpha,
+        act_limit,
     )
 
 
@@ -123,6 +157,8 @@ def fused_experts_nvfp4(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    *,
+    has_inactive: bool = False,
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
@@ -134,23 +170,51 @@ def fused_experts_nvfp4(
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg = nvfp4_moe.prefill_config(M, top_k, num_experts, hidden_states.device.index)
 
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    sorted_ids, expert_ids, ntpp = moe_align_block_size(
+        topk_ids, cfg["BLOCK_SIZE_M"], num_experts, has_inactive=has_inactive
+    )
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     nvfp4_moe.prefill_gemm(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
-        tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
-        apply_router_weight_on_input, cfg,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        ic1,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        top_k,
+        apply_router_weight_on_input,
+        cfg,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
-    ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
+    gated_act_and_mul(
+        activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit
+    )
+    ic3 = (
+        torch.zeros((M, top_k, H), device=dev, dtype=dt)
+        if has_inactive
+        else torch.empty((M, top_k, H), device=dev, dtype=dt)
+    )
     nvfp4_moe.prefill_gemm(
-        ic2, down_packed, down_scale, down_global, ic3,
-        tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
-        not apply_router_weight_on_input, cfg,
+        ic2,
+        down_packed,
+        down_scale,
+        down_global,
+        ic3,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        1,
+        not apply_router_weight_on_input,
+        cfg,
     )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
@@ -173,6 +237,8 @@ def fused_experts_nvfp4_w4a4(
     activation: str = "silu",
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    *,
+    has_inactive: bool = False,
 ) -> torch.Tensor:
     """Prefill NVFP4 MoE with NVFP4 activations (W4A4) where the GPU and the batch favour it, else :func:`fused_experts_nvfp4`.
 
@@ -181,15 +247,43 @@ def fused_experts_nvfp4_w4a4(
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     inter = gate_up_packed.shape[1] // 2
-    cfg = nvfp4_moe.w4a4_prefill_config(M, top_k, num_experts, H, inter, activation, hidden_states.dtype, hidden_states.device.index)
+    cfg = nvfp4_moe.w4a4_prefill_config(
+        M,
+        top_k,
+        num_experts,
+        H,
+        inter,
+        activation,
+        hidden_states.dtype,
+        hidden_states.device.index,
+    )
     if cfg is None:
         return fused_experts_nvfp4(
-            hidden_states, gate_up_packed, gate_up_scale, gate_up_global, down_packed, down_scale, down_global,
-            topk_weights, topk_ids, num_experts, activation, False, act_alpha, act_limit,
+            hidden_states,
+            gate_up_packed,
+            gate_up_scale,
+            gate_up_global,
+            down_packed,
+            down_scale,
+            down_global,
+            topk_weights,
+            topk_ids,
+            num_experts,
+            activation,
+            False,
+            act_alpha,
+            act_limit,
+            has_inactive=has_inactive,
         )
     dev = hidden_states.device
-    g = torch.stack((gate_up_input_scale[:num_experts], down_input_scale[:num_experts])).float().amax(dim=1)
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    g = (
+        torch.stack((gate_up_input_scale[:num_experts], down_input_scale[:num_experts]))
+        .float()
+        .amax(dim=1)
+    )
+    sorted_ids, expert_ids, ntpp = moe_align_block_size(
+        topk_ids, cfg["BLOCK_SIZE_M"], num_experts, has_inactive=has_inactive
+    )
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
@@ -197,12 +291,40 @@ def fused_experts_nvfp4_w4a4(
     q = torch.empty((num_valid, inter // 2), device=dev, dtype=torch.uint8)
     qs = torch.empty((num_valid, inter // 16), device=dev, dtype=torch.float8_e4m3fn)
     nvfp4_moe.w4a4_gate_up_gemm(
-        xq, xs, g[0:1], gate_up_packed, gate_up_scale, gate_up_global, q, qs, g[1:2], sorted_ids, expert_ids, ntpp,
-        num_valid, top_k, activation, act_alpha, act_limit, cfg["gate_up"],
+        xq,
+        xs,
+        g[0:1],
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        q,
+        qs,
+        g[1:2],
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        top_k,
+        activation,
+        act_alpha,
+        act_limit,
+        cfg["gate_up"],
     )
     out = torch.zeros_like(hidden_states)
     nvfp4_moe.w4a4_down_gemm(
-        q, qs, g[1:2], down_packed, down_scale, down_global, out, tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
+        q,
+        qs,
+        g[1:2],
+        down_packed,
+        down_scale,
+        down_global,
+        out,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        top_k,
         cfg["down"],
     )
     return out

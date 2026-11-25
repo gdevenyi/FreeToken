@@ -24,9 +24,13 @@ _STEP_LOCK_USAGE = (1 << 62) - 1
 # that makes the PCIe fetch and the CPU compute finish closest together, "stochastic" rounds
 # up with probability equal to the fractional part, "prefer-fetch" always rounds up.
 _HYBRID_FETCH_ROUNDING = {"min-wait": 0, "stochastic": 1, "prefer-fetch": 2}
-_hybrid_fetch_round = (os.getenv("FREETOKEN_HYBRID_FETCH_ROUND") or "min-wait").strip().lower()
+_hybrid_fetch_round = (
+    (os.getenv("FREETOKEN_HYBRID_FETCH_ROUND") or "min-wait").strip().lower()
+)
 if _hybrid_fetch_round not in _HYBRID_FETCH_ROUNDING:
-    raise ValueError(f"FREETOKEN_HYBRID_FETCH_ROUND={_hybrid_fetch_round!r}: expected one of {sorted(_HYBRID_FETCH_ROUNDING)}")
+    raise ValueError(
+        f"FREETOKEN_HYBRID_FETCH_ROUND={_hybrid_fetch_round!r}: expected one of {sorted(_HYBRID_FETCH_ROUNDING)}"
+    )
 _HYBRID_FETCH_ROUND = _HYBRID_FETCH_ROUNDING[_hybrid_fetch_round]
 _HYBRID_FETCH_SEED = 0
 # Phase 2 of the hybrid ensure kernel scans a pool wider than this in tiles of this width.
@@ -40,7 +44,9 @@ ENSURE_QUERY_WIDTH = 128
 ENSURE_ONE_CALL_WIDTH = 256
 
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
+def ensure_experts(
+    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -60,7 +66,9 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, *, record_sta
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats and record_stats else None,
+        stats=cache.lru_stats[layer_id]
+        if cache.collect_stats and record_stats
+        else None,
         id_base=layer_id * cache.num_experts,
     )
 
@@ -68,7 +76,9 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, *, record_sta
 class HybridRoutes(NamedTuple):
     """One layer's routes split between the GPU and the CPU, each [bs, top_k]."""
 
-    gpu_slots: torch.Tensor  # cache slot of each route; a CPU route is -1, or 0 with clamp
+    gpu_slots: (
+        torch.Tensor
+    )  # cache slot of each route; a CPU route is -1, or 0 with clamp
     gpu_w: torch.Tensor  # router weights, 0 for a CPU route
     cpu_ids: torch.Tensor  # expert ids, -1 for a GPU route
 
@@ -101,9 +111,13 @@ def ensure_experts_hybrid(
     # Q16 fixed point: the kernel caps in integers.
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     weights = weights.contiguous()
-    routes = HybridRoutes(expert_ids, torch.empty_like(weights), torch.empty_like(expert_ids))
+    routes = HybridRoutes(
+        expert_ids, torch.empty_like(weights), torch.empty_like(expert_ids)
+    )
     cap = cache.num_experts if fetch_cap is None else fetch_cap
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, weights, routes, clamp, max_fetch, frac_q16, cap)
+    _ensure_experts_hybrid_gpu(
+        cache, layer_id, expert_ids, weights, routes, clamp, max_fetch, frac_q16, cap
+    )
     return routes
 
 
@@ -151,10 +165,6 @@ def reset_cache(cache) -> None:
         cache.num_indices.zero_()
         return
     _reset_cache_gpu(cache)
-
-
-
-
 
 
 def _ensure_experts_hybrid_gpu(
@@ -309,9 +319,18 @@ def _materialize_layer_kernel(
     tl.store(num_indices_ptr, num_experts)
 
 
-
-
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "fetch_cap", "cache_size", "id_of_slot_ptr", "usage_ptr"])
+@triton.jit(
+    do_not_specialize=[
+        "layer_id",
+        "num_active",
+        "max_fetch",
+        "fetch_frac_q16",
+        "fetch_cap",
+        "cache_size",
+        "id_of_slot_ptr",
+        "usage_ptr",
+    ]
+)
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -397,22 +416,34 @@ def _ensure_experts_hybrid_kernel(
         elif ROUND == 2:
             max_fetch = (num_missing * fetch_frac_q16 + 0xFFFF) >> 16
         else:
-            cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16)
+            cost_lo = tl.maximum(
+                lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16
+            )
             cost_hi = tl.maximum(
-                (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
+                (lo + 1) * ((1 << 16) - fetch_frac_q16),
+                (num_missing - lo - 1) * fetch_frac_q16,
             )
             max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     is_hit = is_active & (slot >= 0)
     # a pool smaller than num_experts may hold fewer free slots than misses
-    num_fetch = tl.minimum(tl.minimum(num_missing, tl.minimum(max_fetch, fetch_cap)), cache_size - tl.sum(is_hit.to(tl.int32)))
+    num_fetch = tl.minimum(
+        tl.minimum(num_missing, tl.minimum(max_fetch, fetch_cap)),
+        cache_size - tl.sum(is_hit.to(tl.int32)),
+    )
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
 
     if BY_CRF:
-        old_rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
-        old_crf = tl.load(expert_crf_ptr + base + off_e, mask=e_mask, other=0.0).to(tl.float32)
+        old_rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(
+            tl.int64
+        )
+        old_crf = tl.load(expert_crf_ptr + base + off_e, mask=e_mask, other=0.0).to(
+            tl.float32
+        )
         dt = tl.maximum(step - old_rec, 0).to(tl.float32)
-        decayed_crf = tl.where(old_rec >= 0, old_crf * tl.exp2(-dt * (1.0 / 128.0)), 0.0)
+        decayed_crf = tl.where(
+            old_rec >= 0, old_crf * tl.exp2(-dt * (1.0 / 128.0)), 0.0
+        )
         new_crf = tl.where(is_active & e_mask, decayed_crf + 1.0, decayed_crf)
         lease = tl.minimum((new_crf * 32.0).to(tl.int64), 512)
         # Lock current-step hit slots with _STEP_LOCK_USAGE during Phase 2 victim scan so even if
@@ -432,9 +463,13 @@ def _ensure_experts_hybrid_kernel(
         # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
         # spans only [0, num_experts), so it can only break exact-recency ties).
         if BY_RECENCY:
-            rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
+            rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(
+                tl.int64
+            )
             score = tl.where(
-                is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+                is_missing,
+                rec * num_experts + (num_experts - 1 - off_e),
+                -1152921504606846976,
             ).to(tl.int64)
         else:
             missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
@@ -444,17 +479,25 @@ def _ensure_experts_hybrid_kernel(
         off_k = tl.arange(0, CHUNK)
         tl.debug_barrier()  # the scan below must see the hit stamps
         if SMALL:
-            u_reg = tl.load(usage_ptr + off_k, mask=off_k < cache_size, other=9223372036854775807).to(tl.int64)
+            u_reg = tl.load(
+                usage_ptr + off_k, mask=off_k < cache_size, other=9223372036854775807
+            ).to(tl.int64)
         for i in tl.range(num_fetch):
             if SMALL:
                 victim = tl.argmin(u_reg, axis=0).to(tl.int32)
-                u_reg = tl.where(off_k == victim, 4611686018427387903 if BY_CRF else step, u_reg)
+                u_reg = tl.where(
+                    off_k == victim, 4611686018427387903 if BY_CRF else step, u_reg
+                )
             else:
                 best_u = tl.full((), 9223372036854775807, tl.int64)
                 best_s = tl.full((), 0, tl.int32)
                 for c0 in tl.range(0, cache_size, CHUNK):
                     offs = c0 + off_k
-                    uu = tl.load(usage_ptr + offs, mask=offs < cache_size, other=9223372036854775807).to(tl.int64)
+                    uu = tl.load(
+                        usage_ptr + offs,
+                        mask=offs < cache_size,
+                        other=9223372036854775807,
+                    ).to(tl.int64)
                     cmin = tl.min(uu, axis=0)
                     carg = (tl.argmin(uu, axis=0) + c0).to(tl.int32)
                     take = cmin < best_u
@@ -485,14 +528,15 @@ def _ensure_experts_hybrid_kernel(
         tl.store(expert_crf_ptr + base + off_e, new_crf, mask=is_active & e_mask)
         tl.debug_barrier()
 
-    # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
+    # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU / remote EP) ----
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
+        valid_e = (e >= 0) & (e < num_experts)
+        s = tl.load(slot_for_id_ptr + base + e, mask=valid_e, other=-1)
         # every warp loads e, one thread stores below; a warp that loads after that store indexes with a slot id
         tl.debug_barrier()
-        on_gpu = s >= 0
-        tl.store(cpu_ids_ptr + i, tl.where(on_gpu, -1, e))
+        on_gpu = valid_e & (s >= 0)
+        tl.store(cpu_ids_ptr + i, tl.where(valid_e & (~on_gpu), e, -1))
         tl.store(gpu_w_ptr + i, tl.where(on_gpu, tl.load(weights_ptr + i), 0.0))
         if CLAMP:
             s = tl.maximum(s, 0)
@@ -534,7 +578,9 @@ def crf_hybrid_step_reference(
     id_of_slot, usage = cache.pool_state(layer_id)
     num_slots = id_of_slot.numel()
 
-    active_list = sorted(set(expert_ids.reshape(-1).tolist()))
+    active_list = sorted(
+        e for e in set(expert_ids.reshape(-1).tolist()) if 0 <= e < num_experts
+    )
     cache.active_mask.zero_()
     if active_list:
         cache.active_mask[active_list] = 1
@@ -594,9 +640,17 @@ def crf_hybrid_step_reference(
         cache.expert_crf[layer_id, e] = new_crf[e]
         cache.expert_recency[layer_id, e] = step
 
-    slots = cache.slot_for_id[layer_id, expert_ids.long()].to(torch.int32)
-    on_gpu = slots >= 0
-    cpu_ids = torch.where(on_gpu, torch.full_like(expert_ids, -1), expert_ids)
+    valid_e = (expert_ids >= 0) & (expert_ids < num_experts)
+    safe_ids = expert_ids.clamp(0, max(0, num_experts - 1)).long()
+    slots = torch.where(
+        valid_e,
+        cache.slot_for_id[layer_id, safe_ids].to(torch.int32),
+        torch.full_like(expert_ids, -1),
+    )
+    on_gpu = valid_e & (slots >= 0)
+    cpu_ids = torch.where(
+        valid_e & (~on_gpu), expert_ids, torch.full_like(expert_ids, -1)
+    )
     gpu_w = torch.where(on_gpu, weights, torch.zeros_like(weights))
     gpu_slots = slots.clamp(min=0) if clamp else slots
     expert_ids.copy_(gpu_slots)
@@ -605,11 +659,11 @@ def crf_hybrid_step_reference(
 
 @triton.jit(do_not_specialize=["threshold"])
 def _prefill_hit_compact_kernel(
-    slot_ptr,     # [num_experts] int32: this layer's slot_for_id row
-    dst_ptr,      # [num_experts] int32 out: buffer rows (expert ids), compacted
-    src_ptr,      # [num_experts] int32 out: pool-local slots, compacted
-    num_ptr,      # [1] int64 out: hit count
-    threshold,    # first pool-local slot outside the staging buffers
+    slot_ptr,  # [num_experts] int32: this layer's slot_for_id row
+    dst_ptr,  # [num_experts] int32 out: buffer rows (expert ids), compacted
+    src_ptr,  # [num_experts] int32 out: pool-local slots, compacted
+    num_ptr,  # [1] int64 out: hit count
+    threshold,  # first pool-local slot outside the staging buffers
     num_experts,
     BLOCK: tl.constexpr,
 ):

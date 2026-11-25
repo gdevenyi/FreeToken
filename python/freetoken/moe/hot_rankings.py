@@ -182,6 +182,7 @@ class HotExpertRankings:
         num_experts: int,
         *,
         step: int = 8,
+        ep_size: int = 1,
     ) -> dict[int, int]:
         """Allocate ``total_slots`` across ``layers`` (each ``<= num_experts``) by greedy marginal
         hit-rate gain when ``hit_curves`` cover all ``layers``, else uniform round-robin."""
@@ -196,6 +197,7 @@ class HotExpertRankings:
             return uniform
 
         step = max(1, step)
+        ep_scale = max(1, int(ep_size))
         floor = min(base, max(0, (base * 3 // 4) // step * step))
         ceil = min(num_experts, max(base, ((base * 5 // 4) + step - 1) // step * step))
         caps = {l: floor for l in layers}
@@ -206,8 +208,8 @@ class HotExpertRankings:
             for l in layers:
                 if caps[l] + step > ceil:
                     continue
-                r_now = self.interp_hit_rate(l, caps[l]) or 0.0
-                r_nxt = self.interp_hit_rate(l, caps[l] + step) or 0.0
+                r_now = self.interp_hit_rate(l, caps[l] * ep_scale) or 0.0
+                r_nxt = self.interp_hit_rate(l, (caps[l] + step) * ep_scale) or 0.0
                 gain = r_nxt - r_now
                 if gain > best_gain:
                     best_gain = gain
@@ -225,7 +227,7 @@ class HotExpertRankings:
         return caps if sum(caps.values()) == total_slots else uniform
 
     def select_for_layer(
-        self, layer_id: int, num_experts: int, k_hot: int
+        self, layer_id: int, num_experts: int, k_hot: int, *, ep_offset: int = 0
     ) -> list[int]:
         if k_hot <= 0:
             return []
@@ -233,7 +235,8 @@ class HotExpertRankings:
         ranked = self.by_layer.get(layer_id, ())
         chosen: list[int] = []
         seen: set[int] = set()
-        for eid in ranked:
+        for global_eid in ranked:
+            eid = global_eid - ep_offset
             if 0 <= eid < num_experts and eid not in seen:
                 chosen.append(eid)
                 seen.add(eid)
@@ -247,15 +250,20 @@ class HotExpertRankings:
                     return chosen
         return chosen
 
-    def to_pseudo_counts(self, num_layers: int, num_experts: int) -> torch.Tensor:
+    def to_pseudo_counts(
+        self, num_layers: int, num_experts: int, *, ep_offset: int = 0, ep_size: int = 1
+    ) -> torch.Tensor:
         """Convert rankings / hit curves into ``[num_layers, num_experts]`` weights for ``split_slots``."""
+        ep_scale = max(1, int(ep_size))
         out = torch.zeros((num_layers, num_experts), dtype=torch.float64)
         for l in range(num_layers):
-            order = self.select_for_layer(l, num_experts, num_experts)
+            order = self.select_for_layer(
+                l, num_experts, num_experts, ep_offset=ep_offset
+            )
             prev_w: float | None = None
             for rank, eid in enumerate(order):
-                r0 = self.interp_hit_rate(l, rank)
-                r1 = self.interp_hit_rate(l, rank + 1)
+                r0 = self.interp_hit_rate(l, rank * ep_scale)
+                r1 = self.interp_hit_rate(l, (rank + 1) * ep_scale)
                 if r0 is not None and r1 is not None and r1 >= r0:
                     w = max(1e-9, r1 - r0)
                 else:

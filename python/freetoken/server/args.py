@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import math
 import json
+import math
 import os
 from dataclasses import dataclass, field
-from typing import List, Tuple
 
 import torch
-from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
+
 from freetoken.distributed import DistributedInfo
+from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
@@ -81,7 +81,7 @@ class ServerArgs(SchedulerConfig):
     # --gpu entries in TP-rank order, empty = not given
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
-    gpu_assigned: "tuple[str, ...] | None" = None
+    gpu_assigned: tuple[str, ...] | None = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -123,10 +123,10 @@ def _json_object(text: str) -> dict:
 
 
 def parse_args(
-    args: List[str],
+    args: list[str],
     run_shell: bool = False,
     prog: str | None = None,
-) -> Tuple[ServerArgs, bool]:
+) -> tuple[ServerArgs, bool]:
     """
     Parse command line arguments and return an EngineConfig.
 
@@ -154,7 +154,9 @@ def parse_args(
     def _parse_module_list(value: str) -> tuple[str, ...]:
         names = tuple(p.strip() for p in value.split(",") if p.strip())
         if not names:
-            raise argparse.ArgumentTypeError("expected comma-separated module names or glob patterns")
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated module names or glob patterns"
+            )
         return names
 
     def _parse_moe_cache_rate(value: str) -> float:
@@ -168,22 +170,34 @@ def parse_args(
 
     def _parse_mem_size(value: str) -> int:
         units = {
-            "b": 1, "k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10, "m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20,
-            "g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30,
+            "b": 1,
+            "k": 1 << 10,
+            "kb": 1 << 10,
+            "kib": 1 << 10,
+            "m": 1 << 20,
+            "mb": 1 << 20,
+            "mib": 1 << 20,
+            "g": 1 << 30,
+            "gb": 1 << 30,
+            "gib": 1 << 30,
         }
         text = value.strip().lower()
         number = text.rstrip("abgikm")
-        unit = text[len(number):]
+        unit = text[len(number) :]
         try:
             size = int(float(number) * units[unit])
         except (KeyError, ValueError, OverflowError) as exc:
-            raise argparse.ArgumentTypeError("must be a size with a unit, e.g. 12GiB or 800MiB") from exc
+            raise argparse.ArgumentTypeError(
+                "must be a size with a unit, e.g. 12GiB or 800MiB"
+            ) from exc
         if size <= 0:
             raise argparse.ArgumentTypeError("must be positive")
         return size
 
     def _parse_cache_split(value: str) -> str:
-        if value == "equal" or (value.startswith("profile:") and len(value) > len("profile:")):
+        if value == "equal" or (
+            value.startswith("profile:") and len(value) > len("profile:")
+        ):
             return value
         raise argparse.ArgumentTypeError("must be equal or profile:<path>")
 
@@ -249,7 +263,11 @@ def parse_args(
             return "minimax_m3"
         if "minimax" in marker:
             return "minimax"
-        if "muse_glimmer" in marker or "muse-glimmer" in marker or "museglimmer" in marker:
+        if (
+            "muse_glimmer" in marker
+            or "muse-glimmer" in marker
+            or "museglimmer" in marker
+        ):
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
@@ -314,13 +332,19 @@ def parse_args(
             return "minimax_m3"
         if "minimax" in marker:
             return "minimax"
-        if "muse_glimmer" in marker or "muse-glimmer" in marker or "museglimmer" in marker:
+        if (
+            "muse_glimmer" in marker
+            or "muse-glimmer" in marker
+            or "museglimmer" in marker
+        ):
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
         return None
 
-    parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")
+    parser = argparse.ArgumentParser(
+        prog=prog, description="FreeToken Server Arguments"
+    )
 
     parser.add_argument(
         "--model-path",
@@ -679,7 +703,11 @@ def parse_args(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,
-        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name), *KV_FORMAT_ALIASES],
+        choices=[
+            "auto",
+            *(name for name in KV_FORMATS if name != NONE.name),
+            *KV_FORMAT_ALIASES,
+        ],
         help="How K and V are stored. 'auto' keeps the compute dtype; 'fp8'/'fp8_e4m3' and 'int8' alias "
         "'fp8_per_token_head' and 'int8_per_token_head'. The per_token_head formats store 8 bits per element "
         "plus one scale per token and local head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
@@ -851,8 +879,18 @@ def parse_args(
         type=str,
         default="auto",
         choices=[
-            "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive",
+            "auto",
+            "off",
+            "deepseekv32",
+            "gpt_oss",
+            "qwen3",
+            "glm",
+            "minimax",
+            "minimax_m3",
+            "muse_glimmer",
+            "gemma4",
+            "flint",
+            "ricursive",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
@@ -1051,6 +1089,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-ep",
+        action="store_true",
+        default=ServerArgs.moe_ep,
+        help=(
+            "Shard routed MoE experts disjointly across the TP group (Expert Parallelism, EP=TP) "
+            "at full intermediate width instead of sharding every expert's intermediate axis."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,
@@ -1246,7 +1294,9 @@ def parse_args(
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
         if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+            parser.error(
+                "tensor parallelism is not supported yet: --gpu takes one entry"
+            )
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
@@ -1258,7 +1308,9 @@ def parse_args(
         parser.error("--kv-host-restore-tokens must be 0 or more")
     if kwargs["kv_host_tier_gb"] and kwargs["speculative_algorithm"] == "mtp":
         # the MTP draft KV pool follows the target's page ids; the host tier does not copy it (v1)
-        parser.error("--kv-host-tier-gb is not supported with --speculative-algorithm mtp")
+        parser.error(
+            "--kv-host-tier-gb is not supported with --speculative-algorithm mtp"
+        )
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
@@ -1272,7 +1324,9 @@ def parse_args(
     entry = kwargs.pop("nvfp4_backend", None)
     if entry is not None:
         if kwargs["quant_backend"] is not None:
-            parser.error("--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead")
+            parser.error(
+                "--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead"
+            )
         if entry:
             kwargs["quant_backend"] = entry
 
@@ -1302,14 +1356,17 @@ def parse_args(
 
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:
-        media_root = os.path.realpath(os.path.expanduser(kwargs["allowed_local_media_path"]))
+        media_root = os.path.realpath(
+            os.path.expanduser(kwargs["allowed_local_media_path"])
+        )
         if not os.path.isdir(media_root):
             parser.error(f"--allowed-local-media-path {media_root} is not a directory")
         kwargs["allowed_local_media_path"] = media_root
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (
-            os.path.basename(os.path.normpath(kwargs["model_path"])) or kwargs["model_path"]
+            os.path.basename(os.path.normpath(kwargs["model_path"]))
+            or kwargs["model_path"]
         )
 
     if kwargs["tool_call_parser"] == "auto":
@@ -1356,8 +1413,11 @@ def parse_args(
         cfg = cached_load_hf_config(kwargs["model_path"]).to_dict()
         text_cfg = cfg.get("text_config") or {}
         dtype_str = (
-            cfg.get("torch_dtype") or cfg.get("dtype")
-            or text_cfg.get("torch_dtype") or text_cfg.get("dtype") or "bfloat16"
+            cfg.get("torch_dtype")
+            or cfg.get("dtype")
+            or text_cfg.get("torch_dtype")
+            or text_cfg.get("dtype")
+            or "bfloat16"
         )
 
     DTYPE_MAP = {
@@ -1371,9 +1431,18 @@ def parse_args(
 
     disabled = set(ENCODER_KINDS) if kwargs.pop("text_model_only") else set()
     disabled.update(kwargs.pop("mm_disable"))
-    image_min_tokens, image_max_tokens = kwargs.pop("image_min_tokens"), kwargs.pop("image_max_tokens")
-    if image_min_tokens is not None and image_max_tokens is not None and image_min_tokens > image_max_tokens:
-        parser.error(f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}")
+    image_min_tokens, image_max_tokens = (
+        kwargs.pop("image_min_tokens"),
+        kwargs.pop("image_max_tokens"),
+    )
+    if (
+        image_min_tokens is not None
+        and image_max_tokens is not None
+        and image_min_tokens > image_max_tokens
+    ):
+        parser.error(
+            f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}"
+        )
     kwargs["mm"] = MultimodalConfig(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),

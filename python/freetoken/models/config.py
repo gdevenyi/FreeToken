@@ -68,6 +68,37 @@ def fp32_router_enabled() -> bool:
     return os.getenv("FREETOKEN_FP32_ROUTER", "0").strip().lower() in _ENV_TRUE
 
 
+def moe_ep_enabled(flag: bool = False) -> bool:
+    """Disjoint Expert Parallelism across the TP group for routed MoE experts (opt-in, default OFF).
+    When enabled at ``TP > 1``, rank ``r`` owns routed experts ``[r * (E // TP), (r + 1) * (E // TP))``
+    at full ``moe_intermediate_size`` instead of sharding every expert along ``I``.
+    ``--moe-ep`` or ``FREETOKEN_MOE_EP=1``."""
+    if flag:
+        return True
+    return os.getenv("FREETOKEN_MOE_EP", "0").strip().lower() in _ENV_TRUE
+
+
+def moe_ep_slice(
+    num_experts: int,
+    *,
+    moe_ep: bool | None = None,
+    tp_info: Any = None,
+) -> tuple[int, int, int]:
+    """Return ``(ep_size, ep_offset, local_num_experts)`` for ``num_experts``."""
+    from freetoken.distributed import try_get_tp_info
+
+    enabled = moe_ep_enabled() if moe_ep is None else bool(moe_ep)
+    tp = tp_info if tp_info is not None else try_get_tp_info()
+    if not enabled or tp is None or tp.size <= 1:
+        return 1, 0, int(num_experts)
+    if num_experts % tp.size != 0:
+        raise ValueError(
+            f"MoE expert parallelism requires num_experts ({num_experts}) divisible by tp_size ({tp.size})"
+        )
+    local = num_experts // tp.size
+    return tp.size, tp.rank * local, local
+
+
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
@@ -383,6 +414,8 @@ class ModelConfig:
     moe_strategy: str = "fused"
     # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
     decode_target: str = "gpu"
+    # disjoint expert parallelism across the TP group (--moe-ep / FREETOKEN_MOE_EP=1)
+    moe_ep: bool = False
     # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
     quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----
@@ -480,6 +513,27 @@ class ModelConfig:
         only store experts for the trailing layers; everything else has all layers MoE.
         """
         return self.num_layers - self.first_k_dense_replace
+
+    def ep_info(self, tp_info: Any = None) -> tuple[int, int, int]:
+        """``(ep_size, ep_offset, local_num_experts)`` for this rank."""
+        return moe_ep_slice(self.num_experts, moe_ep=self.moe_ep, tp_info=tp_info)
+
+    @property
+    def local_num_experts(self) -> int:
+        """Routed experts stored on this rank (``num_experts // tp_size`` under ``moe_ep``, else ``num_experts``)."""
+        return self.ep_info()[2]
+
+    @property
+    def local_moe_intermediate_size(self) -> int:
+        """Per-rank routed expert intermediate width (full ``moe_intermediate_size`` under ``moe_ep``)."""
+        from freetoken.distributed import try_get_tp_info
+
+        ep_size, _, _ = self.ep_info()
+        if ep_size > 1:
+            return self.moe_intermediate_size
+        tp = try_get_tp_info()
+        tp_size = tp.size if tp is not None else 1
+        return self.moe_intermediate_size // tp_size
 
     @property
     def is_multimodal(self) -> bool:

@@ -3,13 +3,14 @@ from __future__ import annotations
 import collections
 import os
 import re
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Callable, Collection
 
 import safetensors
 import torch
-from freetoken.utils import download_hf_weight
 from tqdm import tqdm
+
+from freetoken.utils import download_hf_weight
 
 LayerToBank = Callable[[int, object], int | None]
 DropPageCache = Callable[[str], None]
@@ -29,11 +30,11 @@ class Nvfp4ExpertSourceSpec:
     global_reciprocal: bool = False
 
 
-def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
+def _canon_kind(spec: Nvfp4ExpertSourceSpec, kind: str) -> str:
     return spec.kind_map.get(kind, kind) if spec.kind_map else kind
 
 
-def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
+def _ingest_global(spec: Nvfp4ExpertSourceSpec, tensor: torch.Tensor) -> torch.Tensor:
     if spec.global_reciprocal:
         tensor = 1.0 / tensor.float()
     return tensor.to(torch.float32)
@@ -52,7 +53,9 @@ def _activation_scale():
     return quant.stored_tensors(QuantKind.NVFP4).get("input_scale")
 
 
-def _ingest(spec: "Nvfp4ExpertSourceSpec", act, role: str, tensor: torch.Tensor) -> torch.Tensor:
+def _ingest(
+    spec: Nvfp4ExpertSourceSpec, act, role: str, tensor: torch.Tensor
+) -> torch.Tensor:
     if role.endswith("_global"):
         return _ingest_global(spec, tensor)
     if role.endswith("_input"):
@@ -136,10 +139,14 @@ def iter_nvfp4_expert_pieces(
     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
     ``layers`` (bank layer ids, default all) reads only those layers' experts.
     """
+    from freetoken.models.config import moe_ep_slice
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map
     from freetoken.moe.expert_pieces import per_expert_pieces
 
+    ep_size, ep_offset, local_experts = moe_ep_slice(
+        config.num_experts, moe_ep=getattr(config, "moe_ep", None)
+    )
     drop = drop_page_cache or _drop
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
@@ -154,18 +161,30 @@ def iter_nvfp4_expert_pieces(
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None or (keep is not None and bank_layer not in keep):
             continue
+        raw_expert = int(match.group("expert"))
+        if ep_size > 1 and not (ep_offset <= raw_expert < ep_offset + local_experts):
+            continue
+        local_expert = raw_expert - ep_offset
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = _canon_kind(spec, match.group("kind"))
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-        wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
+        wanted[name] = (
+            bank_layer,
+            local_expert,
+            spec.proj_to_role[proj] + _kind_suffix(kind),
+        )
         if kind == "weight" and act is not None:
             act_name = name[: match.start("kind")] + act.name
             if act_name in weight_map:
-                wanted[act_name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + "_input")
-    experts = (_num_moe_layers(config) if keep is None else len(keep)) * config.num_experts
+                wanted[act_name] = (
+                    bank_layer,
+                    local_expert,
+                    spec.proj_to_role[proj] + "_input",
+                )
+    experts = (_num_moe_layers(config) if keep is None else len(keep)) * local_experts
     acts = [name for name, (_, _, role) in wanted.items() if role.endswith("_input")]
     # a partial set serves no W4A4 kernel; the pieces then carry none
     if len(acts) != experts * 3:
@@ -174,14 +193,18 @@ def iter_nvfp4_expert_pieces(
         acts = []
     per_expert = 12 if acts else 9
     if len(wanted) != experts * per_expert:
-        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * per_expert}")
+        raise ValueError(
+            f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * per_expert}"
+        )
 
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
         for name, shard in weight_map.items():
             if name in wanted:
                 by_shard[shard].append(name)
-        for shard in tqdm(sorted(by_shard), desc=f"Loading {spec.desc}", disable=not primary):
+        for shard in tqdm(
+            sorted(by_shard), desc=f"Loading {spec.desc}", disable=not primary
+        ):
             path = os.path.join(folder, shard)
             drop(path)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
@@ -192,11 +215,13 @@ def iter_nvfp4_expert_pieces(
     def _parallel():
         from freetoken.models.weight import iter_expert_tensors_parallel
 
-        for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
+        for name, tensor in iter_expert_tensors_parallel(
+            folder, lambda n: n in wanted, workers=workers, chunk=chunk
+        ):
             yield name, _ingest(spec, act, wanted[name][2], tensor)
 
     stream = _parallel() if parallel else _serial()
-    shard = _tp_slice()
+    shard = None if ep_size > 1 else _tp_slice()
     if shard is not None:
         tp_size, tp_rank = shard
         inter = config.moe_intermediate_size

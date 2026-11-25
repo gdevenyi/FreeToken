@@ -1,13 +1,14 @@
 import os
-from typing import TYPE_CHECKING, Iterator, Tuple
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
-
 
 from .base import BaseOP
 from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
 # Router decision (topk_weights[float32], topk_ids[int32]) for models whose router
 # is computed outside the MoE layer. Such models call ``routed_forward`` with a
 # precomputed routing instead of going through the generic softmax+top-k path.
-TopK = Tuple[torch.Tensor, torch.Tensor]
+TopK = tuple[torch.Tensor, torch.Tensor]
 
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
@@ -67,10 +68,12 @@ class MoELayer(BaseOP):
         decode_target: str = "gpu",
         quant_config: QuantConfig | None = None,
         prefix: str = "",
+        moe_ep: bool | None = None,
     ):
         super().__init__()
+        from freetoken.models.config import moe_ep_slice
 
-        self.num_experts = num_experts
+        self.global_num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -78,7 +81,10 @@ class MoELayer(BaseOP):
 
         tp_info = get_tp_info()
         self.tp_rank = tp_info.rank
-        self.tp_size = tp_size = tp_info.size
+        self.tp_size = tp_info.size
+        self.ep_size, self.ep_offset, self.num_experts = moe_ep_slice(
+            num_experts, moe_ep=moe_ep, tp_info=tp_info
+        )
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -103,6 +109,21 @@ class MoELayer(BaseOP):
             return self._comm.all_reduce(hidden_states)
         return hidden_states
 
+    def _remap_ep_routes(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map global router expert IDs onto this EP rank's local ``[0, num_experts)`` slice,
+        marking remote-rank routes inactive (``id = -1``, ``weight = 0.0``)."""
+        if self.ep_size <= 1:
+            return topk_weights, topk_ids
+        local_ids = topk_ids - self.ep_offset
+        valid = (local_ids >= 0) & (local_ids < self.num_experts)
+        remapped_ids = torch.where(valid, local_ids, -1).to(torch.int32)
+        remapped_w = torch.where(valid, topk_weights, 0.0)
+        return remapped_w.contiguous(), remapped_ids.contiguous()
+
     def _resident_gemm(
         self,
         hidden_states: torch.Tensor,
@@ -110,8 +131,12 @@ class MoELayer(BaseOP):
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
         return self.quant_method.apply(
-            hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
-            layer=self, is_prefill=get_global_ctx().batch.is_prefill,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.quant_method.resident_view(self),
+            layer=self,
+            is_prefill=get_global_ctx().batch.is_prefill,
         )
 
     def routed_forward(
@@ -133,6 +158,7 @@ class MoELayer(BaseOP):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
+        topk_weights, topk_ids = self._remap_ep_routes(topk_weights, topk_ids)
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
@@ -147,7 +173,10 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+        topk_weights, topk_ids = self._remap_ep_routes(topk_weights, topk_ids)
+        return self._maybe_all_reduce(
+            self._resident_gemm(hidden_states, topk_weights, topk_ids)
+        )
 
 
 class OffloadMoELayer(MoELayer):
@@ -171,6 +200,7 @@ class OffloadMoELayer(MoELayer):
         decode_target: str = "gpu",
         quant_config: QuantConfig | None = None,
         prefix: str = "",
+        moe_ep: bool | None = None,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -191,6 +221,7 @@ class OffloadMoELayer(MoELayer):
             decode_target=decode_target,
             quant_config=quant_config,
             prefix=prefix,
+            moe_ep=moe_ep,
         )
         self.offload_cache: OffloadMoeCache | None = None
 
@@ -226,6 +257,7 @@ class OffloadMoELayer(MoELayer):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
+        topk_weights, topk_ids = self._remap_ep_routes(topk_weights, topk_ids)
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
@@ -244,6 +276,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        topk_weights, topk_ids = self._remap_ep_routes(topk_weights, topk_ids)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -257,6 +290,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        topk_weights, topk_ids = self._remap_ep_routes(topk_weights, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
@@ -291,7 +325,15 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        slots = cache.load_experts(self.layer_id, topk_ids)
+        if self.ep_size > 1:
+            slots, topk_weights = cache.load_experts_ep(
+                self.layer_id,
+                topk_ids,
+                topk_weights,
+                clamp=not self.skips_inactive_slots,
+            )
+        else:
+            slots = cache.load_experts(self.layer_id, topk_ids)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -327,8 +369,12 @@ class OffloadMoELayer(MoELayer):
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
         # with several quants this holds only because the cache zeroes its staging area after prefill
         clamp = not self.skips_inactive_slots
-        gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
-        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+        gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(
+            self.layer_id, topk_ids, topk_weights, clamp=clamp
+        )
+        pending = executor.decode_submit(
+            self.layer_id, hidden_states, topk_weights, cpu_ids
+        )
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
@@ -374,19 +420,34 @@ class OffloadMoELayer(MoELayer):
             pool_views = cache.pool_bank_views(self.layer_id)
             pool_alphas = cache.alphas_for_slots(self.layer_id)
             if 0 < _SMALL_PREFILL_GROUPED_ROUTES <= topk_ids.numel():
-                uniq_slots, inv = torch.unique(slot_ids.reshape(-1), return_inverse=True)
+                flat_slots = slot_ids.reshape(-1)
+                if self.ep_size > 1:
+                    valid = flat_slots >= 0
+                    if not valid.any():
+                        return torch.zeros_like(hidden_states)
+                    uniq_slots, inv_valid = torch.unique(
+                        flat_slots[valid], return_inverse=True
+                    )
+                    mapped = torch.full_like(flat_slots, -1, dtype=torch.int32)
+                    mapped[valid] = inv_valid.to(torch.int32)
+                else:
+                    uniq_slots, inv = torch.unique(flat_slots, return_inverse=True)
+                    mapped = inv.to(torch.int32)
                 idx = uniq_slots.long()
                 compact_views = tuple(v.index_select(0, idx) for v in pool_views)
                 compact_alphas = (
                     None
                     if pool_alphas is None
-                    else (pool_alphas[0].index_select(0, idx), pool_alphas[1].index_select(0, idx))
+                    else (
+                        pool_alphas[0].index_select(0, idx),
+                        pool_alphas[1].index_select(0, idx),
+                    )
                 )
                 return self._expert_gemm(
                     cache,
                     hidden_states,
                     topk_weights,
-                    inv.to(torch.int32).view_as(topk_ids),
+                    mapped.view_as(topk_ids),
                     views=compact_views,
                     n=int(uniq_slots.numel()),
                     alphas=compact_alphas,
@@ -431,24 +492,43 @@ class OffloadMoELayer(MoELayer):
         cache.release_prefill_layer(self.layer_id)
         return out
 
-    def _ensure_unique(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> torch.Tensor:
+    def _ensure_unique(
+        self, cache: OffloadMoeCache, topk_ids: torch.Tensor
+    ) -> torch.Tensor:
         """Make this layer's routed experts resident and return ``topk_ids`` mapped to slots.
 
         The LRU kernel is sized for decode: its block is next_pow2(ids) x next_pow2(slots), so a
         prefill's tokens x top_k ids overflow Triton's element limit, and even a block under it
         can fail to launch on a full GPU. It gets the unique ids (at most num_experts) in
         decode-width chunks; each chunk's misses are copied before the next ensure reuses the plan."""
-        uniq, inverse = torch.unique(topk_ids.reshape(-1), return_inverse=True)
+        flat = topk_ids.reshape(-1)
+        if self.ep_size > 1:
+            valid = flat >= 0
+            inactive_fill = -1 if self.skips_inactive_slots else 0
+            out = torch.full_like(flat, inactive_fill, dtype=torch.int32)
+            if not valid.any():
+                return out.view_as(topk_ids)
+            uniq, inverse = torch.unique(flat[valid], return_inverse=True)
+        else:
+            valid = None
+            uniq, inverse = torch.unique(flat, return_inverse=True)
         n = uniq.numel()
         # Each ensure stamps a newer LRU step, so a later chunk evicts the earlier chunks' slots
         # only once every other slot of the layer's pool is gone.
         pool = cache.pool_slots(self.layer_id)
-        assert n <= pool, f"{n} routed experts exceed layer {self.layer_id}'s {pool}-slot pool"
+        assert n <= pool, (
+            f"{n} routed experts exceed layer {self.layer_id}'s {pool}-slot pool"
+        )
         uniq = uniq.to(torch.int32)
         for start in range(0, n, _ENSURE_CHUNK_IDS):
-            part = uniq[start : start + _ENSURE_CHUNK_IDS]  # a contiguous view: ensure rewrites it in place
+            part = uniq[
+                start : start + _ENSURE_CHUNK_IDS
+            ]  # a contiguous view: ensure rewrites it in place
             cache.ensure_experts(self.layer_id, part)
             cache.copy_missing()
+        if valid is not None:
+            out[valid] = uniq[inverse]
+            return out.view_as(topk_ids)
         return uniq[inverse].view_as(topk_ids)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
@@ -479,14 +559,23 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
-        from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+        from freetoken.moe.legacy_format import (
+            canonical_role,  # legacy_format imports this package
+        )
 
         view = ExpertView(
             {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+            slots=None if n is not None else topk_ids,
+            n=n,
+            alphas=alphas,
         )
         return self.quant_method.apply(
-            hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            view,
+            layer=self,
+            is_prefill=is_prefill,
         )
 
 
@@ -533,13 +622,17 @@ def make_moe_layer(
     subclasses constructible through the same seam.
     """
     offload = is_offload_moe_strategy(config.moe_strategy)
-    layer_cls = (offload_cls or OffloadMoELayer) if offload else (resident_cls or MoELayer)
+    layer_cls = (
+        (offload_cls or OffloadMoELayer) if offload else (resident_cls or MoELayer)
+    )
     kwargs = dict(
         num_experts=num_experts if num_experts is not None else config.num_experts,
         top_k=top_k if top_k is not None else config.num_experts_per_tok,
         hidden_size=hidden_size if hidden_size is not None else config.hidden_size,
         intermediate_size=(
-            intermediate_size if intermediate_size is not None else config.moe_intermediate_size
+            intermediate_size
+            if intermediate_size is not None
+            else config.moe_intermediate_size
         ),
         renormalize=renormalize if renormalize is not None else config.norm_topk_prob,
         activation=activation,
@@ -552,6 +645,7 @@ def make_moe_layer(
         quant_config=quant_config,
         prefix=prefix,
         layer_id=layer_id,
+        moe_ep=getattr(config, "moe_ep", None),
     )
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"

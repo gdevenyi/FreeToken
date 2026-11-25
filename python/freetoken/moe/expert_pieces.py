@@ -8,9 +8,10 @@ their ``_scale`` / ``_global`` companions, or an already fused ``gate_up``). The
 
 from __future__ import annotations
 
-from typing import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 
 import torch
+
 from freetoken.layers.quantization import QuantKind
 from freetoken.models.register import _load_attr, get_model_spec
 
@@ -21,7 +22,9 @@ def num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:
         return int(value)
-    return int(config.num_layers) - int(getattr(config, "first_k_dense_replace", 0) or 0)
+    return int(config.num_layers) - int(
+        getattr(config, "first_k_dense_replace", 0) or 0
+    )
 
 
 def bank_layer_of(config, layer: int) -> int | None:
@@ -61,11 +64,27 @@ def iter_expert_pieces(
     spec = get_model_spec(config.architectures[0])
     hook = _model_hook(spec, "iter_expert_pieces")
     if hook is not None:
-        pieces = hook(model_path, config, kind, layers=layers, parallel=parallel, workers=workers, chunk=chunk)
+        pieces = hook(
+            model_path,
+            config,
+            kind,
+            layers=layers,
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
+        )
         if pieces is not None:
             return pieces
     if kind is QuantKind.NONE:
-        return _bf16_pieces(model_path, config, spec, layers=layers, parallel=parallel, workers=workers, chunk=chunk)
+        return _bf16_pieces(
+            model_path,
+            config,
+            spec,
+            layers=layers,
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
+        )
     if kind is QuantKind.NVFP4:
         spec_hook = _model_hook(spec, "nvfp4_expert_spec")
         if spec_hook is None:
@@ -73,9 +92,17 @@ def iter_expert_pieces(
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 
         return iter_nvfp4_expert_pieces(
-            model_path, config, spec_hook(model_path, config), layers=layers, parallel=parallel, workers=workers, chunk=chunk
+            model_path,
+            config,
+            spec_hook(model_path, config),
+            layers=layers,
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
         )
-    raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
+    raise NotImplementedError(
+        f"{spec.module} provides no expert reader for {kind!r} experts"
+    )
 
 
 def packed_expert_source_info(key: str) -> tuple[int, str] | None:
@@ -94,51 +121,93 @@ def packed_expert_source_info(key: str) -> tuple[int, str] | None:
 def _source_layer(key: str) -> int | None:
     """Checkpoint layer of a ``model.layers.N....`` key."""
     parts = key.split(".")
-    return int(parts[2]) if len(parts) > 2 and parts[:2] == ["model", "layers"] and parts[2].isdigit() else None
+    return (
+        int(parts[2])
+        if len(parts) > 2 and parts[:2] == ["model", "layers"] and parts[2].isdigit()
+        else None
+    )
 
 
-def stacked_expert_pieces(tensors: Iterable[tuple[str, torch.Tensor]], config, *, layers: Collection[int] | None = None) -> Iterator[Piece]:
+def stacked_expert_pieces(
+    tensors: Iterable[tuple[str, torch.Tensor]],
+    config,
+    *,
+    layers: Collection[int] | None = None,
+) -> Iterator[Piece]:
     """Whole-layer ``experts.gate_up_proj`` / ``experts.down_proj`` tensors -> one piece per layer, for ``layers`` (bank layer ids, default all)."""
+    from freetoken.models.config import moe_ep_slice
+
     keep = None if layers is None else set(layers)
     pending: dict[int, dict[str, torch.Tensor]] = {}
     num_experts = config.num_experts
+    ep_size, ep_offset, local_experts = moe_ep_slice(
+        num_experts, moe_ep=getattr(config, "moe_ep", None)
+    )
     for name, tensor in tensors:
         info = packed_expert_source_info(name)
         if info is None:
             # another format's layer stores its experts in another form
             layer = _source_layer(name)
-            if keep is not None and layer is not None and bank_layer_of(config, layer) not in keep:
+            if (
+                keep is not None
+                and layer is not None
+                and bank_layer_of(config, layer) not in keep
+            ):
                 continue
             raise ValueError(f"Unexpected expert weight key: {name}")
         layer, packed_name = info
         bank_layer = bank_layer_of(config, layer)
         if bank_layer is None:
-            raise ValueError(f"Unexpected MoE expert layer {layer}; expected a routed-expert layer")
+            raise ValueError(
+                f"Unexpected MoE expert layer {layer}; expected a routed-expert layer"
+            )
         if keep is not None and bank_layer not in keep:
             continue
         if tensor.size(0) != num_experts:
-            raise ValueError(f"Unexpected {packed_name} expert count {tensor.size(0)}; expected {num_experts}")
+            raise ValueError(
+                f"Unexpected {packed_name} expert count {tensor.size(0)}; expected {num_experts}"
+            )
+        if ep_size > 1:
+            tensor = tensor[ep_offset : ep_offset + local_experts].contiguous()
         piece = pending.setdefault(bank_layer, {})
         piece["gate_up" if packed_name == "gate_up_proj" else "down"] = tensor
         if len(piece) == 2:
             del pending[bank_layer]
-            yield bank_layer, 0, num_experts, piece
+            yield bank_layer, 0, local_experts, piece
     if pending:
         raise ValueError(f"Missing MoE expert source layers: {sorted(pending)}")
 
 
-def _bf16_pieces(model_path: str, config, spec, *, layers: Collection[int] | None, parallel: bool, workers: int, chunk: int) -> Iterator[Piece]:
+def _bf16_pieces(
+    model_path: str,
+    config,
+    spec,
+    *,
+    layers: Collection[int] | None,
+    parallel: bool,
+    workers: int,
+    chunk: int,
+) -> Iterator[Piece]:
     device = torch.device("cpu")
     if parallel:
         iter_weights = _model_hook(spec, "iter_weights_parallel")
         if iter_weights is None:
-            raise NotImplementedError(f"{spec.module} provides no iter_weights_parallel")
+            raise NotImplementedError(
+                f"{spec.module} provides no iter_weights_parallel"
+            )
         tensors = iter_weights(
-            model_path, device, include_moe_experts=True, include_non_moe=False, workers=workers, chunk=chunk
+            model_path,
+            device,
+            include_moe_experts=True,
+            include_non_moe=False,
+            workers=workers,
+            chunk=chunk,
         )
     else:
         iter_weights = _load_attr(spec.module, spec.iter_weights)
-        tensors = iter_weights(model_path, device, include_moe_experts=True, include_non_moe=False)
+        tensors = iter_weights(
+            model_path, device, include_moe_experts=True, include_non_moe=False
+        )
     return stacked_expert_pieces(tensors, config, layers=layers)
 
 
@@ -160,16 +229,24 @@ def per_expert_pieces(
             continue
         bank_layer, expert, role = where
         piece = pending.setdefault((bank_layer, expert), {})
-        piece[role] = tensor.reshape(1, -1) if role.endswith(("_global", "_input")) else tensor.unsqueeze(0)
+        piece[role] = (
+            tensor.reshape(1, -1)
+            if role.endswith(("_global", "_input"))
+            else tensor.unsqueeze(0)
+        )
         if len(piece) == tensors_per_expert:
             del pending[(bank_layer, expert)]
             yield bank_layer, expert, expert + 1, piece
     if pending:
         missing = sorted(pending)[:8]
-        raise ValueError(f"Incomplete expert tensors in checkpoint (layer, expert): {missing}")
+        raise ValueError(
+            f"Incomplete expert tensors in checkpoint (layer, expert): {missing}"
+        )
 
 
-def iter_extra_layer_expert_pieces(model_path: str, prefix: str, locate: Callable[[str], tuple[int | None, str] | None]) -> Iterator[Piece]:
+def iter_extra_layer_expert_pieces(
+    model_path: str, prefix: str, locate: Callable[[str], tuple[int | None, str] | None]
+) -> Iterator[Piece]:
     """The routed experts of one MoE layer outside the model's stack (an MTP head), as pieces of bank layer 0.
 
     The family names the tensors: ``locate(name)`` -> ``(expert, role)`` of a per-expert tensor, ``(None, "gate_up" | "down")`` of a stacked one, or None. A name under ``prefix`` that ``locate`` does not read is refused.
@@ -188,13 +265,21 @@ def iter_extra_layer_expert_pieces(model_path: str, prefix: str, locate: Callabl
                 elif name.startswith(prefix):
                     unknown.append(name)
     if unknown:
-        raise ValueError(f"{model_path}: the experts under {prefix}* use a format this reader does not support, e.g. {sorted(unknown)[:3]}")
+        raise ValueError(
+            f"{model_path}: the experts under {prefix}* use a format this reader does not support, e.g. {sorted(unknown)[:3]}"
+        )
     if not found:
         raise ValueError(f"{model_path} has no routed experts under {prefix}*")
-    stacked = {role: (file, name) for name, (file, expert, role) in found.items() if expert is None}
+    stacked = {
+        role: (file, name)
+        for name, (file, expert, role) in found.items()
+        if expert is None
+    }
     if stacked:
         if missing := {"gate_up", "down"} - set(stacked):
-            raise ValueError(f"{model_path}: stacked experts under {prefix}* lack {sorted(missing)}")
+            raise ValueError(
+                f"{model_path}: stacked experts under {prefix}* lack {sorted(missing)}"
+            )
         piece = {}
         for role, (file, name) in stacked.items():
             with safetensors.safe_open(file, framework="pt", device="cpu") as f:
@@ -204,10 +289,16 @@ def iter_extra_layer_expert_pieces(model_path: str, prefix: str, locate: Callabl
     def tensors():
         for file in dict.fromkeys(file for file, _, _ in found.values()):
             with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-                yield from ((name, f.get_tensor(name)) for name, where in found.items() if where[0] == file)
+                yield from (
+                    (name, f.get_tensor(name))
+                    for name, where in found.items()
+                    if where[0] == file
+                )
 
     roles = {role for _, _, role in found.values()}
-    return per_expert_pieces(tensors(), lambda name: (0, *found[name][1:]), tensors_per_expert=len(roles))
+    return per_expert_pieces(
+        tensors(), lambda name: (0, *found[name][1:]), tensors_per_expert=len(roles)
+    )
 
 
 __all__ = [
