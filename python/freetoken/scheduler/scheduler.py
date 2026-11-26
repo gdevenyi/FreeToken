@@ -475,6 +475,7 @@ class Scheduler(SchedulerIOMixin):
                             i,
                             req.sampling_params.top_logprobs,
                             req.sampling_params.allowed_token_ids,
+                            req.sampling_params.logprob_token_ids,
                         )
                     req.stats.stamp_token(now)
                     reply.append(msg)
@@ -549,6 +550,16 @@ class Scheduler(SchedulerIOMixin):
             cached = req.cached_len
             emitted = int(output.emitted_cpu[i])
             msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : emitted + 1])
+            if req.sampling_params.logprobs:
+                _attach_verify_logprobs(
+                    msg,
+                    output,
+                    i,
+                    n,
+                    req.sampling_params.top_logprobs,
+                    req.sampling_params.allowed_token_ids,
+                    req.sampling_params.logprob_token_ids,
+                )
             # k drafts were proposed; the step hands _commit_tokens the emitted accepted
             # drafts plus the target's own token, so when a stop lands on a draft every
             # committed token is an accepted draft: count min(n, emitted), with n already
@@ -1364,26 +1375,85 @@ def logprob_candidates(
     return [int(ids[k]) for k in keep], [logprobs[k] for k in keep]
 
 
+def _extract_row_logprobs(
+    chosen_val: float,
+    raw_top_ids: list[int] | None,
+    raw_top_lps: list[float] | None,
+    top: int,
+    allowed_token_ids: list[int] | None = None,
+    logprob_token_ids: list[int] | None = None,
+) -> tuple[float, list[int], list[float]]:
+    effective_top = (len(logprob_token_ids) + 1) if logprob_token_ids else top
+    if effective_top > 0 and raw_top_ids is not None and raw_top_lps is not None:
+        allowed_set: frozenset[int] | bool = (
+            frozenset(allowed_token_ids) if allowed_token_ids else False
+        )
+        top_ids, top_lps = logprob_candidates(
+            raw_top_ids[:effective_top],
+            raw_top_lps[:effective_top],
+            allowed_ids=allowed_set,
+        )
+    else:
+        top_ids, top_lps = [], []
+    return float(chosen_val), top_ids, top_lps
+
+
 def _attach_logprobs(
     msg: DetokenizeMsg,
     output: ForwardOutput,
     row: int,
     top: int,
     allowed_token_ids: list[int] | None = None,
+    logprob_token_ids: list[int] | None = None,
 ) -> None:
     """Copy batch row ``row``'s sampled-token logprobs onto its reply, cut to ``top`` alternatives."""
     if output.chosen_logprobs_cpu is None:
         return
-    msg.chosen_logprob = float(output.chosen_logprobs_cpu[row].item())
-    if top > 0 and output.top_ids_cpu is not None:
-        allowed_set = frozenset(allowed_token_ids) if allowed_token_ids else False
-        msg.top_ids, msg.top_logprobs = logprob_candidates(
-            output.top_ids_cpu[row, :top].tolist(),
-            output.top_logprobs_cpu[row, :top].tolist(),
-            allowed_ids=allowed_set,
+    chosen, top_ids, top_lps = _extract_row_logprobs(
+        float(output.chosen_logprobs_cpu[row].item()),
+        output.top_ids_cpu[row].tolist() if output.top_ids_cpu is not None else None,
+        output.top_logprobs_cpu[row].tolist()
+        if output.top_logprobs_cpu is not None
+        else None,
+        top,
+        allowed_token_ids,
+        logprob_token_ids,
+    )
+    msg.chosen_logprob = chosen
+    msg.top_ids = top_ids
+    msg.top_logprobs = top_lps
+
+
+def _attach_verify_logprobs(
+    msg: DetokenizeMsg,
+    output,
+    row: int,
+    committed_n: int,
+    top: int,
+    allowed_token_ids: list[int] | None = None,
+    logprob_token_ids: list[int] | None = None,
+) -> None:
+    """Copy committed tokens ``0..committed_n-1``'s logprobs from a verify step onto ``msg``."""
+    chosen_cpu = getattr(output, "chosen_logprobs_cpu", None)
+    if chosen_cpu is None or committed_n <= 0:
+        return
+    top_ids_cpu = getattr(output, "top_ids_cpu", None)
+    top_lps_cpu = getattr(output, "top_logprobs_cpu", None)
+    steps: list[tuple[int, float, list[int], list[float]]] = []
+    for j in range(committed_n):
+        chosen, top_ids, top_lps = _extract_row_logprobs(
+            float(chosen_cpu[row, j].item()),
+            top_ids_cpu[row, j].tolist() if top_ids_cpu is not None else None,
+            top_lps_cpu[row, j].tolist() if top_lps_cpu is not None else None,
+            top,
+            allowed_token_ids,
+            logprob_token_ids,
         )
-    else:
-        msg.top_ids, msg.top_logprobs = [], []
+        steps.append((int(msg.next_tokens[j]), chosen, top_ids, top_lps))
+    msg.chosen_logprob = steps[0][1]
+    msg.top_ids = steps[0][2]
+    msg.top_logprobs = steps[0][3]
+    msg.step_logprobs = steps
 
 
 def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:

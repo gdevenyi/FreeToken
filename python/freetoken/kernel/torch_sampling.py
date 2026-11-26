@@ -20,7 +20,22 @@ from __future__ import annotations
 
 import torch
 
-from freetoken.kernel.triton.sampling import softmax  # noqa: F401  (re-exported)
+from freetoken.kernel.triton.sampling import softmax as _triton_softmax
+
+
+def softmax(
+    logits: torch.Tensor,
+    temperature: torch.Tensor | float | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    if logits.device.type != "cuda":
+        scaled = logits.float()
+        if temperature is not None:
+            t = _per_row(temperature, scaled.shape[0], scaled.device, torch.float32)
+            scaled = scaled / t.clamp_min(1e-6)
+        return torch.softmax(scaled, dim=-1)
+    return _triton_softmax(logits, temperature, enable_pdl=enable_pdl)
+
 
 __all__ = [
     "softmax",

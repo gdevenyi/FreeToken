@@ -292,10 +292,11 @@ class CacheManager:
                     pin = b
                     ends.add(b + CHUNK_SIZE)
         walk = getattr(handle, "walk_len", 0)
+        b_walk = align_down(walk, CHUNK_SIZE)
         if (
-            walk > start
+            b_walk > start
         ):  # the prompt leaves an existing path here: snapshot the branch point
-            ends.add(walk + CHUNK_SIZE)
+            ends.add(b_walk + CHUNK_SIZE)
         return tuple(sorted(e for e in ends if start + CHUNK_SIZE < e < n)), pin
 
     def commit_chunk(self, req: Req) -> None:

@@ -262,50 +262,65 @@ def tokenize_worker(
             ) + n_control == len(pending_msg)
             sampled_replies: list[UserReply] = []
             if len(detokenize_msg) > 0:
-                replies, reasoning_counts, text_offsets = (
-                    detokenize_manager.detokenize_with_meta(detokenize_msg)
+                replies, reasoning_counts, text_offsets, step_offsets = (
+                    detokenize_manager.detokenize_with_step_meta(detokenize_msg)
                 )
-                sampled_replies = [
-                    UserReply(
-                        uid=msg.uid,
-                        incremental_output=reply,
-                        finished=msg.finished,
-                        finish_reason=msg.finish_reason,
-                        matched_stop=msg.matched_stop,
-                        hit_stop_token=bool(getattr(msg, "hit_stop_token", False)),
-                        reasoning_tokens=reasoning_tokens,
-                        text_offset=text_offset,
-                        completion_tokens_delta=len(msg.next_tokens),
-                        kv_used_pages=msg.kv_used_pages,
-                        kv_total_pages=msg.kv_total_pages,
-                        mamba_used_slots=msg.mamba_used_slots,
-                        mamba_total_slots=msg.mamba_total_slots,
-                        swa_used_tokens=msg.swa_used_tokens,
-                        swa_total_tokens=msg.swa_total_tokens,
-                        gpu_mem_bytes=msg.gpu_mem_bytes,
-                        timings=msg.timings,
-                        kld=msg.kld,
-                        # a message carries logprobs only for its one committed token
-                        logprobs=(
+                sampled_replies = []
+                for msg, reply, reasoning_tokens, text_offset, per_step_offs in zip(
+                    detokenize_msg,
+                    replies,
+                    reasoning_counts,
+                    text_offsets,
+                    step_offsets,
+                    strict=True,
+                ):
+                    lp_list: list[dict] | None = None
+                    lp_first: dict | None = None
+                    if getattr(msg, "step_logprobs", None):
+                        lp_list = [
                             build_logprobs_entry(
                                 detokenize_manager.tokenizer,
-                                msg.next_tokens[0],
-                                msg.chosen_logprob,
-                                msg.top_ids,
-                                msg.top_logprobs,
+                                tok_id,
+                                chosen_lp,
+                                t_ids,
+                                t_lps,
                             )
-                            if msg.chosen_logprob is not None
-                            else None
-                        ),
+                            for tok_id, chosen_lp, t_ids, t_lps in msg.step_logprobs
+                        ]
+                        lp_first = lp_list[0] if lp_list else None
+                    elif msg.chosen_logprob is not None:
+                        lp_first = build_logprobs_entry(
+                            detokenize_manager.tokenizer,
+                            msg.next_tokens[0],
+                            msg.chosen_logprob,
+                            msg.top_ids,
+                            msg.top_logprobs,
+                        )
+                    sampled_replies.append(
+                        UserReply(
+                            uid=msg.uid,
+                            incremental_output=reply,
+                            finished=msg.finished,
+                            finish_reason=msg.finish_reason,
+                            matched_stop=msg.matched_stop,
+                            hit_stop_token=bool(getattr(msg, "hit_stop_token", False)),
+                            reasoning_tokens=reasoning_tokens,
+                            text_offset=text_offset,
+                            text_offsets=per_step_offs,
+                            completion_tokens_delta=len(msg.next_tokens),
+                            kv_used_pages=msg.kv_used_pages,
+                            kv_total_pages=msg.kv_total_pages,
+                            mamba_used_slots=msg.mamba_used_slots,
+                            mamba_total_slots=msg.mamba_total_slots,
+                            swa_used_tokens=msg.swa_used_tokens,
+                            swa_total_tokens=msg.swa_total_tokens,
+                            gpu_mem_bytes=msg.gpu_mem_bytes,
+                            timings=msg.timings,
+                            kld=msg.kld,
+                            logprobs=lp_first,
+                            logprobs_list=lp_list,
+                        )
                     )
-                    for msg, reply, reasoning_tokens, text_offset in zip(
-                        detokenize_msg,
-                        replies,
-                        reasoning_counts,
-                        text_offsets,
-                        strict=True,
-                    )
-                ]
 
             # An error reply and a client abort are both terminal for their uid, and neither
             # produces the finished DetokenizeMsg that would release the decode state.

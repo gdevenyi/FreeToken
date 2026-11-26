@@ -120,7 +120,7 @@ _THINKING_KWARG_KEYS = (
     "reasoning_effort",
 )
 _DISABLE_EFFORTS = ("none", "off")
-_DISABLE_THINKING_TYPES = ("disabled", "off", "none", "false")
+_DISABLE_THINKING_TYPES = ("disabled", "off", "none", "false", "between_tools")
 _ENABLE_THINKING_TYPES = ("enabled", "on", "true", "adaptive")
 
 

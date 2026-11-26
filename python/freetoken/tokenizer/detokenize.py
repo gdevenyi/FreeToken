@@ -136,10 +136,80 @@ class DetokenizeManager:
     def detokenize_with_meta(
         self, msgs: list[DetokenizeMsg]
     ) -> tuple[list[str], list[int], list[int]]:
+        incremental_strs, reasoning_tokens, text_offsets, _ = (
+            self.detokenize_with_step_meta(msgs)
+        )
+        return incremental_strs, reasoning_tokens, text_offsets
+
+    def detokenize_with_step_meta(
+        self, msgs: list[DetokenizeMsg]
+    ) -> tuple[list[str], list[int], list[int], list[list[int] | None]]:
         """Incremental text per message; for a finished message, its reasoning token count
-        (0 otherwise or when the model emitted no reasoning end tag); and where each message's
-        first token starts in the generated text. That offset ignores stop-string holdback,
-        which delays when text is sent but not where it lands."""
+        (0 otherwise or when the model emitted no reasoning end tag); where each message's
+        first token starts in the generated text; and per-token offsets when a message carries
+        multi-token ``step_logprobs``. Offsets ignore stop-string holdback."""
+        sub_msgs: list[DetokenizeMsg] = []
+        sub_spans: list[tuple[int, int, bool]] = []
+        for msg in msgs:
+            step_lps = getattr(msg, "step_logprobs", None)
+            if step_lps and len(msg.next_tokens) > 1:
+                start = len(sub_msgs)
+                m = len(msg.next_tokens)
+                for j, tok in enumerate(msg.next_tokens):
+                    is_last = j == m - 1
+                    sub_msgs.append(
+                        DetokenizeMsg(
+                            uid=msg.uid,
+                            next_tokens=[tok],
+                            finished=msg.finished and is_last,
+                            finish_reason=msg.finish_reason if is_last else None,
+                            matched_stop=msg.matched_stop if is_last else None,
+                            stop_strs=msg.stop_strs,
+                            keep_stop_str=msg.keep_stop_str,
+                            skip_special_tokens=msg.skip_special_tokens,
+                            trim_last_token=msg.trim_last_token if is_last else False,
+                            hit_stop_token=msg.hit_stop_token if is_last else False,
+                        )
+                    )
+                sub_spans.append((start, len(sub_msgs), True))
+            else:
+                start = len(sub_msgs)
+                sub_msgs.append(msg)
+                sub_spans.append((start, start + 1, step_lps is not None))
+
+        if any(end - start > 1 for start, end, _ in sub_spans):
+            # Step multi-token logprob messages sequentially per uid so DecodeStatus advances token-by-token.
+            inc_sub: list[str] = []
+            reas_sub: list[int] = []
+            off_sub: list[int] = []
+            for sm in sub_msgs:
+                i_s, r_s, o_s = self._detokenize_batch_core([sm])
+                inc_sub.append(i_s[0])
+                reas_sub.append(r_s[0])
+                off_sub.append(o_s[0])
+            incremental_strs: list[str] = []
+            reasoning_tokens: list[int] = []
+            text_offsets: list[int] = []
+            step_offsets: list[list[int] | None] = []
+            for start, end, has_step in sub_spans:
+                incremental_strs.append("".join(inc_sub[start:end]))
+                reasoning_tokens.append(reas_sub[end - 1])
+                text_offsets.append(off_sub[start])
+                step_offsets.append(off_sub[start:end] if has_step else None)
+            return incremental_strs, reasoning_tokens, text_offsets, step_offsets
+
+        incremental_strs, reasoning_tokens, text_offsets = self._detokenize_batch_core(
+            msgs
+        )
+        step_offsets = [
+            [off] if getattr(m, "step_logprobs", None) is not None else None
+            for m, off in zip(msgs, text_offsets, strict=True)
+        ]
+        return incremental_strs, reasoning_tokens, text_offsets, step_offsets
+
+    def _detokenize_batch_core(
+        self, msgs: list[DetokenizeMsg]
+    ) -> tuple[list[str], list[int], list[int]]:
         read_ids: list[list[int]] = []
         surr_ids: list[list[int]] = []
         skip: list[bool] = []

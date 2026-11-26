@@ -55,9 +55,14 @@ class SamplingParams:
     # token's raw (pre-temperature) logprob and the top_logprobs best alternatives.
     logprobs: bool = False
     top_logprobs: int = 0
+    # Per-request PRNG seed for deterministic non-greedy sampling across batch sizes and spec steps.
+    seed: int | None = None
     # vLLM allowed_token_ids: sampling is masked to these ids (sorted, unique). A request that
     # also asks for logprobs gets them renormalized over this set (Sampler.compute_logprobs).
     allowed_token_ids: list[int] | None = None
+    # vLLM logprob_token_ids: specific token ids whose full-vocab logprobs are returned at each
+    # generated position (in addition to the sampled token), without masking sampling.
+    logprob_token_ids: list[int] | None = None
     # One chunk of a KL-divergence base file ({"path", "chunk", "slice_rows", "bos_token_id"}), set
     # only by the /v1/internal/kld endpoint (--enable-kld-endpoint); see freetoken.benchmark.kld.
     kld: dict | None = None
@@ -75,6 +80,7 @@ class SamplingParams:
         must be checked against the tokenizer before the request reaches the engine."""
         fields = [
             ("allowed_token_ids", self.allowed_token_ids or []),
+            ("logprob_token_ids", self.logprob_token_ids or []),
             ("logit_bias", [int(tid) for tid, _ in self.logit_bias or ()]),
             ("stop_token_ids", self.stop_token_ids),
         ]

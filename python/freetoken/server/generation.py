@@ -86,11 +86,13 @@ class PromptAdmitted:
 @dataclass
 class ReasoningDelta:
     text: str
+    logprobs: list[dict[str, Any]] | None = None
 
 
 @dataclass
 class ContentDelta:
     text: str
+    logprobs: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -134,6 +136,7 @@ class GenDone:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     timings: dict[str, Any] | None = None
+    logprobs: list[dict[str, Any]] | None = None
 
 
 GenEvent = (
@@ -170,6 +173,7 @@ class GenResult:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     timings: dict[str, Any] | None = None
+    logprobs: list[dict[str, Any]] | None = None
 
 
 def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -230,6 +234,10 @@ class GenSpec:
         None  # tools for FunctionCallParser; None disables parsing
     )
     inline_system_policy: str | None = None
+    include_logprobs: bool = False
+    disable_parallel_tool_use: bool = False
+    tool_choice_mode: str | None = None
+    response_format: dict[str, Any] | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -273,6 +281,8 @@ def resolve_sampling(
     skip_special_tokens: bool | None = None,
     timings_per_token: bool = False,
     allowed_token_ids: list[int] | None = None,
+    logprob_token_ids: list[int] | None = None,
+    seed: int | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults. Range errors
@@ -339,6 +349,21 @@ def resolve_sampling(
         allowed = sorted({int(t) for t in allowed_token_ids})
         if allowed[0] < 0:
             raise ValueError("allowed_token_ids must be non-negative token ids")
+    lp_targets = None
+    if logprob_token_ids is not None:
+        if not 1 <= len(logprob_token_ids) <= MAX_ALLOWED_TOKEN_IDS:
+            raise ValueError(
+                f"logprob_token_ids must hold 1 to {MAX_ALLOWED_TOKEN_IDS} ids, got {len(logprob_token_ids)}"
+            )
+        seen_lp: set[int] = set()
+        lp_targets = []
+        for raw_t in logprob_token_ids:
+            ti = int(raw_t)
+            if ti < 0:
+                raise ValueError("logprob_token_ids must be non-negative token ids")
+            if ti not in seen_lp:
+                seen_lp.add(ti)
+                lp_targets.append(ti)
     params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
@@ -357,7 +382,9 @@ def resolve_sampling(
         stop_token_ids=ids,
         include_stop_str_in_output=bool(include_stop_str_in_output),
         timings_per_token=timings_per_token,
+        seed=int(seed) if seed is not None else None,
         allowed_token_ids=allowed,
+        logprob_token_ids=lp_targets,
     )
     if skip_special_tokens is not None:
         params.skip_special_tokens = bool(skip_special_tokens)
@@ -375,7 +402,25 @@ def render_messages(
     hoist system messages to the front and merge multiples into one to satisfy
     that constraint. ``hoist_system=False`` leaves late system messages in place
     for the tokenizer's inline-system policy (the Anthropic path)."""
-    rendered = [_render_message(m) for m in messages]
+    raw_rendered = [_render_message(m) for m in messages]
+    # Chat templates render role=="tool" messages as text, so defer any images inside
+    # a tool message onto a synthetic user turn right after the contiguous tool run.
+    rendered: list[dict[str, Any]] = []
+    deferred_tool_images: list[dict[str, Any]] = []
+    for m in raw_rendered:
+        if m.get("role") != "tool" and deferred_tool_images:
+            rendered.append({"role": "user", "content": list(deferred_tool_images)})
+            deferred_tool_images.clear()
+        if m.get("role") == "tool" and isinstance(m.get("content"), list):
+            parts = m["content"]
+            m = dict(m)
+            m["content"] = "".join(
+                p.get("text") or "" for p in parts if p.get("type") == "text"
+            )
+            deferred_tool_images.extend(p for p in parts if p.get("type") == "image")
+        rendered.append(m)
+    if deferred_tool_images:
+        rendered.append({"role": "user", "content": list(deferred_tool_images)})
     if not hoist_system or any(m.get("role") == "developer" for m in rendered):
         # The tokenizer maps developer per template and then merges in order; hoisting system
         # alone here would put it ahead of a developer message that came first.
@@ -399,12 +444,24 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
+        thinking_chunks = [
+            p.get("thinking") or p.get("text") or ""
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "thinking"
+        ]
+        if thinking_chunks and not (
+            m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
+        ):
+            m["reasoning_content"] = "\n\n".join(t for t in thinking_chunks if t)
         m["content"] = _flatten_text_parts(content)
+    if m.get("refusal") and not m.get("content"):
+        m["content"] = str(m["refusal"])
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
-    # gemma4; thinking: gpt-oss) — accept any, emit both.
+    # gemma4; thinking: gpt-oss) — accept any, emit all applicable keys.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
     if reasoning:
         m.setdefault("reasoning_content", reasoning)
+        m.setdefault("reasoning", reasoning)
         # gpt-oss's template raises when a tool-call assistant turn carries BOTH content and
         # thinking -- it renders one or the other. Visible text wins: dropping it would lose
         # what the user saw, and every other family reads `content` too.
@@ -431,14 +488,28 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
+_UNSUPPORTED_MEDIA_PARTS = frozenset(
+    {"input_audio", "audio_url", "video_url", "input_video", "file", "input_file"}
+)
+
+
 def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
     """Plain string for text-only parts; a template-ready part list with {"type": "image"} entries (source kept under freetoken_ref) when images are present."""
     out: list[dict[str, Any]] = []
     has_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
-        if ptype == "text":
+        if ptype in ("text", "input_text", "output_text"):
             out.append({"type": "text", "text": part.get("text") or ""})
+        elif ptype == "refusal":
+            out.append(
+                {
+                    "type": "text",
+                    "text": part.get("refusal") or part.get("text") or "",
+                }
+            )
+        elif ptype in ("thinking", "redacted_thinking"):
+            continue
         elif ptype in ("image_url", "input_image"):
             url = part.get("image_url")
             if isinstance(url, dict):
@@ -451,6 +522,8 @@ def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
         elif ptype == "image" and isinstance(part.get("freetoken_ref"), dict):
             out.append(part)
             has_image = True
+        elif ptype in _UNSUPPORTED_MEDIA_PARTS:
+            raise ValueError(f"{ptype} content parts are not supported by this model")
         else:
             raise ValueError(f"Unsupported content part type: {ptype}")
     if not has_image:
@@ -527,6 +600,8 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
             images=images,
             inline_system_policy=spec.inline_system_policy,
+            tool_choice_mode=spec.tool_choice_mode,
+            response_format=spec.response_format,
         ),
     )
     return uid
@@ -594,6 +669,8 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
         inline_system_policy=spec.inline_system_policy,
+        tool_choice_mode=spec.tool_choice_mode,
+        response_format=spec.response_format,
     )
     try:
         manager = await asyncio.to_thread(build)
@@ -742,6 +819,23 @@ def _valid_json(text: str) -> bool:
         return True
     except (json.JSONDecodeError, ValueError):
         return False
+
+
+def _strip_json_fences(text: str, response_format: dict[str, Any] | None) -> str:
+    """Unwrap markdown ```json ... ``` fences when JSON mode was requested and inner text is valid JSON."""
+    if not isinstance(response_format, dict) or response_format.get("type") not in (
+        "json_object",
+        "json_schema",
+    ):
+        return text
+    stripped = text.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 2:
+            inner = "\n".join(lines[1:-1]).strip()
+            if _valid_json(inner):
+                return inner
+    return text
 
 
 KEEPALIVE = object()
@@ -971,6 +1065,8 @@ async def _generate_events_impl(
                     done = _close_open_call()
                     if done is not None:
                         out.append(done)
+                if spec.disable_parallel_tool_use and calls_emitted >= 1:
+                    continue
                 if open_call is None or starts_new:
                     open_call = {
                         "detector_index": frag.tool_index,
@@ -1001,6 +1097,20 @@ async def _generate_events_impl(
     emitted_content_or_tools = False
     timings: dict[str, Any] | None = None
     admitted = False
+    pending_lps: list[dict[str, Any]] = []
+    want_lps = bool(
+        spec.include_logprobs or getattr(spec.sampling_params, "logprobs", False)
+    )
+
+    def _take_lps() -> list[dict[str, Any]] | None:
+        if not pending_lps:
+            return None
+        taken = list(pending_lps)
+        pending_lps.clear()
+        return taken
+
+    from .logprobs import reply_logprob_pairs
+
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -1013,6 +1123,9 @@ async def _generate_events_impl(
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
             usage.timings = timings
+        if want_lps:
+            for lp_entry, _ in reply_logprob_pairs(ack):
+                pending_lps.append(lp_entry)
         if ack.prompt_tokens_delta and not admitted:
             admitted = True
             yield PromptAdmitted(usage.prompt_tokens, usage.cached_tokens)
@@ -1027,16 +1140,25 @@ async def _generate_events_impl(
                     stripped_reasoning
                 ):  # a bare special token must not open a thinking block
                     emitted_reasoning = True
-                    yield ReasoningDelta(stripped_reasoning)
+                    yield ReasoningDelta(
+                        stripped_reasoning,
+                        logprobs=_take_lps() if not content_delta else None,
+                    )
         if content_delta:
             emitted_content_or_tools = True
             if tool_parser is not None:
-                for ev in _route_tool_text(content_delta):
+                routed = _route_tool_text(content_delta)
+                for ev in routed:
+                    if isinstance(ev, ContentDelta) and pending_lps:
+                        ev.logprobs = _take_lps()
                     yield ev
             elif parse_tools:
                 pending += content_delta
             else:
-                yield ContentDelta(strip_special_tokens(content_delta, specials))
+                yield ContentDelta(
+                    strip_special_tokens(content_delta, specials),
+                    logprobs=_take_lps(),
+                )
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -1085,6 +1207,8 @@ async def _generate_events_impl(
         if done is not None:
             yield done
         for item in tool_parser.recover_truncated_call():
+            if spec.disable_parallel_tool_use and calls_emitted >= 1:
+                break
             yield ToolCallStart(tool_index=calls_emitted, name=item.name)
             yield ToolCallsDelta(
                 [
@@ -1100,22 +1224,26 @@ async def _generate_events_impl(
         if residual:
             stripped = strip_special_tokens(residual, specials)
             if stripped and not (stripped.strip() == "" and suppress_ws):
-                yield ContentDelta(stripped)
+                yield ContentDelta(stripped, logprobs=_take_lps())
         if calls_emitted and finish_reason != "length":
             finish_reason = "tool_calls"
     else:
         parsed = _parse_tool_response(pending, spec, state) if parse_tools else None
         if parsed is not None:
             normal_text, tool_calls = parsed
+            if spec.disable_parallel_tool_use:
+                tool_calls = tool_calls[:1]
             normal_text = strip_special_tokens(normal_text, specials)
             if normal_text:
-                yield ContentDelta(normal_text)
+                yield ContentDelta(normal_text, logprobs=_take_lps())
             if tool_calls:
                 yield ToolCallsDelta(tool_calls)
                 if finish_reason != "length":
                     finish_reason = "tool_calls"
         elif parse_tools and pending:
-            yield ContentDelta(strip_special_tokens(pending, specials))
+            yield ContentDelta(
+                strip_special_tokens(pending, specials), logprobs=_take_lps()
+            )
 
     thinking_off = (
         getattr(state.config, "thinking", None) == "off"
@@ -1141,12 +1269,15 @@ async def _generate_events_impl(
         cached_tokens=usage.cached_tokens,
         reasoning_tokens=usage.reasoning_tokens,
         timings=timings,
+        logprobs=_take_lps(),
     )
 
 
 async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     """Protocol-neutral non-streaming generation: accumulate, split reasoning, parse
     tool calls, strip special tokens. The adapters format the GenResult into their wire."""
+    from .logprobs import reply_logprob_pairs
+
     full_content = ""
     prompt_tokens = 0
     completion_tokens = 0
@@ -1156,6 +1287,10 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     engine_hit_stop_token: bool | None = None
+    want_lps = bool(
+        spec.include_logprobs or getattr(spec.sampling_params, "logprobs", False)
+    )
+    logprob_entries: list[dict[str, Any]] = []
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -1165,6 +1300,9 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
+        if want_lps:
+            for lp_entry, _ in reply_logprob_pairs(ack):
+                logprob_entries.append(lp_entry)
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
@@ -1189,12 +1327,16 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     parsed = _parse_tool_response(content_text, spec, state)
     if parsed is not None:
         content_text, tool_calls = parsed
+        if spec.disable_parallel_tool_use:
+            tool_calls = tool_calls[:1]
         if tool_calls and finish_reason != "length":
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
     clean_reasoning = strip_special_tokens(reasoning_text, specials).strip()
-    clean_content = strip_special_tokens(content_text, specials)
+    clean_content = _strip_json_fences(
+        strip_special_tokens(content_text, specials), spec.response_format
+    )
     thinking_off = (
         getattr(state.config, "thinking", None) == "off"
         or getattr(state.config, "reasoning_parser", None) == "off"
@@ -1217,4 +1359,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         cached_tokens=cached_tokens,
         reasoning_tokens=reasoning_tokens,
         timings=timings,
+        logprobs=logprob_entries if want_lps else None,
     )

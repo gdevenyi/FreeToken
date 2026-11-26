@@ -51,6 +51,7 @@ from .args import ServerArgs
 from .bind import bind_sockets, split_hosts
 from .bind import serve as serve_bound
 from .control_api import register_control_routes
+from .decisions_api import register_decisions_routes
 from .generation import GenerationError, send_new_request
 from .openai_api import register_openai_routes
 from .request_logger import init as init_request_logging
@@ -530,7 +531,11 @@ class _ApiKeyMiddleware:
         )
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] not in ("http", "websocket") or scope["path"] == "/health":
+        if scope["type"] not in ("http", "websocket") or scope["path"] in (
+            "/health",
+            "/v1/health",
+            "/version",
+        ):
             return await self.app(scope, receive, send)
         headers = Headers(scope=scope)
         scheme, _, token = headers.get("authorization", "").partition(" ")
@@ -538,9 +543,17 @@ class _ApiKeyMiddleware:
             headers.get("x-api-key")
         ):
             return await self.app(scope, receive, send)
-        await JSONResponse({"error": "Unauthorized"}, status_code=401)(
-            scope, receive, send
-        )
+        if scope["path"].startswith("/v1/messages"):
+            body = {
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": "Unauthorized",
+                },
+            }
+        else:
+            body = {"error": "Unauthorized"}
+        await JSONResponse(body, status_code=401)(scope, receive, send)
 
 
 def install_api_key(app: FastAPI, api_key: str | None) -> None:
@@ -557,6 +570,7 @@ app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifesp
 register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
+register_decisions_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_accounting_routes(app, get_global_state)
 

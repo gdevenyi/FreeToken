@@ -6,17 +6,36 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+def _drop_nulls(data: Any, keys: tuple[str, ...]) -> Any:
+    """Coalesce explicit JSON ``null`` to model defaults for non-nullable OpenAI optional fields."""
+    if not isinstance(data, dict):
+        return data
+    cleaned = dict(data)
+    for k in keys:
+        if k in cleaned and cleaned[k] is None:
+            del cleaned[k]
+    return cleaned
+
+
 class MessageContent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str
     text: str | None = None
+    refusal: str | None = None
+    thinking: str | None = None
     image_url: Any | None = None
     audio_url: Any | None = None
+    input_audio: Any | None = None
+    video_url: Any | None = None
+    file: Any | None = None
 
 
 class Function(BaseModel):
     name: str
     description: str | None = None
     parameters: dict[str, Any] | None = None
+    strict: bool | None = None
 
 
 class Tool(BaseModel):
@@ -38,6 +57,11 @@ class StreamOptions(BaseModel):
     # with include_usage, the chunks after the role chunk also carry the usage so far
     continuous_usage_stats: bool | None = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coalesce_nulls(cls, data: Any) -> Any:
+        return _drop_nulls(data, ("include_usage", "continuous_usage_stats"))
+
 
 class FunctionCall(BaseModel):
     name: str | None = None
@@ -54,12 +78,28 @@ class ToolCall(BaseModel):
 class Message(BaseModel):
     role: str
     content: str | list[MessageContent] | None = None
+    refusal: str | None = None
     tool_call_id: str | None = None
     name: str | None = None
     reasoning: str | None = None
     reasoning_content: str | None = None
     thinking: str | None = None
     tool_calls: list[ToolCall] | None = None
+
+
+_CHAT_NON_NULL_DEFAULTS = (
+    "n",
+    "stream",
+    "timings_per_token",
+    "presence_penalty",
+    "frequency_penalty",
+    "chat_template_kwargs",
+    "ignore_eos",
+    "continue_final_message",
+    "min_tokens",
+    "include_stop_str_in_output",
+    "return_tokens_as_token_ids",
+)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -89,8 +129,15 @@ class ChatCompletionRequest(BaseModel):
     # reads the dict form and 400s only on an unknown "type" value.
     thinking: Any | None = None
     ignore_eos: bool = False
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
+    allowed_token_ids: list[int] | None = None
+    logprob_token_ids: list[int] | None = None
+    return_tokens_as_token_ids: bool = False
     tools: list[Tool] | None = None
-    tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
+    tool_choice: (
+        Literal["none", "auto", "required"] | ToolChoiceObject | dict[str, Any] | None
+    ) = None
     parallel_tool_calls: bool | None = None
     function_call: Any | None = None
     logit_bias: dict[str, float] | None = None
@@ -104,12 +151,15 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: list[int] | None = None
     include_stop_str_in_output: bool = False
     skip_special_tokens: bool | None = None
-    # Accepted for OpenAI compatibility, not honoured: the batched sampling kernel has no
-    # per-request generator (seed); user / metadata / store are opaque to the server.
     seed: int | None = None
     user: str | None = None
     # A client-chosen id echoed as the response id (vLLM request_id / SGLang rid).
     request_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coalesce_nulls(cls, data: Any) -> Any:
+        return _drop_nulls(data, _CHAT_NON_NULL_DEFAULTS)
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -120,6 +170,20 @@ class ChatCompletionRequest(BaseModel):
         ):
             raise ValueError("continue_final_message needs a final assistant message")
         return self
+
+
+_COMPLETION_NON_NULL_DEFAULTS = (
+    "n",
+    "stream",
+    "timings_per_token",
+    "presence_penalty",
+    "frequency_penalty",
+    "ignore_eos",
+    "return_tokens_as_token_ids",
+    "echo",
+    "min_tokens",
+    "include_stop_str_in_output",
+)
 
 
 class CompletionRequest(BaseModel):
@@ -144,7 +208,9 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     logprobs: int | None = None
     allowed_token_ids: list[int] | None = None
+    logprob_token_ids: list[int] | None = None
     return_tokens_as_token_ids: bool = False
+    add_special_tokens: bool | None = None
     echo: bool = False
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
@@ -156,12 +222,15 @@ class CompletionRequest(BaseModel):
     stop_token_ids: list[int] | None = None
     include_stop_str_in_output: bool = False
     skip_special_tokens: bool | None = None
-    # Accepted for OpenAI compatibility, not honoured: the batched sampling kernel has no
-    # per-request generator (seed); user / metadata / store are opaque to the server.
     seed: int | None = None
     user: str | None = None
     # A client-chosen id echoed as the response id (vLLM request_id / SGLang rid).
     request_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coalesce_nulls(cls, data: Any) -> Any:
+        return _drop_nulls(data, _COMPLETION_NON_NULL_DEFAULTS)
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "CompletionRequest":
@@ -172,6 +241,7 @@ class CompletionRequest(BaseModel):
 
 # prompts per /v1/completions request: every one is queued before any is awaited
 MAX_PROMPTS = 256
+MAX_N_CHOICES = 32
 
 
 class TokenizeRequest(BaseModel):
@@ -183,10 +253,26 @@ class TokenizeRequest(BaseModel):
     model: str | None = None
     prompt: str | None = None
     messages: list[Message] | None = None
+    tools: list[Tool] | None = None
     add_special_tokens: bool = True
     add_generation_prompt: bool = True
+    continue_final_message: bool = False
     return_token_strs: bool = False
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coalesce_nulls(cls, data: Any) -> Any:
+        return _drop_nulls(
+            data,
+            (
+                "add_special_tokens",
+                "add_generation_prompt",
+                "continue_final_message",
+                "return_token_strs",
+                "chat_template_kwargs",
+            ),
+        )
 
 
 class DetokenizeRequest(BaseModel):
@@ -195,6 +281,11 @@ class DetokenizeRequest(BaseModel):
     model: str | None = None
     tokens: list[int]
     skip_special_tokens: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coalesce_nulls(cls, data: Any) -> Any:
+        return _drop_nulls(data, ("skip_special_tokens",))
 
 
 class ModelCard(BaseModel):

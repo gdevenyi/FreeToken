@@ -101,11 +101,16 @@ async def _collect(generator):
     return [item async for item in generator]
 
 
-def test_chat_refuses_n_other_than_one():
-    for n in (0, 2):
+def test_chat_validates_n_bounds_and_supports_multi_choice():
+    for n in (0, 33):
         body = run(handle_chat_completion(chat(n=n), None, FakeState(), {}))
         assert body.status_code == 400
         assert json.loads(body.body)["error"]["param"] == "n"
+    multi = run(handle_chat_completion(chat(n=2), None, FakeState(), {}))
+    assert len(multi["choices"]) == 2
+    assert [c["index"] for c in multi["choices"]] == [0, 1]
+    assert multi["usage"]["prompt_tokens"] == 5
+    assert multi["usage"]["completion_tokens"] == 4
 
 
 def test_chat_reports_reasoning_tokens_and_the_null_fingerprint():
@@ -214,7 +219,9 @@ def test_bad_sampling_extras_are_400(field):
     assert body.status_code == 400, field
 
 
-@pytest.mark.parametrize("field", [{"presence_penalty": 3.0}, {"frequency_penalty": -2.5}])
+@pytest.mark.parametrize(
+    "field", [{"presence_penalty": 3.0}, {"frequency_penalty": -2.5}]
+)
 def test_out_of_range_penalties_fail_request_validation(field):
     # upstream's request models bound both penalties to [-2, 2] (FastAPI answers 422)
     with pytest.raises(pydantic.ValidationError):

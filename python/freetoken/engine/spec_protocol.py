@@ -18,10 +18,13 @@ SPEC_RUNNER = "freetoken.spec.runner:SpecRunner"
 class SpecForwardOutput(NamedTuple):
     """Drop-in for ForwardOutput at the drain: row i committed ``next_tokens[i, : emitted[i] + 1]``."""
 
-    next_tokens_gpu: torch.Tensor        # [bs, k+1]
+    next_tokens_gpu: torch.Tensor  # [bs, k+1]
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
-    emitted_cpu: torch.Tensor            # [bs] accepted drafts, 0..k
+    emitted_cpu: torch.Tensor  # [bs] accepted drafts, 0..k
+    chosen_logprobs_cpu: torch.Tensor | None = None
+    top_ids_cpu: torch.Tensor | None = None
+    top_logprobs_cpu: torch.Tensor | None = None
 
 
 class SpecRuntime(Protocol):
@@ -46,7 +49,9 @@ class SpecRuntime(Protocol):
 
     def detach(self, *, keep_kv: bool) -> None: ...
 
-    def capture_graphs(self, bs_list: List[int], pool, rows_per_req: int | None = None) -> None: ...
+    def capture_graphs(
+        self, bs_list: List[int], pool, rows_per_req: int | None = None
+    ) -> None: ...
 
     def feature_sink(self, batch: Batch) -> FeatureSink | None: ...
 
@@ -54,6 +59,8 @@ class SpecRuntime(Protocol):
 
     def propose_into(self, reqs: List[Req], token_pool: torch.Tensor) -> None: ...
 
-    def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput: ...
+    def verify_step(
+        self, batch: Batch, sample_args: BatchSamplingArgs
+    ) -> SpecForwardOutput: ...
 
     def release(self, req: Req) -> None: ...

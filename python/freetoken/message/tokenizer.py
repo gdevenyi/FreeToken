@@ -52,6 +52,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     chosen_logprob: float | None = None
     top_ids: list[int] | None = None
     top_logprobs: list[float] | None = None
+    # Per-token logprobs across all committed tokens of a multi-token speculative verify step:
+    # [(token_id, chosen_logprob, top_ids, top_logprobs), ...].
+    step_logprobs: list[tuple[int, float, list[int], list[float]]] | None = None
     # KV page-pool usage snapshot at this step (not-evictable used/total), passed
     # through to the frontend for the shell status bar. 0/0 for owned-KV models.
     kv_used_pages: int = 0
@@ -98,6 +101,11 @@ class TokenizeMsg(BaseTokenizerMsg):
     inline_system_policy: str | None = None
     # A token-id prompt (OpenAI / vLLM completions): used as is, ``text`` is ignored.
     input_ids: list[int] | None = None
+    # Explicit special-token control for raw string prompts (None uses smart BOS dedup).
+    add_special_tokens: bool | None = None
+    # Render-time tool-choice / JSON-format guidance (injected without mutating caller messages).
+    tool_choice_mode: str | None = None
+    response_format: dict[str, Any] | None = None
 
 
 @dataclass

@@ -82,13 +82,19 @@ from .generation import (
     timings_block,
     with_keepalive,
 )
-from .openai_api import _await_watching_disconnect
+from .logprobs import MAX_CHAT_LOGPROBS, responses_logprobs_content
+from .openai_api import (
+    _ACCEPTED_EFFORTS,
+    _await_watching_disconnect,
+    _model_context_length,
+    _response_format_error,
+)
 from .request_logger import log_request
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
 # codex's stream-idle timeout (default 300s) only resets on a data-bearing SSE
 # frame, so long queue/prefill or decode gaps must be bridged with real events.
-KEEPALIVE_INTERVAL_S = 15.0
+KEEPALIVE_INTERVAL_S = 10.0
 
 
 class ResponsesRequest(BaseModel):
@@ -110,6 +116,18 @@ class ResponsesRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
     reasoning: dict[str, Any] | None = None
+    text: dict[str, Any] | None = None
+    include: list[str] | None = None
+    top_logprobs: int | None = None
+    truncation: str | None = None
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float | None = None
+    min_p: float | None = None
+    logit_bias: dict[str, float] | None = None
+    stop: str | list[str] | None = None
+    stop_token_ids: list[int] | None = None
+    seed: int | None = None
     # Stateful features are accepted but ignored in this subset.
     store: bool = False
     previous_response_id: str | None = None
@@ -149,14 +167,17 @@ def register_responses_routes(
                 if mstate == "loading"
                 else "cache rebuild in progress"
             )
-            return _error_response(503, detail)
+            return _error_response(503, detail, err_type="server_error")
         if req.background:
-            return _error_response(400, "background mode is not supported")
+            return _error_response(
+                400, "background mode is not supported", param="background"
+            )
         if req.previous_response_id:
             return _error_response(
                 400,
                 "previous_response_id is not supported (stateless server); "
                 "resend full context in 'input'",
+                param="previous_response_id",
             )
         return await handle_responses(req, request, state, get_model_sampling())
 
@@ -170,13 +191,25 @@ def register_responses_routes(
     @app.get("/v1/responses/{response_id}")
     async def v1_responses_get(response_id: str):
         return _error_response(
-            404, f"response {response_id!r} not found (stateless server)"
+            404,
+            f"response {response_id!r} not found (stateless server)",
+            err_type="not_found_error",
+        )
+
+    @app.delete("/v1/responses/{response_id}")
+    async def v1_responses_delete(response_id: str):
+        return _error_response(
+            404,
+            f"response {response_id!r} not found (stateless server)",
+            err_type="not_found_error",
         )
 
     @app.post("/v1/responses/{response_id}/cancel")
     async def v1_responses_cancel(response_id: str):
         return _error_response(
-            404, f"response {response_id!r} not found (stateless server)"
+            404,
+            f"response {response_id!r} not found (stateless server)",
+            err_type="not_found_error",
         )
 
 
@@ -189,7 +222,31 @@ async def handle_responses(
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
     if req.max_output_tokens is not None and req.max_output_tokens < 1:
-        return _error_response(400, "max_output_tokens must be a positive integer")
+        return _error_response(
+            400,
+            "max_output_tokens must be a positive integer",
+            param="max_output_tokens",
+        )
+    if req.truncation not in (None, "disabled", "auto"):
+        return _error_response(
+            400,
+            f"truncation must be 'disabled' or 'auto', got {req.truncation!r}",
+            param="truncation",
+        )
+    if req.top_logprobs is not None and not 0 <= req.top_logprobs <= MAX_CHAT_LOGPROBS:
+        return _error_response(
+            400,
+            f"top_logprobs must be between 0 and {MAX_CHAT_LOGPROBS}",
+            param="top_logprobs",
+        )
+    if isinstance(req.reasoning, dict) and req.reasoning.get("effort") is not None:
+        eff = str(req.reasoning.get("effort")).strip().lower()
+        if eff and eff not in _ACCEPTED_EFFORTS:
+            return _error_response(
+                400,
+                f"reasoning.effort must be one of {', '.join(_ACCEPTED_EFFORTS)}; got {req.reasoning.get('effort')!r}",
+                param="reasoning.effort",
+            )
     default_max = (
         getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
     )
@@ -208,6 +265,8 @@ async def handle_responses(
             ),
             thinking=getattr(state.config, "thinking", None),
         )
+        if req.truncation == "auto":
+            await _auto_truncate_spec(spec, state)
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
@@ -308,17 +367,9 @@ def convert_responses_prompt(
     messages.extend(other)
 
     raw_tools = _convert_tools(req.tools) or []
-    selected: str | None = None
-    disabled = False
-    tc = req.tool_choice
-    if isinstance(tc, str):
-        disabled = tc == "none"
-    elif isinstance(tc, dict) and tc.get("type") == "function":
-        selected = tc.get("name") or (tc.get("function") or {}).get("name")
-    if disabled:
-        template_tools, parser_tools = None, None
-    else:
-        template_tools, parser_tools = split_tool_lists(raw_tools, selected)
+    template_tools, parser_tools, _ = _resolve_responses_tool_choice(
+        raw_tools, req.tool_choice
+    )
 
     from .model_meta import effort_toggle_kwargs, thinking_override_kwargs
 
@@ -326,6 +377,8 @@ def convert_responses_prompt(
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
     ctk = thinking_override_kwargs(thinking, ctk)
+    if req.parallel_tool_calls is False:
+        ctk = {**ctk, "parallel_tool_calls": False}
     return render_messages(messages), template_tools, parser_tools, ctk
 
 
@@ -359,6 +412,112 @@ async def handle_responses_input_tokens(req: ResponsesInputTokensRequest, state:
     )
 
 
+def _resolve_responses_tool_choice(
+    raw_tools: list[dict[str, Any]], tc: Any
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, str | None]:
+    tool_names = {(t.get("function") or {}).get("name") for t in raw_tools}
+    if tc is None or tc == "auto":
+        return (raw_tools or None), (raw_tools or None), None
+    if tc == "none":
+        return None, None, None
+    if tc == "required":
+        if not raw_tools:
+            raise ValueError("tool_choice='required' requires non-empty tools")
+        return raw_tools, raw_tools, "required"
+    if isinstance(tc, dict):
+        tc_type = tc.get("type")
+        if tc_type in ("function", "custom"):
+            selected = tc.get("name") or (tc.get("function") or {}).get("name")
+            if not selected or selected not in tool_names:
+                raise ValueError(f"tool_choice {selected!r} was not found in tools")
+            tmpl, parser = split_tool_lists(raw_tools, selected)
+            return tmpl, parser, f"named:{selected}"
+        if tc_type == "allowed_tools":
+            inner = (
+                tc.get("allowed_tools")
+                if isinstance(tc.get("allowed_tools"), dict)
+                else tc
+            )
+            mode = inner.get("mode", "auto")
+            if mode not in ("auto", "required", "none"):
+                raise ValueError(
+                    f"allowed_tools.mode must be 'auto', 'required', or 'none', got {mode!r}"
+                )
+            if mode == "none":
+                return None, None, None
+            refs = inner.get("tools") or []
+            allowed = {
+                (r.get("function") or {}).get("name") or r.get("name")
+                for r in refs
+                if isinstance(r, dict)
+            } - {None, ""}
+            if not allowed:
+                raise ValueError("allowed_tools requires at least one tool")
+            missing = sorted(allowed - tool_names)
+            if missing:
+                raise ValueError(
+                    f"allowed_tools references unknown tool(s): {', '.join(missing)}"
+                )
+            subset = [
+                t for t in raw_tools if (t.get("function") or {}).get("name") in allowed
+            ]
+            if mode == "required" and len(subset) == 1:
+                only = (subset[0].get("function") or {}).get("name")
+                return subset, raw_tools, f"named:{only}"
+            return subset, raw_tools, ("required" if mode == "required" else None)
+    raise ValueError(f"Unsupported tool_choice: {tc!r}")
+
+
+def _extract_responses_format(text_cfg: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(text_cfg, dict):
+        return None
+    fmt = text_cfg.get("format")
+    if not isinstance(fmt, dict):
+        return None
+    ftype = fmt.get("type")
+    if ftype in (None, "text"):
+        return {"type": "text"}
+    if ftype == "json_object":
+        return {"type": "json_object"}
+    if ftype == "json_schema":
+        # Responses API puts schema directly on format ({"type": "json_schema", "name": ..., "schema": ...})
+        nested = (
+            fmt.get("json_schema") if isinstance(fmt.get("json_schema"), dict) else fmt
+        )
+        rf = {"type": "json_schema", "json_schema": nested}
+        if (err := _response_format_error(rf)) is not None:
+            raise ValueError(err)
+        return rf
+    raise ValueError(
+        f"text.format.type {ftype!r} is not supported (supported: text, json_object, json_schema)"
+    )
+
+
+async def _auto_truncate_spec(spec: GenSpec, state: Any) -> None:
+    """Drop oldest non-system conversation turns when ``truncation='auto'`` exceeds the context window."""
+    ctx_limit = _model_context_length(state)
+    if (
+        not ctx_limit
+        or len(spec.messages) <= 1
+        or getattr(state, "frontend_tokenizer", None) is None
+    ):
+        return
+    budget = max(1, ctx_limit - min(spec.sampling_params.max_tokens, ctx_limit // 2))
+    while len(spec.messages) > 1:
+        try:
+            count = await count_prompt_tokens(
+                spec.messages, spec.template_tools, spec.chat_template_kwargs, state
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if count <= budget:
+            return
+        drop_idx = 1 if spec.messages[0].get("role") == "system" else 0
+        if drop_idx >= len(spec.messages) - 1:
+            return
+        del spec.messages[drop_idx]
+
+
 def convert_responses_to_genspec(
     req: ResponsesRequest,
     model_sampling: dict[str, Any],
@@ -370,20 +529,40 @@ def convert_responses_to_genspec(
     messages, template_tools, parser_tools, ctk = convert_responses_prompt(
         req, reasoning_parser=reasoning_parser, thinking=thinking
     )
+    raw_tools = _convert_tools(req.tools) or []
+    _, _, tool_choice_mode = _resolve_responses_tool_choice(raw_tools, req.tool_choice)
+    response_format = _extract_responses_format(req.text)
+    want_lps = bool(req.include and "message.output_text.logprobs" in req.include)
+    sp = resolve_sampling(
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        max_tokens=req.max_output_tokens or default_max_tokens,
+        ignore_eos=False,
+        model_sampling=model_sampling,
+        stop=req.stop,
+        presence_penalty=req.presence_penalty,
+        frequency_penalty=req.frequency_penalty,
+        repetition_penalty=req.repetition_penalty,
+        min_p=req.min_p,
+        logit_bias=req.logit_bias,
+        stop_token_ids=req.stop_token_ids,
+        seed=req.seed,
+        timings_per_token=timings_per_token,
+    )
+    if want_lps:
+        sp.logprobs = True
+        sp.top_logprobs = req.top_logprobs if req.top_logprobs is not None else 0
     return GenSpec(
         messages=messages,
-        sampling_params=resolve_sampling(
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            max_tokens=req.max_output_tokens or default_max_tokens,
-            ignore_eos=False,
-            model_sampling=model_sampling,
-            timings_per_token=timings_per_token,
-        ),
+        sampling_params=sp,
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
+        include_logprobs=want_lps,
+        disable_parallel_tool_use=bool(req.parallel_tool_calls is False),
+        tool_choice_mode=tool_choice_mode,
+        response_format=response_format,
     )
 
 
@@ -396,7 +575,12 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         if role == "developer":
             role = "system"
         return [{"role": role, "content": _input_content(item.get("content"))}]
-    if itype == "function_call":
+    if itype in ("function_call", "custom_tool_call"):
+        args_val = (
+            json.dumps({"input": item.get("input", "")})
+            if itype == "custom_tool_call" and "arguments" not in item
+            else (item.get("arguments", "") or "")
+        )
         return [
             {
                 "role": "assistant",
@@ -408,13 +592,13 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
                         "type": "function",
                         "function": {
                             "name": item.get("name", ""),
-                            "arguments": item.get("arguments", "") or "",
+                            "arguments": args_val,
                         },
                     }
                 ],
             }
         ]
-    if itype == "function_call_output":
+    if itype in ("function_call_output", "custom_tool_call_output"):
         output = item.get("output")
         content = (
             _input_content(output) if isinstance(output, list) else _stringify(output)
@@ -435,16 +619,20 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         return [tool_msg, {"_deferred_tool_images": True, "content": images}]
     if itype == "reasoning":
         # Folded into its assistant turn by _merge_assistant_run; summary-only /
-        # encrypted items carry no recoverable text.
+        # encrypted items carry no recoverable raw reasoning text.
         text = "".join(
             c.get("text") or ""
             for c in (item.get("content") or [])
-            if isinstance(c, dict) and c.get("type") == "reasoning_text"
+            if isinstance(c, dict) and c.get("type") in ("reasoning_text", "text")
         )
         if text:
             return [{"role": "assistant", "reasoning_content": text}]
         return []
-    return []
+    if itype == "item_reference":
+        raise ValueError(
+            "item_reference is not supported on this stateless server; resend full item content"
+        )
+    raise ValueError(f"Unsupported input item type: {itype!r}")
 
 
 def _merge_assistant_run(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -538,8 +726,25 @@ def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] |
         return None
     converted: list[dict[str, Any]] = []
     for tool in tools:
-        if tool.get("type") not in (None, "function"):
-            # Built-in tools (web_search, code_interpreter, ...) are unsupported; skip.
+        ttype = tool.get("type")
+        if ttype == "custom":
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description"),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"input": {"type": "string"}},
+                            "required": ["input"],
+                        },
+                    },
+                }
+            )
+            continue
+        if ttype not in (None, "function"):
+            # Built-in server tools (web_search, code_interpreter, ...) are unsupported; skip.
             continue
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
         converted.append(
@@ -567,7 +772,8 @@ def build_responses_response(
     state: Any = None,
 ) -> Response:
     truncated = result.finish_reason == "length"
-    item_status = "incomplete" if truncated else "completed"
+    want_lps = bool(req.include and "message.output_text.logprobs" in req.include)
+    lp_items = responses_logprobs_content(result.logprobs or []) if want_lps else None
     output: list[Any] = []
     if result.reasoning:
         output.append(
@@ -578,24 +784,35 @@ def build_responses_response(
                 content=[
                     ReasoningTextContent(type="reasoning_text", text=result.reasoning)
                 ],
-                status="completed",
+                status="incomplete"
+                if (truncated and not result.content and not result.tool_calls)
+                else "completed",
             )
         )
-    if result.content:
+    if result.content or (not result.reasoning and not result.tool_calls):
+        msg_kwargs: dict[str, Any] = {}
+        if lp_items is not None:
+            msg_kwargs["logprobs"] = lp_items
         output.append(
             ResponseOutputMessage(
                 id=f"msg_{uuid.uuid4().hex}",
                 role="assistant",
-                status=item_status,
+                status="incomplete"
+                if (truncated and not result.tool_calls)
+                else "completed",
                 type="message",
                 content=[
                     ResponseOutputText(
-                        type="output_text", text=result.content, annotations=[]
+                        type="output_text",
+                        text=result.content or "",
+                        annotations=[],
+                        **msg_kwargs,
                     )
                 ],
             )
         )
-    for call in result.tool_calls:
+    for idx, call in enumerate(result.tool_calls):
+        is_last = idx == len(result.tool_calls) - 1
         output.append(
             ResponseFunctionToolCall(
                 type="function_call",
@@ -603,7 +820,7 @@ def build_responses_response(
                 call_id=f"call_{uuid.uuid4().hex[:24]}",
                 name=call.name or "",
                 arguments=call.parameters or "",
-                status="completed",
+                status="incomplete" if (truncated and is_last) else "completed",
             )
         )
 
@@ -621,6 +838,7 @@ def build_responses_response(
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
         timings=timings_block(state, result.timings),
+        req=req,
     )
 
 
@@ -635,9 +853,33 @@ def _response_obj(
     error: ResponseError | None = None,
     incomplete_reason: str | None = None,
     timings: dict[str, Any] | None = None,
+    req: ResponsesRequest | None = None,
 ) -> Response:
     # Response allows extra fields, so timings rides along without forking the schema.
     extra: dict[str, Any] = {"timings": timings} if timings is not None else {}
+    if status == "completed":
+        extra["completed_at"] = float(int(time.time()))
+    if req is not None:
+        if req.instructions is not None:
+            extra["instructions"] = req.instructions
+        if req.metadata is not None:
+            extra["metadata"] = req.metadata
+        if req.temperature is not None:
+            extra["temperature"] = req.temperature
+        if req.top_p is not None:
+            extra["top_p"] = req.top_p
+        if req.max_output_tokens is not None:
+            extra["max_output_tokens"] = req.max_output_tokens
+        if req.truncation in ("auto", "disabled"):
+            extra["truncation"] = req.truncation
+    parallel = (
+        bool(req.parallel_tool_calls)
+        if (req is not None and req.parallel_tool_calls is not None)
+        else True
+    )
+    tc_val: Any = "auto"
+    if req is not None and isinstance(req.tool_choice, str):
+        tc_val = req.tool_choice
     return Response(
         id=response_id,
         created_at=created,
@@ -650,8 +892,8 @@ def _response_obj(
         incomplete_details=IncompleteDetails(reason=incomplete_reason)
         if incomplete_reason
         else None,
-        parallel_tool_calls=True,
-        tool_choice="auto",
+        parallel_tool_calls=parallel,
+        tool_choice=tc_val,
         tools=[],
         **extra,
     )
@@ -707,6 +949,7 @@ async def responses_stream_generator(
             status=status,
             usage=usage,
             incomplete_reason=incomplete_reason,
+            req=req,
         )
 
     yield _sse(
@@ -733,11 +976,14 @@ async def responses_stream_generator(
     usage_cached = 0
     usage_reasoning = 0
 
+    want_lps = bool(req.include and "message.output_text.logprobs" in req.include)
+
     def close_current() -> list[str]:
         nonlocal current, output_index
         frames: list[str] = []
         if current is None:
             return frames
+        is_trunc = finish_reason == "length"
         if current["kind"] == "reasoning":
             item_id, text = current["id"], current["text"]
             frames.append(
@@ -757,10 +1003,11 @@ async def responses_stream_generator(
                 type="reasoning",
                 summary=[],
                 content=[ReasoningTextContent(type="reasoning_text", text=text)],
-                status="completed",
+                status="incomplete" if is_trunc else "completed",
             )
         elif current["kind"] == "message":
             item_id, text = current["id"], current["text"]
+            all_lps = current.get("logprobs") or []
             frames.append(
                 _sse(
                     ResponseTextDoneEvent(
@@ -770,10 +1017,11 @@ async def responses_stream_generator(
                         output_index=output_index,
                         content_index=0,
                         text=text,
-                        logprobs=[],
+                        logprobs=all_lps,
                     )
                 )
             )
+            part_kwargs: dict[str, Any] = {"logprobs": all_lps} if want_lps else {}
             frames.append(
                 _sse(
                     ResponseContentPartDoneEvent(
@@ -783,7 +1031,10 @@ async def responses_stream_generator(
                         output_index=output_index,
                         content_index=0,
                         part=ResponseOutputText(
-                            type="output_text", text=text, annotations=[]
+                            type="output_text",
+                            text=text,
+                            annotations=[],
+                            **part_kwargs,
                         ),
                     )
                 )
@@ -793,10 +1044,15 @@ async def responses_stream_generator(
             done_item = ResponseOutputMessage(
                 id=item_id,
                 role="assistant",
-                status="incomplete" if finish_reason == "length" else "completed",
+                status="incomplete" if is_trunc else "completed",
                 type="message",
                 content=[
-                    ResponseOutputText(type="output_text", text=text, annotations=[])
+                    ResponseOutputText(
+                        type="output_text",
+                        text=text,
+                        annotations=[],
+                        **part_kwargs,
+                    )
                 ],
             )
         else:  # function_call
@@ -819,7 +1075,7 @@ async def responses_stream_generator(
                 call_id=current["call_id"],
                 name=current["name"],
                 arguments=args,
-                status="completed",
+                status="incomplete" if is_trunc else "completed",
             )
         frames.append(
             _sse(
@@ -940,7 +1196,12 @@ async def responses_stream_generator(
                     for f in close_current():
                         yield f
                     item_id = f"msg_{uuid.uuid4().hex}"
-                    current = {"kind": "message", "id": item_id, "text": ""}
+                    current = {
+                        "kind": "message",
+                        "id": item_id,
+                        "text": "",
+                        "logprobs": [],
+                    }
                     yield _sse(
                         ResponseOutputItemAddedEvent(
                             type="response.output_item.added",
@@ -968,6 +1229,11 @@ async def responses_stream_generator(
                         )
                     )
                 current["text"] += ev.text
+                delta_lps = (
+                    responses_logprobs_content(ev.logprobs or []) if want_lps else []
+                )
+                if delta_lps:
+                    current["logprobs"].extend(delta_lps)
                 yield _sse(
                     ResponseTextDeltaEvent(
                         type="response.output_text.delta",
@@ -976,7 +1242,7 @@ async def responses_stream_generator(
                         output_index=output_index,
                         content_index=0,
                         delta=ev.text,
-                        logprobs=[],
+                        logprobs=delta_lps,
                         **timings_extra(),
                     )
                 )
@@ -1027,6 +1293,13 @@ async def responses_stream_generator(
                         yield f
 
             elif isinstance(ev, GenDone):
+                if (
+                    want_lps
+                    and ev.logprobs
+                    and current is not None
+                    and current["kind"] == "message"
+                ):
+                    current["logprobs"].extend(responses_logprobs_content(ev.logprobs))
                 finish_reason = ev.finish_reason
                 usage_pt, usage_ct = ev.prompt_tokens, ev.completion_tokens
                 usage_cached = ev.cached_tokens if cache_report else 0
@@ -1140,8 +1413,16 @@ def _error_response(
     code: str | None = None,
     *,
     err_type: str = "invalid_request_error",
+    param: str | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"message": message, "type": err_type, "code": code}},
+        content={
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": param,
+                "code": code,
+            }
+        },
     )

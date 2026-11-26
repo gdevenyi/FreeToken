@@ -59,6 +59,8 @@ class ServerArgs(SchedulerConfig):
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
+    # Maximum number of prompts accepted in a single /v1/completions batch request.
+    max_completion_prompts: int = 256
     # Server-side thinking policy: "auto" honours the request, "on"/"off" override every
     # client spelling of the knob so operator policy cannot be bypassed per request.
     thinking: str = "auto"
@@ -847,6 +849,13 @@ def parse_args(
         type=str,
         default=ServerArgs.served_model_name,
         help="Model id returned by /v1/models. Defaults to the basename of --model.",
+    )
+
+    parser.add_argument(
+        "--max-completion-prompts",
+        type=_positive_int,
+        default=ServerArgs.max_completion_prompts,
+        help="Maximum number of prompts accepted in a single /v1/completions batch request (default: 256).",
     )
 
     parser.add_argument(

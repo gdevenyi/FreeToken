@@ -114,6 +114,62 @@ def _ids_below(ids: list[int], bound: int) -> bool:
     return min(ids) >= 0 and max(ids) < bound
 
 
+def _render_directives(
+    tool_choice_mode: str | None, response_format: dict[str, Any] | None
+) -> str | None:
+    parts: list[str] = []
+    if tool_choice_mode == "required":
+        parts.append(
+            "You MUST respond by calling at least one of the provided tools. "
+            "Do not reply with plain text only."
+        )
+    elif isinstance(tool_choice_mode, str) and tool_choice_mode.startswith("named:"):
+        fn_name = tool_choice_mode.removeprefix("named:")
+        parts.append(
+            f"You MUST respond by calling the `{fn_name}` tool with valid JSON arguments "
+            "matching its schema. Do not call any other tool or reply with plain text."
+        )
+    if isinstance(response_format, dict):
+        fmt_type = response_format.get("type")
+        if fmt_type == "json_object":
+            parts.append(
+                "You MUST output ONLY a valid JSON object. "
+                "Do not wrap the JSON in markdown code fences or include any extra text."
+            )
+        elif fmt_type == "json_schema":
+            js = response_format.get("json_schema")
+            schema = (
+                js.get("schema")
+                if isinstance(js, dict)
+                else response_format.get("schema")
+            )
+            schema_txt = (
+                json.dumps(schema, ensure_ascii=False)
+                if isinstance(schema, dict)
+                else "{}"
+            )
+            parts.append(
+                f"You MUST output ONLY valid JSON that strictly conforms to this JSON Schema: {schema_txt}. "
+                "Do not wrap the JSON in markdown code fences or include any extra text."
+            )
+    return "\n\n".join(parts) if parts else None
+
+
+def _inject_leading_directive(
+    messages: list[dict[str, Any]], directive: str
+) -> list[dict[str, Any]]:
+    copied = [dict(m) for m in messages]
+    if (
+        copied
+        and copied[0].get("role") in ("system", "developer")
+        and isinstance(copied[0].get("content"), str)
+    ):
+        existing = copied[0]["content"]
+        copied[0]["content"] = f"{existing}\n\n{directive}" if existing else directive
+        return copied
+    return [{"role": "system", "content": directive}, *copied]
+
+
 class TokenizeManager:
     def __init__(
         self,
@@ -140,6 +196,11 @@ class TokenizeManager:
                 raise ValueError(
                     f"allowed_token_ids must be in [0, {len(self.tokenizer)})"
                 )
+            logprob_ids = getattr(msg.sampling_params, "logprob_token_ids", None)
+            if logprob_ids and not _ids_below(logprob_ids, len(self.tokenizer)):
+                raise ValueError(
+                    f"logprob_token_ids must be in [0, {len(self.tokenizer)})"
+                )
             if msg.input_ids is not None:
                 # an id past the embedding rows would fault the engine, not just this request
                 if msg.input_ids and not _ids_below(msg.input_ids, len(self.tokenizer)):
@@ -157,12 +218,21 @@ class TokenizeManager:
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
-            # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
-            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+            # the template already rendered one. Raw-string prompts honor explicit
+            # add_special_tokens, or suppress BOS auto-insertion if prompt already starts with bos_token.
+            explicit_special = getattr(msg, "add_special_tokens", None)
+            if explicit_special is not None:
+                add_special = bool(explicit_special)
+            else:
+                templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+                add_special = not templated
+                if add_special and isinstance(prompt, str):
+                    bos = getattr(self.tokenizer, "bos_token", None)
+                    if isinstance(bos, str) and bos and prompt.startswith(bos):
+                        add_special = False
             input_ids: torch.Tensor = (  # type: ignore
                 self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
+                    prompt, return_tensors="pt", add_special_tokens=add_special
                 )
             )
             input_ids = input_ids.view(-1).to(torch.int32)
@@ -198,8 +268,15 @@ class TokenizeManager:
         if not isinstance(msg.text, list):
             return msg.text
         kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
+        raw_messages = msg.text
+        directive = _render_directives(
+            getattr(msg, "tool_choice_mode", None),
+            getattr(msg, "response_format", None),
+        )
+        if directive:
+            raw_messages = _inject_leading_directive(raw_messages, directive)
         messages = _map_developer_role(
-            msg.text,
+            raw_messages,
             getattr(self.tokenizer, "chat_template", None),
             has_dsv4_encoder=self._dsv4_encoder is not None,
             preserve_inline_system=msg.inline_system_policy is not None,

@@ -15,7 +15,10 @@ from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 
+from dataclasses import replace
+
 from .api_models import (
+    MAX_N_CHOICES,
     MAX_PROMPTS,
     ChatCompletionRequest,
     CompletionRequest,
@@ -48,7 +51,13 @@ from .generation import (
     submit_generation,
     timings_block,
 )
-from .logprobs import completion_logprobs_error, completions_logprobs
+from .logprobs import (
+    MAX_CHAT_LOGPROBS,
+    chat_logprobs_content,
+    completion_logprobs_error,
+    completions_logprobs,
+    reply_logprob_pairs,
+)
 from .request_logger import log_request
 
 logger = logging.getLogger(__name__)
@@ -87,6 +96,9 @@ def chat_request_to_genspec(
     ctk = thinking_override_kwargs(thinking, ctk)
     if req.continue_final_message:
         ctk = {**ctk, "continue_final_message": True}
+    if req.parallel_tool_calls is False:
+        ctk = {**ctk, "parallel_tool_calls": False}
+    template_tools, parser_tools, tool_choice_mode = _resolve_chat_tools(req)
     return GenSpec(
         messages=render_messages(
             [m.model_dump(exclude_none=True) for m in req.messages]
@@ -98,13 +110,31 @@ def chat_request_to_genspec(
             timings_per_token=timings_per_token,
         ),
         chat_template_kwargs=ctk,
-        template_tools=_tools_for_template(req),
-        parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+        template_tools=template_tools,
+        parser_tools=parser_tools,
+        include_logprobs=bool(req.logprobs),
+        disable_parallel_tool_use=bool(req.parallel_tool_calls is False),
+        tool_choice_mode=tool_choice_mode,
+        response_format=req.response_format,
     )
 
 
 def _all_tool_dicts(tools) -> list[dict[str, Any]]:
     return [t.model_dump(exclude_none=True) for t in (tools or [])]
+
+
+async def _build_model_card(state: Any) -> ModelCard:
+    model_id = _served_model_name(state)
+    ctx = _model_context_length(state)
+    efforts, default_effort = await _effort_fields(state)
+    return ModelCard(
+        id=model_id,
+        root=state.config.model_path,
+        max_model_len=ctx,
+        context_length=ctx,
+        supported_reasoning_efforts=efforts,
+        default_reasoning_effort=default_effort,
+    )
 
 
 def _maintenance_gate(state: Any) -> JSONResponse | None:
@@ -120,7 +150,7 @@ def _maintenance_gate(state: Any) -> JSONResponse | None:
         msg = "server unavailable: maintenance failed (restart required)"
     else:
         msg = "server unavailable: cache rebuild in progress"
-    return JSONResponse({"error": msg}, status_code=503)
+    return create_error_response(msg, status_code=503, err_type="server_error")
 
 
 def register_openai_routes(
@@ -160,22 +190,22 @@ def register_openai_routes(
 
     @app.get("/v1/models")
     async def v1_models():
+        card = await _build_model_card(get_state())
+        return ModelList(data=[card])
+
+    @app.get("/v1/models/{model_id:path}")
+    async def v1_model_detail(model_id: str):
         state = get_state()
-        model_id = _served_model_name(state)
-        ctx = _model_context_length(state)
-        efforts, default_effort = await _effort_fields(state)
-        return ModelList(
-            data=[
-                ModelCard(
-                    id=model_id,
-                    root=state.config.model_path,
-                    max_model_len=ctx,
-                    context_length=ctx,
-                    supported_reasoning_efforts=efforts,
-                    default_reasoning_effort=default_effort,
-                )
-            ]
-        )
+        served = _served_model_name(state)
+        if model_id not in (served, state.config.model_path):
+            return create_error_response(
+                f"The model {model_id!r} does not exist",
+                status_code=404,
+                err_type="not_found_error",
+                param="model",
+                code="model_not_found",
+            )
+        return await _build_model_card(state)
 
 
 # How often a non-streaming handler looks at the transport while the engine generates: one
@@ -250,17 +280,34 @@ async def handle_chat_completion(
 ):
     if req.function_call is not None:
         return create_error_response(
-            "function_call is not supported; use tools/tool_choice instead"
+            "function_call is not supported; use tools/tool_choice instead",
+            param="function_call",
         )
-    if _response_format_unsupported(req.response_format):
-        rtype = (req.response_format or {}).get("type")
+    for name in _UNIMPLEMENTED_CHAT_FIELDS:
+        if _is_set(getattr(req, name, None)):
+            return create_error_response(
+                f"{name} is not supported by this server", param=name
+            )
+    if (rf_err := _response_format_error(req.response_format)) is not None:
+        return create_error_response(rf_err, param="response_format")
+    if not 1 <= req.n <= MAX_N_CHOICES:
         return create_error_response(
-            f"response_format.type {rtype!r} is not supported "
-            "(supported: text, json_object, json_schema)",
-            param="response_format",
+            f"n must be between 1 and {MAX_N_CHOICES}, got {req.n}", param="n"
         )
-    if req.n != 1:
-        return create_error_response("Only n=1 is supported", param="n")
+    if req.top_logprobs is not None:
+        if not req.logprobs:
+            return create_error_response(
+                "top_logprobs requires logprobs=true", param="top_logprobs"
+            )
+        if not 0 <= req.top_logprobs <= MAX_CHAT_LOGPROBS:
+            return create_error_response(
+                f"top_logprobs must be between 0 and {MAX_CHAT_LOGPROBS}",
+                param="top_logprobs",
+            )
+    if req.logprob_token_ids is not None and not req.logprobs:
+        return create_error_response(
+            "logprob_token_ids requires logprobs=true", param="logprob_token_ids"
+        )
     # Case/whitespace and the "off" disable synonym stay accepted here because
     # effort_toggle_kwargs normalizes and honors them downstream.
     effort = (
@@ -303,6 +350,14 @@ async def handle_chat_completion(
     except ValueError as exc:
         return create_error_response(str(exc))
 
+    chat_id_fields = [
+        (name, ids)
+        for name, ids in spec.sampling_params.client_token_ids()
+        if name in ("allowed_token_ids", "logprob_token_ids")
+    ]
+    if (bad := await _token_id_error(state, chat_id_fields)) is not None:
+        return bad
+
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
         # through GenerationError; only the stream path needs the pre-check.
@@ -310,55 +365,94 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    try:
-        uid = await submit_generation(spec, state)
-    except GenerationError as exc:
-        return create_error_response(str(exc), code=exc.code)
+    specs = _fan_out_specs(spec, req.n)
+    uids: list[int] = []
+    for sample_spec in specs:
+        try:
+            uids.append(await submit_generation(sample_spec, state))
+        except GenerationError as exc:
+            if uids and hasattr(state, "abort_user"):
+                await asyncio.gather(
+                    *(state.abort_user(u) for u in uids), return_exceptions=True
+                )
+            return create_error_response(str(exc), code=exc.code)
 
     if req.stream:
-        chunks = stream_chat_completion_chunks(uid, req, state, spec)
-        if request is not None:
-            chunks = state.stream_with_cancellation(chunks, request, uid)
+        if len(uids) == 1:
+            chunks = stream_chat_completion_chunks(uids[0], req, state, specs[0])
+            if request is not None:
+                chunks = state.stream_with_cancellation(chunks, request, uids[0])
+        else:
+            chunks = _stream_multi_chat_chunks(uids, req, state, specs, request)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await _await_watching_disconnect(
-            generate_full(uid, spec, state, source="/v1/chat/completions"),
-            request,
-            state,
-            uid,
-        )
+        if len(uids) == 1:
+            single = await _await_watching_disconnect(
+                generate_full(uids[0], specs[0], state, source="/v1/chat/completions"),
+                request,
+                state,
+                uids[0],
+            )
+            results = None if single is None else [single]
+        else:
+            results = await _await_watching_disconnect(
+                asyncio.gather(
+                    *(
+                        generate_full(u, s, state, source="/v1/chat/completions")
+                        for u, s in zip(uids, specs, strict=True)
+                    )
+                ),
+                request,
+                state,
+                uids,
+            )
     except GenerationError as exc:
+        if len(uids) > 1 and hasattr(state, "abort_user"):
+            await asyncio.gather(
+                *(state.abort_user(u) for u in uids), return_exceptions=True
+            )
         return create_error_response(str(exc), code=exc.code)
-    if result is None:
+    if results is None:
         return _client_disconnected_response()
-    message: dict[str, Any] = {"role": "assistant", "content": result.content}
-    if result.reasoning:
-        message["reasoning_content"] = result.reasoning
-    if result.tool_calls:
-        message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
 
+    choices: list[dict[str, Any]] = []
+    for idx, res in enumerate(results):
+        message: dict[str, Any] = {"role": "assistant", "content": res.content}
+        if res.reasoning:
+            message["reasoning_content"] = res.reasoning
+        if res.tool_calls:
+            message["tool_calls"] = _tool_calls_to_openai(res.tool_calls)
+        choice: dict[str, Any] = {
+            "index": idx,
+            "message": message,
+            "finish_reason": res.finish_reason,
+        }
+        if req.logprobs:
+            choice["logprobs"] = {
+                "content": chat_logprobs_content(
+                    res.logprobs or [], req.return_tokens_as_token_ids
+                ),
+                "refusal": None,
+            }
+        choices.append(choice)
+
+    first = results[0]
     response: dict[str, Any] = {
-        "id": _response_id("chatcmpl", req, public_request_id(uid)),
+        "id": _response_id("chatcmpl", req, public_request_id(uids[0])),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
         "system_fingerprint": None,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": result.finish_reason,
-            }
-        ],
+        "choices": choices,
         "usage": _usage(
-            result.prompt_tokens,
-            result.completion_tokens,
-            _reported_cached(state, result.cached_tokens),
-            reasoning_tokens=result.reasoning_tokens,
+            first.prompt_tokens,
+            sum(r.completion_tokens for r in results),
+            _reported_cached(state, first.cached_tokens),
+            reasoning_tokens=sum(r.reasoning_tokens for r in results),
         ),
     }
-    if (timings := timings_block(state, result.timings)) is not None:
+    if (timings := timings_block(state, first.timings)) is not None:
         response["timings"] = timings
     return response
 
@@ -368,31 +462,49 @@ async def stream_chat_completion_chunks(
     req: ChatCompletionRequest,
     state: Any,
     spec: GenSpec | None = None,
+    *,
+    choice_index: int = 0,
+    shared_id_uid: int | None = None,
+    emit_done_sentinel: bool = True,
+    emit_usage_chunk: bool | None = None,
+    usage_out: GenUsage | None = None,
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
         spec = chat_request_to_genspec(req, {})
-    yield _sse(
-        _chat_chunk(
-            req,
-            uid,
-            [
-                {
-                    "delta": {"role": "assistant", "content": ""},
-                    "index": 0,
-                    "finish_reason": None,
-                }
-            ],
-        )
-    )
+    id_uid = uid if shared_id_uid is None else shared_id_uid
+    role_choice: dict[str, Any] = {
+        "delta": {"role": "assistant", "content": ""},
+        "index": choice_index,
+        "finish_reason": None,
+    }
+    if req.logprobs:
+        role_choice["logprobs"] = None
+    yield _sse(_chat_chunk(req, id_uid, [role_choice]))
 
     timings: dict[str, Any] | None = None
     # timings ride the stream's LAST chunk only: the usage chunk when the client asked
     # for one, otherwise the finish chunk
-    include_usage = bool(req.stream_options and req.stream_options.include_usage)
-    continuous_usage = include_usage and bool(req.stream_options.continuous_usage_stats)
+    include_usage = (
+        bool(req.stream_options and req.stream_options.include_usage)
+        if emit_usage_chunk is None
+        else emit_usage_chunk
+    )
+    continuous_usage = include_usage and bool(
+        req.stream_options and req.stream_options.continuous_usage_stats
+    )
     # the final usage chunk reads it too, so a stream cut by an error reports what it produced
-    usage = GenUsage()
+    usage = usage_out if usage_out is not None else GenUsage()
+
+    def _lp_obj(entries: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+        if not req.logprobs:
+            return None
+        if not entries:
+            return None
+        return {
+            "content": chat_logprobs_content(entries, req.return_tokens_as_token_ids),
+            "refusal": None,
+        }
 
     def emit(chunk: dict[str, Any]) -> bytes:
         if continuous_usage:
@@ -424,39 +536,30 @@ async def stream_chat_completion_chunks(
                     "error": {
                         "message": str(exc),
                         "type": "invalid_request_error",
+                        "param": None,
                         "code": exc.code,
                     }
                 }
             )
             break
         if isinstance(ev, ReasoningDelta):
-            yield emit(
-                _chat_chunk(
-                    req,
-                    uid,
-                    [
-                        {
-                            "delta": {"reasoning_content": ev.text},
-                            "index": 0,
-                            "finish_reason": None,
-                        }
-                    ],
-                )
-            )
+            c_dict: dict[str, Any] = {
+                "delta": {"reasoning_content": ev.text},
+                "index": choice_index,
+                "finish_reason": None,
+            }
+            if req.logprobs:
+                c_dict["logprobs"] = _lp_obj(ev.logprobs)
+            yield emit(_chat_chunk(req, id_uid, [c_dict]))
         elif isinstance(ev, ContentDelta):
-            yield emit(
-                _chat_chunk(
-                    req,
-                    uid,
-                    [
-                        {
-                            "delta": {"content": ev.text},
-                            "index": 0,
-                            "finish_reason": None,
-                        }
-                    ],
-                )
-            )
+            c_dict = {
+                "delta": {"content": ev.text},
+                "index": choice_index,
+                "finish_reason": None,
+            }
+            if req.logprobs:
+                c_dict["logprobs"] = _lp_obj(ev.logprobs)
+            yield emit(_chat_chunk(req, id_uid, [c_dict]))
         elif isinstance(ev, ToolCallStart):
             open_tool = {
                 "index": tool_calls_sent,
@@ -467,7 +570,7 @@ async def stream_chat_completion_chunks(
             yield emit(
                 _chat_chunk(
                     req,
-                    uid,
+                    id_uid,
                     [
                         {
                             "delta": {
@@ -482,7 +585,7 @@ async def stream_chat_completion_chunks(
                                     }
                                 ]
                             },
-                            "index": 0,
+                            "index": choice_index,
                             "finish_reason": None,
                         }
                     ],
@@ -496,7 +599,7 @@ async def stream_chat_completion_chunks(
                 yield emit(
                     _chat_chunk(
                         req,
-                        uid,
+                        id_uid,
                         [
                             {
                                 "delta": {
@@ -507,7 +610,7 @@ async def stream_chat_completion_chunks(
                                         }
                                     ]
                                 },
-                                "index": 0,
+                                "index": choice_index,
                                 "finish_reason": None,
                             }
                         ],
@@ -530,7 +633,7 @@ async def stream_chat_completion_chunks(
                         yield emit(
                             _chat_chunk(
                                 req,
-                                uid,
+                                id_uid,
                                 [
                                     {
                                         "delta": {
@@ -543,7 +646,7 @@ async def stream_chat_completion_chunks(
                                                 }
                                             ]
                                         },
-                                        "index": 0,
+                                        "index": choice_index,
                                         "finish_reason": None,
                                     }
                                 ],
@@ -557,11 +660,11 @@ async def stream_chat_completion_chunks(
                     yield emit(
                         _chat_chunk(
                             req,
-                            uid,
+                            id_uid,
                             [
                                 {
                                     "delta": {"tool_calls": [delta]},
-                                    "index": 0,
+                                    "index": choice_index,
                                     "finish_reason": None,
                                 }
                             ],
@@ -570,23 +673,104 @@ async def stream_chat_completion_chunks(
                 tool_calls_sent += 1
         elif isinstance(ev, GenDone):
             timings = ev.timings
-            done = _chat_chunk(
-                req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]
-            )
-            if not include_usage and (t := timings_block(state, timings)) is not None:
+            done_choice: dict[str, Any] = {
+                "delta": {},
+                "index": choice_index,
+                "finish_reason": ev.finish_reason,
+            }
+            if req.logprobs:
+                done_choice["logprobs"] = _lp_obj(ev.logprobs)
+            done = _chat_chunk(req, id_uid, [done_choice])
+            if (
+                emit_done_sentinel
+                and not include_usage
+                and (t := timings_block(state, timings)) is not None
+            ):
                 done["timings"] = t
             yield emit(done)
 
-    if include_usage:
+    if include_usage and emit_done_sentinel:
         final: dict[str, Any] = {
-            **_chat_chunk(req, uid, []),
+            **_chat_chunk(req, id_uid, []),
             "usage": _reported_usage(state, usage),
         }
         if (t := timings_block(state, timings)) is not None:
             final["timings"] = t
         yield _sse(final)
 
-    yield b"data: [DONE]\n\n"
+    if emit_done_sentinel:
+        yield b"data: [DONE]\n\n"
+
+
+async def _stream_multi_chat_chunks(
+    uids: list[int],
+    req: ChatCompletionRequest,
+    state: Any,
+    specs: list[GenSpec],
+    request: Request | None,
+) -> AsyncIterator[bytes]:
+    """Merge ``n > 1`` chat streams concurrently onto one SSE stream."""
+    usages = [GenUsage() for _ in uids]
+    queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue()
+
+    async def _pump(idx: int) -> None:
+        try:
+            async for chunk in stream_chat_completion_chunks(
+                uids[idx],
+                req,
+                state,
+                specs[idx],
+                choice_index=idx,
+                shared_id_uid=uids[0],
+                emit_done_sentinel=False,
+                emit_usage_chunk=False,
+                usage_out=usages[idx],
+            ):
+                await queue.put(chunk)
+        except BaseException as exc:  # noqa: BLE001
+            await queue.put(exc)
+        finally:
+            await queue.put(None)
+
+    tasks = [asyncio.create_task(_pump(i)) for i in range(len(uids))]
+    finished = 0
+    try:
+        while finished < len(uids):
+            if request is not None and await request.is_disconnected():
+                break
+            item = await queue.get()
+            if item is None:
+                finished += 1
+            elif isinstance(item, BaseException):
+                raise item
+            else:
+                yield item
+        if finished == len(uids):
+            if req.stream_options and req.stream_options.include_usage:
+                merged = GenUsage(
+                    prompt_tokens=usages[0].prompt_tokens,
+                    completion_tokens=sum(u.completion_tokens for u in usages),
+                    cached_tokens=usages[0].cached_tokens,
+                    reasoning_tokens=sum(u.reasoning_tokens for u in usages),
+                    timings=usages[0].timings,
+                )
+                final: dict[str, Any] = {
+                    **_chat_chunk(req, uids[0], []),
+                    "usage": _reported_usage(state, merged),
+                }
+                if (t := timings_block(state, usages[0].timings)) is not None:
+                    final["timings"] = t
+                yield _sse(final)
+            yield b"data: [DONE]\n\n"
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if finished < len(uids) and hasattr(state, "abort_user"):
+            await asyncio.gather(
+                *(asyncio.shield(state.abort_user(u)) for u in uids),
+                return_exceptions=True,
+            )
 
 
 async def handle_completion(
@@ -599,8 +783,10 @@ async def handle_completion(
     if unsupported is not None:
         reason, param = unsupported
         return create_error_response(reason, param=param)
-    if req.n != 1:
-        return create_error_response("Only n=1 is supported", param="n")
+    if not 1 <= req.n <= MAX_N_CHOICES:
+        return create_error_response(
+            f"n must be between 1 and {MAX_N_CHOICES}, got {req.n}", param="n"
+        )
     try:  # surfaces an out-of-range value as a 400 rather than a 500 from the worker
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None)
@@ -611,22 +797,14 @@ async def handle_completion(
         )
     except ValueError as exc:
         return create_error_response(str(exc))
-    if (
-        sampling.logprobs
-        and not sampling.is_logprob_read
-        and getattr(state.config, "speculative_algorithm", None)
-    ):
-        # speculative decode steps go through verify_step, which samples no logprobs; a
-        # max_tokens=1 read finishes on its prefill sample, which has them
-        return create_error_response(
-            "logprobs need max_tokens=1 when the server runs speculative decoding (--spec-algo)",
-            param="max_tokens",
-        )
     token_prompts = _is_token_prompt(req.prompt)
     prompts = _prompt_list(req.prompt)
-    if len(prompts) > MAX_PROMPTS:
+    max_prompts = int(
+        getattr(state.config, "max_completion_prompts", None) or MAX_PROMPTS
+    )
+    if len(prompts) > max_prompts:
         return create_error_response(
-            f"prompt must hold at most {MAX_PROMPTS} prompts, got {len(prompts)}",
+            f"prompt must hold at most {max_prompts} prompts, got {len(prompts)}",
             param="prompt",
         )
     id_fields = sampling.client_token_ids()
@@ -643,18 +821,27 @@ async def handle_completion(
         and getattr(state.config, "enable_timings_report", False)
     )
 
-    def _tokenize_msg(uid: int, prompt: str | list[int]) -> TokenizeMsg:
+    def _tokenize_msg(
+        uid: int, prompt: str | list[int], sample_idx: int = 0
+    ) -> TokenizeMsg:
         sampling_params = _resolve_sampling(
             req,
             model_sampling,
             default_max_tokens=default_max_tokens,
             timings_per_token=timings_pt,
         )
+        if sample_idx > 0 and sampling_params.seed is not None:
+            sampling_params.seed = sampling_params.seed + sample_idx
         if token_prompts:
             return TokenizeMsg(
                 uid=uid, text="", input_ids=prompt, sampling_params=sampling_params
             )
-        return TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling_params)
+        return TokenizeMsg(
+            uid=uid,
+            text=prompt,
+            sampling_params=sampling_params,
+            add_special_tokens=req.add_special_tokens,
+        )
 
     # echo returns what the client sent, so take it before the FIM wrap below
     echo_texts = list(prompts) if req.echo else [""] * len(prompts)
@@ -667,19 +854,39 @@ async def handle_completion(
                 param="suffix",
             )
         prompts = [_fim_prompt(p, req.suffix, markers) for p in prompts]
+
+    jobs: list[tuple[int, int, str | list[int], str]] = [
+        (p_idx * req.n + s_idx, s_idx, prompt, echo_texts[p_idx])
+        for p_idx, prompt in enumerate(prompts)
+        for s_idx in range(req.n)
+    ]
+
     if req.stream:
-        if len(prompts) != 1:
-            return create_error_response(
-                "Streaming completions only support a single prompt"
-            )
-        uid = state.new_user()
-        try:
-            await send_new_request(state, uid, _tokenize_msg(uid, prompts[0]))
-        except GenerationError as exc:
-            return create_error_response(str(exc), code=exc.code)
-        chunks = stream_completion_chunks(uid, req, state, echo_text=echo_texts[0])
-        if request is not None:
-            chunks = state.stream_with_cancellation(chunks, request, uid)
+        if len(jobs) == 1:
+            uid = state.new_user()
+            try:
+                await send_new_request(state, uid, _tokenize_msg(uid, prompts[0], 0))
+            except GenerationError as exc:
+                return create_error_response(str(exc), code=exc.code)
+            chunks = stream_completion_chunks(uid, req, state, echo_text=echo_texts[0])
+            if request is not None:
+                chunks = state.stream_with_cancellation(chunks, request, uid)
+            return StreamingResponse(chunks, media_type="text/event-stream")
+
+        stream_uids: list[int] = []
+        for _, s_idx, prompt, _ in jobs:
+            uid = state.new_user()
+            try:
+                await send_new_request(state, uid, _tokenize_msg(uid, prompt, s_idx))
+            except GenerationError as exc:
+                if stream_uids and hasattr(state, "abort_user"):
+                    await asyncio.gather(
+                        *(state.abort_user(u) for u in stream_uids),
+                        return_exceptions=True,
+                    )
+                return create_error_response(str(exc), code=exc.code)
+            stream_uids.append(uid)
+        chunks = _stream_multi_completion_chunks(stream_uids, jobs, req, state, request)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     choices: list[dict[str, Any]] = []
@@ -692,10 +899,10 @@ async def handle_completion(
     first_timings: dict[str, Any] | None = None
     # every prompt is queued before any is drained, so the scheduler can prefill them together
     uids: list[int] = []
-    for prompt in prompts:
+    for _, s_idx, prompt, _ in jobs:
         uid = state.new_user()
         try:
-            await send_new_request(state, uid, _tokenize_msg(uid, prompt))
+            await send_new_request(state, uid, _tokenize_msg(uid, prompt, s_idx))
         except GenerationError as exc:
             # nothing would drain the prompts already queued
             if uids:
@@ -719,7 +926,9 @@ async def handle_completion(
             if not t.done() and t is not asyncio.current_task():
                 t.cancel()
 
-    async def _drain_one(uid: int, index: int) -> dict[str, Any] | JSONResponse:
+    async def _drain_one(
+        uid: int, index: int, sample_idx: int, echo_prefix: str
+    ) -> dict[str, Any] | JSONResponse:
         nonlocal prompt_tokens, completion_tokens, cached_tokens, first_timings
         text = ""
         entries: list[dict] = []
@@ -731,12 +940,14 @@ async def handle_completion(
                 return create_error_response(
                     ack.error, code=getattr(ack, "error_code", None)
                 )
-            prompt_tokens += ack.prompt_tokens_delta
+            if sample_idx == 0:
+                prompt_tokens += ack.prompt_tokens_delta
+                cached_tokens += ack.cached_tokens
             completion_tokens += ack.completion_tokens_delta
-            cached_tokens += ack.cached_tokens
-            if req.logprobs is not None and ack.logprobs is not None:
-                entries.append(ack.logprobs)
-                offsets.append(ack.text_offset)
+            if req.logprobs is not None:
+                for lp_entry, lp_off in reply_logprob_pairs(ack):
+                    entries.append(lp_entry)
+                    offsets.append(lp_off)
             text += ack.incremental_output
             if ack.finished:
                 if index == 0:
@@ -745,7 +956,7 @@ async def handle_completion(
                 break
         return {
             "index": index,
-            "text": echo_texts[index] + text,
+            "text": echo_prefix + text,
             "finish_reason": finish_reason,
             "logprobs": (
                 completions_logprobs(
@@ -758,7 +969,8 @@ async def handle_completion(
 
     async def _gather_drains():
         drain_tasks.extend(
-            asyncio.create_task(_drain_one(u, i)) for i, u in enumerate(uids)
+            asyncio.create_task(_drain_one(u, choice_idx, s_idx, echo_prefix))
+            for u, (choice_idx, s_idx, _, echo_prefix) in zip(uids, jobs, strict=True)
         )
         results = await asyncio.gather(*drain_tasks, return_exceptions=True)
         for res in results:
@@ -798,7 +1010,7 @@ def _completion_chunk(
 ) -> dict[str, Any]:
     return {
         "id": _response_id("cmpl", req, public_request_id(uid)),
-        "object": "text_completion.chunk",
+        "object": "text_completion",
         "created": int(time.time()),
         "model": req.model,
         "choices": choices,
@@ -806,12 +1018,28 @@ def _completion_chunk(
 
 
 async def stream_completion_chunks(
-    uid: int, req: CompletionRequest, state: Any, echo_text: str = ""
+    uid: int,
+    req: CompletionRequest,
+    state: Any,
+    echo_text: str = "",
+    *,
+    choice_index: int = 0,
+    shared_id_uid: int | None = None,
+    emit_done_sentinel: bool = True,
+    emit_usage_chunk: bool | None = None,
+    usage_out: GenUsage | None = None,
 ) -> AsyncIterator[bytes]:
-    usage = GenUsage()
+    id_uid = uid if shared_id_uid is None else shared_id_uid
+    usage = usage_out if usage_out is not None else GenUsage()
     timings: dict[str, Any] | None = None
-    include_usage = bool(req.stream_options and req.stream_options.include_usage)
-    continuous_usage = include_usage and bool(req.stream_options.continuous_usage_stats)
+    include_usage = (
+        bool(req.stream_options and req.stream_options.include_usage)
+        if emit_usage_chunk is None
+        else emit_usage_chunk
+    )
+    continuous_usage = include_usage and bool(
+        req.stream_options and req.stream_options.continuous_usage_stats
+    )
 
     def emit(chunk: dict[str, Any]) -> bytes:
         if continuous_usage:
@@ -836,11 +1064,11 @@ async def stream_completion_chunks(
         yield _sse(
             _completion_chunk(
                 req,
-                uid,
+                id_uid,
                 [
                     {
                         "text": echo_text,
-                        "index": 0,
+                        "index": choice_index,
                         "finish_reason": None,
                         "logprobs": None,
                     }
@@ -854,11 +1082,13 @@ async def stream_completion_chunks(
                     "error": {
                         "message": ack.error,
                         "type": "invalid_request_error",
+                        "param": None,
                         "code": getattr(ack, "error_code", None),
                     }
                 }
             )
-            yield b"data: [DONE]\n\n"
+            if emit_done_sentinel:
+                yield b"data: [DONE]\n\n"
             return
         usage.prompt_tokens += ack.prompt_tokens_delta
         usage.completion_tokens += ack.completion_tokens_delta
@@ -866,19 +1096,20 @@ async def stream_completion_chunks(
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
             usage.timings = timings
-        if req.logprobs is not None and ack.logprobs is not None:
-            pending.append(ack.logprobs)
-            pending_offsets.append(ack.text_offset)
+        if req.logprobs is not None:
+            for lp_entry, lp_off in reply_logprob_pairs(ack):
+                pending.append(lp_entry)
+                pending_offsets.append(lp_off)
         if ack.incremental_output:
             sent_len += len(ack.incremental_output)
             yield emit(
                 _completion_chunk(
                     req,
-                    uid,
+                    id_uid,
                     [
                         {
                             "text": ack.incremental_output,
-                            "index": 0,
+                            "index": choice_index,
                             "finish_reason": None,
                             # Mid-stream, a stamp past sent_len is held-back text still to come.
                             "logprobs": (
@@ -904,11 +1135,11 @@ async def stream_completion_chunks(
     # ride the finish chunk, so the joined stream matches the non-stream list.
     done_chunk = _completion_chunk(
         req,
-        uid,
+        id_uid,
         [
             {
                 "text": "",
-                "index": 0,
+                "index": choice_index,
                 "finish_reason": finish_reason,
                 "logprobs": (
                     completions_logprobs(
@@ -923,20 +1154,106 @@ async def stream_completion_chunks(
             }
         ],
     )
-    if not include_usage and (t := timings_block(state, timings)) is not None:
+    if (
+        emit_done_sentinel
+        and not include_usage
+        and (t := timings_block(state, timings)) is not None
+    ):
         # as on the chat stream: the finish chunk is the last one only when no usage
         # chunk follows
         done_chunk["timings"] = t
     yield emit(done_chunk)
-    if include_usage:
+    if include_usage and emit_done_sentinel:
         final: dict[str, Any] = {
-            **_completion_chunk(req, uid, []),
+            **_completion_chunk(req, id_uid, []),
             "usage": _reported_usage(state, usage),
         }
         if (t := timings_block(state, timings)) is not None:
             final["timings"] = t
         yield _sse(final)
-    yield b"data: [DONE]\n\n"
+    if emit_done_sentinel:
+        yield b"data: [DONE]\n\n"
+
+
+async def _stream_multi_completion_chunks(
+    uids: list[int],
+    jobs: list[tuple[int, int, str | list[int], str]],
+    req: CompletionRequest,
+    state: Any,
+    request: Request | None,
+) -> AsyncIterator[bytes]:
+    """Merge multi-prompt or ``n > 1`` completion streams onto one SSE stream."""
+    usages = [GenUsage() for _ in uids]
+    queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue()
+
+    async def _pump(idx: int) -> None:
+        choice_idx, _, _, echo_prefix = jobs[idx]
+        try:
+            async for chunk in stream_completion_chunks(
+                uids[idx],
+                req,
+                state,
+                echo_text=echo_prefix,
+                choice_index=choice_idx,
+                shared_id_uid=uids[0],
+                emit_done_sentinel=False,
+                emit_usage_chunk=False,
+                usage_out=usages[idx],
+            ):
+                await queue.put(chunk)
+        except BaseException as exc:  # noqa: BLE001
+            await queue.put(exc)
+        finally:
+            await queue.put(None)
+
+    tasks = [asyncio.create_task(_pump(i)) for i in range(len(uids))]
+    finished = 0
+    try:
+        while finished < len(uids):
+            if request is not None and await request.is_disconnected():
+                break
+            item = await queue.get()
+            if item is None:
+                finished += 1
+            elif isinstance(item, BaseException):
+                raise item
+            else:
+                yield item
+        if finished == len(uids):
+            if req.stream_options and req.stream_options.include_usage:
+                prompt_tot = sum(
+                    u.prompt_tokens
+                    for u, (_, s_idx, _, _) in zip(usages, jobs, strict=True)
+                    if s_idx == 0
+                )
+                cached_tot = sum(
+                    u.cached_tokens
+                    for u, (_, s_idx, _, _) in zip(usages, jobs, strict=True)
+                    if s_idx == 0
+                )
+                merged = GenUsage(
+                    prompt_tokens=prompt_tot,
+                    completion_tokens=sum(u.completion_tokens for u in usages),
+                    cached_tokens=cached_tot,
+                    timings=usages[0].timings,
+                )
+                final: dict[str, Any] = {
+                    **_completion_chunk(req, uids[0], []),
+                    "usage": _reported_usage(state, merged),
+                }
+                if (t := timings_block(state, usages[0].timings)) is not None:
+                    final["timings"] = t
+                yield _sse(final)
+            yield b"data: [DONE]\n\n"
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if finished < len(uids) and hasattr(state, "abort_user"):
+            await asyncio.gather(
+                *(asyncio.shield(state.abort_user(u)) for u in uids),
+                return_exceptions=True,
+            )
 
 
 _FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
@@ -1010,6 +1327,19 @@ async def handle_tokenize(req: TokenizeRequest, state: Any):
     generation would tokenize)."""
     if (req.prompt is None) == (req.messages is None):
         return create_error_response("pass exactly one of prompt or messages")
+    if req.continue_final_message and not req.messages:
+        return create_error_response(
+            "continue_final_message requires messages", param="continue_final_message"
+        )
+    if (
+        req.continue_final_message
+        and req.messages
+        and req.messages[-1].role != "assistant"
+    ):
+        return create_error_response(
+            "continue_final_message needs a final assistant message",
+            param="continue_final_message",
+        )
     build = getattr(state, "frontend_tokenizer", None)
     if build is None:
         return create_error_response(
@@ -1028,15 +1358,49 @@ async def handle_tokenize(req: TokenizeRequest, state: Any):
                 [m.model_dump(exclude_none=True) for m in req.messages]
             )
             ctk = dict(req.chat_template_kwargs)
-            if not req.add_generation_prompt:
+            if req.continue_final_message:
                 ctk["continue_final_message"] = True
-            msg = TokenizeMsg(
-                uid=-1,
-                text=messages,
-                sampling_params=SamplingParams(),
-                chat_template_kwargs=ctk,
+            tool_dicts = (
+                [t.model_dump(exclude_none=True) for t in req.tools]
+                if req.tools
+                else None
             )
-            text = await asyncio.to_thread(manager.render_prompt, msg)
+            if not req.add_generation_prompt and not req.continue_final_message:
+                # Render directly with add_generation_prompt=False when the caller asked
+                # not to append a generation prompt without continuing an assistant message.
+                apply_fn = getattr(manager.tokenizer, "apply_chat_template", None)
+                if (
+                    callable(apply_fn)
+                    and getattr(manager, "_dsv4_encoder", None) is None
+                ):
+                    tpl_kwargs = dict(ctk)
+                    if tool_dicts is not None:
+                        tpl_kwargs["tools"] = tool_dicts
+                    text = await asyncio.to_thread(
+                        apply_fn,
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        **tpl_kwargs,
+                    )
+                else:
+                    msg = TokenizeMsg(
+                        uid=-1,
+                        text=messages,
+                        sampling_params=SamplingParams(),
+                        chat_template_kwargs={**ctk, "continue_final_message": True},
+                        tools=tool_dicts,
+                    )
+                    text = await asyncio.to_thread(manager.render_prompt, msg)
+            else:
+                msg = TokenizeMsg(
+                    uid=-1,
+                    text=messages,
+                    sampling_params=SamplingParams(),
+                    chat_template_kwargs=ctk,
+                    tools=tool_dicts,
+                )
+                text = await asyncio.to_thread(manager.render_prompt, msg)
             ids = await asyncio.to_thread(
                 manager.tokenizer.encode, text, add_special_tokens=False
             )
@@ -1058,6 +1422,8 @@ async def handle_detokenize(req: DetokenizeRequest, state: Any):
         return create_error_response(
             "no tokenizer on this server", status_code=503, err_type="api_error"
         )
+    if (bad := await _token_id_error(state, [("tokens", req.tokens)])) is not None:
+        return bad
     manager = await asyncio.to_thread(build)
     text = await asyncio.to_thread(
         manager.tokenizer.decode,
@@ -1092,6 +1458,18 @@ def _thinking_policy(state: Any) -> str | None:
     return getattr(state.config, "thinking", None)
 
 
+def _fan_out_specs(spec: GenSpec, n: int) -> list[GenSpec]:
+    if n <= 1:
+        return [spec]
+    out: list[GenSpec] = []
+    for idx in range(n):
+        sp = replace(spec.sampling_params)
+        if idx > 0 and sp.seed is not None:
+            sp.seed = sp.seed + idx
+        out.append(replace(spec, sampling_params=sp))
+    return out
+
+
 def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
@@ -1117,14 +1495,20 @@ def _resolve_sampling(
         include_stop_str_in_output=req.include_stop_str_in_output,
         skip_special_tokens=req.skip_special_tokens,
         timings_per_token=timings_per_token,
-        # completions only: on chat, extra="allow" leaves these readable but unhonoured
-        allowed_token_ids=req.allowed_token_ids
-        if isinstance(req, CompletionRequest)
-        else None,
+        allowed_token_ids=req.allowed_token_ids,
+        logprob_token_ids=req.logprob_token_ids,
+        seed=req.seed,
     )
     if isinstance(req, CompletionRequest) and req.logprobs is not None:
         sampling_params.logprobs = True
         sampling_params.top_logprobs = req.logprobs
+        if sampling_params.allowed_token_ids:
+            _check_restricted_logprobs(sampling_params)
+    elif isinstance(req, ChatCompletionRequest) and req.logprobs:
+        sampling_params.logprobs = True
+        sampling_params.top_logprobs = (
+            req.top_logprobs if req.top_logprobs is not None else 0
+        )
         if sampling_params.allowed_token_ids:
             _check_restricted_logprobs(sampling_params)
     return sampling_params
@@ -1153,20 +1537,90 @@ def _response_id(prefix: str, req: Any, fallback: Any) -> str:
     return f"{prefix}-{rid}" if rid else f"{prefix}-{fallback}"
 
 
+def _resolve_chat_tools(
+    req: ChatCompletionRequest,
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, str | None]:
+    """Validate ``tool_choice`` against ``tools`` and return ``(template_tools, parser_tools, tool_choice_mode)``."""
+    tc = req.tool_choice
+    all_tools = _all_tool_dicts(req.tools)
+    tool_names = {(t.get("function") or {}).get("name") for t in all_tools}
+    if tc is None or tc == "auto":
+        if not all_tools:
+            return None, None, None
+        return all_tools, all_tools, None
+    if tc == "none":
+        return None, None, None
+    if tc == "required":
+        if not all_tools:
+            raise ValueError("tool_choice='required' requires non-empty tools")
+        return all_tools, all_tools, "required"
+    if isinstance(tc, ToolChoiceObject):
+        selected = tc.function.name
+        if not all_tools or selected not in tool_names:
+            raise ValueError(
+                f"tool_choice function {selected!r} was not found in tools"
+            )
+        filtered = [
+            t for t in all_tools if (t.get("function") or {}).get("name") == selected
+        ]
+        return filtered, all_tools, f"named:{selected}"
+    if isinstance(tc, dict):
+        tc_type = tc.get("type")
+        if tc_type == "function":
+            fn = tc.get("function")
+            selected = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+            if not selected or not all_tools or selected not in tool_names:
+                raise ValueError(
+                    f"tool_choice function {selected!r} was not found in tools"
+                )
+            filtered = [
+                t
+                for t in all_tools
+                if (t.get("function") or {}).get("name") == selected
+            ]
+            return filtered, all_tools, f"named:{selected}"
+        if tc_type == "allowed_tools":
+            spec_obj = tc.get("allowed_tools")
+            inner = spec_obj if isinstance(spec_obj, dict) else tc
+            mode = inner.get("mode", "auto")
+            if mode not in ("auto", "required", "none"):
+                raise ValueError(
+                    f"allowed_tools.mode must be 'auto', 'required', or 'none', got {mode!r}"
+                )
+            if mode == "none":
+                return None, None, None
+            refs = inner.get("tools") or []
+            allowed_names: set[str] = set()
+            for r in refs:
+                if isinstance(r, dict):
+                    rname = (r.get("function") or {}).get("name") or r.get("name")
+                    if rname:
+                        allowed_names.add(rname)
+            if not allowed_names:
+                raise ValueError("allowed_tools requires at least one tool")
+            missing = sorted(allowed_names - tool_names)
+            if missing:
+                raise ValueError(
+                    f"allowed_tools references unknown tool(s): {', '.join(missing)}"
+                )
+            subset = [
+                t
+                for t in all_tools
+                if (t.get("function") or {}).get("name") in allowed_names
+            ]
+            if mode == "required" and len(subset) == 1:
+                only = (subset[0].get("function") or {}).get("name")
+                return subset, all_tools, f"named:{only}"
+            return subset, all_tools, ("required" if mode == "required" else None)
+    raise ValueError(f"Unsupported tool_choice: {tc!r}")
+
+
 def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:
-    if not _should_parse_tools(req):
-        return None
-
-    tools = req.tools or []
-    if isinstance(req.tool_choice, ToolChoiceObject):
-        selected = req.tool_choice.function.name
-        tools = [tool for tool in tools if tool.function.name == selected]
-
-    return [tool.model_dump(exclude_none=True) for tool in tools]
+    return _resolve_chat_tools(req)[0]
 
 
 def _should_parse_tools(req: ChatCompletionRequest) -> bool:
-    return bool(req.tools) and req.tool_choice != "none"
+    return _resolve_chat_tools(req)[1] is not None
 
 
 def _tool_calls_to_openai(calls: list[ToolCallItem]) -> list[dict[str, Any]]:
@@ -1175,7 +1629,6 @@ def _tool_calls_to_openai(calls: list[ToolCallItem]) -> list[dict[str, Any]]:
         result.append(
             {
                 "id": _tool_call_id(call.name, index),
-                "index": index,
                 "type": "function",
                 "function": {
                     "name": call.name,
@@ -1266,23 +1719,32 @@ def _usage(
     return usage
 
 
-def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # No constrained decoding, but clients that ask for JSON in the prompt still need the
-    # wire field accepted instead of a hard 400. Unknown types stay refused.
+def _response_format_error(response_format: dict[str, Any] | None) -> str | None:
     if response_format is None:
-        return False
-    return response_format.get("type") not in (
-        None,
-        "text",
-        "json_object",
-        "json_schema",
-    )
+        return None
+    rtype = response_format.get("type")
+    if rtype not in (None, "text", "json_object", "json_schema"):
+        return (
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)"
+        )
+    if rtype == "json_schema":
+        js = response_format.get("json_schema")
+        schema = (
+            js.get("schema") if isinstance(js, dict) else response_format.get("schema")
+        )
+        if not isinstance(schema, dict):
+            return "response_format with type 'json_schema' requires a json_schema.schema object"
+    return None
 
 
-# vLLM /v1/completions fields that change the result and are not implemented here: a set
-# value is a 400 rather than silently dropped by extra="allow".
+def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
+    return _response_format_error(response_format) is not None
+
+
+# vLLM /v1/completions and /v1/chat/completions fields that change the result and are not
+# implemented here: a set value is a 400 rather than silently dropped by extra="allow".
 _UNIMPLEMENTED_COMPLETION_FIELDS = (
-    "logprob_token_ids",
     "prompt_logprobs",
     "guided_json",
     "guided_regex",
@@ -1291,6 +1753,7 @@ _UNIMPLEMENTED_COMPLETION_FIELDS = (
     "structured_outputs",
     "bad_words",
 )
+_UNIMPLEMENTED_CHAT_FIELDS = _UNIMPLEMENTED_COMPLETION_FIELDS
 
 
 def _is_set(value: Any) -> bool:
@@ -1330,13 +1793,8 @@ def _completion_unsupported_reason(
     logprobs_error = completion_logprobs_error(req)
     if logprobs_error is not None:
         return logprobs_error, "logprobs"
-    if _response_format_unsupported(req.response_format):
-        rtype = (req.response_format or {}).get("type")
-        return (
-            f"response_format.type {rtype!r} is not supported "
-            "(supported: text, json_object, json_schema)",
-            "response_format",
-        )
+    if (rf_err := _response_format_error(req.response_format)) is not None:
+        return rf_err, "response_format"
     return None
 
 
@@ -1411,6 +1869,11 @@ def _model_context_length(state: Any) -> int | None:
 
         num_pages, page_size = kv_pool_geometry(state)
         kv_tokens = num_pages * page_size
+        spec_headroom = max(
+            0, int(getattr(state.config, "decode_rows_per_req", 1) or 1) - 1
+        )
+        if kv_tokens > spec_headroom:
+            kv_tokens -= spec_headroom
     except Exception:  # noqa: BLE001
         kv_tokens = 0
     # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.

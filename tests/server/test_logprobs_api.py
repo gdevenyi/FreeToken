@@ -126,7 +126,7 @@ CHAT_EXTRAS = {
     "top_logprobs": 2,
     "allowed_token_ids": [32, 33],
     "return_tokens_as_token_ids": True,
-    "prompt_logprobs": 1,
+    "temperature": 0.0,
 }
 WEATHER_TOOL = {
     "type": "function",
@@ -136,16 +136,18 @@ WEATHER_TOOL = {
 
 @pytest.mark.parametrize("tools", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
-def test_chat_ignores_logprobs_and_vllm_extras(stream, tools) -> None:
-    # Production runs both parsers; #224 refuses chat logprobs under them, 2bfdae17 refuses
-    # the extras. Chat clients must keep getting a 200 with no logprobs, and the engine no request for them.
+def test_chat_supports_logprobs_and_vllm_extras(stream, tools) -> None:
+    first = entry(32, "Hi", -0.1)
     state = FakeState(
-        [reply(""), reply("Hi", finished=True)],
+        [reply(""), reply("Hi", finished=True, logprobs=first)],
         reasoning_parser="qwen3",
         tool_call_parser="qwen3_coder",
     )
     req = chat_request(
-        stream=stream, tools=[WEATHER_TOOL] if tools else None, **CHAT_EXTRAS
+        stream=stream,
+        tools=[WEATHER_TOOL] if tools else None,
+        chat_template_kwargs={"enable_thinking": False},
+        **CHAT_EXTRAS,
     )
     resp = run(handle_chat_completion(req, None, state, {}))
 
@@ -154,15 +156,27 @@ def test_chat_ignores_logprobs_and_vllm_extras(stream, tools) -> None:
         events = parse_sse(run(_collect(resp.body_iterator)))
         chunks = [e for e in events if isinstance(e, dict)]
         assert chunks and not any("error" in e for e in chunks)
-        choices = [c for e in chunks for c in e["choices"]]
+        lp_items = [
+            item
+            for e in chunks
+            for c in e["choices"]
+            if c.get("logprobs") and c["logprobs"].get("content")
+            for item in c["logprobs"]["content"]
+        ]
     else:
-        choices = resp["choices"]
-    assert choices and not any("logprobs" in c for c in choices)
+        lp_items = resp["choices"][0]["logprobs"]["content"]
+    assert len(lp_items) == 1
+    assert lp_items[0]["token"] == "token_id:32"
+    assert lp_items[0]["logprob"] == -0.1
     sp = state.sent.sampling_params
-    assert (
-        getattr(sp, "logprobs", False) is False and getattr(sp, "top_logprobs", 0) == 0
-    )
-    assert getattr(sp, "allowed_token_ids", None) is None
+    assert sp.logprobs is True and sp.top_logprobs == 2
+    assert sp.allowed_token_ids == [32, 33]
+
+
+def test_chat_rejects_prompt_logprobs() -> None:
+    state = FakeState([reply("Hi", finished=True)])
+    resp = run(handle_chat_completion(chat_request(prompt_logprobs=1), None, state, {}))
+    assert getattr(resp, "status_code", 200) == 400
 
 
 def _status(resp) -> int:
@@ -433,7 +447,6 @@ def _one_token_state() -> FakeState:
 # Result-changing vLLM fields this server does not implement: a set value must be a 400,
 # never a 200 computed as if the field were absent.
 UNIMPLEMENTED_COMPLETION_FIELDS = [
-    ("logprob_token_ids", [32]),
     ("prompt_logprobs", 0),
     ("guided_json", {"type": "object"}),
     ("guided_regex", "[AB]"),
@@ -788,32 +801,17 @@ def test_completion_aborts_the_queued_prompts_when_a_later_one_cannot_be_sent() 
 @pytest.mark.parametrize(
     ("spec_algo", "extra", "status"),
     [
-        ("mtp", {"logprobs": 2, "max_tokens": 8}, 400),
-        (
-            "mtp",
-            {"logprobs": 2, "max_tokens": None},
-            400,
-        ),  # the default budget is not one token
-        (
-            "mtp",
-            {"logprobs": 2, "max_tokens": 1},
-            200,
-        ),  # a read: its logprobs come from the prefill sample
+        ("mtp", {"logprobs": 2, "max_tokens": 8}, 200),
+        ("mtp", {"logprobs": 2, "max_tokens": None}, 200),
+        ("mtp", {"logprobs": 2, "max_tokens": 1}, 200),
         ("mtp", {"max_tokens": 8}, 200),
         (None, {"logprobs": 2, "max_tokens": 8}, 200),
     ],
 )
-def test_completion_logprobs_past_one_token_need_a_runtime_without_spec(
+def test_completion_logprobs_supported_under_speculative_decoding(
     spec_algo, extra, status
 ) -> None:
-    # verify_step samples MTP decode tokens with no logprobs, so a reply would silently
-    # carry fewer entries than tokens
     state = _one_token_state()
     state.config.speculative_algorithm = spec_algo
     resp = run(handle_completion(_completion(**extra), None, state, {}))
     assert _status(resp) == status
-    if status == 400:
-        assert (
-            state.sent is None
-            and "max_tokens" in json.loads(resp.body)["error"]["message"]
-        )

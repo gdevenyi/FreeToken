@@ -58,6 +58,19 @@ def register_control_routes(
     async def health():
         return build_health(get_state(), app.version)
 
+    @app.get("/v1/health")
+    async def v1_health():
+        from fastapi.responses import JSONResponse
+
+        state = get_state()
+        doc = build_health(state, app.version)
+        code = (
+            200
+            if doc.get("status") == "ok" and doc.get("maintenance") == "serving"
+            else 503
+        )
+        return JSONResponse(doc, status_code=code)
+
     from . import request_ring
 
     @app.get("/v1/requests")
@@ -76,9 +89,13 @@ def register_control_routes(
         from .stats import prometheus_text
 
         doc = build_stats(
-            get_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+            get_state(),
+            request_ring.requests_p95_ms(),
+            request_ring.requests_ttft_mean_ms(),
         )
-        return PlainTextResponse(prometheus_text(doc), media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(
+            prometheus_text(doc), media_type="text/plain; version=0.0.4"
+        )
 
     @app.get("/version")
     async def version():
@@ -89,7 +106,9 @@ def register_control_routes(
     @app.get("/v1/stats")
     async def stats():
         doc = build_stats(
-            get_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+            get_state(),
+            request_ring.requests_p95_ms(),
+            request_ring.requests_ttft_mean_ms(),
         )
         # Surface the model's recommended sampling (from its generation_config.json / GGUF
         # metadata) so clients can seed their sampling controls per-model instead of guessing.

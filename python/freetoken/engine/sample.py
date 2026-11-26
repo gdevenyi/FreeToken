@@ -71,6 +71,57 @@ class BatchSamplingArgs:
     # Logprob rows restricted to their allowed_token_ids, indexing the logprob rows above.
     restrict_rows: torch.Tensor | None = None  # [q] int64
     restrict_ids: torch.Tensor | None = None  # [q, A] int64, padded with vocab_size
+    # Logprob rows with an explicit candidate set (allowed_token_ids or logprob_token_ids),
+    # indexing the logprob rows above so candidates are gathered directly without full-vocab topk.
+    explicit_rows: torch.Tensor | None = None  # [e] int64
+    explicit_ids: torch.Tensor | None = None  # [e, M] int64, padded with vocab_size
+    explicit_include_sampled: torch.Tensor | None = None  # [e] bool
+    need_full_topk: bool = False
+    # Non-greedy rows with a deterministic seed: (batch_row, seed, gen_len, temp, top_k, top_p).
+    seeded_rows: list[tuple[int, int, int, float, int, float]] = field(
+        default_factory=list
+    )
+
+
+def mix_step_seed(seed: int, step: int) -> int:
+    """SplitMix64 mix of ``(seed, step)`` into a non-negative 63-bit torch.Generator seed."""
+    x = (
+        (int(seed) & 0xFFFFFFFFFFFFFFFF) + (int(step) * 0x9E3779B97F4A7C15)
+    ) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return (x ^ (x >> 31)) & 0x7FFFFFFFFFFFFFFF
+
+
+def sample_seeded_row(
+    row_logits: torch.Tensor,
+    *,
+    seed: int,
+    step: int,
+    temp: float,
+    top_k: int,
+    top_p: float,
+) -> torch.Tensor:
+    """Batch-invariant Gumbel-max sample for one 1D logits row using its per-step seed."""
+    vocab_size = row_logits.shape[-1]
+    scaled = row_logits.float() / max(temp, 1e-6)
+    if 0 < top_k < vocab_size:
+        vals, idx = torch.topk(scaled, k=top_k, dim=-1)
+        masked = torch.full_like(scaled, float("-inf"))
+        masked.scatter_(-1, idx, vals)
+        scaled = masked
+    probs = torch.softmax(scaled, dim=-1)
+    if top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+        cum = torch.cumsum(sorted_probs, dim=-1)
+        drop = (cum - sorted_probs) >= top_p
+        drop[..., 0] = False
+        sorted_probs = sorted_probs.masked_fill(drop, 0.0)
+        probs = torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
+    gen = torch.Generator(device=row_logits.device)
+    gen.manual_seed(mix_step_seed(seed, step))
+    noise = torch.empty_like(probs).exponential_(1.0, generator=gen).clamp_min_(1e-30)
+    return torch.argmax(probs / noise, dim=-1)
 
 
 def make_device_tensor(
@@ -202,8 +253,12 @@ def _verify_plan(plan: LogitsPlan, width: int) -> LogitsPlan:
     return out
 
 
-def sampling_module():
-    """flashinfer.sampling when installed, else triton on sm_70+ or torch below."""
+def sampling_module(device: torch.device | None = None):
+    """flashinfer.sampling when installed, else triton on sm_70+ CUDA or torch on CPU/older GPUs."""
+    if device is not None and device.type != "cuda":
+        from freetoken.kernel import torch_sampling as sampling
+
+        return sampling
     import freetoken.utils.arch as arch
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -222,7 +277,7 @@ def sample_impl(
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
 ) -> torch.Tensor:
-    sampling = sampling_module()
+    sampling = sampling_module(logits.device)
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     if top_k is None and top_p is None:
         return sampling.sampling_from_probs(probs)
@@ -314,6 +369,16 @@ class Sampler:
         # an empty list after the filter leaves the row unmasked rather than all -inf
         return [t for t in p.allowed_token_ids or () if 0 <= t < self.vocab_size]
 
+    def _logprob_targets(self, p) -> list[int]:
+        seen: set[int] = set()
+        out: list[int] = []
+        for t in p.logprob_token_ids or ():
+            ti = int(t)
+            if 0 <= ti < self.vocab_size and ti not in seen:
+                seen.add(ti)
+                out.append(ti)
+        return out
+
     def _prompt_mask(self, req) -> torch.Tensor:
         """[V] bool marking the request's prompt ids, uploaded once per request."""
         prompt_len = req.max_device_len - req.output_len
@@ -369,17 +434,8 @@ class Sampler:
             if any(want_logprobs) and not logprob_all_rows
             else None
         )
-        max_top_logprobs = min(
-            max(
-                (p.top_logprobs for p, want in zip(params, want_logprobs) if want),
-                default=0,
-            ),
-            self.vocab_size,
-        )
-        restrict = [
-            (i, self._allowed(p))
-            for i, p in enumerate(p for p, want in zip(params, want_logprobs) if want)
-        ]
+        logprob_params = [p for p, want in zip(params, want_logprobs) if want]
+        restrict = [(i, self._allowed(p)) for i, p in enumerate(logprob_params)]
         restrict = [(i, ids) for i, ids in restrict if ids]
         restrict_rows = restrict_ids = None
         if restrict:
@@ -389,6 +445,43 @@ class Sampler:
             restrict_ids = _padded_rows(
                 [ids for _, ids in restrict], self.vocab_size, self.device
             )
+
+        explicit_entries: list[tuple[int, list[int], bool]] = []
+        row_widths: list[int] = []
+        need_full_topk = False
+        for i, p in enumerate(logprob_params):
+            targets = self._logprob_targets(p)
+            allowed = self._allowed(p)
+            if targets:
+                if allowed:
+                    allowed_set = set(allowed)
+                    targets = [t for t in targets if t in allowed_set]
+                # reserve one extra pad slot so compute_logprobs can append sampled_token if needed
+                explicit_entries.append((i, targets + [self.vocab_size], True))
+                row_widths.append(len(targets) + 1)
+            elif allowed:
+                k_req = min(p.top_logprobs, len(allowed))
+                if k_req > 0:
+                    explicit_entries.append((i, allowed, False))
+                row_widths.append(k_req)
+            else:
+                k_req = min(p.top_logprobs, self.vocab_size)
+                if k_req > 0:
+                    need_full_topk = True
+                row_widths.append(k_req)
+        max_top_logprobs = max(row_widths, default=0)
+        explicit_rows = explicit_ids = explicit_include_sampled = None
+        if explicit_entries and max_top_logprobs > 0:
+            explicit_rows = make_device_tensor(
+                [i for i, _, _ in explicit_entries], torch.int64, self.device
+            )
+            explicit_ids = _padded_rows(
+                [ids for _, ids, _ in explicit_entries], self.vocab_size, self.device
+            )
+            if any(inc for _, _, inc in explicit_entries):
+                explicit_include_sampled = make_device_tensor(
+                    [inc for _, _, inc in explicit_entries], torch.bool, self.device
+                )
         if all(is_greedy):
             return BatchSamplingArgs(
                 temperatures=None,
@@ -400,6 +493,10 @@ class Sampler:
                 max_top_logprobs=max_top_logprobs,
                 restrict_rows=restrict_rows,
                 restrict_ids=restrict_ids,
+                explicit_rows=explicit_rows,
+                explicit_ids=explicit_ids,
+                explicit_include_sampled=explicit_include_sampled,
+                need_full_topk=need_full_topk,
             )
 
         MIN_P = MIN_T = 1e-6
@@ -416,6 +513,15 @@ class Sampler:
             1.0 if g else min(max(p.top_p, MIN_P), 1.0)
             for p, g in zip(params, is_greedy)
         ]
+        seeded_rows: list[tuple[int, int, int, float, int, float]] = []
+        for row, (req, p, g) in enumerate(zip(batch.reqs, params, is_greedy)):
+            if g or p.seed is None or not getattr(req, "can_decode", True):
+                continue
+            prompt_len = req.max_device_len - req.output_len
+            gen_len = max(0, req.device_len - prompt_len)
+            seeded_rows.append(
+                (row, int(p.seed), gen_len, ts[row], top_ks[row], top_ps[row])
+            )
         temperatures = make_device_tensor(ts, torch.float32, self.device)
         top_k, top_p = None, None
         if any(k != self.vocab_size for k in top_ks):
@@ -440,6 +546,11 @@ class Sampler:
             max_top_logprobs=max_top_logprobs,
             restrict_rows=restrict_rows,
             restrict_ids=restrict_ids,
+            explicit_rows=explicit_rows,
+            explicit_ids=explicit_ids,
+            explicit_include_sampled=explicit_include_sampled,
+            need_full_topk=need_full_topk,
+            seeded_rows=seeded_rows,
         )
 
     @nvtx_annotate("Sampler")
@@ -466,6 +577,15 @@ class Sampler:
                 # greedy rows must follow argmax's deterministic tie-breaking.
                 greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
                 tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+            for row, seed, gen_len, temp, tk, tp in args.seeded_rows:
+                tokens[row] = sample_seeded_row(
+                    logits[row],
+                    seed=seed,
+                    step=gen_len,
+                    temp=temp,
+                    top_k=tk,
+                    top_p=tp,
+                ).to(tokens.dtype)
         if record_counts:
             self.record_tokens(tokens, args)
         return tokens
@@ -520,21 +640,83 @@ class Sampler:
             chosen_logprobs.index_copy_(0, rows, request_chosen_logprobs)
 
         if args.max_top_logprobs > 0:
-            request_top_logprobs, request_top_ids = torch.topk(
-                request_logprobs, k=args.max_top_logprobs, dim=-1
+            n_req = request_logprobs.shape[0]
+            k_out = args.max_top_logprobs
+            request_top_ids = torch.full(
+                (n_req, k_out), -1, dtype=torch.int64, device=logits.device
             )
+            request_top_logprobs = torch.full(
+                (n_req, k_out), float("-inf"), dtype=torch.float32, device=logits.device
+            )
+            if args.need_full_topk or args.explicit_rows is None:
+                k_vocab = min(k_out, self.vocab_size)
+                tk_lps, tk_ids = torch.topk(request_logprobs, k=k_vocab, dim=-1)
+                request_top_ids[:, :k_vocab] = tk_ids
+                request_top_logprobs[:, :k_vocab] = tk_lps
+            if args.explicit_rows is not None and args.explicit_ids is not None:
+                cand_ids = args.explicit_ids.clone()
+                if args.explicit_include_sampled is not None:
+                    samp = request_tokens[args.explicit_rows].unsqueeze(1)
+                    already = (cand_ids == samp).any(dim=1)
+                    need = args.explicit_include_sampled & (~already)
+                    cand_ids[:, -1] = torch.where(
+                        need, samp.squeeze(1), cand_ids[:, -1]
+                    )
+                scratch = torch.full(
+                    (cand_ids.shape[0], 1),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=logits.device,
+                )
+                padded_lps = torch.cat(
+                    [request_logprobs[args.explicit_rows], scratch], dim=1
+                )
+                cand_lps = padded_lps.gather(1, cand_ids)
+                valid = cand_ids < self.vocab_size
+                # Keep valid -inf candidates ahead of vocab_size padding slots.
+                sort_key = torch.where(
+                    valid,
+                    cand_lps.clamp_min(-1e38),
+                    torch.full_like(cand_lps, float("-inf")),
+                )
+                order = torch.argsort(sort_key, dim=1, descending=True)
+                sorted_ids = cand_ids.gather(1, order)
+                sorted_lps = cand_lps.gather(1, order)
+                sorted_ids = torch.where(
+                    sorted_ids < self.vocab_size,
+                    sorted_ids,
+                    torch.full_like(sorted_ids, -1),
+                )
+                take = min(k_out, sorted_ids.shape[1])
+                exp_ids = torch.full(
+                    (cand_ids.shape[0], k_out),
+                    -1,
+                    dtype=torch.int64,
+                    device=logits.device,
+                )
+                exp_lps = torch.full(
+                    (cand_ids.shape[0], k_out),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=logits.device,
+                )
+                exp_ids[:, :take] = sorted_ids[:, :take]
+                exp_lps[:, :take] = sorted_lps[:, :take]
+                request_top_ids[args.explicit_rows] = exp_ids
+                request_top_logprobs[args.explicit_rows] = exp_lps
+
             if rows is None:
                 top_ids = request_top_ids.to(torch.int32)
                 top_logprobs = request_top_logprobs
             else:
                 top_ids = torch.full(
-                    (logits.shape[0], args.max_top_logprobs),
+                    (logits.shape[0], k_out),
                     -1,
                     dtype=torch.int32,
                     device=logits.device,
                 )
                 top_logprobs = torch.full(
-                    (logits.shape[0], args.max_top_logprobs),
+                    (logits.shape[0], k_out),
                     float("-inf"),
                     dtype=torch.float32,
                     device=logits.device,
@@ -553,6 +735,50 @@ class Sampler:
             chosen_logprobs.to("cpu", non_blocking=True),
             top_ids.to("cpu", non_blocking=True),
             top_logprobs.to("cpu", non_blocking=True),
+        )
+
+    def compute_verify_logprobs(
+        self,
+        logits: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        args: BatchSamplingArgs,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Per-row logprobs across a speculative verify batch of ``width`` rows per request,
+        returning ``(chosen [bs, width], top_ids [bs, width, K], top_logprobs [bs, width, K])`` on CPU."""
+        if not args.logprob_all_rows and (
+            args.logprob_row_idx is None or args.logprob_row_idx.numel() == 0
+        ):
+            return None
+        offsets = torch.arange(width, device=logits.device)
+
+        def expand_rows(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else (t.unsqueeze(1) * width + offsets).flatten()
+
+        def repeat_rows(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else t.repeat_interleave(width, dim=0)
+
+        verify_args = BatchSamplingArgs(
+            temperatures=None,
+            logprob_row_idx=expand_rows(args.logprob_row_idx),
+            logprob_all_rows=args.logprob_all_rows,
+            max_top_logprobs=args.max_top_logprobs,
+            restrict_rows=expand_rows(args.restrict_rows),
+            restrict_ids=repeat_rows(args.restrict_ids),
+            explicit_rows=expand_rows(args.explicit_rows),
+            explicit_ids=repeat_rows(args.explicit_ids),
+            explicit_include_sampled=repeat_rows(args.explicit_include_sampled),
+            need_full_topk=args.need_full_topk,
+        )
+        res = self.compute_logprobs(logits, sampled_tokens.reshape(-1), verify_args)
+        if res is None:
+            return None
+        bs = logits.shape[0] // width
+        chosen_cpu, top_ids_cpu, top_lps_cpu = res
+        return (
+            chosen_cpu.view(bs, width),
+            top_ids_cpu.view(bs, width, -1),
+            top_lps_cpu.view(bs, width, -1),
         )
 
     def sample_verify(
@@ -582,6 +808,17 @@ class Sampler:
         if args.greedy_mask is not None:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
+        for row, seed, gen_len, temp, tk, tp in args.seeded_rows:
+            base = row * width
+            for j in range(width):
+                tokens[base + j] = sample_seeded_row(
+                    logits[base + j],
+                    seed=seed,
+                    step=gen_len + j,
+                    temp=temp,
+                    top_k=tk,
+                    top_p=tp,
+                ).to(tokens.dtype)
         return tokens
 
     def probs(
@@ -590,7 +827,7 @@ class Sampler:
         """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
         if args.temperatures is None:
             return None
-        sampling = sampling_module()
+        sampling = sampling_module(logits.device)
         width = drafts.shape[1] + 1
         if args.penalties:
             logits = self._penalize_rows(logits, args, drafts)

@@ -189,11 +189,24 @@ class SpecRunner:
         # through a pageable temporary and block the host
         host = self._host.view(-1)[: bs * (width + 1)].view(bs, width + 1)
         host.copy_(packed, non_blocking=True)
+        logprobs = engine.sampler.compute_verify_logprobs(
+            logits, out, sample_args, width
+        )
         copy_done = torch.cuda.Event()
         copy_done.record(engine.stream)
         # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
         self.proposer.post_verify(batch, out, emitted)
-        return SpecForwardOutput(out, host[:, :width], copy_done, host[:, width])
+        if logprobs is None:
+            return SpecForwardOutput(out, host[:, :width], copy_done, host[:, width])
+        return SpecForwardOutput(
+            out,
+            host[:, :width],
+            copy_done,
+            host[:, width],
+            logprobs[0],
+            logprobs[1],
+            logprobs[2],
+        )
 
     def release(self, req: Req) -> None:
         self.proposer.release(req)

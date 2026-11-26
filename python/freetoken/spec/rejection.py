@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 
 def reject(
-    logits: torch.Tensor,   # [bs*(k+1), V], k+1 rows per request
-    drafts: torch.Tensor,   # [bs, k] int64
+    logits: torch.Tensor,  # [bs*(k+1), V], k+1 rows per request
+    drafts: torch.Tensor,  # [bs, k] int64
     args: BatchSamplingArgs,
     sampler: Sampler,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -29,10 +29,10 @@ def reject(
 
 
 def reject_with_draft_probs(
-    logits: torch.Tensor,   # [bs*(k+1), V]
-    drafts: torch.Tensor,   # [bs, k] int64, slot j drawn from q[:, j]
+    logits: torch.Tensor,  # [bs*(k+1), V]
+    drafts: torch.Tensor,  # [bs, k] int64, slot j drawn from q[:, j]
     support: torch.Tensor,  # [bs, k, K] the token ids where q can be nonzero
-    q: torch.Tensor,        # [bs, k, K] q over support
+    q: torch.Tensor,  # [bs, k, K] q over support
     args: BatchSamplingArgs,
     sampler: Sampler,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -45,7 +45,9 @@ def reject_with_draft_probs(
     bs, k = drafts.shape
     p = p.view(bs, k + 1, -1)
     # a NaN or a wrong total in q would reach the target's output through the residual
-    ok = torch.isfinite(q).flatten(1).all(dim=1) & ((q.sum(dim=-1) - 1.0).abs() < 1e-3).all(dim=1)
+    ok = torch.isfinite(q).flatten(1).all(dim=1) & (
+        (q.sum(dim=-1) - 1.0).abs() < 1e-3
+    ).all(dim=1)
     if args.greedy_mask is not None:
         ok &= ~args.greedy_mask
     q = torch.where(ok.view(-1, 1, 1), q, torch.zeros_like(q))
@@ -53,7 +55,18 @@ def reject_with_draft_probs(
     p_d = p[:, :k].gather(2, d).squeeze(-1)
     # a row without a usable q verifies with q one-hot at its draft, which is ``reject``: accept with p(d), else sample p without d; a greedy row's p is one-hot at its argmax
     q_d = torch.where(ok.view(-1, 1), (q * (support == d)).sum(dim=-1), 1.0)
-    accept = torch.rand_like(p_d) * q_d < p_d
+    rand_u = torch.rand_like(p_d)
+    if args.seeded_rows:
+        from freetoken.engine.sample import mix_step_seed
+
+        for row, seed, gen_len, _, _, _ in args.seeded_rows:
+            for j in range(k):
+                gen = torch.Generator(device=p_d.device)
+                gen.manual_seed(mix_step_seed(seed, gen_len + j))
+                rand_u[row, j] = torch.rand(
+                    (), dtype=p_d.dtype, device=p_d.device, generator=gen
+                )
+    accept = rand_u * q_d < p_d
     emitted = accept.to(torch.int64).cumprod(dim=1).sum(dim=1)
     rows = torch.arange(bs, device=p.device)
     slot = emitted.clamp(max=k - 1)
@@ -61,11 +74,26 @@ def reject_with_draft_probs(
     # the residual max(0, p - q) at the first rejected slot; the bonus row is p itself
     pick = p[rows, emitted]
     pick.scatter_add_(1, support[rows, slot], -q[rows, slot] * rejected)
-    pick.scatter_add_(1, drafts[rows, slot].view(-1, 1), -(rejected & ~ok.view(-1, 1)).float())
+    pick.scatter_add_(
+        1, drafts[rows, slot].view(-1, 1), -(rejected & ~ok.view(-1, 1)).float()
+    )
     pick.clamp_(min=0.0)
     total = pick.sum(dim=-1, keepdim=True)
     pick = torch.where(total > 0, pick / total.clamp_min(1e-30), p[rows, emitted])
     recovered = sampling_module().sampling_from_probs(pick).to(torch.int64)
+    if args.seeded_rows:
+        from freetoken.engine.sample import mix_step_seed
+
+        for row, seed, gen_len, _, _, _ in args.seeded_rows:
+            step_idx = gen_len + int(emitted[row].item())
+            gen = torch.Generator(device=pick.device)
+            gen.manual_seed(mix_step_seed(seed, step_idx) ^ 0x5555555555555555)
+            noise = (
+                torch.empty_like(pick[row])
+                .exponential_(1.0, generator=gen)
+                .clamp_min_(1e-30)
+            )
+            recovered[row] = torch.argmax(pick[row] / noise, dim=-1).to(torch.int64)
     out = torch.cat([drafts, drafts[:, -1:]], dim=1)
     out.scatter_(1, emitted.view(-1, 1), recovered.view(-1, 1))
     return out, emitted

@@ -17,9 +17,13 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .anthropic_models import (
     AnthropicContentBlock,
@@ -57,12 +61,16 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
-from .openai_api import _await_watching_disconnect
+from .openai_api import (
+    _ACCEPTED_EFFORTS,
+    _await_watching_disconnect,
+    _response_format_error,
+)
 from .request_logger import log_request
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
 # bridging long queue/prefill/decode gaps for clients with stream-idle timeouts.
-KEEPALIVE_INTERVAL_S = 15.0
+KEEPALIVE_INTERVAL_S = 10.0
 
 # OpenAI finish_reason -> Anthropic stop_reason (vLLM's stop_reason_map).
 STOP_REASON_MAP = {
@@ -75,8 +83,12 @@ STOP_REASON_MAP = {
 def _anthropic_stop(
     finish_reason: str | None, matched_stop: str | None
 ) -> tuple[str | None, str | None]:
-    """(stop_reason, stop_sequence). A stop-string hit is reported as 'stop_sequence'
-    with the matched string, otherwise the finish_reason is mapped normally."""
+    """(stop_reason, stop_sequence) with vLLM/Anthropic priority:
+    max_tokens > tool_use > stop_sequence > end_turn."""
+    if finish_reason == "length":
+        return "max_tokens", None
+    if finish_reason == "tool_calls":
+        return "tool_use", None
     if matched_stop is not None:
         return "stop_sequence", matched_stop
     return STOP_REASON_MAP.get(finish_reason or "stop"), None
@@ -128,6 +140,25 @@ def register_anthropic_routes(
             )
         return await request_validation_exception_handler(request, exc)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        if request.url.path.startswith("/v1/messages"):
+            err_type = {
+                401: "authentication_error",
+                403: "permission_error",
+                404: "not_found_error",
+                413: "request_too_large",
+                429: "rate_limit_error",
+                503: "overloaded_error",
+                529: "overloaded_error",
+            }.get(
+                exc.status_code,
+                "api_error" if exc.status_code >= 500 else "invalid_request_error",
+            )
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            return _anthropic_error_response(exc.status_code, err_type, detail)
+        return await http_exception_handler(request, exc)
+
 
 async def handle_anthropic_messages(
     req: AnthropicMessagesRequest,
@@ -135,6 +166,10 @@ async def handle_anthropic_messages(
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    if not req.messages:
+        return _anthropic_error_response(
+            400, "invalid_request_error", "messages: at least one message is required"
+        )
     try:
         spec = convert_anthropic_to_genspec(
             req,
@@ -208,7 +243,7 @@ async def handle_anthropic_messages(
     response = anthropic_full_response(
         result, req.model, uid, cache_report=cache_report
     )
-    return JSONResponse(content=response.model_dump(exclude_none=True))
+    return JSONResponse(content=_dump_anthropic_message(response))
 
 
 async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state: Any):
@@ -283,6 +318,147 @@ def strip_anthropic_billing_cch(text: str) -> str:
     return "\n".join(out)
 
 
+_VALID_THINKING_TYPES = frozenset(
+    {
+        "enabled",
+        "disabled",
+        "adaptive",
+        "auto",
+        "between_tools",
+        "on",
+        "off",
+        "true",
+        "false",
+        "none",
+    }
+)
+_ANTHROPIC_EFFORTS = frozenset({*_ACCEPTED_EFFORTS, "max"})
+
+
+def _validate_anthropic_controls(
+    req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+) -> dict[str, Any] | None:
+    """Validate ``thinking`` and ``output_config`` and extract ``response_format`` if present."""
+    if req.thinking is not None:
+        if not isinstance(req.thinking, dict):
+            raise ValueError("thinking must be an object")
+        ttype = req.thinking.get("type")
+        if ttype is not None:
+            if not isinstance(ttype, str):
+                raise ValueError(f"Unsupported thinking.type: {ttype!r}")
+            norm = ttype.strip().lower()
+            if norm and norm not in _VALID_THINKING_TYPES:
+                raise ValueError(f"Unsupported thinking.type: {ttype!r}")
+        budget = req.thinking.get("budget_tokens")
+        if budget is not None:
+            if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+                raise ValueError("thinking.budget_tokens must be a positive integer")
+
+    response_format: dict[str, Any] | None = None
+    if req.output_config is not None:
+        if not isinstance(req.output_config, dict):
+            raise ValueError("output_config must be an object")
+        eff = req.output_config.get("effort")
+        if eff is not None:
+            if not isinstance(eff, str):
+                raise ValueError(f"Unsupported output_config.effort: {eff!r}")
+            norm_eff = eff.strip().lower()
+            if norm_eff and norm_eff not in _ANTHROPIC_EFFORTS:
+                raise ValueError(f"Unsupported output_config.effort: {eff!r}")
+        fmt = req.output_config.get("format")
+        if fmt is not None:
+            if not isinstance(fmt, dict):
+                raise ValueError("output_config.format must be an object")
+            ftype = fmt.get("type")
+            if ftype == "json_schema":
+                nested = (
+                    fmt.get("json_schema")
+                    if isinstance(fmt.get("json_schema"), dict)
+                    else fmt
+                )
+                schema_val = nested.get("schema")
+                if schema_val is None:
+                    response_format = {"type": "json_object"}
+                elif isinstance(schema_val, dict):
+                    response_format = {"type": "json_schema", "json_schema": nested}
+                else:
+                    raise ValueError("output_config.format.schema must be an object")
+            elif ftype not in (None, "text"):
+                raise ValueError(f"Unsupported output_config.format.type: {ftype!r}")
+    return response_format
+
+
+def _tool_to_openai_dict(tool: Any) -> dict[str, Any]:
+    if isinstance(tool, dict):
+        ttype = tool.get("type")
+        name = tool.get("name") or ""
+        if ttype not in (None, "custom", "function"):
+            raise ValueError(
+                f"Server tool type {ttype!r} (tool {name!r}) is not supported; only custom client tools are supported"
+            )
+        if "function" in tool and isinstance(tool["function"], dict):
+            fn = dict(tool["function"])
+            fn["description"] = fn.get("description") or ""
+            return {"type": "function", "function": fn}
+        schema = dict(tool.get("input_schema") or {"type": "object"})
+        if "type" not in schema:
+            schema["type"] = "object"
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description") or "",
+                "parameters": schema,
+            },
+        }
+    if tool.type not in (None, "custom"):
+        raise ValueError(
+            f"Server tool type {tool.type!r} (tool {tool.name!r}) is not supported; only custom client tools are supported"
+        )
+    schema = dict(tool.input_schema or {"type": "object"})
+    if "type" not in schema:
+        schema["type"] = "object"
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description if tool.description is not None else "",
+            "parameters": schema,
+        },
+    }
+
+
+def _document_text(block: AnthropicContentBlock) -> str:
+    src = block.source or {}
+    stype = src.get("type")
+    if stype == "text":
+        body = src.get("data") or ""
+    elif stype == "content":
+        raw_c = src.get("content")
+        if isinstance(raw_c, str):
+            body = raw_c
+        elif isinstance(raw_c, list):
+            body = "\n".join(
+                item.get("text") or ""
+                for item in raw_c
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            body = ""
+    else:
+        raise ValueError(
+            f"Unsupported document source type {stype!r}; only 'text' and 'content' documents are supported"
+        )
+    parts: list[str] = []
+    if block.title:
+        parts.append(f"[Document: {block.title}]")
+    if block.context:
+        parts.append(block.context)
+    if body:
+        parts.append(body)
+    return "\n".join(parts)
+
+
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
@@ -296,6 +472,24 @@ def convert_anthropic_prompt(
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
+    del reasoning_parser
+    _validate_anthropic_controls(req)
+
+    # Build active tool registry (supporting defer_loading, tool_addition, tool_removal, tool_reference).
+    tool_order: list[str] = []
+    known_tools: dict[str, dict[str, Any]] = {}
+    deferred_names: set[str] = set()
+    referenced_names: set[str] = set()
+    removed_names: set[str] = set()
+    for t in req.tools or []:
+        t_dict = _tool_to_openai_dict(t)
+        t_name = t_dict["function"]["name"]
+        if t_name not in known_tools:
+            tool_order.append(t_name)
+        known_tools[t_name] = t_dict
+        if getattr(t, "defer_loading", False):
+            deferred_names.add(t_name)
+
     # Hoisting turn-specific reminders rewrites the cached prompt prefix.
     # Preserve their position; the tokenizer adapts them to the model's roles.
     system_texts: list[str] = []
@@ -316,25 +510,63 @@ def convert_anthropic_prompt(
     other: list[dict[str, Any]] = []
     for msg in req.messages:
         if msg.role == "system":
-            text = _content_text(msg.content)
+            if isinstance(msg.content, list):
+                for b in msg.content:
+                    if b.type == "tool_addition":
+                        for raw_add in b.tools or []:
+                            added = _tool_to_openai_dict(raw_add)
+                            aname = added["function"]["name"]
+                            if aname not in known_tools:
+                                tool_order.append(aname)
+                            known_tools[aname] = added
+                            removed_names.discard(aname)
+                            if isinstance(raw_add, dict) and raw_add.get(
+                                "defer_loading"
+                            ):
+                                deferred_names.add(aname)
+                    elif b.type == "tool_removal":
+                        names_to_drop = list(b.tool_names or [])
+                        if b.tool_name:
+                            names_to_drop.append(b.tool_name)
+                        if b.name:
+                            names_to_drop.append(b.name)
+                        removed_names.update(names_to_drop)
+            text = strip_anthropic_billing_cch(_content_text(msg.content))
             if not other:
-                stripped = strip_anthropic_billing_cch(text)
-                if stripped:
-                    system_texts.append(stripped)
+                if text:
+                    system_texts.append(text)
             elif text:
                 other.append({"role": "system", "content": text})
             continue
 
         if isinstance(msg.content, str):
-            other.append({"role": msg.role, "content": msg.content})
+            if (
+                msg.role == "user"
+                and other
+                and other[-1].get("role") == "user"
+                and isinstance(other[-1].get("content"), str)
+            ):
+                prev_c = other[-1]["content"]
+                other[-1]["content"] = (
+                    f"{prev_c}\n\n{msg.content}"
+                    if (prev_c and msg.content)
+                    else (prev_c or msg.content)
+                )
+            else:
+                other.append({"role": msg.role, "content": msg.content})
             continue
 
         content_parts: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
         thinking_parts: list[str] = []
+        saw_tool_result = False
         for block in msg.content:
             if block.type == "text" and block.text:
                 content_parts.append({"type": "text", "text": block.text})
+            elif block.type == "document":
+                doc_txt = _document_text(block)
+                if doc_txt:
+                    content_parts.append({"type": "text", "text": doc_txt})
             elif block.type == "thinking" and block.thinking:
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
@@ -353,7 +585,11 @@ def convert_anthropic_prompt(
                     }
                 )
             elif block.type == "tool_result":
-                text, images = _tool_result_parts(block.content)
+                saw_tool_result = True
+                text, images, refs = _tool_result_parts(block.content, known_tools)
+                referenced_names.update(refs)
+                if block.is_error and not text:
+                    text = "Tool execution failed"
                 if msg.role == "user":
                     other.append(
                         {
@@ -384,8 +620,13 @@ def convert_anthropic_prompt(
             else:
                 openai_msg["content"] = content_parts
         elif not tool_calls and not thinking_parts:
-            # Nothing usable in this message (e.g. image-only) — skip it.
-            continue
+            if msg.role == "assistant":
+                # Preserve empty / redacted_thinking-only assistant turns so adjacent user turns never merge.
+                openai_msg["content"] = ""
+            elif saw_tool_result:
+                continue
+            else:
+                continue
         other.append(openai_msg)
 
     messages: list[dict[str, Any]] = []
@@ -394,28 +635,41 @@ def convert_anthropic_prompt(
         messages.append({"role": "system", "content": system_text})
     messages.extend(other)
 
-    raw_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.input_schema,
-            },
-        }
-        for tool in (req.tools or [])
+    active_all_tools = [
+        known_tools[name] for name in tool_order if name not in removed_names
     ]
-    # Anthropic tool_choice: "none" hides the tools from the model entirely;
-    # "auto"/"any" parse all tools, "tool" forces one.
+    visible_tools = [
+        known_tools[name]
+        for name in tool_order
+        if name not in removed_names
+        and (name not in deferred_names or name in referenced_names)
+    ]
+
+    # Validate and apply Anthropic tool_choice ("none", "auto", "any", "tool").
     if req.tool_choice and req.tool_choice.type == "none":
         template_tools, parser_tools = None, None
     else:
-        selected = (
-            req.tool_choice.name
-            if (req.tool_choice and req.tool_choice.type == "tool")
-            else None
-        )
-        template_tools, parser_tools = split_tool_lists(raw_tools, selected)
+        selected: str | None = None
+        if req.tool_choice:
+            if req.tool_choice.type == "any" and not active_all_tools:
+                raise ValueError("tool_choice.type='any' requires non-empty tools")
+            if req.tool_choice.type == "tool":
+                selected = req.tool_choice.name
+                if not selected:
+                    raise ValueError("tool_choice.type='tool' requires a tool name")
+                active_names = {t["function"]["name"] for t in active_all_tools}
+                if selected not in active_names:
+                    raise ValueError(
+                        f"tool_choice tool {selected!r} was not found in tools"
+                    )
+        if selected:
+            template_tools = [
+                t for t in active_all_tools if t["function"]["name"] == selected
+            ]
+            parser_tools = active_all_tools or None
+        else:
+            template_tools = visible_tools or None
+            parser_tools = active_all_tools or None
 
     # Native extended-thinking toggle -> template kwargs, broadcast in every
     # spelling the ecosystem's templates read (a bare enable_thinking bool is
@@ -450,9 +704,20 @@ def convert_anthropic_prompt(
         ctk = thinking_toggle_kwargs(True)
     ctk = thinking_override_kwargs(thinking, ctk)
 
+    if req.tool_choice and req.tool_choice.disable_parallel_tool_use:
+        ctk["parallel_tool_calls"] = False
+
+    rendered_msgs = render_messages(messages, hoist_system=False)
+    if (
+        rendered_msgs
+        and rendered_msgs[-1].get("role") == "assistant"
+        and not rendered_msgs[-1].get("tool_calls")
+    ):
+        ctk["continue_final_message"] = True
+
     # late system reminders stay in place: the tokenizer folds them instead (prefix reuse)
     return (
-        render_messages(messages, hoist_system=False),
+        rendered_msgs,
         template_tools,
         parser_tools,
         ctk,
@@ -467,9 +732,16 @@ def convert_anthropic_to_genspec(
     inline_system_policy: str = "auto",
     thinking: str | None = None,
 ) -> GenSpec:
+    response_format = _validate_anthropic_controls(req)
     messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
         req, reasoning_parser=reasoning_parser, thinking=thinking
     )
+    tool_choice_mode: str | None = None
+    if req.tool_choice:
+        if req.tool_choice.type == "any":
+            tool_choice_mode = "required"
+        elif req.tool_choice.type == "tool" and req.tool_choice.name:
+            tool_choice_mode = f"named:{req.tool_choice.name}"
     return GenSpec(
         messages=messages,
         sampling_params=resolve_sampling(
@@ -486,6 +758,11 @@ def convert_anthropic_to_genspec(
         template_tools=template_tools,
         parser_tools=parser_tools,
         inline_system_policy=inline_system_policy,
+        disable_parallel_tool_use=bool(
+            req.tool_choice and req.tool_choice.disable_parallel_tool_use
+        ),
+        tool_choice_mode=tool_choice_mode,
+        response_format=response_format,
     )
 
 
@@ -503,33 +780,59 @@ def _content_text(content) -> str:
 def _image_part(source: dict[str, Any] | None) -> dict[str, Any]:
     src = source or {}
     stype = src.get("type")
+    if stype not in ("base64", "url"):
+        raise ValueError(f"unsupported image source type: {stype!r}")
     data = src.get("data") if stype == "base64" else src.get("url")
     if not data:
         # an unsupported image source must fail the request, not degrade to a text-only answer
-        raise ValueError(f"unsupported image source type: {stype!r}")
+        raise ValueError(f"image source of type {stype!r} is missing data/url")
     return {
         "type": "image",
         "freetoken_ref": {"kind": "b64" if stype == "base64" else "url", "data": data},
     }
 
 
-def _tool_result_parts(content) -> tuple[str, list[dict[str, Any]]]:
-    """The text of a tool_result and its image blocks as image parts."""
+def _tool_result_parts(
+    content: Any, known_tools: dict[str, dict[str, Any]] | None = None
+) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """The text of a tool_result, its image blocks, and any referenced deferred tool names."""
     if content is None:
-        return "", []
+        return "", [], []
     if isinstance(content, str):
-        return content, []
+        return content, [], []
     texts: list[str] = []
     images: list[dict[str, Any]] = []
+    referenced: list[str] = []
+    loaded_defs: list[dict[str, Any]] = []
     for item in content:
         if isinstance(item, dict):
-            if item.get("type") == "image":
+            itype = item.get("type")
+            if itype == "image":
                 images.append(_image_part(item.get("source")))
+            elif itype == "tool_reference":
+                ref_name = item.get("tool_name") or item.get("name") or ""
+                if ref_name:
+                    referenced.append(ref_name)
+                    if known_tools and ref_name in known_tools:
+                        loaded_defs.append(known_tools[ref_name]["function"])
+            elif itype == "document":
+                doc_block = AnthropicContentBlock.model_validate(item)
+                doc_txt = _document_text(doc_block)
+                if doc_txt:
+                    texts.append(doc_txt)
             else:
-                texts.append(item.get("text") or "")
+                txt = item.get("text")
+                if txt:
+                    texts.append(str(txt))
         else:
             texts.append(str(item))
-    return "".join(texts), images
+    if loaded_defs:
+        texts.append(
+            "<additional_tools>\n"
+            + json.dumps(loaded_defs, ensure_ascii=False)
+            + "\n</additional_tools>"
+        )
+    return "\n".join(texts), images, referenced
 
 
 # --------------------------------------------------------------------------- #
@@ -542,10 +845,13 @@ def anthropic_full_response(
     if result.reasoning:
         content.append(
             AnthropicContentBlock(
-                type="thinking", thinking=result.reasoning, signature=""
+                type="thinking",
+                thinking=result.reasoning,
+                signature=uuid.uuid4().hex,
             )
         )
-    content.append(AnthropicContentBlock(type="text", text=result.content or ""))
+    if result.content or (not result.reasoning and not result.tool_calls):
+        content.append(AnthropicContentBlock(type="text", text=result.content or ""))
     for index, call in enumerate(result.tool_calls):
         content.append(
             AnthropicContentBlock(
@@ -580,10 +886,11 @@ def _anthropic_usage(
     the cached prefix and cache_read_input_tokens carries it (absent when 0, matching
     sglang). With the flag off, input_tokens is the full prompt length."""
     cached = cached_tokens if cache_report else 0
+    extra = {"cache_read_input_tokens": cached} if cached > 0 else {}
     return AnthropicUsage(
         input_tokens=max(prompt_tokens - cached, 0),
         output_tokens=completion_tokens,
-        cache_read_input_tokens=cached or None,
+        **extra,
     )
 
 
@@ -629,15 +936,16 @@ async def anthropic_event_stream(
         nonlocal block_open, block_index
         frames: list[str] = []
         if block_open == "thinking":
-            # Real thinking blocks end with a signature_delta; emit an empty one for
-            # shape compliance (this server has no signing key and never verifies
-            # signatures on replayed thinking blocks).
+            # Emit a non-empty opaque signature so Claude Code / Anthropic SDKs preserve
+            # the thinking block across multi-turn replays.
             frames.append(
                 _event(
                     AnthropicStreamEvent(
                         type="content_block_delta",
                         index=block_index,
-                        delta=AnthropicDelta(type="signature_delta", signature=""),
+                        delta=AnthropicDelta(
+                            type="signature_delta", signature=uuid.uuid4().hex
+                        ),
                     )
                 )
             )
@@ -660,6 +968,8 @@ async def anthropic_event_stream(
                     id=f"msg_{public_request_id(uid)}",
                     content=[],
                     model=model,
+                    stop_reason=None,
+                    stop_sequence=None,
                     usage=usage,
                 ),
             )
@@ -765,8 +1075,8 @@ async def anthropic_event_stream(
                     yield f
 
             elif isinstance(ev, ToolCallArgsDelta):
-                if block_open != "tool":
-                    continue  # defensive: fragment without an open tool block
+                if block_open != "tool" or not ev.fragment:
+                    continue  # defensive: fragment without an open tool block or empty fragment
                 if not tool_stable:
                     continue  # fragments don't concatenate cleanly: full args at close
                 yield _tool_args_delta(ev.fragment)
@@ -776,8 +1086,10 @@ async def anthropic_event_stream(
                     if block_open == "tool" and tool_ordinal == call.tool_index:
                         # Close of a ToolCallStart-opened block: top up whatever of
                         # the final (authoritative) arguments wasn't streamed yet.
-                        final = call.parameters or ""
-                        if final.startswith(tool_args_sent):
+                        final = _canonical_json_args_str(call.parameters)
+                        if not tool_args_sent:
+                            yield _tool_args_delta(final)
+                        elif final.startswith(tool_args_sent):
                             remainder = final[len(tool_args_sent) :]
                             if remainder:
                                 yield _tool_args_delta(remainder)
@@ -787,7 +1099,7 @@ async def anthropic_event_stream(
                     # Standalone complete call (buffered fallback path).
                     for f in _open_tool(call.name, call.tool_index):
                         yield f
-                    yield _tool_args_delta(call.parameters or "")
+                    yield _tool_args_delta(_canonical_json_args_str(call.parameters))
                     for f in _stop_block():
                         yield f
 
@@ -852,9 +1164,36 @@ async def anthropic_event_stream(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _dump_anthropic_message(msg: AnthropicMessagesResponse) -> dict[str, Any]:
+    """Serialize ``AnthropicMessagesResponse`` keeping required nullable ``stop_reason`` and ``stop_sequence``."""
+    d = msg.model_dump(exclude_none=True)
+    d["stop_reason"] = msg.stop_reason
+    d["stop_sequence"] = msg.stop_sequence
+    return d
+
+
 def _event(event: AnthropicStreamEvent) -> str:
     """Encode an event as a named Anthropic SSE frame: ``event: <type>\\ndata: <json>``."""
-    return f"event: {event.type}\ndata: {event.model_dump_json(exclude_none=True)}\n\n"
+    d = event.model_dump(exclude_none=True)
+    if event.type == "message_start" and event.message is not None:
+        d["message"] = _dump_anthropic_message(event.message)
+    elif event.type == "message_delta" and event.delta is not None:
+        d.setdefault("delta", {})
+        d["delta"]["stop_reason"] = event.delta.stop_reason
+        d["delta"]["stop_sequence"] = event.delta.stop_sequence
+    return f"event: {event.type}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n"
+
+
+def _canonical_json_args_str(arguments: Any) -> str:
+    """Return a non-empty valid JSON object string so ``anthropic-sdk-python``'s ``jiter.from_json`` never crashes."""
+    if isinstance(arguments, str) and arguments.strip():
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                return arguments
+        except json.JSONDecodeError:
+            pass
+    return json.dumps(_parse_json_args(arguments), ensure_ascii=False)
 
 
 def _tool_use_id(name: str | None, index: int) -> str:
