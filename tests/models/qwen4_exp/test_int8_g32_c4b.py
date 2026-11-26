@@ -122,3 +122,35 @@ def test_int8_g32_linear_and_hc8_emitter_and_fp32_router(monkeypatch):
     lin0.weight.copy_(qw0)
     lin0.weight_scale.copy_(sc0)
     assert torch.all(lin0.forward(torch.randn(3, 64, dtype=torch.bfloat16)) == 0)
+
+
+def test_int8_g32_meta_tensor_support(monkeypatch):
+    """keycheck3.py streams checkpoint shapes as meta tensors; quantize_int8_g32 and dense_emitter
+    must emit int8/fp16 meta tensors without calling Tensor.item()."""
+    monkeypatch.setenv("FREETOKEN_INT8_DENSE", "1")
+    monkeypatch.setenv("FREETOKEN_HC_INT8", "1")
+
+    w_meta = torch.empty((64, 128), dtype=torch.bfloat16, device="meta")
+    qw_m, sc_m = quantize_int8_g32(w_meta)
+    assert qw_m.is_meta and qw_m.dtype == torch.int8 and qw_m.shape == (64, 128)
+    assert sc_m.is_meta and sc_m.dtype == torch.float16 and sc_m.shape == (64, 4)
+
+    g = SimpleNamespace(
+        num_key_heads=4, key_head_dim=32, num_value_heads=8, value_head_dim=32
+    )
+    cfg = SimpleNamespace(
+        attn_quant="int8_g32",
+        quant=None,
+        tie_word_embeddings=False,
+        linear_attention_group=lambda: g,
+    )
+    emit, quant_active, _ = dense_emitter(cfg, rank=0, world=2)
+    assert quant_active is True
+    emitted = dict(
+        emit(
+            "model.layers.0.linear_attn.in_proj.weight",
+            torch.empty((784, 128), dtype=torch.bfloat16, device="meta"),
+        )
+    )
+    assert emitted["model.layers.0.linear_attn.in_proj_qkvz.weight"].is_meta
+    assert emitted["model.layers.0.linear_attn.in_proj_qkvz.weight"].dtype == torch.int8

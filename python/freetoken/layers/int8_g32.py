@@ -44,10 +44,8 @@ def quantize_int8_g32(
     scale_f16 = scale_f32.to(torch.float16)
     inv = 1.0 / scale_f16.float().clamp(min=1e-8)
     q = torch.round(wf * inv.unsqueeze(-1)).clamp_(-127.0, 127.0).to(torch.int8)
-    # Exact zero groups stay zero with finite minimal scale.
-    zero_mask = amax == 0
-    if bool(zero_mask.any()):
-        q = torch.where(zero_mask.unsqueeze(-1), torch.zeros_like(q), q)
+    # Exact zero groups stay zero with finite minimal scale (no host sync; meta-tensor safe).
+    q = torch.where((amax == 0).unsqueeze(-1), torch.zeros_like(q), q)
     return q.view(n, k).contiguous(), scale_f16.contiguous()
 
 
@@ -355,7 +353,7 @@ def _try_pack_marlin_u8b128(
                 device_capability=cap_int,
             ):
                 return None
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110
         pass
 
     if padded_n != n:
