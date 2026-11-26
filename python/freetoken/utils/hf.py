@@ -309,13 +309,9 @@ def cached_load_hf_config(
     from freetoken.models.gguf.reader import gguf_config_source
 
     if (gguf_src := gguf_config_source(model_path)) is not None:
-        if overrides:
-            raise ValueError(
-                "--hf-overrides applies to a HF config.json; a GGUF carries its own metadata"
-            )
         from freetoken.models.gguf.config import build_gguf_shim
 
-        return build_gguf_shim(gguf_src)
+        return build_gguf_shim(gguf_src, overrides=overrides)
     config = _load_hf_config(model_path)
     data = config.to_dict()
     if overrides:

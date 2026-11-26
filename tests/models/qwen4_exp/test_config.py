@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from freetoken.attention import AttnType
 from freetoken.models.config import (
     FullAttentionGroupConfig,
@@ -23,7 +22,8 @@ def _text_config():
         num_attention_heads=24,
         num_key_value_heads=2,
         layer_types=[
-            "full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(48)
+            "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
+            for i in range(48)
         ],
         rope_parameters={
             "rope_type": "default",
@@ -79,7 +79,9 @@ def _hf_config(quantization_config=RADIXARK_NVFP4):
 def test_groups_and_layer_split():
     cfg = parse_config(_hf_config())
     full = [g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig)]
-    linear = [g for g in cfg.attention_groups if isinstance(g, LinearGatedDeltaGroupConfig)]
+    linear = [
+        g for g in cfg.attention_groups if isinstance(g, LinearGatedDeltaGroupConfig)
+    ]
     assert len(full) == 1 and len(linear) == 1
     assert full[0].layer_ids == tuple(range(3, 48, 4))
     assert len(linear[0].layer_ids) == 36
@@ -137,7 +139,9 @@ def test_qwen4_args_payload():
 
 def test_ple_on_full_attention_layer_rejected():
     hf = _hf_config()
-    hf.text_config.ple_layer_ids = [4]  # one-indexed 4 == zero-based 3, a full_attention layer
+    hf.text_config.ple_layer_ids = [
+        4
+    ]  # one-indexed 4 == zero-based 3, a full_attention layer
     with pytest.raises(ValueError, match="linear_attention"):
         parse_config(hf)
 
@@ -162,8 +166,16 @@ def test_eos_token_id_list_uses_the_first_entry():
 
 def _vision_config():
     return SimpleNamespace(
-        hidden_size=1152, depth=27, num_heads=16, intermediate_size=4304, patch_size=16, temporal_patch_size=2,
-        spatial_merge_size=2, num_position_embeddings=2304, out_hidden_size=2560, in_channels=3,
+        hidden_size=1152,
+        depth=27,
+        num_heads=16,
+        intermediate_size=4304,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=2304,
+        out_hidden_size=2560,
+        in_channels=3,
         deepstack_visual_indexes=[],
     )
 
@@ -174,44 +186,70 @@ def test_vision_turns_on_mrope_and_the_tower():
     config = parse_config(hf)
     assert config.is_multimodal and config.model_is_mrope
     assert config.rotary_config.mrope_section == [11, 11, 10]
-    assert config.rotary_config.mrope_layout == "interleaved" and config.rotary_config.rotary_dim == 64
-    assert config.vision_config.out_hidden_size == 2560 and config.vision_config.deepstack_visual_indexes == ()
+    assert (
+        config.rotary_config.mrope_layout == "interleaved"
+        and config.rotary_config.rotary_dim == 64
+    )
+    assert (
+        config.vision_config.out_hidden_size == 2560
+        and config.vision_config.deepstack_visual_indexes == ()
+    )
     assert config.qwen4_args.image_token_id == 248056
 
 
 def test_text_only_keeps_the_1d_rope():
     config = parse_config(_hf_config())
-    assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
+    assert (
+        not config.is_multimodal
+        and not config.model_is_mrope
+        and config.rotary_config.mrope_section is None
+    )
+
+
 # the merged-projection prefixes the model asks the QuantConfig about (attention.py / layers/linear_attn/gdn.py)
 DENSE_PREFIXES = (
-    "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",
-    "model.layers.0.linear_attn.in_proj_qkvz", "model.layers.0.linear_attn.out_proj",
+    "model.layers.3.self_attn.qkv_proj",
+    "model.layers.3.self_attn.o_proj",
+    "model.layers.0.linear_attn.in_proj_qkvz",
+    "model.layers.0.linear_attn.out_proj",
 )
 BF16_PREFIXES = (
-    "model.layers.0.linear_attn.in_proj_ba", "model.layers.0.mlp.shared_expert.gate_up_proj",
-    "model.layers.3.self_attn.indexer.index_qk_proj", "lm_head",
+    "model.layers.0.linear_attn.in_proj_ba",
+    "model.layers.0.mlp.shared_expert.gate_up_proj",
+    "model.layers.3.self_attn.indexer.index_qk_proj",
+    "lm_head",
 )
 
 
 def _quant(hf, tmp_path):
     from freetoken.models.register import checkpoint_quant_config, get_model_spec
 
-    return checkpoint_quant_config(str(tmp_path), hf, get_model_spec(hf.architectures[0]))
+    return checkpoint_quant_config(
+        str(tmp_path), hf, get_model_spec(hf.architectures[0])
+    )
 
 
 def test_block_fp8_dense_schemes(tmp_path):
     quant = _quant(_hf_config(LOVEDHEART_NVFP4_FP8), tmp_path)
     for prefix in DENSE_PREFIXES:
         scheme = quant.scheme_for(prefix)
-        assert str(scheme.kind) == "fp8_block" and scheme.has("weight_scale_inv"), prefix
+        assert str(scheme.kind) == "fp8_block" and scheme.has("weight_scale_inv"), (
+            prefix
+        )
     for prefix in BF16_PREFIXES:
         assert quant.scheme_for(prefix) is None, prefix
     assert str(quant.scheme_for("model.layers.0.mlp.experts").kind) == "nvfp4"
     assert parse_config(_hf_config(LOVEDHEART_NVFP4_FP8)).expert_quant == "nvfp4"
 
 
-@pytest.mark.parametrize("quantization_config", [RADIXARK_NVFP4, NVIDIA_NVFP4, None], ids=["RadixArk", "nvidia", "bf16"])
-def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_config, tmp_path):
+@pytest.mark.parametrize(
+    "quantization_config",
+    [RADIXARK_NVFP4, NVIDIA_NVFP4, None],
+    ids=["RadixArk", "nvidia", "bf16"],
+)
+def test_released_checkpoints_keep_the_dense_projections_bf16(
+    quantization_config, tmp_path
+):
     quant = _quant(_hf_config(quantization_config), tmp_path)
     for prefix in DENSE_PREFIXES + BF16_PREFIXES:
         assert quant.scheme_for(prefix) is None, prefix
@@ -246,7 +284,6 @@ def _write_checkpoint_config(path, **fields) -> None:
 
 def test_the_engine_serves_the_model_card_1m_recipe(tmp_path):
     import torch
-
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
     from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
@@ -260,9 +297,88 @@ def test_the_engine_serves_the_model_card_1m_recipe(tmp_path):
         mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
     )
     rotary = config.model_config.rotary_config
-    assert rotary.scaling["rope_type"] == "yarn" and rotary.scaling["factor"] == 4.0 and rotary.mrope_section is None
-    assert rotary.max_position == 262144 and rotary.rotary_dim == 64 and rotary.base == 10000000
+    assert (
+        rotary.scaling["rope_type"] == "yarn"
+        and rotary.scaling["factor"] == 4.0
+        and rotary.mrope_section is None
+    )
+    assert (
+        rotary.max_position == 262144
+        and rotary.rotary_dim == 64
+        and rotary.base == 10000000
+    )
     assert config.max_seq_len == 4 * 262144
-    plain = EngineConfig(model_path=str(tmp_path), tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16,
-                         mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
-    assert plain.model_config.rotary_config.scaling is None and plain.max_seq_len == 262144
+    plain = EngineConfig(
+        model_path=str(tmp_path),
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
+    )
+    assert (
+        plain.model_config.rotary_config.scaling is None and plain.max_seq_len == 262144
+    )
+
+
+def test_gguf_qwen4exp_supports_yarn_rope_hf_overrides(monkeypatch):
+    import pytest
+    from freetoken.models.gguf.config import GgufConfigShim, _validate_gguf_overrides
+    from freetoken.models.qwen4_exp import gguf as q4_gguf
+
+    validated = _validate_gguf_overrides(
+        "qwen4exp", {"text_config": {"rope_parameters": MODEL_CARD_YARN}}
+    )
+    assert validated["text_config"]["rope_parameters"]["factor"] == 4.0
+    with pytest.raises(ValueError, match="rope_parameters"):
+        _validate_gguf_overrides("qwen4exp", {"hidden_size": 128})
+    with pytest.raises(ValueError, match="HF config.json"):
+        _validate_gguf_overrides("llama", {"rope_parameters": MODEL_CARD_YARN})
+
+    monkeypatch.setattr(q4_gguf, "check_scales", lambda _p: None)
+    monkeypatch.setattr(q4_gguf, "gguf_tensor_index", lambda _p: {})
+    md = {
+        "qwen4exp.embedding_length": 2560,
+        "qwen4exp.block_count": 48,
+        "qwen4exp.attention.head_count": 16,
+        "qwen4exp.attention.head_count_kv": 2,
+        "qwen4exp.attention.key_length": 256,
+        "qwen4exp.rope.freq_base": 10000000.0,
+        "qwen4exp.rope.dimension_count": 64,
+        "qwen4exp.rope.dimension_sections": [11, 11, 10, 0],
+        "qwen4exp.attention.compress_ratios": [1, 4],
+        "qwen4exp.ssm.time_step_rank": 48,
+        "qwen4exp.context_length": 262144,
+        "qwen4exp.full_attention_interval": 4,
+        "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen4exp.expert_count": 512,
+        "qwen4exp.expert_used_count": 10,
+        "qwen4exp.expert_feed_forward_length": 640,
+        "qwen4exp.expert_shared_feed_forward_length": 640,
+        "qwen4exp.ssm.group_count": 16,
+        "qwen4exp.ssm.state_size": 128,
+        "qwen4exp.ssm.inner_size": 6144,
+        "qwen4exp.ssm.conv_kernel": 4,
+        "qwen4exp.hyper_connection.count": 4,
+        "qwen4exp.hyper_connection.low_rank": 320,
+        "qwen4exp.attention.indexer.head_count": 4,
+        "qwen4exp.attention.indexer.key_length": 128,
+        "qwen4exp.attention.indexer.top_k": 2048,
+        "qwen4exp.ple.layers": [0, 4, 8, 12, 16, 20, 24, 28],
+        "qwen4exp.embedding_length_per_layer_input": 256,
+        "qwen4exp.ple.conv_kernel": 2,
+        "qwen4exp.ple.ngram_size": 3,
+        "qwen4exp.ple.heads_per_ngram": 8,
+        "qwen4exp.ple.eos_token_id": 248044,
+    }
+    shim = GgufConfigShim(
+        architectures=["Qwen4ExpGGUFForCausalLM"],
+        model_path="/var/tmp/fake.gguf",
+        model_type="qwen4exp",
+        metadata=md,
+        vocab_size=248320,
+        tie_word_embeddings=False,
+        hf_overrides=validated,
+    )
+    mcfg = q4_gguf.parse_gguf_config(shim)
+    assert mcfg.rotary_config.scaling["rope_type"] == "yarn"
+    assert mcfg.rotary_config.scaling["factor"] == 4.0
+    assert mcfg.rotary_config.max_position == 262144

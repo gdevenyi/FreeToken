@@ -157,6 +157,17 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
     sections = [int(s) for s in kv("rope.dimension_sections")][:3]
     ratios = [int(r) for r in kv("attention.compress_ratios")]
     n_v = int(kv("ssm.time_step_rank"))
+    rope_parameters: dict = {
+        "rope_type": "default",
+        "rope_theta": float(kv("rope.freq_base")),
+        "partial_rotary_factor": int(kv("rope.dimension_count")) / head_dim,
+        "mrope_section": sections,
+        "mrope_interleaved": True,
+    }
+    ov = getattr(shim, "hf_overrides", None) or {}
+    tc_ov = ov.get("text_config") if isinstance(ov.get("text_config"), dict) else ov
+    if isinstance(tc_ov, dict) and isinstance(tc_ov.get("rope_parameters"), dict):
+        rope_parameters = dict(tc_ov["rope_parameters"])
     text = SimpleNamespace(
         **_FAMILY_DEFAULTS,
         hidden_size=int(kv("embedding_length")),
@@ -166,13 +177,7 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         num_attention_heads=int(kv("attention.head_count")),
         num_key_value_heads=int(kv("attention.head_count_kv")),
         head_dim=head_dim,
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": float(kv("rope.freq_base")),
-            "partial_rotary_factor": int(kv("rope.dimension_count")) / head_dim,
-            "mrope_section": sections,
-            "mrope_interleaved": True,
-        },
+        rope_parameters=rope_parameters,
         max_position_embeddings=int(kv("context_length")),
         full_attention_interval=int(kv("full_attention_interval")),
         rms_norm_eps=float(kv("attention.layer_norm_rms_epsilon")),

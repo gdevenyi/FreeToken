@@ -9,13 +9,15 @@ the raw GGUF metadata dict, and a few derived facts that need the tensor table
 
 from __future__ import annotations
 
+import copy
 import functools
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from .mmproj import Mmproj, find_mmproj, warn_inline_vision
-from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
+from .reader import gguf_architecture, gguf_tensor_names, load_gguf_metadata
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
 # reuses the model classes but a GGUF parse_config / iter_weights).
@@ -61,6 +63,8 @@ class GgufConfigShim:
     hf_fields: dict[str, Any] = field(default_factory=dict)
     # the encoder's preprocessor_config.json; None without an encoder
     preprocessor_config: dict[str, Any] | None = None
+    # optional --hf-overrides (e.g. YaRN rope_parameters) validated by build_gguf_shim
+    hf_overrides: dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str) -> Any:
         from freetoken.utils.hf import RawConfigShim
@@ -98,13 +102,17 @@ def _vocab_size(model_path: str) -> int:
 
 
 @functools.cache
-def _mm_fields(module: str, model_path: str, mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _mm_fields(
+    module: str, model_path: str, mmproj: Mmproj, vocab_size: int
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     return importlib.import_module(module).gguf_mm_config(
         load_gguf_metadata(model_path), mmproj, vocab_size, model_path=model_path
     )
 
 
-def mm_fields(model_path: str, mmproj: Mmproj) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def mm_fields(
+    model_path: str, mmproj: Mmproj
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """The HF config keys and the preprocessor config that the family of the text GGUF ``model_path`` derives from ``mmproj``."""
     from freetoken.models.register import get_model_spec
 
@@ -112,7 +120,35 @@ def mm_fields(model_path: str, mmproj: Mmproj) -> tuple[dict[str, Any], dict[str
     return _mm_fields(spec.module, model_path, mmproj, _vocab_size(model_path))
 
 
-def build_gguf_shim(model_path: str) -> GgufConfigShim:
+def _validate_gguf_overrides(
+    arch: str, overrides: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    if not overrides:
+        return {}
+    allowed_archs = {"qwen4exp"}
+    if arch not in allowed_archs:
+        raise ValueError(
+            "--hf-overrides applies to a HF config.json; a GGUF carries its own metadata"
+        )
+    keys = set(overrides)
+    if keys == {"rope_parameters"} and isinstance(
+        overrides["rope_parameters"], Mapping
+    ):
+        return copy.deepcopy(dict(overrides))
+    if keys == {"text_config"} and isinstance(overrides["text_config"], Mapping):
+        tc = overrides["text_config"]
+        if set(tc) == {"rope_parameters"} and isinstance(
+            tc["rope_parameters"], Mapping
+        ):
+            return copy.deepcopy(dict(overrides))
+    raise ValueError(
+        "--hf-overrides on a qwen4exp GGUF supports only rope_parameters / text_config.rope_parameters"
+    )
+
+
+def build_gguf_shim(
+    model_path: str, overrides: Mapping[str, Any] | None = None
+) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
     if registry_key is None:
@@ -120,6 +156,7 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
             f"GGUF architecture {arch!r} is not supported "
             f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
+    validated_overrides = _validate_gguf_overrides(arch, overrides)
     names = gguf_tensor_names(model_path)
     warn_inline_vision(model_path, names)
     metadata = load_gguf_metadata(model_path)
@@ -144,8 +181,12 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
     spec = get_model_spec(registry_key)
     mmproj = find_mmproj(model_path) if spec.encoders else None
     if mmproj is not None:
-        registry_key = GGUF_MMPROJ_TO_REGISTRY.get((arch, mmproj.projector), registry_key)
-    hf_fields, preprocessor_config = ({}, None) if mmproj is None else mm_fields(model_path, mmproj)
+        registry_key = GGUF_MMPROJ_TO_REGISTRY.get(
+            (arch, mmproj.projector), registry_key
+        )
+    hf_fields, preprocessor_config = (
+        ({}, None) if mmproj is None else mm_fields(model_path, mmproj)
+    )
     return GgufConfigShim(
         architectures=[registry_key],
         model_path=model_path,
@@ -155,15 +196,25 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
         tie_word_embeddings=tie_word_embeddings,
         hf_fields=hf_fields,
         preprocessor_config=preprocessor_config,
+        hf_overrides=validated_overrides,
     )
 
 
-def uniform_swiglu_clamp(model_path: str, clamp_exp: Any, clamp_shexp: Any = None) -> float:
+def uniform_swiglu_clamp(
+    model_path: str, clamp_exp: Any, clamp_shexp: Any = None
+) -> float:
     """The one SwiGLU clamp of the DeepSeek-V4 readers. The GGUF holds it per layer (scalar or array, the shared
     expert's optional), the model takes one value, so anything non-uniform is refused instead of taking the first."""
-    values = [v for kv in (clamp_exp, clamp_shexp) if kv is not None for v in (kv if isinstance(kv, list) else [kv])]
+    values = [
+        v
+        for kv in (clamp_exp, clamp_shexp)
+        if kv is not None
+        for v in (kv if isinstance(kv, list) else [kv])
+    ]
     if len(set(map(float, values))) != 1:
-        raise NotImplementedError(f"{model_path}: non-uniform swiglu_clamp_exp / swiglu_clamp_shexp is not served")
+        raise NotImplementedError(
+            f"{model_path}: non-uniform swiglu_clamp_exp / swiglu_clamp_shexp is not served"
+        )
     return float(values[0])
 
 
@@ -171,7 +222,9 @@ def routed_expert_count(model_path: str, expert_count: Any, index: dict) -> int:
     """``expert_count`` when every layer's expert tensors carry it. REAP exports prune experts per layer, as a
     per-layer array or with the scalar kept but the tensors shrunk; llama.cpp refuses both, and so does this."""
     if isinstance(expert_count, list):
-        raise NotImplementedError(f"{model_path}: a per-layer expert_count array (REAP-style prune) is not served")
+        raise NotImplementedError(
+            f"{model_path}: a per-layer expert_count array (REAP-style prune) is not served"
+        )
     n_experts = int(expert_count)
     for name, info in index.items():
         if name.endswith(".ffn_gate_exps.weight") and info.ne[-1] != n_experts:
@@ -183,6 +236,10 @@ def routed_expert_count(model_path: str, expert_count: Any, index: dict) -> int:
 
 
 __all__ = [
-    "GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "GGUF_MMPROJ_TO_REGISTRY", "build_gguf_shim",
-    "routed_expert_count", "uniform_swiglu_clamp",
+    "GGUF_ARCH_TO_REGISTRY",
+    "GGUF_MMPROJ_TO_REGISTRY",
+    "GgufConfigShim",
+    "build_gguf_shim",
+    "routed_expert_count",
+    "uniform_swiglu_clamp",
 ]
