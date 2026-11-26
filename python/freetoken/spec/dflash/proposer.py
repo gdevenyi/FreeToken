@@ -408,7 +408,10 @@ class DFlashProposer(Proposer):
         self, reqs: list[Req], rows: torch.Tensor, pending: torch.Tensor
     ) -> SpecProposal:
         bs = len(reqs)
-        greedy = [r.sampling_params.is_greedy for r in reqs]
+        greedy = [
+            r.sampling_params.is_greedy or r.sampling_params.seed is not None
+            for r in reqs
+        ]
         padded = next((b for b in sorted(self._graphs) if b >= bs), None)
         pad = (padded or bs) - bs
         pin = dict(pin_memory=True)

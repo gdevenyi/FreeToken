@@ -55,18 +55,7 @@ def reject_with_draft_probs(
     p_d = p[:, :k].gather(2, d).squeeze(-1)
     # a row without a usable q verifies with q one-hot at its draft, which is ``reject``: accept with p(d), else sample p without d; a greedy row's p is one-hot at its argmax
     q_d = torch.where(ok.view(-1, 1), (q * (support == d)).sum(dim=-1), 1.0)
-    rand_u = torch.rand_like(p_d)
-    if args.seeded_rows:
-        from freetoken.engine.sample import mix_step_seed
-
-        for row, seed, gen_len, _, _, _ in args.seeded_rows:
-            for j in range(k):
-                gen = torch.Generator(device=p_d.device)
-                gen.manual_seed(mix_step_seed(seed, gen_len + j))
-                rand_u[row, j] = torch.rand(
-                    (), dtype=p_d.dtype, device=p_d.device, generator=gen
-                )
-    accept = rand_u * q_d < p_d
+    accept = torch.rand_like(p_d) * q_d < p_d
     emitted = accept.to(torch.int64).cumprod(dim=1).sum(dim=1)
     rows = torch.arange(bs, device=p.device)
     slot = emitted.clamp(max=k - 1)
@@ -80,20 +69,25 @@ def reject_with_draft_probs(
     pick.clamp_(min=0.0)
     total = pick.sum(dim=-1, keepdim=True)
     pick = torch.where(total > 0, pick / total.clamp_min(1e-30), p[rows, emitted])
-    recovered = sampling_module().sampling_from_probs(pick).to(torch.int64)
+    recovered = sampling_module(logits.device).sampling_from_probs(pick).to(torch.int64)
+    out = torch.cat([drafts, drafts[:, -1:]], dim=1)
+    out.scatter_(1, emitted.view(-1, 1), recovered.view(-1, 1))
     if args.seeded_rows:
         from freetoken.engine.sample import mix_step_seed
 
+        # Target-deterministic chain verification: draw y_j ~ p[row, j] from (seed, gen_len + j)
+        # independently of the proposer's q/drafts so unseeded draft RNG never perturbs outputs.
         for row, seed, gen_len, _, _, _ in args.seeded_rows:
-            step_idx = gen_len + int(emitted[row].item())
-            gen = torch.Generator(device=pick.device)
-            gen.manual_seed(mix_step_seed(seed, step_idx) ^ 0x5555555555555555)
-            noise = (
-                torch.empty_like(pick[row])
-                .exponential_(1.0, generator=gen)
-                .clamp_min_(1e-30)
-            )
-            recovered[row] = torch.argmax(pick[row] / noise, dim=-1).to(torch.int64)
-    out = torch.cat([drafts, drafts[:, -1:]], dim=1)
-    out.scatter_(1, emitted.view(-1, 1), recovered.view(-1, 1))
+            y = torch.empty(k + 1, dtype=torch.int64, device=p.device)
+            for j in range(k + 1):
+                gen = torch.Generator(device=p.device)
+                gen.manual_seed(mix_step_seed(seed, gen_len + j))
+                noise = (
+                    torch.empty_like(p[row, j])
+                    .exponential_(1.0, generator=gen)
+                    .clamp_min_(1e-30)
+                )
+                y[j] = torch.argmax(p[row, j] / noise, dim=-1).to(torch.int64)
+            emitted[row] = (drafts[row] == y[:k]).to(torch.int64).cumprod(0).sum()
+            out[row] = y
     return out, emitted

@@ -99,6 +99,37 @@ def test_sampler_seed_is_reproducible_and_batch_invariant():
     )
     assert verify_toks.tolist() == solo_seq[:4]
 
+    # DFlash reject_with_draft_probs with different unseeded drafts commits identical prefix tokens!
+    from freetoken.spec.rejection import reject_with_draft_probs
+
+    support = torch.tensor([[[0, 1], [0, 1], [0, 1]]], dtype=torch.int64)
+    q_a = torch.tensor([[[0.9, 0.1], [0.9, 0.1], [0.9, 0.1]]], dtype=torch.float32)
+    q_b = torch.tensor([[[0.1, 0.9], [0.5, 0.5], [0.2, 0.8]]], dtype=torch.float32)
+    drafts_exact = torch.tensor([solo_seq[:3]], dtype=torch.int64)
+    drafts_wrong = torch.tensor(
+        [[solo_seq[0], (solo_seq[1] + 1) % 64, 0]], dtype=torch.int64
+    )
+    out_a, em_a = reject_with_draft_probs(
+        verify_logits,
+        drafts_exact,
+        support,
+        q_a,
+        sampler.prepare(verify_batch),
+        sampler,
+    )
+    out_b, em_b = reject_with_draft_probs(
+        verify_logits,
+        drafts_wrong,
+        support,
+        q_b,
+        sampler.prepare(verify_batch),
+        sampler,
+    )
+    assert int(em_a[0].item()) == 3
+    assert out_a[0, : int(em_a[0].item()) + 1].tolist() == solo_seq[:4]
+    assert int(em_b[0].item()) == 1
+    assert out_b[0, : int(em_b[0].item()) + 1].tolist() == solo_seq[:2]
+
 
 def test_sampler_compute_logprobs_allowed_neg_inf_never_leaks_token_zero():
     sampler = Sampler(device=torch.device("cpu"), vocab_size=100)
