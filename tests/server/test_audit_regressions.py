@@ -130,7 +130,10 @@ def test_anthropic_cch_stripping_and_adaptive_thinking():
         model="qwen",
         max_tokens=64,
         system=[
-            {"type": "text", "text": "x-anthropic-billing-header: v=1; cch=abcd1234;\n"},
+            {
+                "type": "text",
+                "text": "x-anthropic-billing-header: v=1; cch=abcd1234;\n",
+            },
             {"type": "text", "text": "Keep cch=9999ffff; literal here."},
         ],
         thinking={"type": "Adaptive"},
@@ -310,6 +313,49 @@ def test_media_ssrf_and_bounds():
 
 def test_split_hosts_unwraps_ipv6_brackets():
     assert split_hosts(" [::1] , 127.0.0.1 , ::1 ") == ["::1", "127.0.0.1"]
+
+
+def test_cudagraph_pool_recapture_preserves_mempool_use_count():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from freetoken.kernel.l2_persist import (
+        clear_stream_persisting_l2_window,
+        find_graph_pool_window,
+        set_stream_persisting_l2_window,
+    )
+
+    dev_idx = torch.cuda.current_device()
+    stream = torch.cuda.Stream()
+    x = torch.ones(256, 256, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(x)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=None, stream=stream):
+        out.copy_(x * 2)
+    pool = graph.pool()
+    win1 = find_graph_pool_window(pool, dev_idx)
+    assert win1 is not None
+    set_stream_persisting_l2_window(
+        stream, win1[0], win1[1], max_window_mb=16, device_index=dev_idx
+    )
+    recaptured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(recaptured, pool=pool, stream=stream):
+        out.copy_(x * 2)
+    graph.reset()
+    graph = recaptured
+    win2 = find_graph_pool_window(pool, dev_idx)
+    assert win2 == win1
+    clear_stream_persisting_l2_window(
+        stream, reset_device_limit=False, device_index=dev_idx
+    )
+    graph.replay()
+    stream.synchronize()
+    clear_stream_persisting_l2_window(
+        stream, reset_device_limit=True, device_index=dev_idx
+    )
+    assert float(out[0, 0].item()) == 2.0
 
 
 def test_pread_exact_handles_short_reads(monkeypatch, tmp_path):

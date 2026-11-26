@@ -311,11 +311,15 @@ class GraphRunner:
                     if pool is None:
                         pool = graph.pool()  # reuse cuda graph handle to reduce memory
                         if _maybe_arm_l2_window(pool):
-                            # Re-capture the initial graph with accessPolicyWindow active on self.stream
-                            # so every instantiated cudaGraphExec_t node inherits the L2 policy.
-                            graph = torch.cuda.CUDAGraph()
-                            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                            # Keep `graph` alive until `recaptured` finishes capture so PyTorch's
+                            # CUDACachingAllocator private mempool use_count never drops to zero.
+                            recaptured = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(
+                                recaptured, pool=pool, stream=self.stream
+                            ):
                                 self._store_output(bs, self.forward())
+                            graph.reset()
+                            graph = recaptured
                     _upload_graph(graph, self.stream)
                     self._reset_moe_offload_cache()
                 self.graph_map[bs] = graph
