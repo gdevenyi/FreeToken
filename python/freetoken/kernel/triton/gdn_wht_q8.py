@@ -63,16 +63,17 @@ def _wht128_q8_pack_slot_kernel(
     BLOCK_M: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
+    zero_i64 = tl.full((), 0, tl.int64)
+    pid = zero_i64 + tl.program_id(0)
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
-    rows_per_layer_i64 = rows_per_layer.to(tl.int64)
-    total_rows = num_layers.to(tl.int64) * rows_per_layer_i64
+    rows_per_layer_i64 = zero_i64 + rows_per_layer
+    total_rows = (zero_i64 + num_layers) * rows_per_layer_i64
     mask_m = offs_m < total_rows
     layer = offs_m // rows_per_layer_i64
     row_in_layer = offs_m - layer * rows_per_layer_i64
-    stride_layer_i64 = stride_layer.to(tl.int64)
-    stride_slot_i64 = stride_slot.to(tl.int64)
-    slot_idx_i64 = slot_idx.to(tl.int64)
+    stride_layer_i64 = zero_i64 + stride_layer
+    stride_slot_i64 = zero_i64 + stride_slot
+    slot_idx_i64 = zero_i64 + slot_idx
     offs_k = tl.arange(0, 128)
 
     y = tl.zeros((BLOCK_M, 128), dtype=tl.float32)
@@ -134,16 +135,17 @@ def _wht128_q8_unpack_slot_kernel(
     stride_slot,
     BLOCK_M: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
+    zero_i64 = tl.full((), 0, tl.int64)
+    pid = zero_i64 + tl.program_id(0)
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
-    rows_per_layer_i64 = rows_per_layer.to(tl.int64)
-    total_rows = num_layers.to(tl.int64) * rows_per_layer_i64
+    rows_per_layer_i64 = zero_i64 + rows_per_layer
+    total_rows = (zero_i64 + num_layers) * rows_per_layer_i64
     mask_m = offs_m < total_rows
     layer = offs_m // rows_per_layer_i64
     row_in_layer = offs_m - layer * rows_per_layer_i64
-    stride_layer_i64 = stride_layer.to(tl.int64)
-    stride_slot_i64 = stride_slot.to(tl.int64)
-    slot_idx_i64 = slot_idx.to(tl.int64)
+    stride_layer_i64 = zero_i64 + stride_layer
+    stride_slot_i64 = zero_i64 + stride_slot
+    slot_idx_i64 = zero_i64 + slot_idx
     offs_k = tl.arange(0, 128)
     offs_g = tl.arange(0, 4)
 
