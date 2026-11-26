@@ -71,7 +71,9 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     from freetoken.gpu_select import set_assigned_gpu
 
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
-    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
+    targets = (
+        args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
+    )
     set_assigned_gpu(targets[args.tp_info.rank])
 
     import torch
@@ -150,7 +152,9 @@ def launch_server(
         from freetoken.gpu_select import resolve_gpu_uuids
 
         try:
-            server_args = replace(server_args, gpu_assigned=resolve_gpu_uuids(server_args.gpu))
+            server_args = replace(
+                server_args, gpu_assigned=resolve_gpu_uuids(server_args.gpu)
+            )
         except ValueError as exc:
             raise SystemExit(f"{prog or 'ft serve'}: error: {exc}") from exc
         logger.info(
@@ -158,7 +162,7 @@ def launch_server(
             f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
         )
 
-    def start_subprocess() -> "BackendHandle":
+    def start_subprocess() -> BackendHandle:
         import multiprocessing as mp
 
         from .supervisor import BackendHandle
@@ -192,6 +196,7 @@ def launch_server(
                 "frontend_addr": server_args.zmq_frontend_addr,
                 "local_bs": 1,
                 "mm": server_args.mm,
+                "chat_template": server_args.chat_template,
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
                 "ack_queue": ack_queue,
@@ -212,6 +217,7 @@ def launch_server(
                     "frontend_addr": server_args.zmq_frontend_addr,
                     "local_bs": 1,
                     "mm": server_args.mm,
+                    "chat_template": server_args.chat_template,
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "ack_queue": ack_queue,

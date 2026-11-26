@@ -26,6 +26,8 @@ class SchedulerConfig(EngineConfig):
     kld_endpoint: bool = False
     # hybrid GDN: where prefills donate state snapshots (CacheManager): chunk | structural
     gdn_snapshot_policy: str = "chunk"
+    # Optional Jinja chat template file overriding the checkpoint's own chat_template.
+    chat_template: str | None = None
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

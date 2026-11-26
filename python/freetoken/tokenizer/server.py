@@ -165,6 +165,7 @@ def tokenize_worker(
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
     mm: MultimodalConfig | None = None,
+    chat_template: str | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(
         backend_addr, create=False, encoder=BaseBackendMsg.encoder
@@ -174,7 +175,7 @@ def tokenize_worker(
     )
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
     assert local_bs > 0
-    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path, chat_template=chat_template)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
     from freetoken.mm.processor import get_mm_processor

@@ -166,7 +166,9 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
         self._pending_flush: tuple[FlushCacheBackendMsg, float] | None = None
-        self.tokenizer = load_tokenizer(config.model_path)
+        self.tokenizer = load_tokenizer(
+            config.model_path, chat_template=getattr(config, "chat_template", None)
+        )
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (

@@ -852,6 +852,14 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=ServerArgs.chat_template,
+        metavar="FILE",
+        help="Jinja chat template file overriding the checkpoint's own chat_template.",
+    )
+
+    parser.add_argument(
         "--max-completion-prompts",
         type=_positive_int,
         default=ServerArgs.max_completion_prompts,
@@ -1351,6 +1359,12 @@ def parse_args(
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    if kwargs["chat_template"] is not None:
+        tpl_path = os.path.realpath(os.path.expanduser(kwargs["chat_template"]))
+        if not os.path.isfile(tpl_path):
+            parser.error(f"--chat-template {tpl_path} is not a file")
+        kwargs["chat_template"] = tpl_path
 
     # every process reads the GGUF config, tokenizer workers included, so the choice travels in the environment
     from freetoken.models.gguf.mmproj import MMPROJ_ENV

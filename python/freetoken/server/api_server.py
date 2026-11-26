@@ -236,7 +236,10 @@ class FrontendManager:
                 from freetoken.utils import load_tokenizer
 
                 self._frontend_tokenizer = TokenizeManager(
-                    load_tokenizer(self.config.model_path),
+                    load_tokenizer(
+                        self.config.model_path,
+                        chat_template=getattr(self.config, "chat_template", None),
+                    ),
                     get_mm_processor(self.config.model_path, self.config.mm),
                 )
             return self._frontend_tokenizer

@@ -2,7 +2,8 @@ import copy
 import functools
 import json
 import os
-from typing import Any, FrozenSet, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from huggingface_hub import hf_hub_download, snapshot_download
 from huggingface_hub.utils import EntryNotFoundError
@@ -28,14 +29,34 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
-def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
+def _read_chat_template_override(chat_template: str) -> str:
+    if os.path.isfile(chat_template):
+        with open(chat_template, encoding="utf-8") as f:
+            if chat_template.endswith(".json"):
+                return str(json.load(f)["chat_template"])
+            return f.read()
+    if "{%" in chat_template or "{{" in chat_template:
+        return chat_template
+    raise FileNotFoundError(f"chat template file not found: {chat_template}")
+
+
+def load_tokenizer(
+    model_path: str, chat_template: str | None = None
+) -> PreTrainedTokenizerBase:
     from freetoken.models.gguf.reader import gguf_config_source
 
+    override = chat_template or os.environ.get("FREETOKEN_CHAT_TEMPLATE") or None
     if (gguf_src := gguf_config_source(model_path)) is not None:
         from freetoken.models.gguf.tokenizer import load_gguf_tokenizer
 
-        return load_gguf_tokenizer(gguf_src)
+        tokenizer = load_gguf_tokenizer(gguf_src)
+        if override is not None:
+            tokenizer.chat_template = _read_chat_template_override(override)
+        return tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if override is not None:
+        tokenizer.chat_template = _read_chat_template_override(override)
+        return tokenizer
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
         try:
@@ -52,12 +73,18 @@ def load_image_processor(model_path: str) -> Any:
     from freetoken.models.gguf.reader import gguf_config_source
 
     if gguf_config_source(model_path) is not None:
-        from transformers.models.auto.image_processing_auto import get_image_processor_class_from_name
+        from transformers.models.auto.image_processing_auto import (
+            get_image_processor_class_from_name,
+        )
 
         config = cached_load_hf_config(model_path).preprocessor_config
         if config is None:
-            raise ValueError(f"{model_path}: GGUF has no vision mmproj to build an image processor from")
-        return get_image_processor_class_from_name(config["image_processor_type"]).from_dict(config)
+            raise ValueError(
+                f"{model_path}: GGUF has no vision mmproj to build an image processor from"
+            )
+        return get_image_processor_class_from_name(
+            config["image_processor_type"]
+        ).from_dict(config)
     from transformers import AutoImageProcessor
 
     return AutoImageProcessor.from_pretrained(model_path)
@@ -65,7 +92,7 @@ def load_image_processor(model_path: str) -> Any:
 
 def load_eos_token_ids(
     model_path: str, tokenizer: PreTrainedTokenizerBase
-) -> FrozenSet[int]:
+) -> frozenset[int]:
     """Return the full set of stop-token ids for generation.
 
     Chat models often terminate a turn with a token other than ``tokenizer.eos_token``
@@ -86,7 +113,9 @@ def load_eos_token_ids(
     try:
         try:
             gen_eos = GenerationConfig.from_pretrained(model_path).eos_token_id
-        except OSError:  # no generation_config.json, config.json can still list the stop ids
+        except (
+            OSError
+        ):  # no generation_config.json, config.json can still list the stop ids
             gen_eos = getattr(_load_hf_config(model_path), "eos_token_id", None)
     except Exception:
         gen_eos = None
@@ -225,7 +254,10 @@ def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
     # config.json wins when it has one; the sidecar is only read for exports that never wrote it there
     if getattr(config, "quantization_config", None) is not None:
         return
-    if getattr(getattr(config, "text_config", None), "quantization_config", None) is not None:
+    if (
+        getattr(getattr(config, "text_config", None), "quantization_config", None)
+        is not None
+    ):
         return
     quant = sidecar_quantization_config(model_path)
     if quant is None:
@@ -257,7 +289,9 @@ def _with_overrides(config: Any, data: dict, overrides: Mapping[str, Any]) -> di
     merged = dict(data)
     for key, value in overrides.items():
         section = getattr(config, key, None)
-        if isinstance(value, Mapping) and isinstance(section, (PretrainedConfig, RawConfigShim)):
+        if isinstance(value, Mapping) and isinstance(
+            section, (PretrainedConfig, RawConfigShim)
+        ):
             merged[key] = _with_overrides(section, merged.get(key) or {}, value)
         else:
             merged[key] = copy.deepcopy(value)
@@ -276,7 +310,9 @@ def cached_load_hf_config(
 
     if (gguf_src := gguf_config_source(model_path)) is not None:
         if overrides:
-            raise ValueError("--hf-overrides applies to a HF config.json; a GGUF carries its own metadata")
+            raise ValueError(
+                "--hf-overrides applies to a HF config.json; a GGUF carries its own metadata"
+            )
         from freetoken.models.gguf.config import build_gguf_shim
 
         return build_gguf_shim(gguf_src)
@@ -291,13 +327,17 @@ def cached_load_hf_config(
 
 def _weight_allow_patterns(repo_id: str) -> list[str]:
     try:
-        index = hf_hub_download(repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm)
+        index = hf_hub_download(
+            repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm
+        )
         with open(index, encoding="utf-8") as f:
             shards = sorted(set(json.load(f)["weight_map"].values()))
     except Exception as e:
         logger.warning(
             "no usable %s for %s (%s); falling back to *.safetensors",
-            SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
+            SAFE_WEIGHTS_INDEX_NAME,
+            repo_id,
+            e,
         )
         return ["*.safetensors"]
     return shards or ["*.safetensors"]
