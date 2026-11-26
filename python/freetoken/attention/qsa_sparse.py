@@ -32,10 +32,12 @@ static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturab
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.core import Batch, get_global_ctx
 from freetoken.utils import init_logger
 
@@ -131,7 +133,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self.cmp_page_size = self.page_size // self.ratio
         self.block_topk = self.token_topk // self.ratio
         self.select_width = self.token_topk + self.ratio - 1
-        assert self.token_topk % self.ratio == 0, "QSA budget must be a whole number of blocks"
+        assert self.token_topk % self.ratio == 0, (
+            "QSA budget must be a whole number of blocks"
+        )
         # The sparse attend kernel bakes 1/sqrt(head_dim) into its exp2 scale.
         assert config.attn_sm_scale in (None, self.head_dim**-0.5), (
             "qsa_sparse serves the default 1/sqrt(head_dim) attention scale only"
@@ -146,13 +150,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             from freetoken.layers.rotary import build_section_table
 
             self._section_table = build_section_table(
-                tuple(group.rotary_config.mrope_section), group.rotary_config.mrope_layout
+                tuple(group.rotary_config.mrope_section),
+                group.rotary_config.mrope_layout,
             ).to(self.device)
 
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
-        self.capture_bs: List[int] = []
+        self.capture_bs: list[int] = []
         self._capture_rows_per_req = 1
 
     @staticmethod
@@ -198,7 +203,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token indexer cos/sin rows for [3, n] mrope positions."""
         from freetoken.layers.rotary import mrope_cos_sin_rows
 
-        return mrope_cos_sin_rows(self._index_rope_cache(), positions, self._section_table)
+        return mrope_cos_sin_rows(
+            self._index_rope_cache(), positions, self._section_table
+        )
 
     # ----- metadata -----------------------------------------------------------------------
     def prepare_metadata(self, batch: Batch) -> None:
@@ -206,7 +213,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         seqlens_q = [r.extend_len for r in reqs]
         seqlens_k = [r.device_len for r in reqs]
         is_decode = getattr(batch, "phase", None) == "decode"
-        qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        qo_indptr = (
+            torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        )
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)
         md = QSASparseMetadata(
@@ -244,17 +253,21 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return md.is_prefill and self.index_heads == 4
 
     def _block_table(self, table_idx: torch.Tensor) -> torch.Tensor:
-        return (self._block_base_view().index_select(0, table_idx) // self.page_size).to(
-            torch.int32
-        )
+        return (
+            self._block_base_view().index_select(0, table_idx) // self.page_size
+        ).to(torch.int32)
 
-    def _stage_decode(self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor) -> None:
+    def _stage_decode(
+        self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor
+    ) -> None:
         """Copy this step's addressing into the static graph buffers and point the metadata
         at them (restage-per-replay, m3/dsa precedent)."""
         self._graph["block_table"][:bs].copy_(
             self._block_base_view().index_select(0, table_idx) // self.page_size
         )
-        self._graph["kvlen"][:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
+        self._graph["kvlen"][:bs].copy_(
+            md.kv_len_cpu.to(self.device, non_blocking=True)
+        )
         self._graph["table_idx"][:bs].copy_(table_idx)
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
@@ -326,6 +339,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_format=self.kvcache.kv_format,
             k_scale=self.kvcache.k_scale(layer_id),
             v_scale=self.kvcache.v_scale(layer_id),
+            is_prefill=md.is_prefill,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
@@ -339,10 +353,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
             if rope_positions.dim() == 1:
                 rope_positions = rope_positions.unsqueeze(0).expand(3, -1)
             rope_positions = rope_positions.to(torch.int32)
-            self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
+            self.kvcache.rope_positions.index_copy_(
+                0, out_loc, rope_positions.t().contiguous()
+            )
             # groups are ratio-aligned within a page, so the group start is the slot rounded down
-            first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()
-            md.rope_rows = torch.arange(out_loc.numel(), dtype=torch.int32, device=self.device)
+            first_pos = self.kvcache.rope_positions.index_select(
+                0, out_loc - out_loc % self.ratio
+            ).t()
+            md.rope_rows = torch.arange(
+                out_loc.numel(), dtype=torch.int32, device=self.device
+            )
             md.q_rope_cache = self._index_rope_rows(rope_positions)
             md.k_rope_cache = self._index_rope_rows(first_pos)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -352,7 +372,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # group closes exactly on out_loc % index_ratio == index_ratio - 1.
         closing = out_loc % self.ratio == self.ratio - 1
         scratch = self.kvcache.cmp_scratch_base + slots
-        md.cmp_rows = torch.where(closing, out_loc // self.ratio, scratch).to(torch.int32)
+        md.cmp_rows = torch.where(closing, out_loc // self.ratio, scratch).to(
+            torch.int32
+        )
         # Only the last ring_capacity rows of a request survive to the next forward; the rest
         # are masked off instead of dumped somewhere (vLLM rule).
         ends = md.cu_seqlens.to(torch.int64).index_select(0, req + 1)
@@ -476,7 +498,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
                     logits,
                     visible,
                 )
-            blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
+            blocks = self._scratch(
+                "blocks", end - start, self.block_topk, dtype=torch.int32
+            )
             self._top_blocks(logits, visible, blocks)
             expand_qsa_block_indices(
                 blocks,
@@ -502,7 +526,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if self._block_topk_kernel is not None:
             scratch_width = self._topk_scratch_width(logits.shape[1])
             scratch = (
-                self._scratch("topk_scratch", logits.shape[0], scratch_width, dtype=torch.int32)
+                self._scratch(
+                    "topk_scratch", logits.shape[0], scratch_width, dtype=torch.int32
+                )
                 if scratch_width
                 else None
             )
@@ -515,7 +541,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         logits.masked_fill_(column.unsqueeze(0) >= visible.unsqueeze(1), -float("inf"))
         width = min(self.block_topk, columns)
         values, chosen = torch.topk(logits, width, dim=-1)
-        blocks[:, :width] = torch.where(values > -float("inf"), chosen.to(torch.int32), -1)
+        blocks[:, :width] = torch.where(
+            values > -float("inf"), chosen.to(torch.int32), -1
+        )
         if width < self.block_topk:
             blocks[:, width:] = -1
 
@@ -528,7 +556,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return qsa_block_topk_scratch_width(columns, self.block_topk)
 
     # ----- scratch ------------------------------------------------------------------------
-    def _scratch(self, name: str, rows: int, *shape: int, dtype: torch.dtype) -> torch.Tensor:
+    def _scratch(
+        self, name: str, rows: int, *shape: int, dtype: torch.dtype
+    ) -> torch.Tensor:
         """A per-forward transient: the static decode buffer when it is wide enough (so a
         captured graph keeps one address), otherwise a fresh allocation."""
         buffer = self._graph.get(name)
@@ -537,7 +567,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+    def init_capture_graph(
+        self, max_seq_len: int, bs_list: list[int], rows_per_req: int = 1
+    ) -> None:
         self.capture_bs = sorted(bs_list)
         self._capture_rows_per_req = rows_per_req
         max_bs = max(bs_list)
@@ -552,18 +584,27 @@ class QSASparseAttnBackend(BaseAttnBackend):
             return torch.empty(shape, dtype=dtype, device=self.device)
 
         self._graph = {
-            "block_table": torch.zeros((max_bs, pages), dtype=torch.int32, device=self.device),
+            "block_table": torch.zeros(
+                (max_bs, pages), dtype=torch.int32, device=self.device
+            ),
             "kvlen": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device).repeat_interleave(rows_per_req),
-            "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device) * rows_per_req,
+            "token_to_req": torch.arange(
+                max_bs, dtype=torch.int32, device=self.device
+            ).repeat_interleave(rows_per_req),
+            "cu_seqlens": torch.arange(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            )
+            * rows_per_req,
             "logits": empty(chunk, columns, dtype=torch.float32),
             "visible": empty(rows, dtype=torch.int32),
             "blocks": empty(rows, self.block_topk, dtype=torch.int32),
             "indices": empty(rows, self.select_width, dtype=torch.int32),
             "pooled": empty(rows, self.index_head_dim, dtype=self.dtype),
             "first_pos": empty(rows, dtype=torch.int32),
-            "q_index": empty(rows, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            "q_index": empty(
+                rows, self.index_heads, self.index_head_dim, dtype=self.dtype
+            ),
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
@@ -581,8 +622,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: Batch) -> None:
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
-        assert batch.active_table_idx is not None, "graph batch is missing its page-table rows"
-        self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
+        assert batch.active_table_idx is not None, (
+            "graph batch is missing its page-table rows"
+        )
+        self._stage_decode(
+            md, batch.padded_size, batch.active_table_idx.to(torch.int64)
+        )
 
     def reset_capture(self) -> None:
         super().reset_capture()
@@ -611,7 +656,13 @@ def qsa_selection_stats(
     """
     valid = indices >= 0
     behind = positions.to(torch.int64).unsqueeze(1) - indices.to(torch.int64)
-    counts = {"rows": indices.shape[0], "tokens": int(valid.sum()), "overlap_hits": 0, "overlap_tokens": 0, "overlap_reqs": 0}
+    counts = {
+        "rows": indices.shape[0],
+        "tokens": int(valid.sum()),
+        "overlap_hits": 0,
+        "overlap_tokens": 0,
+        "overlap_reqs": 0,
+    }
     for a in ages:
         counts[f"old{a}"] = int((valid & (behind > a)).sum())
     uids = torch.tensor(row_uids)
@@ -647,14 +698,20 @@ class QSASelectionSampler:
             return
         rows_per_req = batch.rows_per_req or 1
         rows = len(batch.reqs) * rows_per_req
-        select = getattr(backend, "selection_view", None)  # only the QSA backend has one
+        select = getattr(
+            backend, "selection_view", None
+        )  # only the QSA backend has one
         view = select(rows) if select is not None else None
         if view is None or self.pending is not None:
             self.skipped += 1
             return
-        pin = torch.cuda.is_available()
-        indices = torch.empty(view.shape, dtype=view.dtype, pin_memory=pin).copy_(view, non_blocking=pin)
-        positions = torch.empty(rows, dtype=batch.positions.dtype, pin_memory=pin).copy_(batch.positions[:rows], non_blocking=pin)
+        pin = view.is_cuda
+        indices = torch.empty(view.shape, dtype=view.dtype, pin_memory=pin).copy_(
+            view, non_blocking=pin
+        )
+        positions = torch.empty(
+            rows, dtype=batch.positions.dtype, pin_memory=pin
+        ).copy_(batch.positions[:rows], non_blocking=pin)
         event = None
         if pin:
             event = torch.cuda.Event()
@@ -663,7 +720,9 @@ class QSASelectionSampler:
         self.pending = (indices, positions, uids, event)
 
     def _take_ready(self) -> None:
-        if self.pending is None or (self.pending[3] is not None and not self.pending[3].query()):
+        if self.pending is None or (
+            self.pending[3] is not None and not self.pending[3].query()
+        ):
             return
         indices, positions, uids, _ = self.pending
         self.pending = None
@@ -680,7 +739,10 @@ class QSASelectionSampler:
         if not self.samples and not self.skipped:
             return None
         w, tokens = self.window, self.window.get("tokens", 0)
-        old = " ".join(f"old{a // 1024}k={w.get(f'old{a}', 0) / tokens if tokens else 0:.3f}" for a in QSA_SELECTION_AGES)
+        old = " ".join(
+            f"old{a // 1024}k={w.get(f'old{a}', 0) / tokens if tokens else 0:.3f}"
+            for a in QSA_SELECTION_AGES
+        )
         hits, base = w.get("overlap_hits", 0), w.get("overlap_tokens", 0)
         text = (
             f"qsa samples={self.samples} skipped={self.skipped} rows={w.get('rows', 0)} tokens={tokens} {old} "
@@ -690,4 +752,9 @@ class QSASelectionSampler:
         return text
 
 
-__all__ = ["QSASelectionSampler", "QSASparseAttnBackend", "QSASparseMetadata", "qsa_selection_stats"]
+__all__ = [
+    "QSASelectionSampler",
+    "QSASparseAttnBackend",
+    "QSASparseMetadata",
+    "qsa_selection_stats",
+]

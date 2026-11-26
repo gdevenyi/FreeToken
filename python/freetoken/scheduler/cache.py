@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, NamedTuple, Tuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+
 from freetoken.core import Req
 from freetoken.kernel.sm_upload import upload_step_tensor
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
@@ -16,6 +17,7 @@ from .status import KVStats
 if TYPE_CHECKING:
     from .utils import PendingReq
 
+
 # Proactive out-of-window free_swa runs on any decode step that has slid out `interval`
 # positions since the request's last free (== sglang SWA_EVICTION_INTERVAL).
 def _swa_eviction_interval() -> int:
@@ -23,7 +25,9 @@ def _swa_eviction_interval() -> int:
     try:
         return max(1, int(raw))
     except ValueError:
-        raise ValueError(f"FREETOKEN_SWA_EVICTION_INTERVAL must be an integer, got {raw!r}")
+        raise ValueError(
+            f"FREETOKEN_SWA_EVICTION_INTERVAL must be an integer, got {raw!r}"
+        )
 
 
 _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
@@ -39,7 +43,9 @@ LOGPROB_READ_SNAPSHOT_DONATE = ("all", "boundary", "none")
 # boundary, a fork from an existing path and each SNAPSHOT_STRIDE tokens, and caps each path
 GDN_SNAPSHOT_POLICIES = ("chunk", "structural")
 SNAPSHOT_STRIDE = 32768
-SNAPSHOT_PATH_CAP = 2  # the pinned root and the tail; the previous turn's prompt end stays on top
+SNAPSHOT_PATH_CAP = (
+    2  # the pinned root and the tail; the previous turn's prompt end stays on top
+)
 
 
 class KVRestore(NamedTuple):
@@ -73,19 +79,35 @@ class _KVHostPages:
 
 
 class CacheManager:
-    def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
-                 logprob_read_snapshot_donate: str = "all", isolate_logprob_reads: bool = False,
-                 snapshot_policy: str = "chunk", kv_host=None, elastic_pool=None):
+    def __init__(
+        self,
+        num_pages: int,
+        page_size: int,
+        page_table: torch.Tensor,
+        type: str,
+        linear_state_pool=None,
+        swa_pool=None,
+        sliding_window_size=None,
+        radix_lookahead: bool = False,
+        logprob_read_snapshot_donate: str = "all",
+        isolate_logprob_reads: bool = False,
+        snapshot_policy: str = "chunk",
+        kv_host=None,
+        elastic_pool=None,
+    ):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
         self.elastic_pool = elastic_pool
         if elastic_pool is not None:
-            self.free_slots = elastic_pool.initial_free_kv_slots(num_pages, page_size, device)
+            self.free_slots = elastic_pool.initial_free_kv_slots(
+                num_pages, page_size, device
+            )
             self.supports_runtime_rebuild = False
         else:
-            self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+            self.free_slots = (
+                torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+            )
         # Hybrid GDN models drive a second currency (GDN state snapshots in LinearStatePool)
         # through a HybridRadixCache; SWA models drive a second currency (swa-pool KV slots in
         # the HybridSWAKVCache global-paged mode) through a SWARadixCache; non-hybrid models keep
@@ -95,12 +117,18 @@ class CacheManager:
         self.sliding_window_size = sliding_window_size
         self.is_hybrid = type == "hybrid_radix"
         # --kv-host-tier-gb: the KV pool, when it has host pages (hybrid radix only; None = no KV host tier)
-        self.kv_host = kv_host if self.is_hybrid and getattr(kv_host, "num_host_pages", 0) else None
+        self.kv_host = (
+            kv_host
+            if self.is_hybrid and getattr(kv_host, "num_host_pages", 0)
+            else None
+        )
         # GDN snapshots a finished logprob read (max_tokens=1 + logprobs) donates: "all" (the
         # x64 prefill boundary and the live final state), "boundary" (only the former), "none".
         # A burst of such reads otherwise evicts long conversations' snapshots.
         if logprob_read_snapshot_donate not in LOGPROB_READ_SNAPSHOT_DONATE:
-            raise ValueError(f"unknown snapshot donate policy {logprob_read_snapshot_donate!r}")
+            raise ValueError(
+                f"unknown snapshot donate policy {logprob_read_snapshot_donate!r}"
+            )
         self.logprob_read_snapshot_donate = logprob_read_snapshot_donate
         self.isolate_logprob_reads = isolate_logprob_reads
         if snapshot_policy not in GDN_SNAPSHOT_POLICIES:
@@ -128,17 +156,25 @@ class CacheManager:
         self.page_size = page_size
         self.cache_type = type
         # radix_lookahead keys position i by (t_i, t_{i+1}), so a hit also matches the token after it and a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written for a different next token
-        assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
+        assert not (radix_lookahead and self.is_swa), (
+            "the SWA radix cache keeps token keys"
+        )
         self.radix_lookahead = radix_lookahead
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
-    prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
+    prefill_chunk_budget = (
+        None  # generic shared page pool: no per-model prefill chunk cap
+    )
 
     @property
     def prefix_replay_tokens(self) -> int:
         """Prompt-tail tokens a prefix hit must leave to the prefill (a pool whose model recomputes them)."""
-        return getattr(self.swa_pool, "prefix_replay_tokens", 0) if self.swa_pool is not None else 0
+        return (
+            getattr(self.swa_pool, "prefix_replay_tokens", 0)
+            if self.swa_pool is not None
+            else 0
+        )
 
     @property
     def prefill_chunk_align(self) -> int:
@@ -151,56 +187,86 @@ class CacheManager:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
         (active requests + protected prefix; evictable prefix-cache pages are excluded)."""
         total = self.num_pages
-        unmapped = 0 if self.elastic_pool is None else self.elastic_pool.unmapped_kv_pages
-        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
-                     else self.prefix_cache.size_info.evictable_size)
-        return total - unmapped - len(self.free_slots) - evictable // self.page_size, total
+        elastic_pool = getattr(self, "elastic_pool", None)
+        unmapped = 0 if elastic_pool is None else elastic_pool.unmapped_kv_pages
+        evictable = (
+            self.prefix_cache.full_evictable_size
+            if (self.is_hybrid or self.is_swa)
+            else self.prefix_cache.size_info.evictable_size
+        )
+        return total - unmapped - len(
+            self.free_slots
+        ) - evictable // self.page_size, total
 
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
+
             tree = HybridRadixCache(device, page_size, ghosts=self.stats.enabled)
-            tree.kv_host = _KVHostPages(self.kv_host) if self.kv_host is not None else None
+            tree.kv_host = (
+                _KVHostPages(self.kv_host) if self.kv_host is not None else None
+            )
             return tree
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        limit = input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))
+        limit = (
+            input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))
+        )
         ids = self._keys(req.input_ids, limit)
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
+
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
+
             m = self.prefix_cache.match_prefix(ids)
-            return MatchResult(HybridCacheHandle(m.cached_len, m.node, m.kv_indices, m.walk_len, m.host_kv),
-                               mamba_value=m.mamba_value, mamba_host=m.mamba_host)
+            return MatchResult(
+                HybridCacheHandle(
+                    m.cached_len, m.node, m.kv_indices, m.walk_len, m.host_kv
+                ),
+                mamba_value=m.mamba_value,
+                mamba_host=m.mamba_host,
+            )
         return self.prefix_cache.match_prefix(ids)
 
     def set_stats_enabled(self, enabled: bool) -> None:
         self.stats.enabled = enabled
         if self.is_hybrid:
             from collections import OrderedDict
+
             self.prefix_cache.ghosts = OrderedDict() if enabled else None
 
     def note_admission(self, req: PendingReq, handle: BaseCacheHandle) -> None:
         """KVSTATS: an admitted request's walk, kept length and evicted continuation."""
         if not self.stats.enabled:
             return
-        walk = getattr(handle, "walk_len", handle.cached_len) if self.is_hybrid else handle.cached_len
+        walk = (
+            getattr(handle, "walk_len", handle.cached_len)
+            if self.is_hybrid
+            else handle.cached_len
+        )
         evicted = 0
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import GHOST_KEYS
-            evicted = self.prefix_cache.evicted_len(walk, self._keys(req.input_ids[walk:], GHOST_KEYS))
+
+            evicted = self.prefix_cache.evicted_len(
+                walk,
+                self._keys(req.input_ids[walk : walk + GHOST_KEYS + 1], GHOST_KEYS),
+            )
         self.stats.note_admission(walk, handle.cached_len, evicted)
 
-    def snapshot_plan(self, req: PendingReq, handle: BaseCacheHandle) -> tuple[tuple[int, ...], int | None]:
+    def snapshot_plan(
+        self, req: PendingReq, handle: BaseCacheHandle
+    ) -> tuple[tuple[int, ...], int | None]:
         """Structural policy: the chunk ends that make a prefill track a snapshot point, and the
         first turn boundary to pin. A track lands on the deepest x64 boundary strictly inside its
         chunk, so an exact point b needs a chunk end at b + 64; a stride ends a chunk at the stride
@@ -210,7 +276,14 @@ class CacheManager:
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
 
         start, n = handle.cached_len, req.input_len
-        ends, pin = set(range((start // SNAPSHOT_STRIDE + 1) * SNAPSHOT_STRIDE, n, SNAPSHOT_STRIDE)), None
+        ends, pin = (
+            set(
+                range(
+                    (start // SNAPSHOT_STRIDE + 1) * SNAPSHOT_STRIDE, n, SNAPSHOT_STRIDE
+                )
+            ),
+            None,
+        )
         if self.turn_end_id is not None:
             hit = (req.input_ids == self.turn_end_id).nonzero()
             if len(hit):
@@ -219,7 +292,9 @@ class CacheManager:
                     pin = b
                     ends.add(b + CHUNK_SIZE)
         walk = getattr(handle, "walk_len", 0)
-        if walk > start:  # the prompt leaves an existing path here: snapshot the branch point
+        if (
+            walk > start
+        ):  # the prompt leaves an existing path here: snapshot the branch point
             ends.add(walk + CHUNK_SIZE)
         return tuple(sorted(e for e in ends if start + CHUNK_SIZE < e < n)), pin
 
@@ -229,16 +304,27 @@ class CacheManager:
         from this chunk's handle and ping-pong pair before this commit, so it gets the new ones."""
         if not self.structural or req.mamba_last_track_seqlen is None:
             return
-        old_handle, old_cursor, tracked = req.cache_handle, req.mamba_next_track_idx, req.mamba_last_track_seqlen
+        old_handle, old_cursor, tracked = (
+            req.cache_handle,
+            req.mamba_next_track_idx,
+            req.mamba_last_track_seqlen,
+        )
         self._cache_req_hybrid(req, finished=False)
         succ = getattr(req, "next_chunk", None)
         if succ is None:
             return
-        assert succ.cache_handle is old_handle, "the next chunk must hold this chunk's handle"
+        assert succ.cache_handle is old_handle, (
+            "the next chunk must hold this chunk's handle"
+        )
         succ.cache_handle = req.cache_handle
         succ.mamba_ping_pong = req.mamba_ping_pong
-        if succ.mamba_next_track_idx == old_cursor and succ.mamba_last_track_seqlen == tracked:
-            succ.mamba_last_track_seqlen = None  # it made no track of its own: this one is consumed
+        if (
+            succ.mamba_next_track_idx == old_cursor
+            and succ.mamba_last_track_seqlen == tracked
+        ):
+            succ.mamba_last_track_seqlen = (
+                None  # it made no track of its own: this one is consumed
+            )
 
     def kv_stats_line(self, extra: str | None = None) -> str | None:
         """The KVSTATS line of the window since the last call (radix eviction counts included)."""
@@ -257,7 +343,9 @@ class CacheManager:
             line += f" | elastic kv_mapped={ep.mapped_usable_kv_pages}/{self.num_pages} moe_slots={ep.active_moe_slots}/{ep.geo.va_moe_slots}"
         return line
 
-    def restore_host_kv(self, handle: BaseCacheHandle) -> tuple[BaseCacheHandle, KVRestore | None]:
+    def restore_host_kv(
+        self, handle: BaseCacheHandle
+    ) -> tuple[BaseCacheHandle, KVRestore | None]:
         """--kv-host-tier-gb, at admission of a locked match: give the host-only nodes of the matched
         path device pages now (so a later request of this pass reuses them, and the commit sees a
         device prefix) and return the handle over the whole prefix with the copies to run before the
@@ -277,7 +365,12 @@ class CacheManager:
             off += n.length
         pc.counts["kv_host_hit"] += 1  # KVSTATS only
         pc.counts["kv_host_hit_tokens"] += off
-        full = HybridCacheHandle(handle.cached_len, handle.node, torch.cat([handle.kv_indices, dev]), handle.walk_len)
+        full = HybridCacheHandle(
+            handle.cached_len,
+            handle.node,
+            torch.cat([handle.kv_indices, dev]),
+            handle.walk_len,
+        )
         return full, KVRestore(host_pages, (dev[::ps] // ps).tolist(), nodes)
 
     def undo_host_kv(self, plan: KVRestore) -> None:
@@ -292,14 +385,23 @@ class CacheManager:
 
     @property
     def available_size(self) -> int:
-        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
-                     else self.prefix_cache.size_info.evictable_size)
-        return evictable + (len(self.free_slots) + self.borrowable_kv_pages) * self.page_size
+        evictable = (
+            self.prefix_cache.full_evictable_size
+            if (self.is_hybrid or self.is_swa)
+            else self.prefix_cache.size_info.evictable_size
+        )
+        return (
+            evictable
+            + (len(self.free_slots) + self.borrowable_kv_pages) * self.page_size
+        )
 
     @property
     def mamba_available_size(self) -> int:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
-        return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
+        return (
+            self.linear_state_pool.num_free_slots
+            + self.prefix_cache.mamba_evictable_size
+        )
 
     @property
     def swa_available_size(self) -> int:
@@ -325,7 +427,9 @@ class CacheManager:
         (evict_mamba), returning their slots + any freed KV to the pools. With a host bank the
         snapshots are demoted to it instead, and their nodes keep their KV."""
         while self.linear_state_pool.num_free_slots < n:
-            er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots, self._host_alloc())
+            er = self.prefix_cache.evict_mamba(
+                n - self.linear_state_pool.num_free_slots, self._host_alloc()
+            )
             if not er.mamba_slots:
                 break
             self._release(er)
@@ -349,7 +453,7 @@ class CacheManager:
             pool.free_host(er.host_slots)
         self._free(er.kv_indices)
 
-    def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
+    def snapshot_toolcall_anchor(self, reqs: list[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
         slot that is idle during decode (the kernel-side ×CHUNK track only runs on prefill
         extends). Must run on the engine stream before the current step's kernels: cached_len
@@ -392,7 +496,7 @@ class CacheManager:
         req.toolcall_anchor_counted = True
         self.stats.note_anchor(outcome)
 
-    def maybe_free_swa_out_of_window(self, reqs: List[Req]) -> None:
+    def maybe_free_swa_out_of_window(self, reqs: list[Req]) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
         footprint to ~one window so a smaller-than-full swa pool (swa_full_tokens_ratio<1) stays
         viable. Mirrors sglang ``ScheduleBatch.maybe_evict_swa`` / ``free_swa_out_of_window_slots``:
@@ -407,8 +511,10 @@ class CacheManager:
         window = self.sliding_window_size
         for req in reqs:
             if req.decode_batch_idx < 1:
-                continue                       # overlap guard: extend forward may still be running
-            floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
+                continue  # overlap guard: extend forward may still be running
+            floor = (
+                req.cache_handle.cached_len
+            )  # reused prefix -> its swa is tree-owned, not ours
             threshold = (req.device_len - 1) - window - self.page_size
             if req.toolcall_anchor_len is not None:
                 # Keep the window ending at the anchor resumable: a client-side rewrite of the
@@ -432,7 +538,7 @@ class CacheManager:
                 self._free_swa(self.page_table[req.table_idx, start:new_evicted])
                 req.swa_evicted_seqlen = new_evicted
 
-    def free_swa_out_of_window_extend(self, reqs: List[Req]) -> None:
+    def free_swa_out_of_window_extend(self, reqs: list[Req]) -> None:
         """Prefill sibling of ``maybe_free_swa_out_of_window``: before allocating a chunk, return
         each request's now-out-of-window SWA slots so a chunked prompt's live swa stays ~one window
         regardless of prompt length (else a prompt longer than the swa pool exhausts alloc_swa).
@@ -448,8 +554,12 @@ class CacheManager:
             return
         window = self.sliding_window_size
         for req in reqs:
-            floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
-            new_evicted = align_down(req.cached_len - window - self.page_size, self.page_size)
+            floor = (
+                req.cache_handle.cached_len
+            )  # reused prefix -> its swa is tree-owned, not ours
+            new_evicted = align_down(
+                req.cached_len - window - self.page_size, self.page_size
+            )
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
                 self._free_swa(self.page_table[req.table_idx, start:new_evicted])
@@ -458,7 +568,9 @@ class CacheManager:
     def lock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:
             # records the window boundary on the (frozen) handle for unlock/dec_lock.
-            object.__setattr__(handle, "swa_uuid", self.prefix_cache.inc_lock(handle.node))
+            object.__setattr__(
+                handle, "swa_uuid", self.prefix_cache.inc_lock(handle.node)
+            )
         elif self.is_hybrid:
             self.prefix_cache.inc_lock(handle.node)
         else:
@@ -478,9 +590,9 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
-    def allocate_paged(self, reqs: List[Req]) -> None:
+    def allocate_paged(self, reqs: list[Req]) -> None:
         needed_pages = 0
-        allocation_info: List[Tuple[int, int, int]] = []
+        allocation_info: list[tuple[int, int, int]] = []
         for req in reqs:
             first_page = div_ceil(req.cached_len, self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
@@ -497,7 +609,9 @@ class CacheManager:
                 if self.is_swa:
                     self.ensure_swa_slots(len(allocated))
                 self.swa_pool.alloc_swa(allocated)
-            _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            _write_page_table(
+                self.page_table, allocated, allocation_info, self.page_size
+            )
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
@@ -518,7 +632,9 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
         insert_ids = self._keys(req.input_ids, req.cached_len)
-        cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices[: len(insert_ids)])
+        cached_len, new_handle = self.prefix_cache.insert_prefix(
+            insert_ids, page_indices[: len(insert_ids)]
+        )
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
@@ -540,8 +656,9 @@ class CacheManager:
             # locked since admission, so the row already equals canonical there.
             if cached_len > old_handle.cached_len:
                 canonical = new_handle.get_matched_indices()
-                self.page_table[req.table_idx, old_handle.cached_len : cached_len].copy_(
-                    canonical[old_handle.cached_len : cached_len])
+                self.page_table[
+                    req.table_idx, old_handle.cached_len : cached_len
+                ].copy_(canonical[old_handle.cached_len : cached_len])
             req.cache_handle = new_handle
             self.lock(new_handle)
 
@@ -550,7 +667,9 @@ class CacheManager:
             return "none"
         if not req.sampling_params.is_logprob_read:
             return "all"
-        return "none" if self.isolate_logprob_reads else self.logprob_read_snapshot_donate
+        return (
+            "none" if self.isolate_logprob_reads else self.logprob_read_snapshot_donate
+        )
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
@@ -562,7 +681,9 @@ class CacheManager:
 
         # admission and launch run in one scheduler iteration, so a request reaches here only after
         # the restore before its first forward ran: its adopted pages hold their KV
-        assert getattr(req, "kv_restore", None) is None, "a request left before its KV host restore ran"
+        assert getattr(req, "kv_restore", None) is None, (
+            "a request left before its KV host restore ran"
+        )
 
         pool = self.linear_state_pool
         old_handle = req.cache_handle
@@ -570,7 +691,9 @@ class CacheManager:
 
         if finished:
             if req.toolcall_anchor_len is not None and not req.toolcall_anchor_counted:
-                self._count_anchor(req, "other")  # KVSTATS: finished before cached_len reached it
+                self._count_anchor(
+                    req, "other"
+                )  # KVSTATS: finished before cached_len reached it
             # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
             # finished too early to chunk-commit) is a strictly shorter prefix than the live
             # donate below: insert it first and advance the dedup-free floor to its boundary
@@ -592,9 +715,13 @@ class CacheManager:
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
                 host_freed: list[int] = []
-                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen, host_freed)
+                prefix_len, mamba_exist = self.prefix_cache.insert(
+                    keys, page_indices[:L], frozen, host_freed
+                )
                 self._free_host(host_freed)
-                pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
+                pool.free(
+                    [s for s in req.mamba_ping_pong if mamba_exist or s != frozen]
+                )
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 free_upto = max(free_upto, L)
@@ -608,17 +735,23 @@ class CacheManager:
             keys = self._keys(req.input_ids, insert_len)
             # Without a donated snapshot a node could never be resumed (match_prefix needs
             # one), so a non-donating read frees its pages instead of inserting them.
-            if donate == "all" and insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len:
+            if (
+                donate == "all"
+                and insert_len == req.cached_len
+                and insert_len > 0
+                and len(keys) == insert_len
+            ):
                 host_freed = []
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    keys, page_indices[:insert_len], req.linear_slot_idx, host_freed)
+                    keys, page_indices[:insert_len], req.linear_slot_idx, host_freed
+                )
                 self._free_host(host_freed)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                keep_live = not mamba_exist           # tree now owns linear_slot_idx
+                keep_live = not mamba_exist  # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto :])
+                self._free(page_indices[free_upto:])
             self._free_req_slots(req, keep_live=keep_live)
             if "_free" not in self.__dict__:
                 self.maybe_rebalance_elastic()
@@ -639,10 +772,12 @@ class CacheManager:
             # over-advanced state. Skip; the next boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
             return
-        frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
+        frozen_idx = 1 - req.mamba_next_track_idx  # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
         host_freed: list[int] = []
-        prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen, host_freed)
+        prefix_len, mamba_exist = self.prefix_cache.insert(
+            keys, page_indices[:L], frozen, host_freed
+        )
         self._free_host(host_freed)
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
@@ -654,7 +789,8 @@ class CacheManager:
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
             self.page_table[req.table_idx, old_handle.cached_len : prefix_len].copy_(
-                m.kv_indices[old_handle.cached_len : prefix_len])
+                m.kv_indices[old_handle.cached_len : prefix_len]
+            )
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
         if self.structural:
@@ -663,12 +799,18 @@ class CacheManager:
             pin = req.snapshot_pin
             if pin is not None and pin - CHUNK_SIZE < L <= pin:
                 self.prefix_cache.pin(m.node)
-            if req.prompt_len - L <= 2 * CHUNK_SIZE:  # the prompt end's track (or the last one that can track)
+            if (
+                req.prompt_len - L <= 2 * CHUNK_SIZE
+            ):  # the prompt end's track (or the last one that can track)
                 self.prefix_cache.mark_prompt_end(m.node)
             # before the replacement alloc below: the thinned slot replaces the donated one, so a
             # long prefill stops taking other sessions' snapshots once its path holds the cap
-            self._release(self.prefix_cache.cap_path(m.node, SNAPSHOT_PATH_CAP, self._host_alloc()))
-        if not mamba_exist:                                # tree took `frozen`; replace it
+            self._release(
+                self.prefix_cache.cap_path(
+                    m.node, SNAPSHOT_PATH_CAP, self._host_alloc()
+                )
+            )
+        if not mamba_exist:  # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
             pp[frozen_idx] = pool.alloc(1)[0]
@@ -687,7 +829,8 @@ class CacheManager:
 
         insert_len = align_down(req.cached_len, self.page_size)
         if not finished and self.prefix_cache.has_locked_tombstone(
-                req.input_ids[:insert_len], old_handle.cached_len):
+            req.input_ids[:insert_len], old_handle.cached_len
+        ):
             # insert would free our copy of a tombstone another request still locks, and the
             # windowed re-match may stop before it (#204). Keep the pages; commit at finish.
             return
@@ -702,11 +845,15 @@ class CacheManager:
             # unfinished chunk's frontier is already > 0 and must be honored (else insert adopts
             # sentinel slots -> the request's later SWA gathers read slot 0 -> corruption).
             _, freed = self.prefix_cache.insert(
-                req.input_ids[:insert_len], page_indices[:insert_len],
+                req.input_ids[:insert_len],
+                page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
-                update_kv_after_len=old_handle.cached_len)
+                update_kv_after_len=old_handle.cached_len,
+            )
         self.unlock(old_handle)
-        self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
+        self._free_swa(
+            freed
+        )  # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)
         if finished:
             # Page-unaligned tail (page_size>1) not inserted. The padded slice reaches to the
@@ -730,7 +877,10 @@ class CacheManager:
                 )
                 if keep_from > 0:
                     self._free_swa(
-                        self.prefix_cache.trim_head_swa(req.input_ids[:prompt_len], keep_from))
+                        self.prefix_cache.trim_head_swa(
+                            req.input_ids[:prompt_len], keep_from
+                        )
+                    )
                 self.prefix_cache.match_prefix(req.input_ids[:prompt_len])
         else:
             # inc_lock is node-granular, and the suffix insert just made this chunk's whole
@@ -740,7 +890,9 @@ class CacheManager:
             # alone. The head stays live and unlocked -- still reusable while the pool is
             # roomy, evictable the moment it is not.
             keep_from = align_down(
-                max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0), self.page_size)
+                max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0),
+                self.page_size,
+            )
             if keep_from > 0:
                 self.prefix_cache.match_prefix(req.input_ids[:keep_from])
             m = self.prefix_cache.match_prefix(req.input_ids[:insert_len])
@@ -792,7 +944,9 @@ class CacheManager:
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
             )
-            if self.kv_host is not None:  # only the tree holds KV host pages, as bank slots
+            if (
+                self.kv_host is not None
+            ):  # only the tree holds KV host pages, as bank slots
                 kv, tree_pages = self.kv_host, pc.host_kv_tokens // self.page_size
                 assert kv.num_free_host_pages + tree_pages == kv.num_host_pages, (
                     f"KV host page leak: free({kv.num_free_host_pages}) + tree({tree_pages}) != "
@@ -822,7 +976,9 @@ class CacheManager:
         else:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        unmapped = 0 if self.elastic_pool is None else self.elastic_pool.unmapped_kv_pages
+        unmapped = (
+            0 if self.elastic_pool is None else self.elastic_pool.unmapped_kv_pages
+        )
         if len(self.free_slots) + cache_pages + unmapped != self.num_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"
@@ -840,18 +996,28 @@ class CacheManager:
         cache (RadixPrefixCache.reset() is an unimplemented stub) rather than mutating
         the old one.
         """
+        if self.elastic_pool is not None:
+            raise RuntimeError(
+                "cannot rebuild CacheManager while ElasticKvMoePool is active"
+            )
         device = page_table.device
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
-        self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
+        self.free_slots = (
+            torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
+        )
+        self.prefix_cache = self._make_prefix_cache(
+            device, self.page_size, self.cache_type
+        )
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
             self.linear_state_pool.reclaim_all_host_slots()
-            if self.kv_host is not None:   # the KV host pages belonged to the discarded tree too
+            if (
+                self.kv_host is not None
+            ):  # the KV host pages belonged to the discarded tree too
                 self.kv_host.reclaim_all_host_pages()
 
     @contextmanager
@@ -863,7 +1029,7 @@ class CacheManager:
             # and return the tree's canonical pages instead of the request's duplicates.
             lazy_free_list.append(indices[:: self.page_size].clone())
 
-        lazy_free_list: List[torch.Tensor] = []
+        lazy_free_list: list[torch.Tensor] = []
         try:
             self._free = lazy_free
             yield
@@ -888,7 +1054,9 @@ class CacheManager:
             else self.prefix_cache.size_info.evictable_size
         )
         evictable_pages = evictable // self.page_size
-        active_pages = ep.mapped_usable_kv_pages - len(self.free_slots) - evictable_pages
+        active_pages = (
+            ep.mapped_usable_kv_pages - len(self.free_slots) - evictable_pages
+        )
         reclaimable_blocks = (
             ep.mapped_usable_kv_pages - max(active_pages + hyst, floor_pages + hyst)
         ) // qp
@@ -899,8 +1067,12 @@ class CacheManager:
             need_evict = (want_free_pages - len(self.free_slots)) * self.page_size
             evicted = self._evict(min(evictable, need_evict))
             if len(evicted) > 0:
-                self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
-        self.free_slots = ep.return_free_kv_blocks(self.free_slots, page_size=self.page_size)
+                self.free_slots = torch.cat(
+                    [self.free_slots, evicted[:: self.page_size]]
+                )
+        self.free_slots = ep.return_free_kv_blocks(
+            self.free_slots, page_size=self.page_size
+        )
 
     def flush(self) -> int:
         """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
@@ -908,11 +1080,20 @@ class CacheManager:
         if self.kv_host is not None:
             # drop the KV host tier first (host-only nodes go, nodes on both tiers keep their device
             # pages), so the eviction below frees the device prefixes instead of demoting them
+            host_only_before = sum(
+                n.length for n in self.prefix_cache._host_kv_nodes() if not n.on_device
+            )
             er = self.prefix_cache.evict_host_kv()
-            dropped = len(er.kv_indices)
+            host_only_after = sum(
+                n.length for n in self.prefix_cache._host_kv_nodes() if not n.on_device
+            )
+            dropped = (host_only_before - host_only_after) + len(er.kv_indices)
             self._release(er)
-        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
-                     else self.prefix_cache.size_info.evictable_size)
+        evictable = (
+            self.prefix_cache.full_evictable_size
+            if (self.is_hybrid or self.is_swa)
+            else self.prefix_cache.size_info.evictable_size
+        )
         evicted = self._evict(evictable, demote=False)
         self._free(evicted)
         self.maybe_rebalance_elastic()
@@ -959,7 +1140,9 @@ class CacheManager:
                     page_size=self.page_size,
                 )
                 self.free_slots = torch.cat([self.free_slots, borrowed])
-            assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
+            assert len(self.free_slots) >= needed_pages, (
+                "Eviction did not free enough space."
+            )
         if self.elastic_pool is not None and len(self.free_slots) > 1:
             self.free_slots = self.free_slots.sort().values
         allocated = self.free_slots[:needed_pages]
@@ -1003,7 +1186,7 @@ class CacheManager:
 def _write_page_table(
     page_table: torch.Tensor,
     allocated: torch.Tensor,
-    allocation_info: List[Tuple[int, int, int]],
+    allocation_info: list[tuple[int, int, int]],
     page_size: int,
 ) -> None:
     needed_tokens = len(allocated)

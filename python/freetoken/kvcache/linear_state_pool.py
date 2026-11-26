@@ -182,24 +182,21 @@ class LinearStatePool:
                         unpack_slot_wht128_q8,
                     )
 
-                    # Pre-compile and verify both WHT128-Q8_0 Triton kernels at startup.
-                    warm_state = torch.zeros(
-                        (1, 1, WHT_DIM),
-                        dtype=self.recurrent_states.dtype,
-                        device=self._device,
-                    )
+                    # Pre-compile and verify both WHT128-Q8_0 Triton kernels against the real
+                    # pool strides/shapes (using slot 0, the padding sink) so no JIT happens live.
                     pack_slot_wht128_q8(
-                        warm_state,
+                        self.recurrent_states,
                         0,
-                        self._pack_staging[0][:1],
-                        self._pack_staging[1][:1],
+                        self._pack_staging[0],
+                        self._pack_staging[1],
                     )
                     unpack_slot_wht128_q8(
-                        self._pack_staging[0][:1],
-                        self._pack_staging[1][:1],
-                        warm_state,
+                        self._pack_staging[0],
+                        self._pack_staging[1],
+                        self.recurrent_states,
                         0,
                     )
+                    self.recurrent_states[:, 0].zero_()
                 continue
             nbytes = t[:, 0].numel() * t.element_size()
             layout[name] = (offset, t.dtype, (t.shape[0], *t.shape[2:]))
@@ -689,14 +686,13 @@ def gdn_prefill_workspace_bytes(config) -> int:
         return 0
     # EngineConfig has no max_extend_tokens (the served config is a SchedulerConfig subclass)
     extent = min(getattr(config, "max_extend_tokens", 8192), config.max_seq_len)
+    tp_size = getattr(getattr(config, "tp_info", None), "size", 1)
+    _, _, local_v_heads, _ = _linear_local_dims(linear_group, tp_size)
     nt = -(-extent // _GDN_CHUNK_SIZE)
     states = (
-        nt
-        * linear_group.num_value_heads
-        * linear_group.value_head_dim
-        * linear_group.key_head_dim
+        nt * local_v_heads * linear_group.value_head_dim * linear_group.key_head_dim
     )
-    v_new = extent * linear_group.num_value_heads * linear_group.value_head_dim
+    v_new = extent * local_v_heads * linear_group.value_head_dim
     return (states + v_new) * config.dtype.itemsize
 
 

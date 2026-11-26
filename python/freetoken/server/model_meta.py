@@ -9,7 +9,7 @@ so they belong on the server side of the wire: ``/v1/cache/status`` is what hand
 from __future__ import annotations
 
 import math
-from typing import Any, Tuple
+from typing import Any
 
 from freetoken.tokenizer.effort import (
     EFFORT_SCALE,
@@ -30,7 +30,9 @@ def thinking_toggle_kwargs(enabled: bool) -> dict:
     return dict(THINKING_ON_KWARGS if enabled else THINKING_OFF_KWARGS)
 
 
-def thinking_override_kwargs(policy: str | None, chat_template_kwargs: dict | None) -> dict:
+def thinking_override_kwargs(
+    policy: str | None, chat_template_kwargs: dict | None
+) -> dict:
     """Apply the operator's ``--thinking`` policy over a request's template kwargs.
 
     ``auto`` (or None) keeps whatever the request asked for. ``on``/``off`` strip EVERY client
@@ -41,8 +43,13 @@ def thinking_override_kwargs(policy: str | None, chat_template_kwargs: dict | No
     ctk = dict(chat_template_kwargs or {})
     if policy not in ("on", "off"):
         return ctk
-    for key in (*_THINKING_KWARG_KEYS, *THINKING_ON_KWARGS, *THINKING_OFF_KWARGS,
-                *THINKING_ADAPTIVE_KWARGS):
+    for key in (
+        *_THINKING_KWARG_KEYS,
+        "reasoning_strength",
+        *THINKING_ON_KWARGS,
+        *THINKING_OFF_KWARGS,
+        *THINKING_ADAPTIVE_KWARGS,
+    ):
         ctk.pop(key, None)
     ctk.update(thinking_toggle_kwargs(policy == "on"))
     return ctk
@@ -50,7 +57,7 @@ def thinking_override_kwargs(policy: str | None, chat_template_kwargs: dict | No
 
 def derive_think_gears(
     profile: ThinkingProfile, parser_configured: bool
-) -> Tuple[Tuple[str, ...], str | None, dict] | None:
+) -> tuple[tuple[str, ...], str | None, dict] | None:
     """``(gears, default_gear, kwargs_per_gear)`` for the /v1/cache/status
     ``geometry.reasoning`` block, derived from the checkpoint's probed thinking
     controls -- the checkpoint owns this knowledge; nothing here is keyed by
@@ -96,16 +103,25 @@ def derive_think_gears(
     elif profile.default_state == "adaptive" and "adaptive" in gears:
         default = "adaptive"
     elif efforts.consumes_effort:
-        default = efforts.default if efforts.default in gears else (
-            "medium" if "medium" in gears else gears[-1]
+        default = (
+            efforts.default
+            if efforts.default in gears
+            else ("medium" if "medium" in gears else gears[-1])
         )
     else:
         default = "on" if "on" in gears else gears[-1]
     return tuple(gears), default, kwargs
 
 
-_THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")
+_THINKING_KWARG_KEYS = (
+    "enable_thinking",
+    "thinking",
+    "thinking_mode",
+    "reasoning_effort",
+)
 _DISABLE_EFFORTS = ("none", "off")
+_DISABLE_THINKING_TYPES = ("disabled", "off", "none", "false")
+_ENABLE_THINKING_TYPES = ("enabled", "on", "true", "adaptive")
 
 
 def effort_toggle_kwargs(
@@ -118,17 +134,20 @@ def effort_toggle_kwargs(
     Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
     effort enables it, forwarded for templates that grade it (quantized against
     the checkpoint's probed vocabulary at render time). ``thinking_type`` is the
-    DeepSeek-wire ``thinking: {"type": ...}`` toggle; when present it decides
+    DeepSeek/Anthropic ``thinking: {"type": ...}`` toggle; when present it decides
     the on/off direction outright, "disabled" winning over any effort."""
     ctk = dict(chat_template_kwargs or {})
     if any(key in ctk for key in _THINKING_KWARG_KEYS):
         return ctk
     if isinstance(effort, str):
         effort = effort.strip().lower()
+    norm_type = (
+        thinking_type.strip().lower() if isinstance(thinking_type, str) else None
+    )
     disabled = effort in _DISABLE_EFFORTS
-    if thinking_type == "disabled":
+    if norm_type in _DISABLE_THINKING_TYPES:
         disabled = True
-    elif thinking_type == "enabled":
+    elif norm_type in _ENABLE_THINKING_TYPES:
         disabled = False
     mapped = thinking_toggle_kwargs(not disabled)
     if effort and not disabled and effort not in _DISABLE_EFFORTS:

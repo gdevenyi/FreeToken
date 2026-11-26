@@ -416,19 +416,24 @@ class OffloadMoELayer(MoELayer):
         ):
             # A short extension touches a fraction of each layer's experts, so fetch those. A streamed
             # forward zeroes staging slots this path may register, so no layer streams beside it.
+            if self.ep_size > 1 and not (topk_ids >= 0).any():
+                return torch.zeros_like(hidden_states)
             slot_ids = self._ensure_unique(cache, topk_ids)
             pool_views = cache.pool_bank_views(self.layer_id)
             pool_alphas = cache.alphas_for_slots(self.layer_id)
             if 0 < _SMALL_PREFILL_GROUPED_ROUTES <= topk_ids.numel():
                 flat_slots = slot_ids.reshape(-1)
                 if self.ep_size > 1:
-                    valid = flat_slots >= 0
+                    valid = (topk_ids.reshape(-1) >= 0) & (flat_slots >= 0)
                     if not valid.any():
                         return torch.zeros_like(hidden_states)
                     uniq_slots, inv_valid = torch.unique(
                         flat_slots[valid], return_inverse=True
                     )
-                    mapped = torch.full_like(flat_slots, -1, dtype=torch.int32)
+                    inactive_fill = -1 if self.skips_inactive_slots else 0
+                    mapped = torch.full_like(
+                        flat_slots, inactive_fill, dtype=torch.int32
+                    )
                     mapped[valid] = inv_valid.to(torch.int32)
                 else:
                     uniq_slots, inv = torch.unique(flat_slots, return_inverse=True)

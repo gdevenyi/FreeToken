@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, List, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import numpy as np
 import torch
@@ -15,8 +15,13 @@ from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.engine.sample import make_device_tensor
 from freetoken.kvcache.format import NONE
 from freetoken.models.blocks import embed_input_ids
-from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
+from freetoken.spec.proposer import (
+    DraftContext,
+    Proposer,
+    SpecProposal,
+    check_draft_path,
+)
 from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
@@ -35,7 +40,7 @@ class MTPDraft(Protocol):
     supports_tp: ClassVar[bool]
 
     @staticmethod
-    def draft_config(config: ModelConfig) -> ModelConfig: ...
+    def draft_config(config: ModelConfig, *, tp_size: int = 1) -> ModelConfig: ...
 
     @staticmethod
     def relay_width(config: ModelConfig) -> int:
@@ -43,19 +48,28 @@ class MTPDraft(Protocol):
         ...
 
     @staticmethod
-    def check_source(path: str, target_path: str) -> None:
+    def check_source(path: str, target_path: str, *, tp_size: int = 1) -> None:
         """Raise ValueError if ``path`` cannot give this draft its weights; called before the target loads."""
         ...
 
     @classmethod
-    def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> MTPDraft: ...
+    def load(
+        cls,
+        config: ModelConfig,
+        target_model,
+        model_path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> MTPDraft: ...
 
     @property
     def embed_tokens(self) -> VocabParallelEmbedding:
         """The target's token embedding, which the draft shares."""
         ...
 
-    def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor: ...
+    def forward_hidden(
+        self, embeds: torch.Tensor, prev_hidden: torch.Tensor
+    ) -> torch.Tensor: ...
 
     def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
         """What the target's LM head reads from a draft hidden."""
@@ -87,14 +101,20 @@ class _PrefillSink:
 
     wanted_layers = frozenset()
 
-    def __init__(self, spans: List[tuple[int, int]]) -> None:
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
         self.spans = spans
         self.hidden: torch.Tensor | None = None
 
     def final_hidden(self, x: torch.Tensor) -> None:
         self.hidden = x
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+    def layer_output(
+        self,
+        layer_id: int,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        num_streams: int = 1,
+    ) -> None:
         pass
 
 
@@ -109,16 +129,32 @@ class _VerifySink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.buffer[: x.shape[0]].copy_(x)
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+    def layer_output(
+        self,
+        layer_id: int,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        num_streams: int = 1,
+    ) -> None:
         pass
 
 
 def read_token_map(path: str, vocab_size: int) -> torch.Tensor:
     """The token ids in a ``--speculative-token-map`` file."""
     raw = Path(path).read_bytes()
-    ids = torch.from_numpy(np.frombuffer(raw, dtype="<i4", count=len(raw) // 4).astype(np.int64))
-    if len(raw) % 4 or ids.numel() == 0 or ids.min() < 0 or ids.max() >= vocab_size or ids.unique().numel() != ids.numel():
-        raise ValueError(f"--speculative-token-map {path} must hold distinct little-endian int32 token ids below {vocab_size}")
+    ids = torch.from_numpy(
+        np.frombuffer(raw, dtype="<i4", count=len(raw) // 4).astype(np.int64)
+    )
+    if (
+        len(raw) % 4
+        or ids.numel() == 0
+        or ids.min() < 0
+        or ids.max() >= vocab_size
+        or ids.unique().numel() != ids.numel()
+    ):
+        raise ValueError(
+            f"--speculative-token-map {path} must hold distinct little-endian int32 token ids below {vocab_size}"
+        )
     return ids
 
 
@@ -142,7 +178,9 @@ class MTPProposer(Proposer):
         if not getattr(draft_cls, "supports_tp", False):
             super().adjust_config(config, override)
         if config.use_dummy_weight:
-            raise ValueError("MTP reads its draft from the checkpoint, so it cannot run with --dummy-weight")
+            raise ValueError(
+                "MTP reads its draft from the checkpoint, so it cannot run with --dummy-weight"
+            )
         path = config.speculative_draft_model_path or config.model_path
         # checked here because a draft that cannot load otherwise fails only after the whole target has loaded
         if config.speculative_draft_model_path:
@@ -156,7 +194,9 @@ class MTPProposer(Proposer):
             draft_cls.check_source(path, config.model_path)
         if config.speculative_token_map:
             if config.model_config.tie_word_embeddings:
-                raise ValueError("--speculative-token-map needs an LM head with its own weights, but this one is tied to the embedding")
+                raise ValueError(
+                    "--speculative-token-map needs an LM head with its own weights, but this one is tied to the embedding"
+                )
             read_token_map(config.speculative_token_map, config.model_config.vocab_size)
 
     @classmethod
@@ -164,10 +204,15 @@ class MTPProposer(Proposer):
         if not config.speculative_token_map:
             return
         head = model.lm_head
-        head.keep_rows(read_token_map(config.speculative_token_map, head.num_embeddings), config.model_config.quant)
+        head.keep_rows(
+            read_token_map(config.speculative_token_map, head.num_embeddings),
+            config.model_config.quant,
+        )
         kept, ids = head.kept_rows
         mib = sum(t.nbytes for t in kept.state_dict().values()) / 2**20
-        logger.info_rank0(f"--speculative-token-map: the draft head keeps {ids.numel()} of {head.num_embeddings} rows ({mib:.0f} MiB)")
+        logger.info_rank0(
+            f"--speculative-token-map: the draft head keeps {ids.numel()} of {head.num_embeddings} rows ({mib:.0f} MiB)"
+        )
 
     @classmethod
     def _draft_class(cls, config) -> type[MTPDraft]:
@@ -185,13 +230,17 @@ class MTPProposer(Proposer):
         # relay hidden and carry, and the verify hiddens
         fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
         draft_cfg = (
-            draft_cls.draft_config(with_resident_moe(config.model_config), tp_size=config.tp_info.size)
+            draft_cls.draft_config(
+                with_resident_moe(config.model_config), tp_size=config.tp_info.size
+            )
             if getattr(draft_cls, "supports_tp", False)
             else draft_cls.draft_config(with_resident_moe(config.model_config))
         )
         groups = draft_cfg.kv_cache_group_specs()
         fmt = getattr(config, "kv_format", NONE)
-        return fixed, sum(spec_kv_bytes_per_token(group, config, fmt) for group in groups)
+        return fixed, sum(
+            spec_kv_bytes_per_token(group, config, fmt) for group in groups
+        )
 
     def __init__(self, config, target_model) -> None:
         super().__init__(config, target_model)
@@ -203,15 +252,31 @@ class MTPProposer(Proposer):
         from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
 
         draft_cls = self._draft_class(config)
-        self.draft = draft_cls.load(with_resident_moe(config.model_config), target_model, path, self.device, config.dtype)
+        self.draft = draft_cls.load(
+            with_resident_moe(config.model_config),
+            target_model,
+            path,
+            self.device,
+            config.dtype,
+        )
         # an offloaded or shared MoE layer here would read the target's experts as its own, silently
         target_moe = {id(m) for m in iter_moe_layers(target_model)}
-        if any(isinstance(m, OffloadMoELayer) or id(m) in target_moe for m in iter_moe_layers(self.draft)):
-            raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
+        if any(
+            isinstance(m, OffloadMoELayer) or id(m) in target_moe
+            for m in iter_moe_layers(self.draft)
+        ):
+            raise RuntimeError(
+                f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU"
+            )
         # hot_ids[i] is the target's token id of the draft head's row i
-        self.lm_head, self.hot_ids = target_model.lm_head.kept_rows or (target_model.lm_head, None)
+        self.lm_head, self.hot_ids = target_model.lm_head.kept_rows or (
+            target_model.lm_head,
+            None,
+        )
         self.mrope = config.model_config.model_is_mrope
-        self._prefill_state: dict[int, tuple[int, int]] = {}  # table row -> (uid, first position not drafted yet)
+        self._prefill_state: dict[
+            int, tuple[int, int]
+        ] = {}  # table row -> (uid, first position not drafted yet)
         self._prefill_sink: _PrefillSink | None = None
         self.kv = None
 
@@ -222,32 +287,52 @@ class MTPProposer(Proposer):
         from freetoken.kvcache import create_kvcache_pool
 
         super().attach(ctx)
-        cfg = self.draft.draft_config(with_resident_moe(self.config.model_config))
+        cfg = (
+            self.draft.draft_config(
+                with_resident_moe(self.config.model_config), tp_size=self._tp_info.size
+            )
+            if getattr(self.draft, "supports_tp", False)
+            else self.draft.draft_config(with_resident_moe(self.config.model_config))
+        )
         rows = self.config.max_running_req + 1
         # the draft's own layers on the target's slot ids: same page size, same pages plus the dummy page padded rows write to
         # a rebuild that keeps the target KV pool keeps this one, which the prefix cache still indexes
         if self.kv is None:
             self.kv = create_kvcache_pool(
-                model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
-                device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
+                model_config=cfg,
+                num_pages=ctx.num_pages + 1,
+                page_size=self.config.page_size,
+                dtype=self.dtype,
+                device=ctx.device,
+                num_req_slots=rows,
+                num_speculative_tokens=self.k,
                 kv_format=getattr(self.config, "kv_format", NONE),
             )
         width = self.draft.relay_width(self.config.model_config)
         self.relay = HiddenRelay(rows, width, self.dtype, ctx.device)
-        self.verify_hidden = torch.zeros(rows * (self.k + 1), width, dtype=self.dtype, device=ctx.device)
+        self.verify_hidden = torch.zeros(
+            rows * (self.k + 1), width, dtype=self.dtype, device=ctx.device
+        )
         # verify row of each request's last accepted position; padded rows keep stale but in-range values
-        self.picked_rows = torch.arange(rows, dtype=torch.int64, device=ctx.device) * (self.k + 1)
+        self.picked_rows = torch.arange(rows, dtype=torch.int64, device=ctx.device) * (
+            self.k + 1
+        )
         self.extend_graphs = self.chain_graphs = None
         parts = [p.strip() for p in self.config.attention_backend.split(",")]
         fixed = self.draft.attention_backend
         # backends bind the context's KV pool when they are built
         with get_global_ctx().override(kv_cache=self.kv):
-            self.extend_backend = create_attention_backend(fixed or ("fa" if "fa" in parts else "triton"), cfg)
+            self.extend_backend = create_attention_backend(
+                fixed or ("fa" if "fa" in parts else "triton"), cfg
+            )
             self.chain_backend = create_attention_backend(fixed or "triton", cfg)
             # --speculative-max-batch-size: the one-row extend of a no-draft step has its own capture state
             self.extend_backend_narrow = (
-                create_attention_backend(fixed or ("fa" if "fa" in parts else "triton"), cfg)
-                if getattr(self.config, "speculative_max_batch_size", None) is not None else None
+                create_attention_backend(
+                    fixed or ("fa" if "fa" in parts else "triton"), cfg
+                )
+                if getattr(self.config, "speculative_max_batch_size", None) is not None
+                else None
             )
         self.extend_graphs_narrow = None
 
@@ -268,21 +353,31 @@ class MTPProposer(Proposer):
 
     # ------------------------------------------------------------------ draft forwards
 
-    def _draft_batch(self, reqs: List[_DraftReq], phase: str, rows_per_req: int | None, backend) -> Batch:
+    def _draft_batch(
+        self, reqs: list[_DraftReq], phase: str, rows_per_req: int | None, backend
+    ) -> Batch:
         batch = Batch(reqs=reqs, phase=phase, rows_per_req=rows_per_req)
         batch.padded_reqs = reqs
-        host = torch.cat([torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in reqs])
+        host = torch.cat(
+            [torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in reqs]
+        )
         batch.positions = host.pin_memory().to(self.device, non_blocking=True)
         if self.mrope:
-            batch.mrope_positions = self._mrope_positions(reqs).pin_memory().to(self.device, non_blocking=True)
-        rows = torch.cat([torch.full((r.extend_len,), r.table_idx, dtype=torch.int64) for r in reqs])
+            batch.mrope_positions = (
+                self._mrope_positions(reqs)
+                .pin_memory()
+                .to(self.device, non_blocking=True)
+            )
+        rows = torch.cat(
+            [torch.full((r.extend_len,), r.table_idx, dtype=torch.int64) for r in reqs]
+        )
         rows = rows.pin_memory().to(self.device, non_blocking=True)
         batch.out_loc = self.ctx.page_table[rows, batch.positions.to(torch.int64)]
         backend.prepare_metadata(batch)
         return batch
 
     @staticmethod
-    def _mrope_positions(reqs: List[_DraftReq]) -> torch.Tensor:
+    def _mrope_positions(reqs: list[_DraftReq]) -> torch.Tensor:
         """[3, n] rope rows of the draft positions, by the target's rule: a prompt position's precomputed column, else position + delta."""
         cols = []
         for r in reqs:
@@ -295,24 +390,40 @@ class MTPProposer(Proposer):
             cols.append(col)
         return torch.cat(cols, dim=1)
 
-    def _forward(self, batch: Batch, backend, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
-        with get_global_ctx().forward_batch(batch, kv_cache=self.kv, attn_backend=backend, hide_target_state=True):
+    def _forward(
+        self, batch: Batch, backend, embeds: torch.Tensor, prev_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        with get_global_ctx().forward_batch(
+            batch, kv_cache=self.kv, attn_backend=backend, hide_target_state=True
+        ):
             return self.draft.forward_hidden(embeds, prev_hidden)
 
     def _draft_token(self, hidden: torch.Tensor) -> torch.Tensor:
         token = self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
         token = token if self.hot_ids is None else self.hot_ids[token]
         if self._comm is not None:
-            token = token.contiguous() if self._tp_info.is_primary() else torch.zeros_like(token)
+            token = (
+                token.contiguous()
+                if self._tp_info.is_primary()
+                else torch.zeros_like(token)
+            )
             token = self._comm.all_reduce(token)
         return token
 
     def _view(self, req, cached_len: int, device_len: int) -> _DraftReq:
-        return _DraftReq(cached_len, device_len, req.table_idx, getattr(req, "mrope_delta", 0), getattr(req, "mrope_positions_full", None))
+        return _DraftReq(
+            cached_len,
+            device_len,
+            req.table_idx,
+            getattr(req, "mrope_delta", 0),
+            getattr(req, "mrope_positions_full", None),
+        )
 
     # ------------------------------------------------------------------ one step
 
-    def capture_graphs(self, bs_list: List[int], pool, rows_per_req: int | None = None) -> None:
+    def capture_graphs(
+        self, bs_list: list[int], pool, rows_per_req: int | None = None
+    ) -> None:
         from freetoken.engine.graph import GraphRunner
 
         from .chain_graph import ChainGraphs
@@ -335,7 +446,11 @@ class MTPProposer(Proposer):
                 mrope=self.mrope,
                 rows_per_req=1,
                 phase="verify",
-                ctx_override=dict(kv_cache=self.kv, attn_backend=self.extend_backend_narrow, hide_target_state=True),
+                ctx_override=dict(
+                    kv_cache=self.kv,
+                    attn_backend=self.extend_backend_narrow,
+                    hide_target_state=True,
+                ),
                 pool=pool,
             )
             return
@@ -353,15 +468,26 @@ class MTPProposer(Proposer):
             mrope=self.mrope,
             rows_per_req=self.k + 1,
             phase="verify",
-            ctx_override=dict(kv_cache=self.kv, attn_backend=self.extend_backend, hide_target_state=True),
+            ctx_override=dict(
+                kv_cache=self.kv,
+                attn_backend=self.extend_backend,
+                hide_target_state=True,
+            ),
             pool=pool,
         )
         if self.k > 1 and ChainGraphs.supports(self.chain_backend):
-            self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
+            self.chain_graphs = ChainGraphs(
+                self, bs_list, self.extend_graphs.graph_pool
+            )
 
-    def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
+    def propose(
+        self, reqs: list[Req], rows: torch.Tensor, pending: torch.Tensor
+    ) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
-        if self.chain_graphs is not None and (drafts := self.chain_graphs.replay(reqs, cs)) is not None:
+        if (
+            self.chain_graphs is not None
+            and (drafts := self.chain_graphs.replay(reqs, cs)) is not None
+        ):
             return SpecProposal(drafts)
         token = self.relay.d1[rows]
         hidden = self.relay.hidden[rows]
@@ -370,7 +496,12 @@ class MTPProposer(Proposer):
             # chain step j drafts at position C+j-1 with the previous step's draft hidden standing in for the target's
             views = [self._view(r, c + j - 1, c + j) for r, c in zip(reqs, cs)]
             batch = self._draft_batch(views, "decode", 1, self.chain_backend)
-            hidden = self._forward(batch, self.chain_backend, self.draft.embed_tokens.forward(token), hidden)
+            hidden = self._forward(
+                batch,
+                self.chain_backend,
+                self.draft.embed_tokens.forward(token),
+                hidden,
+            )
             token = self._draft_token(hidden)
             drafts.append(token)
         return SpecProposal(torch.stack(drafts, dim=1))
@@ -378,14 +509,20 @@ class MTPProposer(Proposer):
     def feature_sink(self, batch: Batch) -> _PrefillSink | _VerifySink:
         if batch.phase == "verify":
             return _VerifySink(self.verify_hidden)
-        self._prefill_sink = _PrefillSink([(r.cached_len, r.device_len) for r in batch.reqs])
+        self._prefill_sink = _PrefillSink(
+            [(r.cached_len, r.device_len) for r in batch.reqs]
+        )
         return self._prefill_sink
 
-    def _extend_forward(self, width: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _extend_forward(
+        self, width: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft hiddens of a verify-shaped batch of ``width`` rows per request (k + 1 by default); returns each request's row at its last accepted position and that row's argmax."""
         input_ids = get_global_ctx().batch.input_ids
         n = input_ids.shape[0]
-        hidden = self.draft.forward_hidden(self.draft.embed_tokens.forward(input_ids), self.verify_hidden[:n])
+        hidden = self.draft.forward_hidden(
+            self.draft.embed_tokens.forward(input_ids), self.verify_hidden[:n]
+        )
         if width == 1:
             # no drafts: each request's only row is its last accepted one. picked_rows holds k + 1 strides (attach(),
             # earlier steps) that index past these n rows, at capture and in a padded replay's tail.
@@ -393,12 +530,18 @@ class MTPProposer(Proposer):
         picked = hidden[self.picked_rows[: n // (width or self.k + 1)]]
         return picked, self._draft_token(picked)
 
-    def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:
+    def post_verify(
+        self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor
+    ) -> None:
         """Redraft positions C..C+k from the target's verify hiddens, then relay each request's row at its last accepted position.
         A no-draft step (one row per request) runs the draft over its one emitted token, so the draft stays current."""
         k1 = batch.rows_per_req
         narrow = k1 == 1 and self.k > 0
-        backend = self.extend_backend_narrow if narrow and self.extend_backend_narrow is not None else self.extend_backend
+        backend = (
+            self.extend_backend_narrow
+            if narrow and self.extend_backend_narrow is not None
+            else self.extend_backend
+        )
         graphs = self.extend_graphs_narrow if narrow else self.extend_graphs
         bs, padded = batch.size, batch.padded_size
         tokens = torch.zeros(padded, k1, dtype=torch.int64, device=self.device)
@@ -414,13 +557,21 @@ class MTPProposer(Proposer):
         if not narrow:
             self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
         backend.prepare_metadata(draft)
-        if graphs is not None and graphs.can_use_cuda_graph(draft) and padded in graphs.graph_map:
+        if (
+            graphs is not None
+            and graphs.can_use_cuda_graph(draft)
+            and padded in graphs.graph_map
+        ):
             picked, d1 = graphs.replay(draft)
         else:
-            with get_global_ctx().forward_batch(draft, kv_cache=self.kv, attn_backend=backend, hide_target_state=True):
+            with get_global_ctx().forward_batch(
+                draft, kv_cache=self.kv, attn_backend=backend, hide_target_state=True
+            ):
                 picked, d1 = self._extend_forward(k1)
             picked, d1 = picked[:bs], d1[:bs]
-        table = make_device_tensor([r.table_idx for r in batch.reqs], torch.int64, self.device)
+        table = make_device_tensor(
+            [r.table_idx for r in batch.reqs], torch.int64, self.device
+        )
         self.relay.hidden[table] = picked
         self.relay.d1[table] = d1
 
@@ -446,7 +597,9 @@ class MTPProposer(Proposer):
                 # draft row p embeds the token at p+1
                 emb.append(chunk_embeds[frontier + 1 - s : min(end + 1, e) - s])
                 if final:
-                    emb.append(self.draft.embed_tokens.forward(next_tokens_gpu[i : i + 1]))
+                    emb.append(
+                        self.draft.embed_tokens.forward(next_tokens_gpu[i : i + 1])
+                    )
                 if frontier == s - 1:
                     # cloned: the carry of this row is overwritten below, before the draft forward reads it
                     prev += [self.relay.carry[row : row + 1].clone(), rows[: end - s]]

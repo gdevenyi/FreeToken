@@ -8,7 +8,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
 from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile
 from freetoken.kvcache.format import NONE, KVFormat
 
@@ -276,6 +275,7 @@ def qsa_sparse_paged_attention(
     kv_format: KVFormat = NONE,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    is_prefill: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged K/V caches."""
 
@@ -322,7 +322,7 @@ def qsa_sparse_paged_attention(
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if verify_invariant_enabled() and q.shape[0] <= 64:
+    if verify_invariant_enabled() and not is_prefill:
         block_n, target_splits, partial_warps = 16, 8, 4
     elif base_programs <= small_profile_limit:
         block_n, target_splits, partial_warps = 16, 64, 4

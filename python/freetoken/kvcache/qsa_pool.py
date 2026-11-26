@@ -77,20 +77,24 @@ class _QSAHostArena:
         self.num_host_pages = num_host_pages
         self.device = device
         self.engine_stream = engine_stream
-        self.copy_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.copy_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self.pending_d2h = False
         self._pinned_spans: list[tuple[int, int]] = []
 
         self.feat_elems = [int(b.shape[1]) for b in dev_banks]
         self.dtypes = [b.dtype for b in dev_banks]
-        self.feat_bytes = [n * dt.itemsize for n, dt in zip(self.feat_elems, self.dtypes, strict=True)]
+        self.feat_bytes = [
+            n * dt.itemsize for n, dt in zip(self.feat_elems, self.dtypes, strict=True)
+        ]
         self.bytes_per_page = sum(self.feat_bytes)
 
         offsets: list[int] = []
         spans: list[int] = []
         cursor = 0
         for fb in self.feat_bytes:
-            cursor = _align_up(cursor, 16)
+            cursor = _align_up(cursor, _BLK)
             offsets.append(cursor)
             span = num_host_pages * fb
             spans.append(span)
@@ -111,10 +115,17 @@ class _QSAHostArena:
             torch.frombuffer(
                 mv[off : off + span], dtype=dt, count=num_host_pages * elems
             ).view(num_host_pages, elems)
-            for off, span, dt, elems in zip(offsets, spans, self.dtypes, self.feat_elems, strict=True)
+            for off, span, dt, elems in zip(
+                offsets, spans, self.dtypes, self.feat_elems, strict=True
+            )
         ]
 
-        skip_pin = os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on")
+        skip_pin = os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self.pinned = False
         if pin_memory and device.type == "cuda" and not skip_pin:
             self._pin_bank_groups(offsets, spans, asize)
@@ -128,7 +139,9 @@ class _QSAHostArena:
         self.h2d_blocks = 8
         self.refresh_device_banks(dev_banks)
 
-    def _pin_bank_groups(self, offsets: list[int], spans: list[int], asize: int) -> None:
+    def _pin_bank_groups(
+        self, offsets: list[int], spans: list[int], asize: int
+    ) -> None:
         """Register whole-bank groups (<= 4 GiB when possible) so no bank crosses a register boundary."""
         from freetoken.kernel.pinned import host_register
         from freetoken.moe.host_banks import PinFailed, charge_pin, refund_pin
@@ -151,7 +164,9 @@ class _QSAHostArena:
                     host_register(self.addr + g_off, g_len)
                 except RuntimeError as exc:
                     refund_pin(g_len)
-                    raise PinFailed(f"cudaHostRegister failed for {g_len / 2**30:.1f} GiB KV host arena") from exc
+                    raise PinFailed(
+                        f"cudaHostRegister failed for {g_len / 2**30:.1f} GiB KV host arena"
+                    ) from exc
                 self._pinned_spans.append((self.addr + g_off, g_len))
         except BaseException:
             self.close_pins()
@@ -160,6 +175,14 @@ class _QSAHostArena:
     def close_pins(self) -> None:
         if not self._pinned_spans:
             return
+        if self.device.type == "cuda":
+            if self.copy_stream is not None:
+                self.copy_stream.synchronize()
+            if self.engine_stream is not None:
+                self.engine_stream.synchronize()
+            else:
+                torch.cuda.synchronize(self.device)
+            self.pending_d2h = False
         from freetoken.kernel.pinned import host_unregister
         from freetoken.moe.host_banks import refund_pin
 
@@ -168,6 +191,12 @@ class _QSAHostArena:
             refund_pin(span)
         self._pinned_spans.clear()
         self.pinned = False
+
+    def __del__(self) -> None:
+        try:
+            self.close_pins()
+        except Exception:
+            pass
 
     def refresh_device_banks(self, dev_banks: list[torch.Tensor]) -> None:
         self.dev_banks = dev_banks
@@ -183,9 +212,15 @@ class _QSAHostArena:
             return
         if any(p % 16 != 0 for p in dev_ptrs) or any(p % 16 != 0 for p in host_ptrs):
             return
-        self.dev_bank_ptrs = torch.tensor(dev_ptrs, dtype=torch.int64, device=self.device)
-        self.host_bank_ptrs = torch.tensor(host_ptrs, dtype=torch.int64, device=self.device)
-        self.bank_feat_bytes = torch.tensor(self.feat_bytes, dtype=torch.int64, device=self.device)
+        self.dev_bank_ptrs = torch.tensor(
+            dev_ptrs, dtype=torch.int64, device=self.device
+        )
+        self.host_bank_ptrs = torch.tensor(
+            host_ptrs, dtype=torch.int64, device=self.device
+        )
+        self.bank_feat_bytes = torch.tensor(
+            self.feat_bytes, dtype=torch.int64, device=self.device
+        )
         self.h2d_blocks = default_blocks_per_bank(self.device)
         self.multi_h2d_ok = True
 
@@ -211,7 +246,9 @@ class _QSAHostArena:
                 dst_list: list[int] = []
                 src_list: list[int] = []
                 sz_list: list[int] = []
-                for dev_b, host_b, fb in zip(self.dev_banks, self.host_banks, self.feat_bytes, strict=True):
+                for dev_b, host_b, fb in zip(
+                    self.dev_banks, self.host_banks, self.feat_bytes, strict=True
+                ):
                     d_base = host_b.data_ptr()
                     s_base = dev_b.data_ptr()
                     for s0, d0, n in runs:
@@ -241,12 +278,13 @@ class _QSAHostArena:
             return
         if self.multi_h2d_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+            from freetoken.kernel.sm_upload import upload_step_tensor
 
-            dst_idx = torch.tensor(dst_pages, dtype=torch.int32, pin_memory=True).to(
-                self.device, non_blocking=True
+            dst_idx = upload_step_tensor(
+                torch.tensor(dst_pages, dtype=torch.int32), self.device
             )
-            src_idx = torch.tensor(src_host_pages, dtype=torch.int32, pin_memory=True).to(
-                self.device, non_blocking=True
+            src_idx = upload_step_tensor(
+                torch.tensor(src_host_pages, dtype=torch.int32), self.device
             )
             fast_index_copy_multi_jit(
                 self.dev_bank_ptrs,
@@ -281,9 +319,13 @@ class QSAKVCache(MHAKVCache):
     """
 
     @classmethod
-    def ring_capacity_for(cls, index_ratio: int, num_speculative_tokens: int = 0) -> int:
+    def ring_capacity_for(
+        cls, index_ratio: int, num_speculative_tokens: int = 0
+    ) -> int:
         """Ring depth: one row per pending position, keyed ``position % capacity``; spec decode widens by the draft depth (vLLM sizing)."""
-        return index_ratio * math.ceil((index_ratio + num_speculative_tokens) / index_ratio)
+        return index_ratio * math.ceil(
+            (index_ratio + num_speculative_tokens) / index_ratio
+        )
 
     def __init__(
         self,
@@ -342,7 +384,7 @@ class QSAKVCache(MHAKVCache):
             kv_format=kv_format,
             kv_buffer=kv_buffer,
         )
-        if kv_buffer is None:
+        if kv_buffer is None and not self.kv_format.quantized:
             self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
 
@@ -374,7 +416,9 @@ class QSAKVCache(MHAKVCache):
         )
         # 3-axis rope position of every stored token: a compressed group ropes at its first token, which under mrope is not derivable from the logical position
         self._rope_positions = (
-            torch.zeros(num_pages * self._page_size, 3, dtype=torch.int32, device=self._device)
+            torch.zeros(
+                num_pages * self._page_size, 3, dtype=torch.int32, device=self._device
+            )
             if self._mrope
             else None
         )
@@ -389,7 +433,8 @@ class QSAKVCache(MHAKVCache):
         self._pending_ring = None
         self._rope_positions = None
         super().rebuild(num_pages)
-        self._zero_kv_slabs()
+        if not self.kv_format.quantized:
+            self._zero_kv_slabs()
         # The host arena keeps its size (a page's shape does not depend on the page count), but
         # its contents belonged to the old pool: every host page is free again.
         if self.num_host_pages:
@@ -407,8 +452,9 @@ class QSAKVCache(MHAKVCache):
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .base import spec_kv_bytes_per_token
         from freetoken.attention import AttnType
+
+        from .base import spec_kv_bytes_per_token
 
         num_req_slots = config.max_running_req + 1
         per_token = 0
@@ -416,11 +462,15 @@ class QSAKVCache(MHAKVCache):
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            per_token += spec_kv_bytes_per_token(spec, config, getattr(config, "kv_format", NONE))
+            per_token += spec_kv_bytes_per_token(
+                spec, config, getattr(config, "kv_format", NONE)
+            )
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                ring = cls.ring_capacity_for(spec.index_ratio, getattr(config, "decode_rows_per_req", 1) - 1)
+                ring = cls.ring_capacity_for(
+                    spec.index_ratio, getattr(config, "decode_rows_per_req", 1) - 1
+                )
                 fixed += num_req_slots * row * (ring + 1)
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
@@ -450,7 +500,9 @@ class QSAKVCache(MHAKVCache):
     @property
     def rope_positions(self) -> torch.Tensor:
         """``[num_tokens, 3]`` int32 t/h/w rope position per KV slot (written by the QSA backend)."""
-        assert self._rope_positions is not None, "rope positions are only kept on mrope models"
+        assert self._rope_positions is not None, (
+            "rope positions are only kept on mrope models"
+        )
         return self._rope_positions
 
     @property
@@ -496,10 +548,21 @@ class QSAKVCache(MHAKVCache):
                 for layer_idx in range(layers):
                     banks.append(self._scale_buffer[kv_idx, layer_idx].view(pages, -1))
         for slot in range(self._num_index_layers):
-            banks.append(self._cmp_k_buffer[slot, : self._cmp_scratch_base].view(pages, -1))
+            banks.append(
+                self._cmp_k_buffer[slot, : self._cmp_scratch_base].view(pages, -1)
+            )
         if self._rope_positions is not None:
             banks.append(self._rope_positions.view(pages, -1))
         return banks
+
+    def close(self) -> None:
+        old_arena = getattr(self, "_host_arena", None)
+        if old_arena is not None:
+            old_arena.close_pins()
+            self._host_arena = None
+        self._num_host_pages = 0
+        self._free_host_pages = []
+        self._host_pages = {}
 
     def attach_host_pages(
         self,
@@ -527,7 +590,9 @@ class QSAKVCache(MHAKVCache):
             engine_stream=engine_stream,
         )
         if self._rope_positions is not None:
-            self._host_pages["rope"] = self._host_arena.host_banks[-1].view(n, self._page_size, 3)
+            self._host_pages["rope"] = self._host_arena.host_banks[-1].view(
+                n, self._page_size, 3
+            )
 
     @property
     def num_host_pages(self) -> int:
@@ -543,7 +608,9 @@ class QSAKVCache(MHAKVCache):
 
     def alloc_host_pages(self, n: int = 1) -> list[int]:
         if n > self.num_free_host_pages:
-            raise RuntimeError(f"KV host tier exhausted: need {n}, have {self.num_free_host_pages}")
+            raise RuntimeError(
+                f"KV host tier exhausted: need {n}, have {self.num_free_host_pages}"
+            )
         return [self._free_host_pages.pop() for _ in range(n)]
 
     def free_host_pages(self, host_pages: Sequence[int]) -> None:
@@ -566,7 +633,9 @@ class QSAKVCache(MHAKVCache):
         arena = self._host_arena
         assert arena is not None, "no KV host arena attached"
         if self.host_copies is not None:
-            self.host_copies.to_host(self._arena_pairs(arena.host_banks, dst, arena.dev_banks, src))
+            self.host_copies.to_host(
+                self._arena_pairs(arena.host_banks, dst, arena.dev_banks, src)
+            )
             return
         arena.to_host(src, dst)
 
@@ -578,7 +647,9 @@ class QSAKVCache(MHAKVCache):
         arena = self._host_arena
         assert arena is not None, "no KV host arena attached"
         if self.host_copies is not None:
-            self.host_copies.from_host(self._arena_pairs(arena.dev_banks, dst, arena.host_banks, src))
+            self.host_copies.from_host(
+                self._arena_pairs(arena.dev_banks, dst, arena.host_banks, src)
+            )
             return
         arena.from_host(src, dst)
 

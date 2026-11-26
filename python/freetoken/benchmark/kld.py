@@ -259,6 +259,8 @@ def check_kld_request(
     expect = tokens.astype(np.int64)
     if spec.get("bos_token_id") is not None:
         expect[0] = int(spec["bos_token_id"])
+    if np.any((expect < 0) | (expect >= vocab_size)):
+        raise ValueError(f"kld: token id out of vocab range [0, {vocab_size})")
     if not np.array_equal(ids, expect):
         raise ValueError(f"kld: prompt tokens differ from chunk {chunk} of {base.path}")
     return base
@@ -435,6 +437,10 @@ def base_only_nll(base: KldBase, chunks: Sequence[int]) -> list[float]:
                 off = base.rows_offset + (chunk * base.n_rows + r) * row_bytes
                 scale, min_lp = np.frombuffer(os.pread(fd, 8, off), dtype="<f4")
                 tok = int(tokens[base.first + 1 + r])
+                if tok < 0 or tok >= base.nv:
+                    raise ValueError(
+                        f"kld: target token {tok} out of range [0, {base.nv})"
+                    )
                 q = np.frombuffer(os.pread(fd, 2, off + 8 + 2 * tok), dtype="<u2")[0]
                 out.append(-float(scale * np.float32(q) + min_lp))
     return out

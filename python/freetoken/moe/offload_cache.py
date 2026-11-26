@@ -1496,7 +1496,7 @@ class OffloadMoeCache:
         if rankings is None or not self.banks:
             return 0
         seeded_total = 0
-        crf_unit = 1 << 20
+        crf_lease_max = 512.0
         for p, pool_size in enumerate(self.pool_sizes):
             start = self._pool_stable_from[p] if self.prefill_overlap else 0
             end = min(pool_size, max(0, self.active_cache_size - self.pool_bases[p]))
@@ -1552,8 +1552,8 @@ class OffloadMoeCache:
                     self.expert_crf[l].index_copy_(
                         0, chosen_dev.long(), crf_f.to(self.expert_crf.dtype)
                     )
-                    usage_p[cursor : cursor + k_hot] = (crf_f * float(crf_unit)).to(
-                        usage_p.dtype
+                    usage_p[cursor : cursor + k_hot] = (
+                        (crf_f * 32.0).clamp(1.0, crf_lease_max).to(usage_p.dtype)
                     )
                 else:
                     usage_p[cursor : cursor + k_hot] = ranks_inv
@@ -1584,7 +1584,7 @@ class OffloadMoeCache:
         """
 
     def decode_miss_stats(self) -> dict:
-        if self.decode_target == "hybrid":
+        if self.decode_target == "hybrid" or self.ep_size > 1:
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
@@ -1608,7 +1608,7 @@ class OffloadMoeCache:
 
     def decode_stats_line(self) -> str | None:
         """Decode stats since the last call by layer group (pinned, locked with slots, CPU-only), as one log line; zeroes the counters."""
-        if self.decode_target == "hybrid":
+        if self.decode_target == "hybrid" or self.ep_size > 1:
             rows = torch.stack(
                 [
                     self.stat_steps_layer,
@@ -1655,7 +1655,7 @@ class OffloadMoeCache:
         lists indexed by MoE-layer id: missing/active experts per step and the realized
         miss_rate (missing/active) -- i.e. how cacheable each layer's routing actually was
         under the running LRU. Reads device tensors once (no per-step host sync)."""
-        if self.decode_target == "hybrid":
+        if self.decode_target == "hybrid" or self.ep_size > 1:
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()

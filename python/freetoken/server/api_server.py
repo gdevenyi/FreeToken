@@ -10,13 +10,17 @@ import signal
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+
 from freetoken import __version__
 from freetoken.core import SamplingParams
 from freetoken.message import (
@@ -37,20 +41,19 @@ from freetoken.utils import (
     init_logger,
     load_generation_sampling,
 )
-from pydantic import BaseModel, Field
-from starlette.datastructures import Headers
 
+from . import request_ring
+from .access_log_filter import install_polling_access_log_filter
+from .accounting import AdmissionClosedError, register_accounting_routes
+from .anthropic_api import register_anthropic_routes
 from .args import ServerArgs
 from .bind import bind_sockets, split_hosts
 from .bind import serve as serve_bound
-from .anthropic_api import register_anthropic_routes
-from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
 from .generation import GenerationError, send_new_request
 from .openai_api import register_openai_routes
-from . import request_ring
-from .access_log_filter import install_polling_access_log_filter
-from .request_logger import init as init_request_logging, log_request
+from .request_logger import init as init_request_logging
+from .request_logger import log_request
 from .responses_api import register_responses_routes
 from .stats import StatsTracker
 
@@ -59,7 +62,7 @@ logger = init_logger(__name__, "FrontendAPI")
 _GLOBAL_STATE = None
 # Recommended sampling defaults from the checkpoint's generation_config.json, applied to
 # request fields the caller left unspecified (sglang's sampling_defaults='model').
-_MODEL_SAMPLING: Dict[str, Any] = {}
+_MODEL_SAMPLING: dict[str, Any] = {}
 # Set on an orderly stop (uvicorn lifespan shutdown fired by SIGTERM/SIGINT, or the shell
 # signal handler). The backend supervisor reads this so a worker exiting AS PART of that
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
@@ -77,7 +80,7 @@ def get_global_state() -> FrontendManager:
     return _GLOBAL_STATE
 
 
-def _terminate_backend_workers(processes: List[Any]) -> None:
+def _terminate_backend_workers(processes: list[Any]) -> None:
     """Best-effort, non-blocking teardown of the backend worker processes on an orderly stop.
 
     Called from the shutdown path AFTER ``_SHUTTING_DOWN`` is set, so the supervisor's liveness
@@ -100,7 +103,9 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     def _stop() -> None:
         if _SHUTTING_DOWN.is_set():
             return  # an external stop got here first
-        logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
+        logger.error(
+            "Backend worker is gone and cannot be restarted; stopping the API server"
+        )
         os.kill(os.getpid(), signal.SIGTERM)
 
     timer = threading.Timer(grace_s, _stop)
@@ -109,7 +114,7 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     return timer
 
 
-def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
+def _reap_backend_workers(processes: list[Any], timeout: float = 5.0) -> None:
     """Wait out a preceding ``_terminate_backend_workers`` and SIGKILL whatever is still
     standing. Only the shell path needs this: it owns the process lifetime end to end (no
     outer signal takes the process down for it), and a worker that ignored SIGTERM would keep
@@ -123,7 +128,7 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
             continue
 
 
-def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
+def _unwrap_msg(msg: BaseFrontendMsg) -> list[UserReply]:
     if isinstance(msg, BatchFrontendMsg):
         result = []
         for reply in msg.data:
@@ -147,24 +152,25 @@ class FrontendManager:
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
     uid_counter: int = 0
     initialized: bool = False
-    ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
-    event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    ack_map: dict[int, list[UserReply]] = field(default_factory=dict)
+    event_map: dict[int, asyncio.Event] = field(default_factory=dict)
+    active_waiters: set[int] = field(default_factory=set)
     # Not in the maps above: a disconnect cancels at wait_for_ack, whose finally empties them
     # before any abort path runs. FIFO-bounded; a duplicate AbortMsg is safe (the scheduler acks it).
-    aborted_uids: Dict[int, None] = field(default_factory=dict)
+    aborted_uids: dict[int, None] = field(default_factory=dict)
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
-    rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    rebuild_futures: dict[str, asyncio.Future] = field(default_factory=dict)
     # /v1/cache/flush waiters by request_id; the scheduler owns the deadline, so there is no HTTP timeout.
-    flush_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    flush_futures: dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
     maintenance_state: str = "loading"
-    last_rebuild: Dict[str, Any] | None = None
+    last_rebuild: dict[str, Any] | None = None
     load_progress: Any = None
     # Monotonic timestamp the server became ready; drives /health + /v1/stats uptime without
     # being affected by wall-clock adjustments.
@@ -178,7 +184,7 @@ class FrontendManager:
     # Optional backend metadata delivered once on the ack path at ready: per-unit cache VRAM
     # costs {"kv_bytes_per_token", "moe_bytes_per_expert", "mamba_bytes_per_slot"}. None until
     # the ("meta", …) ack arrives (or forever, on an engine build that doesn't emit one).
-    unit_bytes: Dict[str, int] | None = None
+    unit_bytes: dict[str, int] | None = None
     # Pool-budget baseline from the same ("meta", …) ack: free VRAM captured after the weights
     # loaded but BEFORE any cache pool (KV/MoE/GDN) was allocated (Engine._post_weights_free).
     # Constant for the engine's lifetime — the slider upper bounds derive from it directly,
@@ -186,18 +192,18 @@ class FrontendManager:
     free_vram_bytes: int = 0
     # Per-pool floor unit counts {"kv_tokens", "moe_experts", "mamba_slots"} the rebuild path
     # enforces, from the ("meta", …) ack. None until it arrives (older engine); limits fall back.
-    cache_floors: Dict[str, int] | None = None
+    cache_floors: dict[str, int] | None = None
     # Actual pool sizes allocated at load {"num_pages", "page_size", "moe_cache_size",
     # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
     # (the running snapshot channel) has anything. None until meta arrives.
-    cache_pools: Dict[str, int] | None = None
+    cache_pools: dict[str, int] | None = None
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
-    gpus: List[Dict[str, Any]] = field(default_factory=list)
+    gpus: list[dict[str, Any]] = field(default_factory=list)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
     # BackendHandle after start_backend(). The orderly-shutdown path (lifespan / shell signal
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
     # the shutdown flag before the ensuing deaths. See _terminate_backend_workers.
-    backend_processes: List[Any] = field(default_factory=list)
+    backend_processes: list[Any] = field(default_factory=list)
     # Event loop the listener runs on, captured when the listener starts (_create_listener_once).
     # Lets a cross-thread caller — the supervisor thread's failure callback — marshal rebuild
     # future resolution back onto the loop (asyncio Futures are not thread-safe). None until the
@@ -228,7 +234,8 @@ class FrontendManager:
                 from freetoken.utils import load_tokenizer
 
                 self._frontend_tokenizer = TokenizeManager(
-                    load_tokenizer(self.config.model_path), get_mm_processor(self.config.model_path, self.config.mm)
+                    load_tokenizer(self.config.model_path),
+                    get_mm_processor(self.config.model_path, self.config.mm),
                 )
             return self._frontend_tokenizer
 
@@ -246,7 +253,9 @@ class FrontendManager:
             except Exception:  # noqa: BLE001 -- warmup only; real faults surface on use
                 pass
 
-        threading.Thread(target=_warm, daemon=True, name="frontend-tokenizer-warm").start()
+        threading.Thread(
+            target=_warm, daemon=True, name="frontend-tokenizer-warm"
+        ).start()
 
     def new_user(self) -> int:
         if self.maintenance_state != "serving":
@@ -340,7 +349,11 @@ class FrontendManager:
             for request_id in list(self.flush_futures):
                 fut = self.flush_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
-                    fut.set_result(FlushCacheReply(request_id=request_id, status="failed", error=message))
+                    fut.set_result(
+                        FlushCacheReply(
+                            request_id=request_id, status="failed", error=message
+                        )
+                    )
 
         try:
             loop.call_soon_threadsafe(_resolve_all)
@@ -359,7 +372,12 @@ class FrontendManager:
         await self.send_tokenizer.put(msg)
 
     async def wait_for_ack(self, uid: int):
-        event = self.event_map[uid]
+        event = self.event_map.get(uid)
+        if event is None:
+            return
+        waiters = getattr(self, "active_waiters", None)
+        if waiters is not None:
+            waiters.add(uid)
         # finally, not a trailing statement: every consumer breaks out of its `async for` at
         # the terminal ack, leaving this generator suspended at the yield. Cleanup written
         # after the loop would then only run on paths nobody takes, leaking both maps once
@@ -369,7 +387,11 @@ class FrontendManager:
                 await event.wait()
                 event.clear()
 
-                pending = self.ack_map[uid]
+                pending = self.ack_map.get(uid)
+                if pending is None:
+                    break
+                if not pending:
+                    continue
                 self.ack_map[uid] = []
                 ack = None
                 for ack in pending:
@@ -377,11 +399,16 @@ class FrontendManager:
                 if ack and ack.finished:
                     break
         finally:
+            if waiters is not None:
+                waiters.discard(uid)
             self.ack_map.pop(uid, None)
             self.event_map.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                yield f"data: {json.dumps({'error': ack.error}, ensure_ascii=False)}\n\n".encode()
+                break
             if ack.incremental_output:
                 # SSE: JSON-encode (so a newline inside a token can't break the frame)
                 # and terminate every event with a blank line.
@@ -401,7 +428,9 @@ class FrontendManager:
             while True:
                 if pending is None:
                     pending = asyncio.ensure_future(chunks.__anext__())
-                done, _ = await asyncio.wait({pending}, timeout=STREAM_KEEPALIVE_SECONDS)
+                done, _ = await asyncio.wait(
+                    {pending}, timeout=STREAM_KEEPALIVE_SECONDS
+                )
                 if await request.is_disconnected():
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
@@ -423,7 +452,7 @@ class FrontendManager:
             if not finished:
                 try:
                     await asyncio.shield(self.abort_user(uid))
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("Failed to deliver abort for user %s", uid)
 
     async def abort_user(self, uid: int):
@@ -432,9 +461,9 @@ class FrontendManager:
         self.aborted_uids[uid] = None
         while len(self.aborted_uids) > 65_536:
             self.aborted_uids.pop(next(iter(self.aborted_uids)))
-        self.event_map.pop(uid, None)
-        self.ack_map.pop(uid, None)
-        await asyncio.sleep(0.1)
+        if uid not in getattr(self, "active_waiters", ()):
+            self.event_map.pop(uid, None)
+            self.ack_map.pop(uid, None)
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
@@ -496,7 +525,9 @@ class _ApiKeyMiddleware:
             headers.get("x-api-key")
         ):
             return await self.app(scope, receive, send)
-        await JSONResponse({"error": "Unauthorized"}, status_code=401)(scope, receive, send)
+        await JSONResponse({"error": "Unauthorized"}, status_code=401)(
+            scope, receive, send
+        )
 
 
 def install_api_key(app: FastAPI, api_key: str | None) -> None:
@@ -553,7 +584,9 @@ class _RecordRequestMiddleware:
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "") if scope["type"] == "http" else ""
-        if not path.startswith(_TRACKED_REQUEST_PREFIXES) or path.startswith(_UNTRACKED_REQUEST_PREFIXES):
+        if not path.startswith(_TRACKED_REQUEST_PREFIXES) or path.startswith(
+            _UNTRACKED_REQUEST_PREFIXES
+        ):
             await self.app(scope, receive, send)
             return
         import time as _time
@@ -620,7 +653,7 @@ async def dispatch_rebuild(
     num_swa_pages: int | None = None,
     mode: str = "if_idle",
     timeout: float = 300.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Send a cache-rebuild request to the scheduler and await its result, managing the
     maintenance gate. Returns the scheduler's result dict, or a synthesized
     ``{"status": "failed"|"timeout"}`` on dispatch error / timeout. Every caller reaches it
@@ -650,7 +683,7 @@ async def dispatch_rebuild(
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Do NOT reopen the maintenance gate here: the scheduler may still be mid-rebuild
         # (e.g. a slow CUDA-graph recapture) and the backend request was not cancelled.
         # Leave maintenance_state == "rebuilding" so new generation and new rebuilds stay
@@ -660,7 +693,9 @@ async def dispatch_rebuild(
         return {"status": "timeout", "request_id": request_id}
 
 
-def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> int | None:
+def _resolve_num_swa_pages(
+    state: FrontendManager, req: CacheRebuildRequest
+) -> int | None:
     """External accepts num_swa_pages OR swa_full_tokens_ratio; internally only num_swa_pages
     flows. Convert a ratio to an absolute window at the requested (or current) full anchor, in the
     window pool's own page unit (P for DSV4, 1 token for radix-SWA)."""
@@ -670,30 +705,42 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     pools = getattr(state, "cache_pools", None) or {}
     last = getattr(state, "last_rebuild", None) or {}
     num_pages = req.num_pages or int(
-        last.get("num_pages") or getattr(state.stats, "kv_total_pages", 0)
-        or pools.get("num_pages", 0) or 0
+        last.get("num_pages")
+        or getattr(state.stats, "kv_total_pages", 0)
+        or pools.get("num_pages", 0)
+        or 0
     )
     page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
     from freetoken.kvcache.cache_status import window_pool_spec
 
     spec = window_pool_spec(config)
     if spec is None:
-        raise ValueError("swa_full_tokens_ratio requested but this model has no resizable window pool")
+        raise ValueError(
+            "swa_full_tokens_ratio requested but this model has no resizable window pool"
+        )
     swa_page_size = spec.page_size
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
-    return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
+    return max(
+        1, -(-window_tokens // swa_page_size)
+    )  # ceil-div to the pool's page unit
 
 
 def _maintenance_rejection(state: FrontendManager, action: str) -> JSONResponse | None:
     """The /v1/cache/* refusal while the engine is not serving, or None to proceed."""
     if state.maintenance_state == "loading":
         return JSONResponse(
-            {"status": "loading", "error": f"model is still loading; cannot {action} yet"},
+            {
+                "status": "loading",
+                "error": f"model is still loading; cannot {action} yet",
+            },
             status_code=503,
         )
     if state.maintenance_state == "failed":
         return JSONResponse(
-            {"status": "failed", "error": "server latched in maintenance; restart required"},
+            {
+                "status": "failed",
+                "error": "server latched in maintenance; restart required",
+            },
             status_code=503,
         )
     if state.maintenance_state == "rebuilding":
@@ -718,10 +765,16 @@ async def cache_rebuild(req: CacheRebuildRequest):
         return rejection
     if req.num_swa_pages is not None and req.swa_full_tokens_ratio is not None:
         return JSONResponse(
-            {"status": "failed", "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both"},
+            {
+                "status": "failed",
+                "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both",
+            },
             status_code=422,
         )
-    if req.swa_full_tokens_ratio is not None and not 0.0 < req.swa_full_tokens_ratio <= 1.0:
+    if (
+        req.swa_full_tokens_ratio is not None
+        and not 0.0 < req.swa_full_tokens_ratio <= 1.0
+    ):
         return JSONResponse(
             {"status": "failed", "error": "swa_full_tokens_ratio must be in (0, 1]"},
             status_code=422,
@@ -758,7 +811,8 @@ async def cache_flush(timeout: float = Query(0.0, ge=0.0)):
     except Exception as e:  # noqa: BLE001
         state.flush_futures.pop(request_id, None)
         return JSONResponse(
-            {"status": "failed", "error": f"failed to dispatch flush: {e!r}"}, status_code=503
+            {"status": "failed", "error": f"failed to dispatch flush: {e!r}"},
+            status_code=503,
         )
     try:
         reply = await fut
@@ -882,7 +936,9 @@ def kv_pool_geometry(state: Any) -> tuple[int, int]:
         or 0
     )
     page_size = int(
-        pools.get("page_size", 0) or getattr(getattr(state, "config", None), "page_size", 1) or 1
+        pools.get("page_size", 0)
+        or getattr(getattr(state, "config", None), "page_size", 1)
+        or 1
     )
     return num_pages, page_size
 
@@ -904,13 +960,16 @@ def cache_geometry(state: Any) -> dict:
     pools = getattr(state, "cache_pools", None) or {}
     num_pages, page_size = kv_pool_geometry(state)
     num_mamba_slots = int(
-        last.get("mamba_slots") or tr.mamba_total_slots or pools.get("num_mamba_slots", 0) or 0
+        last.get("mamba_slots")
+        or tr.mamba_total_slots
+        or pools.get("num_mamba_slots", 0)
+        or 0
     )
     moe_cache_size = last.get("moe_cache_size")
     if moe_cache_size is None:
-        moe_cache_size = int(pools.get("moe_cache_size", 0) or 0) or configured_moe_cache_size(
-            config
-        )
+        moe_cache_size = int(
+            pools.get("moe_cache_size", 0) or 0
+        ) or configured_moe_cache_size(config)
     # Effective window/full ratio: derived from the last rebuild's pinned window (num_swa_pages,
     # the internal currency), else the load-time meta value. 0.0 for models without a window pool.
     swa_full_tokens_ratio = float(getattr(state, "swa_full_tokens_ratio", 0.0) or 0.0)
@@ -939,7 +998,12 @@ def cache_geometry(state: Any) -> dict:
             "swa_per_token": int(ub.get("swa_bytes_per_token", 0) or 0),
         }
     except Exception:
-        unit_bytes = {"kv_per_token": 0, "moe_per_expert": 0, "mamba_per_slot": 0, "swa_per_token": 0}
+        unit_bytes = {
+            "kv_per_token": 0,
+            "moe_per_expert": 0,
+            "mamba_per_slot": 0,
+            "swa_per_token": 0,
+        }
     # Thinking control: the gears a client can offer and the chat_template_kwargs
     # each selects, derived from the checkpoint's own probed template (no
     # per-family registry). None until the frontend tokenizer is warm — the
@@ -956,8 +1020,8 @@ def cache_geometry(state: Any) -> dict:
         "num_mamba_slots": num_mamba_slots,
         "num_experts": num_experts,
         "num_moe_layers": num_moe_layers,
-        # Eviction policy of the MoE slot cache ("lru"). Reported so a client can label the
-        # pool without having to know how the server was started.
+        # Eviction policy of the MoE slot cache ("lru" or "crf"). Reported so a client can label
+        # the pool without having to know how the server was started.
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),
         "unit_bytes": unit_bytes,
         "swa_full_tokens_ratio": swa_full_tokens_ratio,
@@ -965,7 +1029,9 @@ def cache_geometry(state: Any) -> dict:
         "swa_page_size": swa_page_size,
         # Concrete current window size in that unit (usable pages): the last rebuild's value if it
         # pinned/derived one, else the load-time pool size. 0 for models without a window pool.
-        "num_swa_pages": int(last.get("num_swa_pages") or pools.get("num_swa_pages", 0) or 0),
+        "num_swa_pages": int(
+            last.get("num_swa_pages") or pools.get("num_swa_pages", 0) or 0
+        ),
         # Engine's exact total cache VRAM budget (all pools), from the ("meta", …) ack. 0 when
         # unknown (pre-budget engine) — the desktop then reverse-derives it from the limits.
         "cache_budget_bytes": int(getattr(state, "cache_budget_bytes", 0) or 0),
@@ -1001,10 +1067,17 @@ async def generate(req: GenerateRequest, request: Request):
     log_request("/generate", req, request)
     state = get_global_state()
     if state.maintenance_state != "serving":
-        detail = "model is still loading" if state.maintenance_state == "loading" else "cache rebuild in progress"
+        detail = (
+            "model is still loading"
+            if state.maintenance_state == "loading"
+            else "cache rebuild in progress"
+        )
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
-        return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
+        return JSONResponse(
+            {"error": f"max_tokens must be at least 1, got {req.max_tokens}"},
+            status_code=400,
+        )
     uid = state.new_user()
     try:
         await send_new_request(
@@ -1047,40 +1120,79 @@ async def run_kld(state: Any, req: KldRequest) -> JSONResponse:
         return JSONResponse({"error": f"kld: {exc}"}, status_code=400)
     chunks = list(range(base.n_chunk)) if req.chunks is None else req.chunks
     if bad := [c for c in chunks if not 0 <= c < base.n_chunk]:
-        return JSONResponse({"error": f"kld: chunks {bad} outside 0..{base.n_chunk - 1}"}, status_code=400)
+        return JSONResponse(
+            {"error": f"kld: chunks {bad} outside 0..{base.n_chunk - 1}"},
+            status_code=400,
+        )
     results: list[dict[str, Any]] = []
     for chunk in chunks:
         ids = base.tokens(chunk).tolist()
-        if req.bos_token_id is not None:
+        if ids and req.bos_token_id is not None:
             ids[0] = req.bos_token_id
-        spec = {"path": base.path, "chunk": chunk, "slice_rows": req.slice_rows, "bos_token_id": req.bos_token_id}
+        spec = {
+            "path": base.path,
+            "chunk": chunk,
+            "slice_rows": req.slice_rows,
+            "bos_token_id": req.bos_token_id,
+        }
         uid = state.new_user()
         try:
-            await send_new_request(state, uid, TokenizeMsg(
-                uid=uid, text="", input_ids=ids,
-                sampling_params=SamplingParams(max_tokens=1, ignore_eos=True, kld=spec),
-            ))
+            await send_new_request(
+                state,
+                uid,
+                TokenizeMsg(
+                    uid=uid,
+                    text="",
+                    input_ids=ids,
+                    sampling_params=SamplingParams(
+                        max_tokens=1, ignore_eos=True, kld=spec
+                    ),
+                ),
+            )
         except GenerationError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         result, error = None, "kld: the scheduler sent no terminal reply"
-        async with contextlib.aclosing(state.wait_for_ack(uid)) as acks:
-            async for ack in acks:
-                if ack.finished:
-                    result = ack.kld if ack.error is None else None
-                    error = ack.error or "kld: the terminal reply carried no statistics"
-                    break
-        results.append(result if result is not None else {**new_chunk_result(chunk), "error": error})
-    return JSONResponse({
-        "base": base.describe(), "slice_rows": req.slice_rows, "bos_token_id": req.bos_token_id,
-        "chunks": results, "summary": summarize(results),
-    })
+        finished_chunk = False
+        try:
+            async with contextlib.aclosing(state.wait_for_ack(uid)) as acks:
+                async for ack in acks:
+                    if ack.finished:
+                        finished_chunk = True
+                        result = ack.kld if ack.error is None else None
+                        error = (
+                            ack.error or "kld: the terminal reply carried no statistics"
+                        )
+                        break
+        finally:
+            if not finished_chunk:
+                try:
+                    await asyncio.shield(state.abort_user(uid))
+                except Exception:
+                    logger.exception("Failed to deliver abort for KLD user %s", uid)
+        results.append(
+            result
+            if result is not None
+            else {**new_chunk_result(chunk), "error": error}
+        )
+    return JSONResponse(
+        {
+            "base": base.describe(),
+            "slice_rows": req.slice_rows,
+            "bos_token_id": req.bos_token_id,
+            "chunks": results,
+            "summary": summarize(results),
+        }
+    )
 
 
 @app.post("/v1/internal/kld")
 async def internal_kld(req: KldRequest):
     state = get_global_state()
     if not getattr(state.config, "kld_endpoint", False):
-        return JSONResponse({"error": "not found: start the server with --enable-kld-endpoint"}, status_code=404)
+        return JSONResponse(
+            {"error": "not found: start the server with --enable-kld-endpoint"},
+            status_code=404,
+        )
     if (rejection := _maintenance_rejection(state, "score KLD chunks")) is not None:
         return rejection
     return await run_kld(state, req)
@@ -1114,7 +1226,9 @@ def _install_shell_stop_handlers() -> None:
         signal.signal(sig, _flag_shutdown)
 
 
-def _serve_and_run_shell(host: str, port: int, api_key: str | None, http_keep_alive_s: int) -> None:
+def _serve_and_run_shell(
+    host: str, port: int, api_key: str | None, http_keep_alive_s: int
+) -> None:
     """Shell mode: serve the API here, and attach the terminal client to it over the loopback.
 
     The shell is an ordinary API client (see ``freetoken.shell``), so shell mode is just
@@ -1141,9 +1255,15 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None, http_keep_al
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(
-        app, host=host, port=port, access_log=False, timeout_keep_alive=http_keep_alive_s,
-    ))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            access_log=False,
+            timeout_keep_alive=http_keep_alive_s,
+        )
+    )
     run_kwargs = {"sockets": bind_sockets(hosts, port)} if len(hosts) > 1 else {}
     thread = threading.Thread(
         target=server.run, kwargs=run_kwargs, name="freetoken-uvicorn", daemon=True
@@ -1166,7 +1286,9 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None, http_keep_al
         _reap_backend_workers(_GLOBAL_STATE.backend_processes)
 
 
-def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
+def run_api_server(
+    config: ServerArgs, start_backend: Callable[[], Any], run_shell: bool
+) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -1260,7 +1382,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
         _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
-        _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
+        _GLOBAL_STATE.swa_full_tokens_ratio = float(
+            meta.pop("swa_full_tokens_ratio", 0.0) or 0.0
+        )
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
         _GLOBAL_STATE.unit_bytes = meta

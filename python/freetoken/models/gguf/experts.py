@@ -13,7 +13,14 @@ import os
 import torch
 
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, row_bytes, type_name
+from freetoken.layers.quantization.ggml_types import (
+    float_dtype,
+    has_expert_scales,
+    mmq_tail_bytes,
+    pad_rows,
+    row_bytes,
+    type_name,
+)
 from freetoken.utils import init_logger
 
 from .reader import GgufTensorInfo, gguf_tensor_index
@@ -26,7 +33,9 @@ def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
     """[E, rows, row_bytes] packed ggml rows, or an [E, rows, K] view in the file's float dtype; the
     bank allocation that copies decides bf16 (a whole-layer float layer) or the file's dtype (a mixed one)."""
     k, rows, experts = info.ne
-    raw = torch.from_numpy(info.data()).view(experts, rows, info.nbytes // (experts * rows))
+    raw = torch.from_numpy(info.data()).view(
+        experts, rows, info.nbytes // (experts * rows)
+    )
     dtype = float_dtype(info.ggml_type)
     return raw if dtype is None else raw.view(dtype)
 
@@ -39,7 +48,14 @@ def _tp_slice() -> tuple[int, int]:
     return (0, 1) if tp is None else (tp.rank, tp.size)
 
 
-def _shard_intermediate(gate_up: list[torch.Tensor], down: torch.Tensor, down_type: int, inter: int, rank: int, world: int):
+def _shard_intermediate(
+    gate_up: list[torch.Tensor],
+    down: torch.Tensor,
+    down_type: int,
+    inter: int,
+    rank: int,
+    world: int,
+):
     """This rank's slice of the expert intermediate axis I, as nvfp4_banks._tp_shard cuts the safetensors experts.
 
     gate and up keep rows ``[rank * I/world, (rank + 1) * I/world)`` of each; down keeps the same span of every packed
@@ -48,7 +64,9 @@ def _shard_intermediate(gate_up: list[torch.Tensor], down: torch.Tensor, down_ty
     if world == 1:
         return gate_up, down
     if inter % world:
-        raise NotImplementedError(f"expert intermediate {inter} does not split over {world} ranks")
+        raise NotImplementedError(
+            f"expert intermediate {inter} does not split over {world} ranks"
+        )
     n = inter // world
     lo = rank * n
     if len(gate_up) == 1:  # stored gate_up: [gate(I) | up(I)] rows
@@ -59,7 +77,9 @@ def _shard_intermediate(gate_up: list[torch.Tensor], down: torch.Tensor, down_ty
     try:
         b_lo, b_n = row_bytes(down_type, lo) if lo else 0, row_bytes(down_type, n)
     except ValueError as exc:
-        raise NotImplementedError(f"{type_name(down_type)} down experts cannot split I={inter} over {world} ranks: {exc}") from None
+        raise NotImplementedError(
+            f"{type_name(down_type)} down experts cannot split I={inter} over {world} ranks: {exc}"
+        ) from None
     return gate_up, down[:, :, b_lo : b_lo + b_n]
 
 
@@ -74,10 +94,18 @@ def _drop_page_cache(info: GgufTensorInfo) -> None:
         pass
 
 
-def _device_bank(shape: tuple[int, ...], ggml_type: int, k: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _device_bank(
+    shape: tuple[int, ...],
+    ggml_type: int,
+    k: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
     """An [E, rows, row] device bank; a zero row follows the last one when ggml's MMQ tiles read past it."""
     experts, rows, row = shape
-    flat = torch.empty(experts * rows + pad_rows(ggml_type, k), row, dtype=dtype, device=device)
+    flat = torch.empty(
+        experts * rows + pad_rows(ggml_type, k), row, dtype=dtype, device=device
+    )
     flat[experts * rows :].zero_()
     return flat[: experts * rows].view(shape)
 
@@ -85,12 +113,16 @@ def _device_bank(shape: tuple[int, ...], ggml_type: int, k: int, dtype: torch.dt
 def resident_expert_bank(info: GgufTensorInfo, device: torch.device) -> torch.Tensor:
     """One stacked ``[E, rows, K]`` expert tensor as a resident device bank, in its packed ggml rows."""
     rows = _expert_rows(info)
-    bank = _device_bank(tuple(rows.shape), info.ggml_type, info.ne[0], rows.dtype, device)
+    bank = _device_bank(
+        tuple(rows.shape), info.ggml_type, info.ne[0], rows.dtype, device
+    )
     bank.copy_(rows)
     return bank
 
 
-def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts: int) -> torch.Tensor:
+def _expert_scales(
+    gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts: int
+) -> torch.Tensor:
     """[E, 4] fp32 (gate, up, down, 1) weight_scale_2 of one layer's experts."""
     gate, up = gate_up if len(gate_up) == 2 else (gate_up[0], gate_up[0])
     out = torch.ones(experts, 4, dtype=torch.float32)
@@ -99,12 +131,23 @@ def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts:
         if s is None:
             continue
         if s.numel() != experts:
-            raise NotImplementedError(f"{info.name}: {s.numel()} scales for {experts} experts")
+            raise NotImplementedError(
+                f"{info.name}: {s.numel()} scales for {experts} experts"
+            )
         out[:, col] = s
     return out
 
 
-def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None):
+def load_gguf_expert_banks(
+    model_path: str,
+    num_layers: int,
+    *,
+    first_layer: int = 0,
+    dummy: bool = False,
+    device: torch.device | None = None,
+    ep_offset: int = 0,
+    ep_size: int = 1,
+):
     """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``."""
     from freetoken.moe.expert_banks import ExpertBanks
     from freetoken.moe.host_banks import HostBank, PinPipeline
@@ -119,8 +162,11 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
     rank, world = _tp_slice()
-    if world > 1 and biased:
-        raise NotImplementedError(f"{model_path}: per-expert biases (gpt-oss) have no tensor-parallel split")
+    inter_rank, inter_world = (0, 1) if ep_size > 1 else (rank, world)
+    if inter_world > 1 and biased:
+        raise NotImplementedError(
+            f"{model_path}: per-expert biases (gpt-oss) have no tensor-parallel split"
+        )
     with PinPipeline() if device is None else contextlib.nullcontext() as pins:
         for layer in range(num_layers):
             blk = f"blk.{first_layer + layer}"
@@ -129,12 +175,19 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 gate = index[f"{blk}.ffn_gate_up_exps.weight"]
                 parts = [gate]
             else:
-                gate, up = index[f"{blk}.ffn_gate_exps.weight"], index[f"{blk}.ffn_up_exps.weight"]
+                gate, up = (
+                    index[f"{blk}.ffn_gate_exps.weight"],
+                    index[f"{blk}.ffn_up_exps.weight"],
+                )
                 if gate.ggml_type != up.ggml_type:
-                    raise NotImplementedError(f"{blk}: gate and up experts have different ggml types")
+                    raise NotImplementedError(
+                        f"{blk}: gate and up experts have different ggml types"
+                    )
                 parts = [gate, up]
             tags.append(("ggml", type_name(gate.ggml_type), type_name(down.ggml_type)))
-            down_k = down.ne[0] // world  # down's K is the (sharded) intermediate axis
+            down_k = (
+                down.ne[0] // inter_world
+            )  # down's K is the (sharded) intermediate axis
             tails["gate_up"].append(mmq_tail_bytes(gate.ggml_type, gate.ne[0]))
             tails["down"].append(mmq_tail_bytes(down.ggml_type, down_k))
             if scaled:
@@ -143,37 +196,89 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 tails["gate_up_bias"].append(0)
                 tails["down_bias"].append(0)
             # a whole-layer float layer runs the bf16 fused MoE; a mixed float/quant layer keeps the float half's own dtype
-            pure_float = float_dtype(gate.ggml_type) is not None and float_dtype(down.ggml_type) is not None
-            rows, d = _shard_intermediate([_expert_rows(info) for info in parts], _expert_rows(down), down.ggml_type, down.ne[0], rank, world)
-            gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
+            pure_float = (
+                float_dtype(gate.ggml_type) is not None
+                and float_dtype(down.ggml_type) is not None
+            )
+            rows, d = _shard_intermediate(
+                [_expert_rows(info) for info in parts],
+                _expert_rows(down),
+                down.ggml_type,
+                down.ne[0],
+                inter_rank,
+                inter_world,
+            )
+            total_experts = rows[0].shape[0]
+            if ep_size > 1:
+                if total_experts % ep_size:
+                    raise NotImplementedError(
+                        f"{blk}: {total_experts} experts do not split evenly across ep_size={ep_size}"
+                    )
+                local_experts = total_experts // ep_size
+                ep_sl = slice(ep_offset, ep_offset + local_experts)
+                rows = [r[ep_sl] for r in rows]
+                d = d[ep_sl]
+            else:
+                ep_sl = slice(None)
+            gate_up_shape = (
+                rows[0].shape[0],
+                sum(r.shape[1] for r in rows),
+                rows[0].shape[2],
+            )
             experts = rows[0].shape[0]
-            gu_dtype, down_dtype = (torch.bfloat16, torch.bfloat16) if pure_float else (rows[0].dtype, d.dtype)
+            gu_dtype, down_dtype = (
+                (torch.bfloat16, torch.bfloat16)
+                if pure_float
+                else (rows[0].dtype, d.dtype)
+            )
             if device is None:
-                host = {"gate_up": HostBank(gate_up_shape, gu_dtype), "down": HostBank(tuple(d.shape), down_dtype)}
+                host = {
+                    "gate_up": HostBank(gate_up_shape, gu_dtype),
+                    "down": HostBank(tuple(d.shape), down_dtype),
+                }
                 if scaled:
                     host["global"] = HostBank((experts, 4), torch.float32)
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {
-                    "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], gu_dtype, device),
-                    "down": _device_bank(tuple(d.shape), down.ggml_type, down_k, down_dtype, device),
+                    "gate_up": _device_bank(
+                        gate_up_shape, gate.ggml_type, gate.ne[0], gu_dtype, device
+                    ),
+                    "down": _device_bank(
+                        tuple(d.shape), down.ggml_type, down_k, down_dtype, device
+                    ),
                 }
                 if scaled:
-                    banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)
+                    banks["global"] = torch.empty(
+                        experts, 4, dtype=torch.float32, device=device
+                    )
             if scaled:
-                banks["global"].copy_(_expert_scales(parts, down, experts))
+                banks["global"].copy_(_expert_scales(parts, down, total_experts)[ep_sl])
             if biased:
-                missing = [f"{blk}.ffn_{p}_exps.bias" for p in ("gate", "up", "down") if f"{blk}.ffn_{p}_exps.bias" not in index]
+                missing = [
+                    f"{blk}.ffn_{p}_exps.bias"
+                    for p in ("gate", "up", "down")
+                    if f"{blk}.ffn_{p}_exps.bias" not in index
+                ]
                 if missing:
-                    raise NotImplementedError(f"{model_path}: {', '.join(missing)}: the per-expert biases ship on every layer of a gpt-oss file")
+                    raise NotImplementedError(
+                        f"{model_path}: {', '.join(missing)}: the per-expert biases ship on every layer of a gpt-oss file"
+                    )
                 # gpt-oss per-expert biases: gate|up as one [E, 2I] row block, down as [E, H]
                 gate_b, up_b, down_b = (
-                    float_tensor(index[f"{blk}.ffn_{p}_exps.bias"]).to(torch.bfloat16) for p in ("gate", "up", "down")
+                    float_tensor(index[f"{blk}.ffn_{p}_exps.bias"]).to(torch.bfloat16)
+                    for p in ("gate", "up", "down")
                 )
-                gate_up_bias, down_bias = torch.cat([gate_b, up_b], dim=1), down_b
-                for role, rows_bias in (("gate_up_bias", gate_up_bias), ("down_bias", down_bias)):
+                gate_up_bias = torch.cat([gate_b, up_b], dim=1)[ep_sl]
+                down_bias = down_b[ep_sl]
+                for role, rows_bias in (
+                    ("gate_up_bias", gate_up_bias),
+                    ("down_bias", down_bias),
+                ):
                     if rows_bias.shape[0] != experts:
-                        raise NotImplementedError(f"{blk}.{role}: {tuple(rows_bias.shape)} for {experts} experts")
+                        raise NotImplementedError(
+                            f"{blk}.{role}: {tuple(rows_bias.shape)} for {experts} experts"
+                        )
                     if device is None:
                         host[role] = HostBank(tuple(rows_bias.shape), torch.bfloat16)
                         banks[role] = host[role].tensor
@@ -201,9 +306,19 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             for role, bank in banks.items():
                 sources[role].append(bank)
     total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
-    logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
+    logger.info_rank0(
+        f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}"
+    )
     # the _bias formats are the gguf layouts plus the per-expert bias bank rows (_BANK_SCHEMAS)
-    return ExpertBanks(("gguf_scaled" if scaled else "gguf") + ("_bias" if biased else ""), sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
+    return ExpertBanks(
+        ("gguf_scaled" if scaled else "gguf") + ("_bias" if biased else ""),
+        sources,
+        kind=QuantKind.GGUF,
+        kernel="ggml",
+        layout=None,
+        layer_tags=tags,
+        row_tail_bytes=tails,
+    )
 
 
 __all__ = ["load_gguf_expert_banks", "resident_expert_bank"]

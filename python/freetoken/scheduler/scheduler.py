@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import math
-import os
 import time
 from dataclasses import replace
-
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, TypeAlias
 
 import torch
+
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -50,7 +49,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
+Indice2D: TypeAlias = tuple[torch.Tensor, torch.Tensor]
 
 
 def _gib(n_bytes: int) -> str:
@@ -62,10 +61,12 @@ class ForwardInput(NamedTuple):
     batch: Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D | None  # (req_mapping, seq_lens or -1); None on verify, whose drain writes the pending token
+    write_tuple: (
+        Indice2D | None
+    )  # (req_mapping, seq_lens or -1); None on verify, whose drain writes the pending token
 
 
-ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+ForwardData: TypeAlias = "tuple[ForwardInput, ForwardOutput]"
 
 
 # one-token chat-turn ends, in order of preference (ChatML, Llama 3, Gemma, Phi)
@@ -84,23 +85,35 @@ class Scheduler(SchedulerIOMixin):
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
         # sent on the readiness ack for /v1/stats gpus; a list so TP can add one entry per rank
-        self.gpus = [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
+        self.gpus = (
+            [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
+        )
 
         # initialize other managers
-        self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        self.table_manager = TableManager(
+            config.max_running_req, self.engine.page_table
+        )
         self.spec: SpecRuntime | None = self.engine.spec
         # ONE cache manager for every model (ShadowRadix layering): the shared page table is the
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
         # linear_state_pool. No model supplies its own manager.
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
             sliding_window_size=next(
-                (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
+                (
+                    g.sliding_window
+                    for g in config.model_config.kv_cache_group_specs()
+                    if g.is_swa
+                ),
                 None,
-            ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            )
+            or getattr(self.engine.kv_cache, "sliding_window_size", None),
             radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
             logprob_read_snapshot_donate=config.logprob_read_snapshot_donate,
             isolate_logprob_reads=config.logprob_read_isolate,
@@ -109,13 +122,18 @@ class Scheduler(SchedulerIOMixin):
             elastic_pool=getattr(self.engine, "elastic_pool", None),
         )
         token_headroom = config.decode_rows_per_req - 1
-        self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
+        self.decode_manager = DecodeManager(
+            config.page_size, token_headroom=token_headroom
+        )
         # A long prompt chunked at the window budget is hundreds of consecutive prefill steps, which left
         # an already-decoding request unscheduled for 267-317 s on 8xRTX4090; unset keeps prefill-first.
         self._interleave = DecodeInterleavePolicy(
             getattr(config, "decode_interleave_every", None)
         )
-        self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
+        self._bidirectional_mm = any(
+            getattr(g, "bidirectional_mm_blocks", False)
+            for g in config.model_config.attention_groups
+        )
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
@@ -128,11 +146,11 @@ class Scheduler(SchedulerIOMixin):
         )
 
         # some alias for easy access
-        self.finished_reqs: Set[Req] = set()
+        self.finished_reqs: set[Req] = set()
         # Abort acknowledgements are a terminal accounting barrier. Queue them while processing
         # inbound control messages, then flush only AFTER _process_last_data publishes any
         # sampled replies from the prior overlapped forward.
-        self._pending_abort_acks: Set[int] = set()
+        self._pending_abort_acks: set[int] = set()
         # With multiple tokenizer workers, an AbortBackendMsg and its earlier UserMsg can arrive
         # through different PUSH producers and be observed out of order. Preserve a bounded
         # tombstone so an abort-before-admission request can never be resurrected after its
@@ -147,7 +165,7 @@ class Scheduler(SchedulerIOMixin):
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
-        self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
+        self._pending_flush: tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -162,11 +180,21 @@ class Scheduler(SchedulerIOMixin):
             )
         if self.cache_manager.structural:
             # the first turn boundary's snapshot is the pinned root; the marker must be one token
-            marker = next((m for m in _TURN_END_MARKERS if load_toolcall_anchor_id(self.tokenizer, m) is not None), None)
-            self.cache_manager.turn_end_id = load_toolcall_anchor_id(self.tokenizer, marker)
+            marker = next(
+                (
+                    m
+                    for m in _TURN_END_MARKERS
+                    if load_toolcall_anchor_id(self.tokenizer, m) is not None
+                ),
+                None,
+            )
+            self.cache_manager.turn_end_id = load_toolcall_anchor_id(
+                self.tokenizer, marker
+            )
             logger.info_rank0(
                 f"GDN snapshot policy structural: turn end {marker!r} (id {self.cache_manager.turn_end_id})"
-                if marker else "GDN snapshot policy structural: no one-token turn end, so no pinned root"
+                if marker
+                else "GDN snapshot policy structural: no one-token turn end, so no pinned root"
             )
         self.token_pool = self.table_manager.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
@@ -174,7 +202,9 @@ class Scheduler(SchedulerIOMixin):
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
         _chunk_cap = self.cache_manager.prefill_chunk_budget
         self.prefill_budget = (
-            min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
+            min(config.max_extend_tokens, _chunk_cap)
+            if _chunk_cap
+            else config.max_extend_tokens
         )
         self.config = config
         self._model_is_mrope = config.model_config.model_is_mrope
@@ -192,7 +222,9 @@ class Scheduler(SchedulerIOMixin):
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
-            moe_stats=self._moe_stats_line if config.moe_collect_stats and moe_cache is not None else None,
+            moe_stats=self._moe_stats_line
+            if config.moe_collect_stats and moe_cache is not None
+            else None,
             kv_stats=self._kv_stats_line if kv_stats else None,
             kv_stats_interval=kv_stats_interval,
         )
@@ -229,16 +261,26 @@ class Scheduler(SchedulerIOMixin):
         guarantee the scheduler is idle — no pending prefill, no running decode, no in-flight
         finished requests. All TP ranks must call this with identical arguments.
         """
+        if not getattr(self.cache_manager, "supports_runtime_rebuild", True):
+            raise RuntimeError(
+                "runtime cache rebuild is not supported when --kv-moe-elastic is active"
+            )
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
-            moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
+            moe_cache_size=moe_cache_size,
+            num_pages=num_pages,
+            num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,
         )
-        if num_pages is not None or num_mamba_slots is not None or num_swa_pages is not None:
+        if (
+            num_pages is not None
+            or num_mamba_slots is not None
+            or num_swa_pages is not None
+        ):
             # Any of these resizes invalidates the prefix cache: a KV resize leaves stale page
             # indices, a mamba resize leaves stale GDN-snapshot slot ids, and a window-pool resize
             # (num_swa_pages) reallocates the SWA/window token pool, leaving stale slot ids in the
@@ -257,7 +299,8 @@ class Scheduler(SchedulerIOMixin):
         _chunk_cap = self.cache_manager.prefill_chunk_budget
         self.prefill_budget = (
             min(self.config.max_extend_tokens, _chunk_cap)
-            if _chunk_cap else self.config.max_extend_tokens
+            if _chunk_cap
+            else self.config.max_extend_tokens
         )
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
@@ -277,8 +320,10 @@ class Scheduler(SchedulerIOMixin):
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
-            or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
-            or self._pending_flush is not None  # a deferred flush to run at idle or time out
+            or self._pending_rebuild
+            is not None  # a queued rebuild to drain toward + execute
+            or self._pending_flush
+            is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -286,8 +331,10 @@ class Scheduler(SchedulerIOMixin):
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
         # NOT a gate — those requests are already freed (no live GPU/page resources).
-        if self._pending_rebuild is not None and last_data is None and not (
-            self.prefill_manager.runnable or self.decode_manager.runnable
+        if (
+            self._pending_rebuild is not None
+            and last_data is None
+            and not (self.prefill_manager.runnable or self.decode_manager.runnable)
         ):
             self._execute_pending_rebuild()
         self._check_pending_flush()
@@ -325,7 +372,8 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
-            or self._pending_flush is not None  # a deferred flush to run at idle or time out
+            or self._pending_flush
+            is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -380,8 +428,8 @@ class Scheduler(SchedulerIOMixin):
         copy_done.synchronize()
         # tokens are on the host from here: the per-request timings' token stamps
         now = time.perf_counter()
-        reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Req] = set()
+        reply: list[DetokenizeMsg] = []
+        new_finished_reqs: set[Req] = set()
         generated = None
         with self.cache_manager.lazy_free_region():
             if batch.phase == "verify":
@@ -421,12 +469,20 @@ class Scheduler(SchedulerIOMixin):
                     if msg.finished and getattr(self, "_kld_jobs", None):
                         msg.kld = self._finish_kld(req.uid)
                     if req.sampling_params.logprobs:
-                        _attach_logprobs(msg, output, i, req.sampling_params.top_logprobs)
+                        _attach_logprobs(
+                            msg,
+                            output,
+                            i,
+                            req.sampling_params.top_logprobs,
+                            req.sampling_params.allowed_token_ids,
+                        )
                     req.stats.stamp_token(now)
                     reply.append(msg)
                     # a timings_per_token request gets the snapshot on every reply, growing
                     if msg.finished or req.sampling_params.timings_per_token:
-                        msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+                        msg.timings = req.stats.finish(
+                            req.input_ids.numel() - req.prompt_len
+                        )
                     finished = msg.finished
 
                     # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -476,7 +532,13 @@ class Scheduler(SchedulerIOMixin):
         )
         self.send_result(reply)
 
-    def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
+    def _drain_verify(
+        self,
+        batch: Batch,
+        output,
+        reply: list[DetokenizeMsg],
+        new_finished_reqs: set[Req],
+    ) -> int:
         """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
         k = batch.rows_per_req - 1  # 0 on a step past --speculative-max-batch-size
         counts, finished = [], []
@@ -508,22 +570,32 @@ class Scheduler(SchedulerIOMixin):
         # before any finish free: the hybrid finish donates the live GDN slot the commit writes
         self.engine.commit_verify(batch.reqs, counts, output.next_tokens_gpu)
         # the last committed token is pending at cached_len, like a decode step's sampled token
-        table, pos, last = torch.tensor(
+        from freetoken.kernel.sm_upload import upload_step_tensor
+
+        triples = torch.tensor(
             [(r.table_idx, r.cached_len, n - 1) for r, n in zip(batch.reqs, counts)],
-            dtype=torch.int64, pin_memory=self.device.type == "cuda",
-        ).to(self.device, non_blocking=True).unbind(1)
-        self.token_pool[table, pos] = output.next_tokens_gpu.gather(1, last.unsqueeze(1)).squeeze(1).to(self.token_pool.dtype)
+            dtype=torch.int64,
+        )
+        table, pos, last = upload_step_tensor(triples, self.device).unbind(1)
+        self.token_pool[table, pos] = (
+            output.next_tokens_gpu.gather(1, last.unsqueeze(1))
+            .squeeze(1)
+            .to(self.token_pool.dtype)
+        )
         for req in finished:
             self.decode_manager.remove_req(req)
             self._free_req_resources(req)
             new_finished_reqs.add(req)
         return sum(counts)
 
-    def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
+    def _commit_tokens(
+        self, req: Req, tokens: torch.Tensor
+    ) -> tuple[DetokenizeMsg, int]:
         """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
         params = req.sampling_params
-        committed: List[int] = []
+        committed: list[int] = []
         finished, finish_reason, matched_stop = False, None, None
+        trim_last_token, hit_stop_token = False, False
         for j in range(tokens.numel()):
             req.append_host(tokens[j : j + 1])
             token = int(tokens[j].item())
@@ -532,13 +604,22 @@ class Scheduler(SchedulerIOMixin):
             # EOS and stop strings win over length.
             # Overlap can advance device_len one token ahead of this host reply.
             hit_length = req.input_ids.numel() >= req.max_device_len
-            hit_eos = (
-                not params.ignore_eos and token in self.eos_token_ids
-            ) or token in params.stop_token_ids
-            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            hit_natural_eos = not params.ignore_eos and token in self.eos_token_ids
+            hit_stop_tok = token in params.stop_token_ids
+            hit_eos = hit_natural_eos or hit_stop_tok
+            matched_stop = (
+                self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            )
             if hit_length or hit_eos or matched_stop is not None:
                 finished = True
-                finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
+                finish_reason = (
+                    "stop" if (hit_eos or matched_stop is not None) else "length"
+                )
+                hit_stop_token = bool(hit_stop_tok and not hit_natural_eos)
+                trim_last_token = bool(
+                    hit_natural_eos
+                    or (hit_stop_tok and not params.include_stop_str_in_output)
+                )
                 break
             if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
                 req.toolcall_anchor_len = req.input_ids.numel()
@@ -552,6 +633,8 @@ class Scheduler(SchedulerIOMixin):
             stop_strs=params.stop_strs or None,
             keep_stop_str=params.include_stop_str_in_output,
             skip_special_tokens=params.skip_special_tokens,
+            trim_last_token=trim_last_token,
+            hit_stop_token=hit_stop_token,
         )
         return msg, len(committed)
 
@@ -571,7 +654,7 @@ class Scheduler(SchedulerIOMixin):
                 return s
         return None
 
-    def _kv_usage_pages(self) -> Tuple[int, int]:
+    def _kv_usage_pages(self) -> tuple[int, int]:
         """(used_pages, total_pages) of the KV page pool.
 
         ``used`` follows SGLang's logging semantics: allocated pages that are not
@@ -582,7 +665,7 @@ class Scheduler(SchedulerIOMixin):
         """
         return self.cache_manager.page_usage()
 
-    def _mamba_slot_usage(self) -> Tuple[int, int] | None:
+    def _mamba_slot_usage(self) -> tuple[int, int] | None:
         """(used_slots, total_slots) of the GDN-state (mamba) pool for hybrid models, else None.
 
         Mirrors SGLang's mamba-pool semantics: ``total`` excludes the reserved padding
@@ -593,7 +676,7 @@ class Scheduler(SchedulerIOMixin):
         total = self.cache_manager.linear_state_pool.num_slots - 1
         return total - self.cache_manager.mamba_available_size, total
 
-    def _swa_token_usage(self) -> Tuple[int, int] | None:
+    def _swa_token_usage(self) -> tuple[int, int] | None:
         """(used_tokens, total_tokens) of the window (swa) pool for SWA models, else None.
 
         Mirrors the mamba accounting: ``total`` excludes the pool's reserved sentinel
@@ -624,7 +707,8 @@ class Scheduler(SchedulerIOMixin):
             if tombstones is not None and msg.uid in tombstones:
                 tombstones.pop(msg.uid, None)
                 logger.debug_rank0(
-                    "Dropping request %d because its abort arrived before admission", msg.uid
+                    "Dropping request %d because its abort arrived before admission",
+                    msg.uid,
                 )
                 return
             if msg.mm_items and self.engine.encoder_cache is None:
@@ -667,7 +751,10 @@ class Scheduler(SchedulerIOMixin):
             if msg.sampling_params.max_tokens > max_output_len:
                 # Offline requests can share SamplingParams; clip only this request.
                 msg = replace(
-                    msg, sampling_params=replace(msg.sampling_params, max_tokens=max_output_len)
+                    msg,
+                    sampling_params=replace(
+                        msg.sampling_params, max_tokens=max_output_len
+                    ),
                 )
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
@@ -676,7 +763,9 @@ class Scheduler(SchedulerIOMixin):
             if sp.min_tokens > 0:
                 # min_tokens: the sampler masks these ids while the output is shorter.
                 sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
-                sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
+                sp.min_tokens_stop_ids = sorted(
+                    set(self.eos_token_ids) | set(sp.stop_token_ids)
+                )
             if sp.kld is not None and not self._admit_kld(msg):
                 return
             self.prefill_manager.add_one_req(msg)
@@ -732,15 +821,21 @@ class Scheduler(SchedulerIOMixin):
             # reject them cleanly rather than ship hang-prone half-wired paths.
             if not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
-                    msg.request_id, "unsupported", "this model's cache does not support runtime rebuild"
+                    msg.request_id,
+                    "unsupported",
+                    "this model's cache does not support runtime rebuild",
                 )
             elif msg.mode != "if_idle":
                 self._reply_rebuild(
-                    msg.request_id, "unsupported", f"mode {msg.mode!r} unsupported (use if_idle)"
+                    msg.request_id,
+                    "unsupported",
+                    f"mode {msg.mode!r} unsupported (use if_idle)",
                 )
             elif self.config.tp_info.size > 1:
                 self._reply_rebuild(
-                    msg.request_id, "unsupported", "runtime rebuild unsupported under TP > 1"
+                    msg.request_id,
+                    "unsupported",
+                    "runtime rebuild unsupported under TP > 1",
                 )
             elif self.prefill_manager.runnable or self.decode_manager.runnable:
                 # if_idle: refuse rather than wait. (finished_reqs hold no resources — they
@@ -771,7 +866,9 @@ class Scheduler(SchedulerIOMixin):
         if not batch.is_prefill:
             return
         for req in batch.reqs:
-            if req.kv_restore is not None:   # the pages the request's host-only prefix adopted
+            if (
+                req.kv_restore is not None
+            ):  # the pages the request's host-only prefix adopted
                 kv.pages_from_host(req.kv_restore.host_pages, req.kv_restore.dev_pages)
                 req.kv_restore = None
             if req.mamba_restore_src is not None:
@@ -788,13 +885,17 @@ class Scheduler(SchedulerIOMixin):
         sp = msg.sampling_params
         try:
             if not getattr(self.config, "kld_endpoint", False):
-                raise ValueError("kld: the server was not started with --enable-kld-endpoint")
+                raise ValueError(
+                    "kld: the server was not started with --enable-kld-endpoint"
+                )
             if not self.cache_manager.is_hybrid:
                 # only the hybrid manager frees a non-donating request's pages instead of caching them
                 raise ValueError("kld: needs a hybrid (GDN) prefix cache")
             if msg.mm_items or sp.max_tokens != 1:
                 raise ValueError("kld: a chunk is a text-only prompt with max_tokens=1")
-            base = check_kld_request(sp.kld, msg.input_ids.tolist(), self.config.model_config.vocab_size)
+            base = check_kld_request(
+                sp.kld, msg.input_ids.tolist(), self.config.model_config.vocab_size
+            )
         except ValueError as exc:
             self.send_result([ErrorReplyMsg(uid=msg.uid, error=str(exc))])
             return False
@@ -813,16 +914,23 @@ class Scheduler(SchedulerIOMixin):
             if job is None or job[1]["error"] is not None:
                 continue
             base, result = job
-            if len(batch.reqs) != 1 or req.cached_len != 0 or req.extend_len != base.n_ctx:
+            if (
+                len(batch.reqs) != 1
+                or req.cached_len != 0
+                or req.extend_len != base.n_ctx
+            ):
                 result["error"] = (
                     f"kld: chunk {result['chunk']} did not prefill cold in one pass (batch of {len(batch.reqs)}, "
                     f"cached {req.cached_len}, extend {req.extend_len} of {base.n_ctx} tokens)"
                 )
                 continue
             batch.kld = KldCapture(
-                base, result["chunk"], capture_targets(base, req.input_ids),
+                base,
+                result["chunk"],
+                capture_targets(base, req.input_ids),
                 slice_rows=int(req.sampling_params.kld["slice_rows"]),
-                primary=self.config.tp_info.is_primary(), result=result,
+                primary=self.config.tp_info.is_primary(),
+                result=result,
             )
 
     def _finish_kld(self, uid: int) -> dict | None:
@@ -850,7 +958,9 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
 
-    def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
+    def _reply_rebuild(
+        self, request_id: str, status: str, error: str | None = None
+    ) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is
         # usable slots (padding sink excluded, matching the status-bar gauge), and num_swa_pages
         # reports 0 unless the model actually has a window pool.
@@ -900,7 +1010,9 @@ class Scheduler(SchedulerIOMixin):
             if not getattr(self.engine, "rebuild_teardown_started", True):
                 # Failed before the destructive phase began: graphs and pools are untouched and
                 # the engine is still serving. A destructive rollback would only add risk.
-                logger.error(f"cache rebuild failed before teardown: {e!r} — old cache intact")
+                logger.error(
+                    f"cache rebuild failed before teardown: {e!r} — old cache intact"
+                )
                 self._reply_rebuild(msg.request_id, "rejected", error=repr(e))
                 return
             if self.config.tp_info.size > 1:
@@ -919,21 +1031,29 @@ class Scheduler(SchedulerIOMixin):
             # CUDA state is not guaranteed sane — a rollback that succeeds here may still surface
             # a deferred fault on a later request; that residual risk is accepted over always
             # forcing a restart.)
-            logger.error(f"cache rebuild failed: {e!r} — rolling back to the previous geometry")
+            logger.error(
+                f"cache rebuild failed: {e!r} — rolling back to the previous geometry"
+            )
             try:
                 self.rebuild_cache(**prior)
             except Exception as e2:  # noqa: BLE001 — rollback failed too; genuinely unrecoverable
-                logger.error(f"cache rebuild rollback failed: {e2!r} — server latched failed")
+                logger.error(
+                    f"cache rebuild rollback failed: {e2!r} — server latched failed"
+                )
                 self._reply_rebuild(
                     msg.request_id,
                     "failed",
                     error=f"{e!r}; rollback to the prior geometry also failed: {e2!r}",
                 )
                 return
-            logger.warning("cache rebuild rolled back to the previous geometry — still serving")
+            logger.warning(
+                "cache rebuild rolled back to the previous geometry — still serving"
+            )
             self._log_cache_geometry("Cache rolled back")
             self._reply_rebuild(
-                msg.request_id, "rejected", error=f"rebuild failed and was rolled back: {e!r}"
+                msg.request_id,
+                "rejected",
+                error=f"rebuild failed and was rolled back: {e!r}",
             )
             return
         # Outside the try: an ack/send failure after a fully-applied rebuild must not be
@@ -945,9 +1065,13 @@ class Scheduler(SchedulerIOMixin):
         # Same idle/timeout contract as sglang's /flush_cache. Even timeout=0 waits for this iteration's safe point.
         if self.config.tp_info.size > 1:
             # each rank checks the deadline on its own clock, so a deferred flush could run on only some ranks
-            self._reply_flush(msg.request_id, "unsupported", "cache flush unsupported under TP > 1")
+            self._reply_flush(
+                msg.request_id, "unsupported", "cache flush unsupported under TP > 1"
+            )
         elif self._pending_flush is not None:
-            self._reply_flush(msg.request_id, "busy", "another cache flush is already waiting")
+            self._reply_flush(
+                msg.request_id, "busy", "another cache flush is already waiting"
+            )
         else:
             self._pending_flush = (msg, time.monotonic() + msg.timeout)
 
@@ -970,13 +1094,23 @@ class Scheduler(SchedulerIOMixin):
                 "scheduler is not idle: "
                 f"{len(self.prefill_manager.pending_list)} queued, "
                 f"{len(self.decode_manager.running_reqs)} running"
-                + (", last batch still in flight" if self._last_data is not None else "")
+                + (
+                    ", last batch still in flight"
+                    if self._last_data is not None
+                    else ""
+                )
             )
             logger.warning_rank0(f"Cache not flushed, {error}")
-            self._reply_flush(msg.request_id, "timeout" if msg.timeout > 0 else "busy", error)
+            self._reply_flush(
+                msg.request_id, "timeout" if msg.timeout > 0 else "busy", error
+            )
 
-    def _reply_flush(self, request_id: str, status: str, error: str | None = None) -> None:
-        self.send_result([FlushCacheResultMsg(request_id=request_id, status=status, error=error)])
+    def _reply_flush(
+        self, request_id: str, status: str, error: str | None = None
+    ) -> None:
+        self.send_result(
+            [FlushCacheResultMsg(request_id=request_id, status=status, error=error)]
+        )
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
@@ -991,8 +1125,12 @@ class Scheduler(SchedulerIOMixin):
         num_swa_pages = eng.kv_cache.window_pages if spec is not None else None
         return dict(
             num_pages=eng.num_pages,
-            moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
-            num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
+            moe_cache_size=eng.moe_offload_cache.cache_size
+            if eng.moe_offload_cache is not None
+            else None,
+            num_mamba_slots=(eng.linear_state_pool.num_slots - 1)
+            if eng.linear_state_pool is not None
+            else None,
             num_swa_pages=num_swa_pages,
         )
 
@@ -1000,7 +1138,10 @@ class Scheduler(SchedulerIOMixin):
         """One-line readout of every pool's new size + VRAM after a rebuild changed them:
         full KV always; swa/mamba/MoE only for models with the pool. Byte figures are
         best-effort (0 when a unit cost cannot be measured) and must never block the reply."""
-        from freetoken.kvcache.cache_status import compute_cache_pools, compute_cache_unit_bytes
+        from freetoken.kvcache.cache_status import (
+            compute_cache_pools,
+            compute_cache_unit_bytes,
+        )
 
         try:
             pools = compute_cache_pools(self.engine)
@@ -1033,7 +1174,10 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         if self.spec is not None and batch.is_decode:
-            batch.phase, batch.rows_per_req = "verify", self.config.verify_rows_for(batch.size)
+            batch.phase, batch.rows_per_req = (
+                "verify",
+                self.config.verify_rows_for(batch.size),
+            )
         self.engine.graph_runner_for(batch).pad_batch(batch)
         if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
@@ -1065,7 +1209,9 @@ class Scheduler(SchedulerIOMixin):
         if self._model_is_mrope:
             batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
+        write_mapping = (
+            None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
+        )
         batch.out_loc = self.engine.page_table[input_mapping]
         # the backends whose captured graphs serve this batch's width stage its metadata
         attn_backend, linear_backend = self.engine.backends_for(batch)
@@ -1087,13 +1233,23 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
-        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+        jobs, plan, rows, block_ends = plan_mm_batch(
+            batch.padded_reqs, self.engine.encoder_cache
+        )
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan
-            batch.mm_rows = upload_step_tensor(torch.tensor(rows, dtype=torch.int64), self.device)
-            batch.mm_block_ends = upload_step_tensor(torch.tensor(block_ends, dtype=torch.int32), self.device)
-        if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
+            batch.mm_rows = upload_step_tensor(
+                torch.tensor(rows, dtype=torch.int64), self.device
+            )
+            batch.mm_block_ends = upload_step_tensor(
+                torch.tensor(block_ends, dtype=torch.int32), self.device
+            )
+        if (
+            self._bidirectional_mm
+            and not self._warned_cut_image
+            and (cut := cut_image_spans(batch.padded_reqs))
+        ):
             # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
             lo, hi = cut[0]
             self._warned_cut_image = True
@@ -1140,7 +1296,9 @@ class Scheduler(SchedulerIOMixin):
             return
         self.send_result(
             [
-                PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
+                PromptAdmittedMsg(
+                    uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens
+                )
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
             ]
         )
@@ -1151,7 +1309,9 @@ class Scheduler(SchedulerIOMixin):
             return
         uids = sorted(pending)
         pending.clear()
-        self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
+        self.send_result(
+            [ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids]
+        )
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
@@ -1165,26 +1325,58 @@ class Scheduler(SchedulerIOMixin):
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
             self.decode_manager.filter_reqs(forward_input.batch.reqs)
         # getattr: the drain tests run this method on a stub scheduler
-        if (sampler := getattr(self, "_qsa_selection", None)) is not None and not batch.is_prefill:
+        if (
+            sampler := getattr(self, "_qsa_selection", None)
+        ) is not None and not batch.is_prefill:
             sampler.after_forward(batch, self.engine.backends_for(batch)[0])
         return forward_output
 
 
-def logprob_candidates(ids: list[int], logprobs: list[float]) -> tuple[list[int], list[float]]:
+def logprob_candidates(
+    ids: list[int],
+    logprobs: list[float],
+    allowed_ids: set[int] | frozenset[int] | bool | None = None,
+) -> tuple[list[int], list[float]]:
     """A row's top-logprob slice minus what is not a candidate: padding (-1 ids) and the
     -inf tail of a row restricted to fewer allowed_token_ids than it asked for."""
-    keep = [k for k, (t, lp) in enumerate(zip(ids, logprobs)) if t >= 0 and math.isfinite(lp)]
+    if allowed_ids is None:
+        keep = [
+            k
+            for k, (t, lp) in enumerate(zip(ids, logprobs))
+            if t >= 0 and math.isfinite(lp)
+        ]
+    elif allowed_ids is False:
+        keep = [
+            k
+            for k, (t, lp) in enumerate(zip(ids, logprobs))
+            if t >= 0 and not math.isnan(lp)
+        ]
+    else:
+        keep = [
+            k
+            for k, (t, lp) in enumerate(zip(ids, logprobs))
+            if t >= 0 and t in allowed_ids and not math.isnan(lp)
+        ]
     return [int(ids[k]) for k in keep], [logprobs[k] for k in keep]
 
 
-def _attach_logprobs(msg: DetokenizeMsg, output: ForwardOutput, row: int, top: int) -> None:
+def _attach_logprobs(
+    msg: DetokenizeMsg,
+    output: ForwardOutput,
+    row: int,
+    top: int,
+    allowed_token_ids: list[int] | None = None,
+) -> None:
     """Copy batch row ``row``'s sampled-token logprobs onto its reply, cut to ``top`` alternatives."""
     if output.chosen_logprobs_cpu is None:
         return
     msg.chosen_logprob = float(output.chosen_logprobs_cpu[row].item())
     if top > 0 and output.top_ids_cpu is not None:
+        allowed_set = frozenset(allowed_token_ids) if allowed_token_ids else False
         msg.top_ids, msg.top_logprobs = logprob_candidates(
-            output.top_ids_cpu[row, :top].tolist(), output.top_logprobs_cpu[row, :top].tolist()
+            output.top_ids_cpu[row, :top].tolist(),
+            output.top_logprobs_cpu[row, :top].tolist(),
+            allowed_ids=allowed_set,
         )
     else:
         msg.top_ids, msg.top_logprobs = [], []
@@ -1243,4 +1435,6 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
     write_host = torch.tensor(write_list, dtype=torch.int64)
-    return upload_step_tensor(mapping_host, device), upload_step_tensor(write_host, device)
+    return upload_step_tensor(mapping_host, device), upload_step_tensor(
+        write_host, device
+    )

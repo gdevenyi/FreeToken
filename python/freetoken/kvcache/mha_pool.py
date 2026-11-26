@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import ClassVar, Sequence
+from collections.abc import Sequence
+from typing import ClassVar
 
 import torch
+
 from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
@@ -52,12 +54,20 @@ class MHAKVCache(BaseKVCachePool):
             layer_map = [-1] * num_layers
             for dense, global_id in enumerate(layer_ids):
                 if global_id < 0 or global_id >= num_layers:
-                    raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
+                    raise ValueError(
+                        f"KV layer id {global_id} outside [0, {num_layers})"
+                    )
                 layer_map[global_id] = dense
             self._layer_map = layer_map
         self._device = device
         self._external_kv_buffer = kv_buffer is not None
-        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads, kv_buffer=kv_buffer)
+        self._alloc(
+            num_storage_layers,
+            num_pages,
+            page_size,
+            local_kv_heads,
+            kv_buffer=kv_buffer,
+        )
 
     def _alloc(
         self,
@@ -70,10 +80,19 @@ class MHAKVCache(BaseKVCachePool):
     ) -> None:
         fmt = self.kv_format
         elem_dim = fmt.elem_dim(self._head_dim)
-        want_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, elem_dim)
+        want_shape = (
+            2,
+            num_storage_layers,
+            num_pages,
+            page_size,
+            local_kv_heads,
+            elem_dim,
+        )
         want_dtype = fmt.elem_tensor_dtype(self._dtype)
         if kv_buffer is not None:
-            assert tuple(kv_buffer.shape) == want_shape and kv_buffer.dtype == want_dtype, (
+            assert (
+                tuple(kv_buffer.shape) == want_shape and kv_buffer.dtype == want_dtype
+            ), (
                 kv_buffer.shape,
                 want_shape,
                 kv_buffer.dtype,
@@ -87,7 +106,13 @@ class MHAKVCache(BaseKVCachePool):
         self._scale_buffer = None
         if fmt.scale_dtype is not None:
             self._scale_buffer = torch.zeros(
-                (2, num_storage_layers, num_pages * page_size, local_kv_heads, fmt.scale_dim(self._head_dim)),
+                (
+                    2,
+                    num_storage_layers,
+                    num_pages * page_size,
+                    local_kv_heads,
+                    fmt.scale_dim(self._head_dim),
+                ),
                 device=self._device,
                 dtype=fmt.scale_store_dtype,
             )
@@ -102,7 +127,11 @@ class MHAKVCache(BaseKVCachePool):
         head_dim from the pool; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, _elem_dim = self._kv_buffer.shape
+        if self._external_kv_buffer:
+            raise RuntimeError("cannot rebuild externally VMM-backed KV cache pool")
+        _, num_storage_layers, _old_pages, page_size, local_kv_heads, _elem_dim = (
+            self._kv_buffer.shape
+        )
         device = self._device
         self._k_buffer = None
         self._v_buffer = None
@@ -127,7 +156,9 @@ class MHAKVCache(BaseKVCachePool):
     def rebuild_from_config(
         self, config, num_pages: int, *, num_swa_pages: int | None = None
     ) -> None:
-        self.rebuild(num_pages + 1)  # +1 for the dummy page (matches create_kvcache_pool)
+        self.rebuild(
+            num_pages + 1
+        )  # +1 for the dummy page (matches create_kvcache_pool)
 
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
@@ -152,10 +183,18 @@ class MHAKVCache(BaseKVCachePool):
         return self._v_buffer[self._dense(index)]
 
     def k_scale(self, index: int) -> torch.Tensor | None:
-        return None if self._scale_buffer is None else self._scale_buffer[0, self._dense(index)]
+        return (
+            None
+            if self._scale_buffer is None
+            else self._scale_buffer[0, self._dense(index)]
+        )
 
     def v_scale(self, index: int) -> torch.Tensor | None:
-        return None if self._scale_buffer is None else self._scale_buffer[1, self._dense(index)]
+        return (
+            None
+            if self._scale_buffer is None
+            else self._scale_buffer[1, self._dense(index)]
+        )
 
     def store_kv(
         self,
@@ -170,7 +209,16 @@ class MHAKVCache(BaseKVCachePool):
         if self.kv_format.quantized:
             from freetoken.kernel.triton.kv_rows import store_kv_rows
 
-            store_kv_rows(self.kv_format, k, v, out_loc, k_cache, v_cache, self.k_scale(layer_id), self.v_scale(layer_id))
+            store_kv_rows(
+                self.kv_format,
+                k,
+                v,
+                out_loc,
+                k_cache,
+                v_cache,
+                self.k_scale(layer_id),
+                self.v_scale(layer_id),
+            )
             return
 
         from freetoken.kernel import store_cache

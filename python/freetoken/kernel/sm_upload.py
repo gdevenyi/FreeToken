@@ -63,12 +63,13 @@ def _default_cuda_copy(
     n_words = nbytes // 4
     block = 1024
     grid = ((n_words + block - 1) // block,)
-    _sm_copy_u32_kernel[grid](
-        dst.data_ptr(),
-        host_dev_ptr + byte_offset,
-        n_words,
-        BLOCK=block,
-    )
+    with torch.cuda.device(dst.device):
+        _sm_copy_u32_kernel[grid](
+            dst.data_ptr(),
+            host_dev_ptr + byte_offset,
+            n_words,
+            BLOCK=block,
+        )
 
 
 class SmUploadRing:
@@ -96,8 +97,9 @@ class SmUploadRing:
         if alloc_fn is None:
             from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
 
-            buf = alloc_pinned_tensor(ring_bytes, dtype=torch.uint8)
-            dev_ptr = device_ptr(buf)
+            with torch.cuda.device(device):
+                buf = alloc_pinned_tensor(ring_bytes, dtype=torch.uint8)
+                dev_ptr = device_ptr(buf)
         else:
             buf, dev_ptr = alloc_fn(ring_bytes)
         self.host_buf = buf
@@ -114,11 +116,19 @@ class SmUploadRing:
 
     def _advance_segment(self) -> None:
         if self.seg_dirty:
-            ev = self.seg_events[self.seg]
-            if ev is None:
-                ev = self._event_factory()
-                self.seg_events[self.seg] = ev
-            ev.record()
+            if self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    ev = self.seg_events[self.seg]
+                    if ev is None:
+                        ev = self._event_factory()
+                        self.seg_events[self.seg] = ev
+                    ev.record()
+            else:
+                ev = self.seg_events[self.seg]
+                if ev is None:
+                    ev = self._event_factory()
+                    self.seg_events[self.seg] = ev
+                ev.record()
             self.seg_dirty = False
         next_seg = (self.seg + 1) % self.num_segments
         next_ev = self.seg_events[next_seg]
@@ -149,25 +159,32 @@ class SmUploadRing:
         return dst
 
 
-_RINGS: dict[int, SmUploadRing | bool] = {}
+_MAX_STREAMS_PER_DEVICE = 4
+_RINGS: dict[tuple[int, int], SmUploadRing | bool] = {}
 
 
-def _get_ring(device: torch.device) -> SmUploadRing | None:
+def _get_ring(device: torch.device, stream_handle: int) -> SmUploadRing | None:
     idx = 0 if device.index is None else int(device.index)
-    ring = _RINGS.get(idx)
+    key = (idx, stream_handle)
+    ring = _RINGS.get(key)
     if ring is False:
         return None
     if ring is not None:
         return ring  # type: ignore[return-value]
     if not _TRITON_OK:
-        _RINGS[idx] = False
+        _RINGS[key] = False
+        return None
+    dev_ring_count = sum(
+        1 for (d, _), v in _RINGS.items() if d == idx and v is not False
+    )
+    if dev_ring_count >= _MAX_STREAMS_PER_DEVICE:
         return None
     try:
         created = SmUploadRing(device)
     except Exception:
-        _RINGS[idx] = False
+        _RINGS[key] = False
         return None
-    _RINGS[idx] = created
+    _RINGS[key] = created
     return created
 
 
@@ -178,10 +195,13 @@ def upload_step_tensor(host_tensor: torch.Tensor, device: torch.device) -> torch
     nbytes = host_tensor.numel() * host_tensor.element_size()
     if nbytes == 0:
         return torch.empty(host_tensor.shape, dtype=host_tensor.dtype, device=device)
-    if sm_upload_enabled() and not torch.cuda.is_current_stream_capturing():
-        ring = _get_ring(device)
-        if ring is not None and ring.can_stage(host_tensor):
-            return ring.upload(host_tensor)
+    if sm_upload_enabled():
+        with torch.cuda.device(device):
+            stream = torch.cuda.current_stream(device)
+            if not torch.cuda.is_current_stream_capturing():
+                ring = _get_ring(device, int(stream.cuda_stream))
+                if ring is not None and ring.can_stage(host_tensor):
+                    return ring.upload(host_tensor)
     staged = host_tensor if host_tensor.is_pinned() else host_tensor.pin_memory()
     return staged.to(device, non_blocking=True)
 

@@ -342,16 +342,24 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
 
 def _validate_kv_format(config, model_config) -> None:
     kv_format = getattr(config, "kv_format", NONE)
+    raw_kv_dtype = getattr(config, "kv_cache_dtype", "auto")
+    cfg_dtype = getattr(config, "dtype", None)
+    if raw_kv_dtype == "bf16" and cfg_dtype is not None and cfg_dtype != torch.bfloat16:
+        raise ValueError(
+            f"--kv-cache-dtype bf16 needs --dtype bfloat16, got {cfg_dtype}"
+        )
+    pool_cls = resolve_pool_class(model_config)
+    if (
+        kv_format.quantized or raw_kv_dtype == "bf16"
+    ) and kv_format.name not in pool_cls.kv_formats:
+        raise ValueError(
+            f"--kv-cache-dtype {raw_kv_dtype}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}"
+        )
     if not kv_format.quantized:
         return
-    pool_cls = resolve_pool_class(model_config)
-    if kv_format.name not in pool_cls.kv_formats:
+    if cfg_dtype != torch.bfloat16:
         raise ValueError(
-            f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}"
-        )
-    if config.dtype != torch.bfloat16:
-        raise ValueError(
-            f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}"
+            f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {cfg_dtype}"
         )
 
 
@@ -961,6 +969,7 @@ class Engine:
         )
         if config.prefill_warmup:
             self._warmup_prefill()
+        self._seed_hot_experts()
 
     def _make_distributed_store(self, config: EngineConfig) -> torch.distributed.Store:
         """The rendezvous store's C10d server ignores the host it's given and always listens
@@ -978,10 +987,15 @@ class Engine:
                 multi_tenant=True,
             )
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", config.distributed_port))
-        sock.listen(1024)
-        self._distributed_listen_addr = sock.getsockname()
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", config.distributed_port))
+            sock.listen(1024)
+            self._distributed_listen_addr = sock.getsockname()
+            listen_fd = sock.detach()
+        except BaseException:
+            sock.close()
+            raise
         # TCPStore takes ownership of the fd and closes it with the store; detach so the
         # Python socket never closes that number again after it has been reused.
         return torch.distributed.TCPStore(
@@ -991,7 +1005,7 @@ class Engine:
             is_master=True,
             timeout=timeout,
             multi_tenant=True,
-            master_listen_fd=sock.detach(),
+            master_listen_fd=listen_fd,
         )
 
     def _init_communication(
@@ -1225,8 +1239,30 @@ class Engine:
             requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
             cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
         else:
-            reserved = self._host_tables_bytes + staging_reserve(
-                config, lambda: _bank_bytes(config, method, layer_methods)
+            host_tier_reserve = int(
+                (getattr(config, "kv_host_tier_gb", 0.0) or 0.0) * (1 << 30)
+            )
+            mamba_host = int(getattr(config, "mamba_host_slots", 0) or 0)
+            if (
+                mamba_host > 0
+                and config.model_config.linear_attention_group() is not None
+            ):
+                from freetoken.kvcache.linear_state_pool import (
+                    linear_state_host_bytes_per_req,
+                )
+
+                host_tier_reserve += mamba_host * linear_state_host_bytes_per_req(
+                    config.model_config.linear_attention_group(),
+                    config.tp_info.size,
+                    self.dtype,
+                    config.slot_states,
+                )
+            reserved = (
+                self._host_tables_bytes
+                + host_tier_reserve
+                + staging_reserve(
+                    config, lambda: _bank_bytes(config, method, layer_methods)
+                )
             )
             cpu_layer_ids = _resolve_cpu_layers(
                 config, num_moe_layers, reserved=reserved, method=method
@@ -1264,6 +1300,8 @@ class Engine:
             config.model_path,
             config.model_config.num_moe_layers,
             local_num_experts,
+            ep_offset=ep_offset,
+            ep_size=ep_size,
         )
         try:
             with _weight_load_context():
@@ -1332,6 +1370,10 @@ class Engine:
             config.decode_rows_per_req if decode_target == "gpu" else 1
         )
         size_cap = sum(p.max_num_slots for p in pools)
+        from freetoken.kvcache.vmm_elastic import kv_moe_elastic_enabled
+
+        elastic_auto_defer = False
+        greedy_auto_plan: tuple[int, int, bool] | None = None
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(
                 config, banks, method, max_slots=size_cap
@@ -1341,21 +1383,30 @@ class Engine:
                     f"--moe-cache-auto: prefill overlap disabled, its {2 * local_num_experts} "
                     "slot floor does not fit beside the KV reserve"
                 )
-            object.__setattr__(config, "moe_cache_size", size)
-            object.__setattr__(config, "moe_prefill_overlap", overlap)
-            if config.num_page_override is None:
-                # Honor the plan's KV half too: MoE slots and KV pages were solved
-                # against ONE budget (ratio x baseline - weights), so both must come
-                # from it. Re-solving pages later from a fresh free-memory reading
-                # double-counts everything allocated since the weights measurement
-                # (this expert cache, the CPU-executor GPU buffers, allocator
-                # slack) and goes negative whenever the expert fill is exact --
-                # a greedy fill leaves no headroom for the measurement delta.
-                object.__setattr__(config, "num_page_override", pages)
-            logger.info_rank0(
-                f"--moe-cache-auto resolved moe_cache_size={size} "
-                f"num_pages={pages} (prefill_overlap={overlap})"
-            )
+            usable_pages = max(1, pages - 1)
+            if (
+                kv_moe_elastic_enabled(config.kv_moe_elastic)
+                and config.num_page_override is None
+            ):
+                # Size permanent MoE slots to the floor so idle KV slabs above kv_elastic_floor_tokens
+                # are dynamically lent to MoE up to size_cap instead of clamping KV to the reserve floor.
+                base_floor = min(
+                    size, 2 * local_num_experts if overlap else local_num_experts
+                )
+                object.__setattr__(config, "moe_cache_size", base_floor)
+                object.__setattr__(config, "moe_prefill_overlap", overlap)
+                elastic_auto_defer = True
+                greedy_auto_plan = (size, usable_pages, overlap)
+            else:
+                object.__setattr__(config, "moe_cache_size", size)
+                object.__setattr__(config, "moe_prefill_overlap", overlap)
+                if config.num_page_override is None:
+                    # plan_cache_budget returns physical pages (usable + 1 dummy page); num_page_override is usable pages.
+                    object.__setattr__(config, "num_page_override", usable_pages)
+                logger.info_rank0(
+                    f"--moe-cache-auto resolved moe_cache_size={size} "
+                    f"num_pages={usable_pages} (prefill_overlap={overlap})"
+                )
         elif config.moe_cache_mem is not None:
             per_slot = expert_bytes_per_slot(banks.sources)
             size = min(config.moe_cache_mem // per_slot, size_cap)
@@ -1386,6 +1437,20 @@ class Engine:
             split_residency=split_residency,
             layer_tags=layer_tags,
         )
+        if (
+            elastic_auto_defer
+            and bank_allocator is None
+            and greedy_auto_plan is not None
+        ):
+            g_size, g_usable_pages, g_overlap = greedy_auto_plan
+            object.__setattr__(config, "moe_cache_size", g_size)
+            object.__setattr__(config, "moe_prefill_overlap", g_overlap)
+            object.__setattr__(config, "num_page_override", g_usable_pages)
+            pool_sizes[:] = split_slots(g_size, pools, self._moe_expert_counts)
+            logger.info_rank0(
+                f"--moe-cache-auto resolved moe_cache_size={g_size} "
+                f"num_pages={g_usable_pages} (prefill_overlap={g_overlap})"
+            )
         if len(pools) > 1:
             logger.info_rank0(
                 f"MoE slot pools: {config.moe_cache_scope}, {len(pools)} pools of {min(pool_sizes)}-{max(pool_sizes)} "
@@ -1454,10 +1519,6 @@ class Engine:
         hot_rankings = HotExpertRankings.discover(config.model_path)
         if hot_rankings is not None:
             cache.hot_rankings = hot_rankings
-            seeded = cache.seed_hot_experts()
-            logger.info_rank0(
-                f"MoE hot-expert rankings loaded from {hot_rankings.source_path}: pre-seeded {seeded} GPU cache slots"
-            )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
@@ -1959,6 +2020,10 @@ class Engine:
         #     marlin cap, non-positive pages, or too few GDN slots to run) must reject
         #     recoverably with the old cache intact -- NOT after teardown, which would
         #     leave the server unable to serve. These checks are model-agnostic.
+        if getattr(self, "elastic_pool", None) is not None:
+            raise CacheRebuildRejected(
+                "runtime cache rebuild is not supported when --kv-moe-elastic is active"
+            )
         moe_pool_sizes = None
         if moe_cache_size is not None:
             if self.moe_offload_cache is None:
@@ -2106,6 +2171,17 @@ class Engine:
         # reuse the startup-resolved bs set (see above)
         self.graph_runner, self.narrow_graph_runner = self._make_graph_runners(
             prior_graph_bs, free_min, aligned_max_seq_len
+        )
+        self._seed_hot_experts()
+
+    def _seed_hot_experts(self) -> None:
+        cache = self.moe_offload_cache
+        if cache is None or getattr(cache, "hot_rankings", None) is None:
+            return
+        seeded = cache.seed_hot_experts()
+        logger.info_rank0(
+            f"MoE hot-expert rankings loaded from {cache.hot_rankings.source_path}: "
+            f"pre-seeded {seeded} GPU cache slots"
         )
 
     def graph_runner_for(self, batch: Batch) -> GraphRunner:
@@ -2276,7 +2352,9 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        next_tokens_gpu = self.sampler.sample(
+            batch_logits, args, record_counts=False
+        ).to(torch.int32)
         if spec_prefill and self._comm is not None:
             next_tokens_gpu = (
                 next_tokens_gpu.contiguous()
@@ -2284,6 +2362,7 @@ class Engine:
                 else torch.zeros_like(next_tokens_gpu)
             )
             next_tokens_gpu = self._comm.all_reduce(next_tokens_gpu)
+        self.sampler.record_tokens(next_tokens_gpu, args)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         # after the TP all-reduce (the rows' agreed tokens), before the event that covers the copies
         logprobs_out = self.sampler.compute_logprobs(
@@ -2448,12 +2527,17 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         if self.narrow_graph_runner is not None:
             self.narrow_graph_runner.destroy_cuda_graphs()
+        if getattr(self, "kv_cache", None) is not None and hasattr(
+            self.kv_cache, "close"
+        ):
+            self.kv_cache.close()
         if getattr(self, "elastic_pool", None) is not None:
             self.kv_cache = None
             self.moe_offload_cache = None
             self.elastic_pool.close()
             self.elastic_pool = None
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         destroy_distributed()
 
 
@@ -3086,17 +3170,22 @@ def _adjust_config(config: EngineConfig):
             f"Auto-selected attention backend: {config.attention_backend}"
         )
     _validate_attention_backend_choice(config, override, required_attn_types)
-    if getattr(config, "speculative_algorithm", None) is not None:
-        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
-
     if is_moe:
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
         from freetoken.models.config import moe_ep_enabled
 
         ep_requested = bool(getattr(config, "moe_ep", False) or moe_ep_enabled())
-        if ep_requested and config.tp_info.size > 1:
-            if model_config.num_experts % config.tp_info.size != 0:
+        tp_info = getattr(config, "tp_info", None)
+        tp_sz = 1 if tp_info is None else tp_info.size
+        if ep_requested and tp_sz > 1:
+            model_path = getattr(config, "model_path", "")
+            if model_path and is_ftw_checkpoint(model_path):
                 raise ValueError(
-                    f"--moe-ep requires num_experts ({model_config.num_experts}) divisible by tp_size ({config.tp_info.size})"
+                    "--moe-ep is not supported on pre-packed FTW checkpoints"
+                )
+            if model_config.num_experts % tp_sz != 0:
+                raise ValueError(
+                    f"--moe-ep requires num_experts ({model_config.num_experts}) divisible by tp_size ({tp_sz})"
                 )
             override("moe_ep", True)
             object.__setattr__(model_config, "moe_ep", True)
@@ -3104,6 +3193,9 @@ def _adjust_config(config: EngineConfig):
             override("moe_ep", False)
             if hasattr(model_config, "moe_ep"):
                 object.__setattr__(model_config, "moe_ep", False)
+
+    if getattr(config, "speculative_algorithm", None) is not None:
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
         local_experts = getattr(

@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.core import Batch, Req, ReqStats
 from freetoken.utils import align_down, div_ceil, init_logger
 
@@ -66,6 +67,7 @@ class PrefillAdder:
     # P3: cap total host-KV tokens restored in one pass while decodes are active (0 = unlimited)
     restore_token_budget: int = 0
     restored_tokens: int = 0
+    deferred_restore: bool = False
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -79,6 +81,7 @@ class PrefillAdder:
         ) * page_size
 
     def _try_allocate_one(self, req: PendingReq):
+        self.deferred_restore = False
         stats = self.cache_manager.stats
         if self.table_manager.available_size == 0:
             stats.note_refusal("table", req.uid)
@@ -104,12 +107,16 @@ class PrefillAdder:
             and self.restored_tokens > 0
             and self.restored_tokens + host_tokens > self.restore_token_budget
         ):
+            self.deferred_restore = True
             if self.cache_manager.is_hybrid:
                 self.cache_manager.prefix_cache.counts["kv_restore_defer"] += 1
             return None
-        estimated_size = self._kv_reservation_size(
-            req.input_len + req.output_len + self.token_headroom, cached_len
-        ) + host_tokens
+        estimated_size = (
+            self._kv_reservation_size(
+                req.input_len + req.output_len + self.token_headroom, cached_len
+            )
+            + host_tokens
+        )
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             stats.note_refusal("kv", req.uid)
@@ -137,9 +144,13 @@ class PrefillAdder:
             ps = self.cache_manager.page_size
             # swa is charged per WHOLE page (allocate_paged -> alloc_swa), so the seat check is
             # in page units too; identical at page_size==1.
-            need_swa = div_ceil(
-                min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
-            ) * ps
+            need_swa = (
+                div_ceil(
+                    min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1,
+                    ps,
+                )
+                * ps
+            )
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
                 stats.note_refusal("swa", req.uid)
                 return self.cache_manager.unlock(handle)
@@ -148,10 +159,14 @@ class PrefillAdder:
         handle, kv_restore = self.cache_manager.restore_host_kv(handle)
         table_idx = self.table_manager.allocate()
         self.cache_manager.note_admission(req, handle)
-        req.snapshot_ends, req.snapshot_pin = self.cache_manager.snapshot_plan(req, handle)
+        req.snapshot_ends, req.snapshot_pin = self.cache_manager.snapshot_plan(
+            req, handle
+        )
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-            device_ids.copy_(_maybe_pinned(req.input_ids[:cached_len]), non_blocking=True)
+            device_ids.copy_(
+                _maybe_pinned(req.input_ids[:cached_len]), non_blocking=True
+            )
             # Write the matched indices into the TAIL of the page_entry: a cache may return
             # fewer matched indices than cached_len, in which case only the trailing n slots are
             # known-live. Today both the generic radix and the SWA radix match a prefix whose
@@ -159,7 +174,9 @@ class PrefillAdder:
             # (DSV4 reads this table too: its pool's full_loc_map is attached to it.)
             matched = handle.get_matched_indices()
             n = int(matched.numel())
-            self.table_manager.page_table[table_idx][cached_len - n : cached_len].copy_(matched)
+            self.table_manager.page_table[table_idx][cached_len - n : cached_len].copy_(
+                matched
+            )
 
         linear_slot_idx = ping_pong = None
         if self.cache_manager.is_hybrid:
@@ -171,7 +188,15 @@ class PrefillAdder:
         restore_host = mr.mamba_host if mr.mamba_value is None else None
         if restore_host is not None:
             self.cache_manager.prefix_cache.counts["host_hit"] += 1  # KVSTATS only
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, restore_host, kv_restore
+        return (
+            handle,
+            table_idx,
+            linear_slot_idx,
+            ping_pong,
+            mr.mamba_value,
+            restore_host,
+            kv_restore,
+        )
 
     def _add_one_req(
         self,
@@ -231,25 +256,54 @@ class PrefillAdder:
 
             # end the chunk at the next snapshot point's chunk end
             ends = pending_req.snapshot_ends
-            cut = next((e for e in ends if cached_len + CHUNK_SIZE < e < cached_len + chunk_size), None)
+            cut = next(
+                (
+                    e
+                    for e in ends
+                    if cached_len + CHUNK_SIZE < e < cached_len + chunk_size
+                ),
+                None,
+            )
             if cut is not None:
                 chunk_size = cut - cached_len
-            elif 0 < remain_len - chunk_size <= CHUNK_SIZE < chunk_size and cached_len + chunk_size not in ends:
+            elif (
+                0 < remain_len - chunk_size <= CHUNK_SIZE < chunk_size
+                and cached_len + chunk_size not in ends
+            ):
                 # a final chunk of 64 tokens or less cannot track: leave it 65-128, so the prompt-end
                 # snapshot is the deepest x64 boundary (the cut above can shift a prompt's chunk grid)
                 chunk_size -= CHUNK_SIZE
         if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
             # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
-            unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)
-            end = mm_chunk_end(pending_req.mm_items, cached_len, cached_len + chunk_size, unit)
-            cut = next((hi for item in pending_req.mm_items for lo, hi in item.offsets if lo < end < hi), None)
-            if cut is not None and self.token_budget < self.pass_budget and cut - cached_len <= self.pass_budget:
+            unit = math.lcm(
+                self.cache_manager.page_size if self.cache_manager.swa_paged else 1,
+                max(1, align),
+            )
+            end = mm_chunk_end(
+                pending_req.mm_items, cached_len, cached_len + chunk_size, unit
+            )
+            cut = next(
+                (
+                    hi
+                    for item in pending_req.mm_items
+                    for lo, hi in item.offsets
+                    if lo < end < hi
+                ),
+                None,
+            )
+            if (
+                cut is not None
+                and self.token_budget < self.pass_budget
+                and cut - cached_len <= self.pass_budget
+            ):
                 # other requests took part of this pass; a pass of its own holds the image whole
                 return None
             chunk_size = end - cached_len
         if self.cache_manager.swa_paged:
             ps = self.cache_manager.page_size
-            self.reserved_swa += (div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)) * ps
+            self.reserved_swa += (
+                div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
+            ) * ps
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
@@ -257,12 +311,15 @@ class PrefillAdder:
         # page span here; charging raw tokens can admit several short requests against one page
         # even though allocate_paged() needs a separate page for each request.
         self.reserved_size += self._kv_reservation_size(
-            pending_req.input_len + pending_req.output_len + self.token_headroom, cached_len
+            pending_req.input_len + pending_req.output_len + self.token_headroom,
+            cached_len,
         )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
-        device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
+        device_ids.copy_(
+            _maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True
+        )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -293,12 +350,16 @@ class PrefillAdder:
             # track only at a snapshot point, at the prompt end, or in the last chunk that can
             # track when the final one is too short to (as "chunk" donates today)
             end, left = cached_len + chunk_size, remain_len - chunk_size
-            req.gdn_track = left == 0 or left <= CHUNK_SIZE or end in pending_req.snapshot_ends
+            req.gdn_track = (
+                left == 0 or left <= CHUNK_SIZE or end in pending_req.snapshot_ends
+            )
             req.snapshot_pin = pending_req.snapshot_pin
         req.mamba_restore_src = restore_src
         req.mamba_restore_host = restore_host
         req.kv_restore = kv_restore
-        req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        req.swa_evicted_seqlen = (
+            swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        )
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -321,7 +382,15 @@ class PrefillAdder:
             return chunked_req.next_chunk
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host, kv_restore = resource
+            (
+                cache_handle,
+                table_idx,
+                linear_slot_idx,
+                ping_pong,
+                restore_src,
+                restore_host,
+                kv_restore,
+            ) = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -342,9 +411,13 @@ class PrefillAdder:
                 self.cache_manager.unlock(cache_handle)
                 self.table_manager.free(table_idx)
                 if linear_slot_idx is not None:
-                    self.cache_manager.linear_state_pool.free([linear_slot_idx, *ping_pong])
+                    self.cache_manager.linear_state_pool.free(
+                        [linear_slot_idx, *ping_pong]
+                    )
             elif kv_restore is not None:
-                self.restored_tokens += len(kv_restore.host_pages) * self.cache_manager.page_size
+                self.restored_tokens += (
+                    len(kv_restore.host_pages) * self.cache_manager.page_size
+                )
             return req
 
         return None
@@ -361,7 +434,7 @@ class PrefillManager:
     # a logprob read prefills in a pass of its own (see PrefillAdder for the cache side)
     isolate_logprob_reads: bool = False
     kv_host_restore_tokens: int = 131072
-    pending_list: List[PendingReq] = field(default_factory=list)
+    pending_list: list[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
         stats = ReqStats(enqueued_at=time.perf_counter())
@@ -382,7 +455,9 @@ class PrefillManager:
             return None
 
         # estimated offset due to in-flight decode
-        restore_budget = self.kv_host_restore_tokens if self.decode_manager.runnable else 0
+        restore_budget = (
+            self.kv_host_restore_tokens if self.decode_manager.runnable else 0
+        )
         adder = PrefillAdder(
             token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
@@ -394,19 +469,20 @@ class PrefillManager:
             isolate_logprob_reads=self.isolate_logprob_reads,
             restore_token_budget=restore_budget,
         )
-        reqs: List[Req] = []
-        chunked_list: List[PendingReq] = []
-        prompt_admissions: List[Tuple[int, int, int]] = []
+        reqs: list[Req] = []
+        chunked_list: list[PendingReq] = []
+        prompt_admissions: list[tuple[int, int, int]] = []
         # Snapshot here, before the forward's complete_one() advances cached_len: the tokens
         # forwarded this batch (extend_len) and the prefix-cache hit. SGLang counts the hit
         # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
         log_new_tokens = 0
         log_cached_tokens = 0
-        for pending_req in self.pending_list:
+        deferred_list: list[PendingReq] = []
+        for idx, pending_req in enumerate(self.pending_list):
             is_continuation = pending_req.chunked_req is not None
-            # break, not continue: the slicing below assumes the admitted requests are a prefix
             read = pending_req.sampling_params.isolated(self.isolate_logprob_reads)
             if read and reqs:
+                deferred_list.extend(self.pending_list[idx:])
                 break  # a read never shares a pass
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
@@ -425,23 +501,34 @@ class PrefillManager:
                     # prompt span starts (ReqStats carries both to the final chunk's Req).
                     pending_req.stats.first_chunk_at = time.perf_counter()
                     pending_req.stats.cache_n = req.cache_handle.cached_len
-                    pending_req.stats.prompt_n = pending_req.input_len - req.cache_handle.cached_len
+                    pending_req.stats.prompt_n = (
+                        pending_req.input_len - req.cache_handle.cached_len
+                    )
                     if pending_req.mm_items and self.encoder_cache is not None:
                         # claim the rows every chunk of this request will gather; the entry outlives the chunks
                         for item in pending_req.mm_items:
                             self.encoder_cache.register(
-                                item.hash, req.uid, mm_rows_after(item, req.cache_handle.cached_len)
+                                item.hash,
+                                req.uid,
+                                mm_rows_after(item, req.cache_handle.cached_len),
                             )
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
                 if read:
+                    deferred_list.extend(self.pending_list[idx + 1 :])
                     break  # nobody joins a read's pass
+            elif not is_continuation and not read and adder.deferred_restore:
+                # Host-KV restore budget for this pass is full, so keep this request queued
+                # in order while allowing zero-restore requests behind it to share the pass.
+                deferred_list.append(pending_req)
+                continue
             else:
+                deferred_list.extend(self.pending_list[idx:])
                 break  # We cannot add more requests
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        self.pending_list = chunked_list + deferred_list
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens

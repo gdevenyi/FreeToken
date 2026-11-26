@@ -192,6 +192,10 @@ class EngineConfig:
             )
 
     def __post_init__(self):
+        if not (1 <= self.distributed_port <= 65535):
+            raise ValueError(
+                f"distributed_port must be in [1, 65535], got {self.distributed_port}"
+            )
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(
                 f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}"

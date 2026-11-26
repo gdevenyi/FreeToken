@@ -11,9 +11,10 @@ watching on top of this.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from queue import Empty
-from typing import Any, Callable, List
+from typing import Any
 
 
 def phase_slug(desc: str) -> str:
@@ -52,14 +53,21 @@ class BackendHandle:
     no longer blocks on."""
 
     ack_queue: Any
-    processes: List[Any] = field(default_factory=list)
+    processes: list[Any] = field(default_factory=list)
     expected_acks: int = 0
 
     def release_acks(self) -> None:
         """Drop the ack queue once readiness has read it for the last time. A multiprocessing queue's
         semaphores are unlinked only when it is collected, and a main process that a signal ends never
         collects it, so resource_tracker reports them as leaked."""
-        self.ack_queue = None
+        q, self.ack_queue = self.ack_queue, None
+        if q is not None:
+            for fn in ("close", "cancel_join_thread"):
+                if hasattr(q, fn):
+                    try:
+                        getattr(q, fn)()
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 class WorkerDied(Exception):
@@ -68,7 +76,7 @@ class WorkerDied(Exception):
         self.message = message
 
 
-def _first_dead(processes: List[Any]) -> Any | None:
+def _first_dead(processes: list[Any]) -> Any | None:
     for p in processes:
         try:
             if not p.is_alive():
@@ -87,7 +95,9 @@ def _as_error(msg: Any) -> str | None:
     return None
 
 
-def _drain_pending_error(get: Callable[[float], Any], attempts: int = 5, timeout: float = 0.02) -> str | None:
+def _drain_pending_error(
+    get: Callable[[float], Any], attempts: int = 5, timeout: float = 0.02
+) -> str | None:
     """After a worker death, poll the ack queue briefly for a final ("error", reason) ack still
     in flight (the queue feeder flushes on process exit), so the real reason wins over the
     generic message. Bounded so a genuinely reason-less death still fails fast."""
@@ -117,6 +127,7 @@ def drain_ready(
     they are forwarded to ``on_meta`` and do NOT count toward readiness. meta is optional --
     an engine build that never emits it must not stall this drain, so nothing waits for it."""
     if get is None:
+
         def get(timeout: float) -> Any:
             return handle.ack_queue.get(timeout=timeout)
 
@@ -130,7 +141,10 @@ def drain_ready(
                 # The worker may have pushed its real failure reason just before exiting; give
                 # the queue a brief window to surface it, else fall back to the generic message.
                 reason = _drain_pending_error(get)
-                raise WorkerDied(reason or f"backend worker {getattr(dead, 'name', '?')} exited during load")
+                raise WorkerDied(
+                    reason
+                    or f"backend worker {getattr(dead, 'name', '?')} exited during load"
+                )
             continue
         err = _as_error(msg)
         if err is not None:
@@ -177,8 +191,9 @@ def run_backend_supervisor(
         if not _shutting_down() and on_failure is not None:
             on_failure(exc.message)
         return
+    finally:
+        handle.release_acks()
 
-    handle.release_acks()
     on_ready()
 
     while True:

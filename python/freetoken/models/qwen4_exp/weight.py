@@ -12,6 +12,7 @@ Dropped: ``mtp.*`` (speculative head, read by :func:`iter_mtp_weights`); ``model
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import struct
@@ -569,10 +570,10 @@ def _int8_dense_emit(
         yield name[: -len("weight")] + "weight_scale", sc
 
 
-def dense_emitter(config, rank: int, world: int):
+def dense_emitter(config, rank: int, world: int, *, include_lmhead: bool = True):
     """``(emit, quantized_dense, lmhead)``: ``emit(name, tensor)`` yields one dense state-dict tensor as this rank loads it,
     TP-sharded and then load-time FP8 or ``int8 g32`` where the builder made quantized modules."""
-    lmhead = config is not None and use_fp8_lmhead(config)
+    lmhead = include_lmhead and config is not None and use_fp8_lmhead(config)
     fp8 = config is not None and config.attn_quant == "fp8_dynamic"
     int8 = config is not None and config.attn_quant == "int8_g32"
     hc8 = config is not None and hc_int8_enabled()
@@ -792,33 +793,24 @@ def iter_mtp_weights(
     reader = _DenseReader(
         quant, get_model_spec(hf_config.architectures[0]).packed_modules_mapping
     )
-    needs_config = tp.size > 1 or fp8_dense_enabled()
+    needs_config = (
+        tp.size > 1 or fp8_dense_enabled() or int8_dense_enabled() or hc_int8_enabled()
+    )
     draft_cfg = (
         draft_config(replace(parse_config(hf_config), quant=quant), tp_size=tp.size)
         if needs_config
         else None
     )
-    fp8 = draft_cfg is not None and draft_cfg.attn_quant == "fp8_dynamic"
-    dense_channel = fp8 and fp8_dense_scale() == "channel"
+    base_emit, _, _ = dense_emitter(draft_cfg, tp.rank, tp.size, include_lmhead=False)
 
     def emit(
         raw_out_name: str, tensor: torch.Tensor
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        name = raw_out_name.removeprefix("mtp.")
-        if draft_cfg is not None:
-            tensor = _shard(name, tensor, draft_cfg, tp.rank, tp.size)
-        if fp8 and _fp8_dense_applies(raw_out_name, draft_cfg):
-            yield from _fp8_dense(
-                name,
-                tensor,
-                draft_cfg,
-                tp.size,
-                dense=True,
-                lm_head=False,
-                dense_channel=dense_channel,
-            )
-        else:
-            yield name, tensor
+        if draft_cfg is None:
+            yield raw_out_name.removeprefix("mtp."), tensor
+            return
+        for out_name, out_tensor in base_emit(raw_out_name, tensor):
+            yield out_name.removeprefix("mtp."), out_tensor
 
     seen = False
     for file in iter_weight_files(model_path):
@@ -872,13 +864,22 @@ def iter_mtp_expert_pieces(model_path: str):
 def iter_vision_weights(
     model_path: str, device: torch.device
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """The vision tower alone, named as iter_weights names it."""
+    """The vision tower alone, named as iter_weights names it (and TP-sharded when TP > 1)."""
+    tp = get_tp_info()
+    vc = (
+        parse_config(cached_load_hf_config(model_path)).vision_config
+        if tp.size > 1
+        else None
+    )
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is not None and name.startswith(VISION_KEY_PREFIXES):
-                    yield name, f.get_tensor(raw_name)
+                    tensor = f.get_tensor(raw_name)
+                    if tp.size > 1:
+                        tensor = _shard_vision(name, tensor, vc, tp.rank, tp.size)
+                    yield name, tensor
 
 
 # ======================================================================================
@@ -931,6 +932,7 @@ def check_ple_table_lut4(
     files = _ple_table_files(path) if os.path.isdir(path) else [path]
     packed_shapes: dict[int, tuple[int, int]] = {}
     scale_shapes: dict[int, tuple[int, int]] = {}
+    has_lut = False
     for fpath in files:
         header, _ = _safetensors_header(fpath)
         for key, meta in header.items():
@@ -947,21 +949,52 @@ def check_ple_table_lut4(
                 if meta["dtype"] != "F16":
                     raise ValueError(f"LUT4 PLE {key} must be F16, got {meta['dtype']}")
                 scale_shapes[int(ms.group("shard"))] = tuple(meta["shape"])
-    if not packed_shapes or set(packed_shapes) != set(scale_shapes):
+                continue
+            ml = _PLE_LUT4_LUT_RE.search(key)
+            if ml is not None:
+                if meta["dtype"] != "F32" or math.prod(meta["shape"]) != 16:
+                    raise ValueError(
+                        f"LUT4 PLE {key} must be F32 with 16 entries, got {meta['dtype']} {meta['shape']}"
+                    )
+                has_lut = True
+    expected_shards = list(range(len(packed_shapes)))
+    if (
+        not packed_shapes
+        or sorted(packed_shapes) != expected_shards
+        or sorted(scale_shapes) != expected_shards
+    ):
         raise ValueError(f"Incomplete lut4-gptq PLE shards at {path}")
-    _shard0_rows, packed_cols = packed_shapes[min(packed_shapes)]
+    if not has_lut:
+        raise ValueError(f"LUT4 PLE at {path} is missing weight_lut")
+    shard0_rows, packed_cols = packed_shapes[0]
     inferred_head_dim = packed_cols * 2
     if head_dim is not None and inferred_head_dim != head_dim:
         raise ValueError(
             f"LUT4 PLE packed width {packed_cols} != head_dim/2 ({head_dim // 2})"
         )
     effective_head_dim = inferred_head_dim if head_dim is None else head_dim
-    _, num_groups = scale_shapes[min(scale_shapes)]
+    if effective_head_dim % 4 != 0:
+        raise ValueError(
+            f"LUT4 PLE head_dim {effective_head_dim} must be divisible by 4"
+        )
+    s0_rows, num_groups = scale_shapes[0]
+    if s0_rows != shard0_rows:
+        raise ValueError(
+            f"LUT4 PLE shard 0 row mismatch: packed={shard0_rows}, scale={s0_rows}"
+        )
     if num_groups <= 0 or effective_head_dim % num_groups != 0:
         raise ValueError(
             f"LUT4 PLE scale groups {num_groups} does not divide head_dim {effective_head_dim}"
         )
-    total_rows = sum(r for r, _ in packed_shapes.values())
+    for shard_idx in expected_shards:
+        if packed_shapes[shard_idx] != (shard0_rows, packed_cols) or scale_shapes[
+            shard_idx
+        ] != (shard0_rows, num_groups):
+            raise ValueError(
+                f"LUT4 PLE shard {shard_idx} shape {packed_shapes[shard_idx]}/{scale_shapes[shard_idx]} "
+                f"differs from shard 0 {(shard0_rows, packed_cols)}/{(shard0_rows, num_groups)}"
+            )
+    total_rows = len(expected_shards) * shard0_rows
     if rows_needed is not None and total_rows < rows_needed:
         raise ValueError(
             f"LUT4 PLE at {path} has {total_rows} rows, model needs {rows_needed}"
@@ -1067,6 +1100,17 @@ def load_ple_table_lut4(
                 out[r0 : r0 + shard_rows, packed_cols:].copy_(
                     ws.contiguous().view(torch.uint8)
                 )
+                del wp, ws
+                if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                    for drop_path in {pf, sf_path}:
+                        try:
+                            fd = os.open(drop_path, os.O_RDONLY)
+                            try:
+                                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            finally:
+                                os.close(fd)
+                        except OSError:
+                            pass
                 if bar is not None:
                     bar.update(shard_rows * row_bytes)
         finally:

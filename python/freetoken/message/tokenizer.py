@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any
 
 from freetoken.core import SamplingParams
 
@@ -11,24 +11,24 @@ from .utils import deserialize_type, serialize_type
 @dataclass
 class BaseTokenizerMsg:
     @staticmethod
-    def encoder(msg: BaseTokenizerMsg) -> Dict:
+    def encoder(msg: BaseTokenizerMsg) -> dict:
         return serialize_type(msg)
 
     @staticmethod
-    def decoder(json: Dict) -> BaseTokenizerMsg:
+    def decoder(json: dict) -> BaseTokenizerMsg:
         return deserialize_type(globals(), json)
 
 
 @dataclass
 class BatchTokenizerMsg(BaseTokenizerMsg):
-    data: List[BaseTokenizerMsg]
+    data: list[BaseTokenizerMsg]
 
 
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
     # tokens committed this step, in order: one per decode step, up to k+1 per speculative verify
-    next_tokens: List[int]
+    next_tokens: list[int]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
@@ -41,6 +41,12 @@ class DetokenizeMsg(BaseTokenizerMsg):
     keep_stop_str: bool = False
     # Decode this request with skip_special_tokens (SamplingParams.skip_special_tokens).
     skip_special_tokens: bool = False
+    # True when the final token in next_tokens should be stripped from detokenized text
+    # (natural EOS, or a client stop_token_id without include_stop_str_in_output). None falls
+    # back to eos_token_ids membership for synthetic/legacy callers.
+    trim_last_token: bool | None = None
+    # True when generation stopped specifically on a client stop_token_id (not natural EOS).
+    hit_stop_token: bool = False
     # Sampled-token logprobs of the one committed token (None unless the request asked):
     # the chosen token's raw logprob and the top alternatives, cut to its top_logprobs.
     chosen_logprob: float | None = None
@@ -84,11 +90,11 @@ class PromptAdmittedMsg(BaseTokenizerMsg):
 @dataclass
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
-    text: str | List[Dict[str, Any]]
+    text: str | list[dict[str, Any]]
     sampling_params: SamplingParams
-    chat_template_kwargs: Dict[str, Any] | None = None
-    tools: List[Dict[str, Any]] | None = None
-    images: List[bytes] | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    images: list[bytes] | None = None
     inline_system_policy: str | None = None
     # A token-id prompt (OpenAI / vLLM completions): used as is, ``text`` is ignored.
     input_ids: list[int] | None = None

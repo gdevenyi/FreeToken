@@ -13,14 +13,14 @@
 
 import ast
 import json
+import logging
 import math
 import os
-import logging
 import re
 from abc import ABC, abstractmethod
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any
 
 import partial_json_parser
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -42,6 +42,7 @@ from .reasoning_parser import (
 try:
     import orjson
 except ModuleNotFoundError:  # FreeToken does not require orjson.
+
     class _OrjsonCompat:
         @staticmethod
         def loads(value: str) -> Any:
@@ -53,10 +54,15 @@ logger = logging.getLogger(__name__)
 _TRUE_ENV_VALUES = {"ON", "TRUE", "1", "YES"}
 _LIGHTLLM_ENABLE_TOOL_NAME_CHECK = os.getenv("LIGHTLLM_ENABLE_TOOL_NAME_CHECK")
 if _LIGHTLLM_ENABLE_TOOL_NAME_CHECK is not None:
-    FORWARD_UNKNOWN_TOOLS = _LIGHTLLM_ENABLE_TOOL_NAME_CHECK.upper() not in _TRUE_ENV_VALUES
+    FORWARD_UNKNOWN_TOOLS = (
+        _LIGHTLLM_ENABLE_TOOL_NAME_CHECK.upper() not in _TRUE_ENV_VALUES
+    )
 else:
     FORWARD_UNKNOWN_TOOLS = (
-        os.getenv("FREETOKEN_FORWARD_UNKNOWN_TOOLS", os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS", "True")).upper()
+        os.getenv(
+            "FREETOKEN_FORWARD_UNKNOWN_TOOLS",
+            os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS", "True"),
+        ).upper()
         in _TRUE_ENV_VALUES
     )
 
@@ -89,19 +95,19 @@ class ToolCallItem(BaseModel):
     """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
 
     tool_index: int
-    name: Optional[str] = None
+    name: str | None = None
     parameters: str  # JSON string
 
 
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
-    def __init__(self, normal_text: str = "", calls: Optional[List[ToolCallItem]] = None):
+    def __init__(self, normal_text: str = "", calls: list[ToolCallItem] | None = None):
         self.normal_text = normal_text
         self.calls = calls or []
 
 
-def _first_existing_pos(text: str, tokens: List[str]) -> int:
+def _first_existing_pos(text: str, tokens: list[str]) -> int:
     positions = [text.find(token) for token in tokens if token in text]
     return min(positions) if positions else -1
 
@@ -109,7 +115,7 @@ def _first_existing_pos(text: str, tokens: List[str]) -> int:
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
     min_length = min(len(s1), len(s2))
-    for i in range(0, min_length):
+    for i in range(min_length):
         if s1[i] == s2[i]:
             prefix += s1[i]
         else:
@@ -117,7 +123,7 @@ def _find_common_prefix(s1: str, s2: str) -> str:
     return prefix
 
 
-def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
+def _partial_json_loads(input_str: str, flags: Allow) -> tuple[Any, int]:
     """
     Parse incomplete or partial JSON strings commonly encountered during streaming.
 
@@ -167,7 +173,9 @@ def _parse_finite_float(value: str) -> float:
 
 def _loads_finite_json(value: str) -> Any:
     # parse_constant alone misses exponent overflow, including inside containers.
-    return json.loads(value, parse_constant=_reject_constant, parse_float=_parse_finite_float)
+    return json.loads(
+        value, parse_constant=_reject_constant, parse_float=_parse_finite_float
+    )
 
 
 def _parse_loose_json_value(value: str) -> Any:
@@ -196,8 +204,8 @@ def _parse_first_json_value(text: str) -> Any:
     return None
 
 
-def _split_top_level(text: str, delimiter: str) -> List[str]:
-    parts: List[str] = []
+def _split_top_level(text: str, delimiter: str) -> list[str]:
+    parts: list[str] = []
     start = 0
     depth = 0
     in_gemma_string = False
@@ -244,8 +252,8 @@ def _parse_gemma_value(value: str) -> Any:
         return value
 
 
-def _parse_gemma_call_args(text: str) -> Dict[str, Any]:
-    args: Dict[str, Any] = {}
+def _parse_gemma_call_args(text: str) -> dict[str, Any]:
+    args: dict[str, Any] = {}
     for item in _split_top_level(text, ","):
         if not item.strip():
             continue
@@ -289,7 +297,7 @@ class BaseFormatDetector(ABC):
         # Stores complete tool call info (name and arguments) for each tool being parsed.
         # Used by serving layer for completion handling when streaming ends.
         # Format: [{"name": str, "arguments": dict}, ...]
-        self.prev_tool_call_arr: List[Dict] = []
+        self.prev_tool_call_arr: list[dict] = []
         # Index of currently streaming tool call. Starts at -1 (no active tool),
         # increments as each tool completes. Tracks which tool's arguments are streaming.
         self.current_tool_id: int = -1
@@ -299,14 +307,14 @@ class BaseFormatDetector(ABC):
         # Tracks raw JSON string content streamed to client for each tool's arguments.
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
-        self.streamed_args_for_tool: List[str] = []
+        self.streamed_args_for_tool: list[str] = []
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
 
-    def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
+    def _get_tool_indices(self, tools: list[Tool]) -> dict[str, int]:
         """
         Get a mapping of tool names to their indices in the tools list.
 
@@ -320,9 +328,11 @@ class BaseFormatDetector(ABC):
         Returns:
             Dictionary mapping tool names to their indices
         """
-        return {tool.function.name: i for i, tool in enumerate(tools) if tool.function.name}
+        return {
+            tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
+        }
 
-    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+    def parse_base_json(self, action: Any, tools: list[Tool]) -> list[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
             action = [action]
@@ -345,13 +355,17 @@ class BaseFormatDetector(ABC):
                 logger.warning(f"Refuse non-finite function.arguments for {name}: {e}")
                 continue
             results.append(
-                ToolCallItem(tool_index=tool_indices.get(name, -1), name=name, parameters=arguments)
+                ToolCallItem(
+                    tool_index=tool_indices.get(name, -1),
+                    name=name,
+                    parameters=arguments,
+                )
             )
 
         return results
 
     @abstractmethod
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
@@ -372,7 +386,12 @@ class BaseFormatDetector(ABC):
                 return i
         return 0
 
-    def _resolve_local_ref(self, schema: Dict, root_schema: Dict, _seen: Optional[set[str]] = None,) -> Dict:
+    def _resolve_local_ref(
+        self,
+        schema: dict,
+        root_schema: dict,
+        _seen: set[str] | None = None,
+    ) -> dict:
         """
         Resolve local JSON Schema references.
 
@@ -406,7 +425,7 @@ class BaseFormatDetector(ABC):
         return merged
 
     @staticmethod
-    def _literal_schema_type(schema: Dict) -> Optional[str]:
+    def _literal_schema_type(schema: dict) -> str | None:
         """Type of an untyped ``enum``/``const`` schema, inferred from its literals."""
         if "const" in schema:
             values = [schema["const"]]
@@ -426,18 +445,20 @@ class BaseFormatDetector(ABC):
         return "loose"
 
     @staticmethod
-    def _literal_allows_null(schema: Dict) -> bool:
+    def _literal_allows_null(schema: dict) -> bool:
         """Whether an ``enum``/``const`` lists JSON null."""
         if "const" in schema:
             return schema["const"] is None
         return isinstance(schema.get("enum"), list) and None in schema["enum"]
 
     @staticmethod
-    def _is_nullable_string(prop: Dict) -> bool:
+    def _is_nullable_string(prop: dict) -> bool:
         ptype = str(prop.get("type", "string")).strip().lower()
         return prop.get("nullable") is True and ptype in ("string", "str", "enum")
 
-    def _normalize_param_schema(self, schema: Dict, root_schema: Dict, _depth: int = 0) -> Dict:
+    def _normalize_param_schema(
+        self, schema: dict, root_schema: dict, _depth: int = 0
+    ) -> dict:
         """Resolve the schema parts needed for tool argument typing."""
         if not isinstance(schema, dict):
             return {"type": "string"}
@@ -451,7 +472,11 @@ class BaseFormatDetector(ABC):
                 result["nullable"] = True
             return result
         if isinstance(param_type, str):
-            return {**schema, "nullable": True} if self._literal_allows_null(schema) else schema
+            return (
+                {**schema, "nullable": True}
+                if self._literal_allows_null(schema)
+                else schema
+            )
         all_of = schema.get("allOf")
         if (
             isinstance(all_of, list)
@@ -477,7 +502,11 @@ class BaseFormatDetector(ABC):
                 branch_type = branch.get("type")
                 if not isinstance(branch_type, str):
                     branch_type = self._literal_schema_type(branch)
-                nullable = nullable or branch_type == "null" or self._literal_allows_null(branch)
+                nullable = (
+                    nullable
+                    or branch_type == "null"
+                    or self._literal_allows_null(branch)
+                )
                 if isinstance(branch_type, str) and branch_type != "null":
                     types.append(branch_type)
             types = list(dict.fromkeys(types))
@@ -500,7 +529,7 @@ class BaseFormatDetector(ABC):
             result["nullable"] = True
         return result
 
-    def _get_tool_schema(self, func_name: str, tools: List[Tool]) -> Dict:
+    def _get_tool_schema(self, func_name: str, tools: list[Tool]) -> dict:
         """Return the root JSON schema for one tool."""
         for tool in tools:
             if tool.function.name != func_name or not tool.function.parameters:
@@ -509,7 +538,7 @@ class BaseFormatDetector(ABC):
             return params if isinstance(params, dict) else {}
         return {}
 
-    def _get_param_config(self, func_name: str, tools: List[Tool]) -> Dict:
+    def _get_param_config(self, func_name: str, tools: list[Tool]) -> dict:
         """Extract and normalize parameter properties for one tool."""
         params = self._get_tool_schema(func_name, tools)
         if not params:
@@ -522,13 +551,19 @@ class BaseFormatDetector(ABC):
             for name, prop in properties.items()
         }
 
-    def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
+    def _convert_param_value(
+        self, value: str, param_name: str, param_config: dict, func_name: str
+    ) -> Any:
         """Convert parameter value based on schema type. Safe alternative to eval()."""
         prop = param_config.get(param_name)
         if isinstance(prop, dict) and self._is_nullable_string(prop):
             # Exactly "null" only: NULL can be a SQL value, and an enum can list the word itself.
             enum = prop.get("enum")
-            return None if value == "null" and not (isinstance(enum, list) and "null" in enum) else value
+            return (
+                None
+                if value == "null" and not (isinstance(enum, list) and "null" in enum)
+                else value
+            )
 
         if value.lower() == "null":
             return None
@@ -537,7 +572,11 @@ class BaseFormatDetector(ABC):
             return value
 
         prop = param_config.get(param_name, {})
-        param_type = str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
+        param_type = (
+            str(prop.get("type", "string")).strip().lower()
+            if isinstance(prop, dict)
+            else "string"
+        )
 
         if param_type in ("string", "str", "enum"):
             return value
@@ -568,7 +607,9 @@ class BaseFormatDetector(ABC):
             return _parse_loose_json_value(value)
         return value
 
-    def _schema_param_type(self, param_name: str, param_config: Dict, missing: str = "string") -> str:
+    def _schema_param_type(
+        self, param_name: str, param_config: dict, missing: str = "string"
+    ) -> str:
         """Normalized schema type for a parameter; ``missing`` when undeclared."""
         if param_name not in param_config:
             return missing
@@ -603,12 +644,16 @@ class BaseFormatDetector(ABC):
             return ""
         if self.eot_token and self.eot_token in residual:
             residual = residual.replace(self.eot_token, "")
-        if self.prev_tool_call_arr and residual.strip() in ("", self.tool_call_separator.strip()):
+        if self.prev_tool_call_arr and residual.strip() in (
+            "",
+            self.tool_call_separator.strip(),
+        ):
             return ""
         return residual
 
-
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         """
         Streaming incremental parsing with tool validation.
 
@@ -632,7 +677,10 @@ class BaseFormatDetector(ABC):
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
         if not (
             self.has_tool_call(current_text)
-            or (self.current_tool_id > 0 and current_text.startswith(self.tool_call_separator))
+            or (
+                self.current_tool_id > 0
+                and current_text.startswith(self.tool_call_separator)
+            )
         ):
             # Only clear buffer if we're sure no tool call is starting
             if not self._ends_with_partial_token(self._buffer, self.bot_token):
@@ -665,7 +713,9 @@ class BaseFormatDetector(ABC):
                     return StreamingParseResult(normal_text=prefix)
                 if tool_call_pos != -1:
                     start_idx = tool_call_pos + len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(self.tool_call_separator):
+                elif self.current_tool_id > 0 and current_text.startswith(
+                    self.tool_call_separator
+                ):
                     start_idx = len(self.tool_call_separator)
                 else:
                     start_idx = 0
@@ -693,7 +743,9 @@ class BaseFormatDetector(ABC):
                             return StreamingParseResult(normal_text=normal_text)
                     return StreamingParseResult()
 
-                is_current_complete = _is_complete_json(current_text[start_idx : start_idx + end_idx])
+                is_current_complete = _is_complete_json(
+                    current_text[start_idx : start_idx + end_idx]
+                )
 
                 # Validate tool name if present
                 if (
@@ -712,7 +764,9 @@ class BaseFormatDetector(ABC):
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
-                    assert "arguments" not in obj, "model generated both parameters and arguments"
+                    assert "arguments" not in obj, (
+                        "model generated both parameters and arguments"
+                    )
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj
@@ -729,7 +783,8 @@ class BaseFormatDetector(ABC):
                 function_name = current_tool_call.get("name")
 
                 if function_name and (
-                    function_name in self._tool_indices or _should_forward_unknown_tool(function_name)
+                    function_name in self._tool_indices
+                    or _should_forward_unknown_tool(function_name)
                 ):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
@@ -768,13 +823,17 @@ class BaseFormatDetector(ABC):
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     try:
-                        cur_args_json = json.dumps(cur_arguments, ensure_ascii=False, allow_nan=False)
+                        cur_args_json = json.dumps(
+                            cur_arguments, ensure_ascii=False, allow_nan=False
+                        )
                     except ValueError as e:
                         # Locate the rejected call's end even when orjson rejects
                         # its non-finite tokens; never serialize this decoded value.
                         payload = current_text[start_idx:]
                         try:
-                            _, end_idx = JSONDecoder().raw_decode(payload, WHITESPACE.match(payload, 0).end())
+                            _, end_idx = JSONDecoder().raw_decode(
+                                payload, WHITESPACE.match(payload, 0).end()
+                            )
                         except JSONDecodeError:
                             return StreamingParseResult()
                         logger.warning(f"Refuse non-finite function.arguments: {e}")
@@ -783,14 +842,20 @@ class BaseFormatDetector(ABC):
                         current_tool_call = {}
                     prev_arguments = None
                     if self.current_tool_id < len(self.prev_tool_call_arr):
-                        prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                        prev_arguments = self.prev_tool_call_arr[
+                            self.current_tool_id
+                        ].get("arguments")
 
                     argument_diff = None
 
                     # If the current tool's JSON is complete, send all remaining arguments
                     if is_current_complete:
-                        argument_diff = cur_args_json[sent:] if cur_args_json is not None else None
-                        completing_tool_id = self.current_tool_id  # Save the ID of the tool that's completing
+                        argument_diff = (
+                            cur_args_json[sent:] if cur_args_json is not None else None
+                        )
+                        completing_tool_id = (
+                            self.current_tool_id
+                        )  # Save the ID of the tool that's completing
 
                         # Only remove the processed portion, keep unprocessed content;
                         # also consume the block's closing tag so it can't jam the
@@ -799,7 +864,7 @@ class BaseFormatDetector(ABC):
                         if self.eot_token:
                             after = self._buffer.lstrip()
                             if after.startswith(self.eot_token):
-                                self._buffer = after[len(self.eot_token):]
+                                self._buffer = after[len(self.eot_token) :]
 
                         if self.current_tool_id < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[self.current_tool_id].clear()
@@ -809,7 +874,9 @@ class BaseFormatDetector(ABC):
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False, allow_nan=False)
+                        prev_args_json = json.dumps(
+                            prev_arguments, ensure_ascii=False, allow_nan=False
+                        )
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
@@ -818,7 +885,11 @@ class BaseFormatDetector(ABC):
                     if argument_diff is not None:
                         # Use the correct tool_index: completing_tool_id for completed tools,
                         # current_tool_id for ongoing
-                        tool_index_to_use = completing_tool_id if is_current_complete else self.current_tool_id
+                        tool_index_to_use = (
+                            completing_tool_id
+                            if is_current_complete
+                            else self.current_tool_id
+                        )
                         res = StreamingParseResult(
                             calls=[
                                 ToolCallItem(
@@ -828,7 +899,9 @@ class BaseFormatDetector(ABC):
                             ],
                         )
                         if not is_current_complete:
-                            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                            self.streamed_args_for_tool[self.current_tool_id] += (
+                                argument_diff
+                            )
 
             # Update prev_tool_call_arr with current state
             if self.current_tool_id >= 0:
@@ -842,7 +915,6 @@ class BaseFormatDetector(ABC):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
-
 
 
 # A bare invoke opener's name: bounded so a literal "<function=" in prose or code
@@ -893,7 +965,7 @@ class InvokeParamStreamMixin:
         self._ps_lead = "{"
         self._ps_emitted_any = False
         self._ps_lead_trimmed = False
-        self._ps_param_config: Dict = {}
+        self._ps_param_config: dict = {}
 
     def _ps_convert_value(self, key: str, raw: str) -> Any:
         if key in self._ps_param_config or self._ps_missing_type != "loose":
@@ -920,13 +992,13 @@ class InvokeParamStreamMixin:
         (may still become one) or "literal". A declared name is required -- not
         the unknown-tool forwarding a wrapped block gets -- and the body must
         start, so the format quoted in prose or code stays text."""
-        rest = text[len(self._ps_invoke_open_prefix):]
+        rest = text[len(self._ps_invoke_open_prefix) :]
         m = _PS_BARE_NAME_RE.match(rest)
         if m is None:
             return "partial" if _PS_BARE_NAME_PARTIAL_RE.fullmatch(rest) else "literal"
         if m.group(1) not in self._tool_indices:
             return "literal"
-        body = rest[m.end():]
+        body = rest[m.end() :]
         for tok in (self._ps_param_open_prefix, self._ps_invoke_close):
             if body.startswith(tok):
                 return "call"
@@ -934,7 +1006,7 @@ class InvokeParamStreamMixin:
                 return "partial"
         return "literal"
 
-    def _ps_find_bare(self, buf: str, limit: int) -> Tuple[int, str]:
+    def _ps_find_bare(self, buf: str, limit: int) -> tuple[int, str]:
         """First bare invoke opener before ``limit`` that is not literal."""
         i = buf.find(self._ps_invoke_open_prefix)
         while i != -1 and i < limit:
@@ -949,39 +1021,53 @@ class InvokeParamStreamMixin:
         if text.startswith(self._ps_outer_open):
             if not self._ps_literal_open:
                 return "yes"
-            body = text[len(self._ps_outer_open):].lstrip()
-            # A repeated opener is a stutter: the block ignores it, as before.
-            for tok in (self._ps_invoke_open_prefix, self._ps_outer_close, self._ps_outer_open):
-                if body.startswith(tok):
+            body = text[len(self._ps_outer_open) :].lstrip()
+            # Peel repeated stutter openers (<tool_call><tool_call>...) before deciding,
+            # so "<tool_call><tool_call>prose" stays literal prose instead of opening a
+            # block that discards the rest of the turn.
+            while self._ps_outer_open and body.startswith(self._ps_outer_open):
+                body = body[len(self._ps_outer_open) :].lstrip()
+            if not body:
+                return "maybe"
+            for tok in (self._ps_invoke_open_prefix, self._ps_outer_close):
+                if tok and body.startswith(tok):
                     return "yes"
-                if tok.startswith(body):
+                if tok and tok.startswith(body):
                     return "maybe"
+            if self._ps_outer_open and self._ps_outer_open.startswith(body):
+                return "maybe"
             return "no"
         if self._ps_outer_open.startswith(text):
             return "maybe"
         if self._ps_bare_invoke:
             prefix = self._ps_invoke_open_prefix
             if text.startswith(prefix):
-                return {"call": "yes", "partial": "maybe"}.get(self._ps_bare_status(text), "no")
+                return {"call": "yes", "partial": "maybe"}.get(
+                    self._ps_bare_status(text), "no"
+                )
             if prefix.startswith(text):
                 return "maybe"
         return "no"
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         self._buffer += new_text
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
         if not hasattr(self, "_ps_mode"):
             self._ps_reset()
 
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
 
         def _emit(fragment: str) -> None:
             if fragment:
                 self.streamed_args_for_tool[self.current_tool_id] += fragment
                 calls.append(
-                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                    ToolCallItem(
+                        tool_index=self.current_tool_id, name=None, parameters=fragment
+                    )
                 )
 
         def _update_prev() -> None:
@@ -1010,7 +1096,7 @@ class InvokeParamStreamMixin:
                         if rest.startswith(self._ps_outer_close):
                             # The model dropped the opener but kept the closer.
                             self._ps_after_bare = False
-                            self._buffer = rest[len(self._ps_outer_close):]
+                            self._buffer = rest[len(self._ps_outer_close) :]
                             continue
                         if self._ps_outer_close.startswith(rest):
                             break
@@ -1023,7 +1109,9 @@ class InvokeParamStreamMixin:
                         buf = self._buffer = rest
                 pos = buf.find(self._ps_outer_open)
                 if self._ps_bare_invoke:
-                    bare, status = self._ps_find_bare(buf, len(buf) if pos == -1 else pos)
+                    bare, status = self._ps_find_bare(
+                        buf, len(buf) if pos == -1 else pos
+                    )
                     if bare > 0:
                         normal_parts.append(buf[:bare])
                         self._buffer = buf[bare:]
@@ -1038,12 +1126,15 @@ class InvokeParamStreamMixin:
                     hold = self._ends_with_partial_token(buf, self._ps_outer_open)
                     if self._ps_bare_invoke:
                         hold = max(
-                            hold, self._ends_with_partial_token(buf, self._ps_invoke_open_prefix)
+                            hold,
+                            self._ends_with_partial_token(
+                                buf, self._ps_invoke_open_prefix
+                            ),
                         )
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
@@ -1052,7 +1143,7 @@ class InvokeParamStreamMixin:
                 opens = self._ps_opens_block(buf)
                 if opens == "maybe":
                     break
-                self._buffer = buf[len(self._ps_outer_open):]
+                self._buffer = buf[len(self._ps_outer_open) :]
                 if opens == "no":
                     normal_parts.append(self._ps_outer_open)  # the tag named in prose
                     continue
@@ -1060,10 +1151,17 @@ class InvokeParamStreamMixin:
                 continue
 
             if mode == "block":
+                if self._ps_outer_open and not self._ps_bare:
+                    while True:
+                        stripped = buf.lstrip()
+                        if stripped.startswith(self._ps_outer_open):
+                            buf = self._buffer = stripped[len(self._ps_outer_open) :]
+                        else:
+                            break
                 inv = buf.find(self._ps_invoke_open_prefix)
                 close = buf.find(self._ps_outer_close) if self._ps_outer_close else -1
                 if close != -1 and (inv == -1 or close < inv):
-                    self._buffer = buf[close + len(self._ps_outer_close):]
+                    self._buffer = buf[close + len(self._ps_outer_close) :]
                     self._ps_mode = "idle"
                     self._ps_after_block = self._ps_trim_after_block
                     continue
@@ -1078,11 +1176,15 @@ class InvokeParamStreamMixin:
                         self.prev_tool_call_arr.append({})
                     while len(self.streamed_args_for_tool) <= self.current_tool_id:
                         self.streamed_args_for_tool.append("")
-                    self._buffer = buf[m.end():]
-                    if func_name in self._tool_indices or _should_forward_unknown_tool(func_name):
+                    self._buffer = buf[m.end() :]
+                    if func_name in self._tool_indices or _should_forward_unknown_tool(
+                        func_name
+                    ):
                         calls.append(
                             ToolCallItem(
-                                tool_index=self.current_tool_id, name=func_name, parameters=""
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
                             )
                         )
                         self.prev_tool_call_arr[self.current_tool_id] = {
@@ -1093,7 +1195,9 @@ class InvokeParamStreamMixin:
                         self._ps_param_config = self._get_param_config(func_name, tools)
                         self._ps_mode = "invoke"
                     else:
-                        logger.warning(f"Model attempted to call undefined function: {func_name}")
+                        logger.warning(
+                            f"Model attempted to call undefined function: {func_name}"
+                        )
                         self._ps_mode = "invoke_skip"
                     continue
                 hold = max(
@@ -1101,9 +1205,13 @@ class InvokeParamStreamMixin:
                     self._ends_with_partial_token(buf, self._ps_outer_close)
                     if self._ps_outer_close
                     else 0,
+                    self._ends_with_partial_token(buf, self._ps_outer_open)
+                    if (self._ps_outer_open and not self._ps_bare)
+                    else 0,
                 )
-                if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
+                prefix = buf[: len(buf) - hold] if hold else buf
+                if prefix and prefix.isspace():
+                    self._buffer = buf[len(prefix) :]  # inter-invoke whitespace
                 break
 
             if mode in ("invoke", "invoke_skip"):
@@ -1116,7 +1224,7 @@ class InvokeParamStreamMixin:
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self._ps_invoke_close):]
+                    self._buffer = buf[e + len(self._ps_invoke_close) :]
                     if self._ps_bare:
                         # A bare invoke is its own block: back to text after it.
                         self._ps_bare = False
@@ -1130,7 +1238,7 @@ class InvokeParamStreamMixin:
                     m = self._ps_param_open_re.search(buf, p)
                     if m is None:
                         break  # parameter tag still streaming
-                    self._buffer = buf[m.end():]
+                    self._buffer = buf[m.end() :]
                     if mode == "invoke_skip":
                         self._ps_mode = "pskip"
                         continue
@@ -1141,7 +1249,9 @@ class InvokeParamStreamMixin:
                         self._ps_key, self._ps_param_config, self._ps_missing_type
                     )
                     if ptype in ("string", "str", "enum"):
-                        _emit(lead + json.dumps(self._ps_key, ensure_ascii=False) + ':"')
+                        _emit(
+                            lead + json.dumps(self._ps_key, ensure_ascii=False) + ':"'
+                        )
                         self._ps_emitted_any = False
                         self._ps_lead_trimmed = False
                         self._ps_mode = "pstr"
@@ -1154,7 +1264,9 @@ class InvokeParamStreamMixin:
                     self._ends_with_partial_token(buf, self._ps_invoke_close),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
+                    self._buffer = buf[
+                        len(buf) - hold :
+                    ]  # whitespace between parameters
                 break
 
             if mode == "pstr":
@@ -1163,7 +1275,9 @@ class InvokeParamStreamMixin:
                     if trimmed != buf:
                         self._buffer = trimmed
                         if self._ps_trim_single or trimmed:
-                            self._ps_lead_trimmed = bool(trimmed) or self._ps_trim_single
+                            self._ps_lead_trimmed = (
+                                bool(trimmed) or self._ps_trim_single
+                            )
                         continue
                     if buf:
                         self._ps_lead_trimmed = True
@@ -1176,12 +1290,12 @@ class InvokeParamStreamMixin:
                     if emit_now:
                         _emit(self._json_escape_chunk(emit_now))
                         self._ps_emitted_any = True
-                        self._buffer = buf[len(emit_now):]
+                        self._buffer = buf[len(emit_now) :]
                     break
                 tail = self._ps_trim_trailing(buf[:end])
                 _emit(self._json_escape_chunk(tail) + '"')
                 _update_prev()
-                self._buffer = buf[end + len(self._ps_param_close):]
+                self._buffer = buf[end + len(self._ps_param_close) :]
                 self._ps_mode = "invoke"
                 continue
 
@@ -1199,13 +1313,13 @@ class InvokeParamStreamMixin:
                         + json.dumps(converted, ensure_ascii=False, allow_nan=False)
                     )
                     _update_prev()
-                self._buffer = buf[end + len(self._ps_param_close):]
+                self._buffer = buf[end + len(self._ps_param_close) :]
                 self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                 continue
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
-    def _ps_finalize_open_call(self) -> List[ToolCallItem]:
+    def _ps_finalize_open_call(self) -> list[ToolCallItem]:
         """The generation ended (max_tokens) inside an open call: close its arguments the
         way the missing closers would have, so the streamed fragments end as valid JSON and
         the one-shot replay returns the same arguments. A held suffix that could only grow
@@ -1216,7 +1330,11 @@ class InvokeParamStreamMixin:
             return []
         buf = self._buffer
         ledger = self.streamed_args_for_tool[self.current_tool_id]
-        held = self._ends_with_partial_token(buf, self._ps_param_close) if mode != "invoke" else 0
+        held = (
+            self._ends_with_partial_token(buf, self._ps_param_close)
+            if mode != "invoke"
+            else 0
+        )
         value = buf[: len(buf) - held]
         if mode == "pstr":
             if not self._ps_lead_trimmed:
@@ -1227,8 +1345,11 @@ class InvokeParamStreamMixin:
             raw = self._ps_trim_trailing(self._ps_trim_leading(value))
             converted = self._ps_convert_value(self._ps_key, raw)
             frag = (
-                self._ps_lead + json.dumps(self._ps_key, ensure_ascii=False) + ":"
-                + json.dumps(converted, ensure_ascii=False) + "}"
+                self._ps_lead
+                + json.dumps(self._ps_key, ensure_ascii=False)
+                + ":"
+                + json.dumps(converted, ensure_ascii=False)
+                + "}"
             )
         else:
             frag = "}" if ledger else "{}"
@@ -1238,7 +1359,9 @@ class InvokeParamStreamMixin:
             parsed = json.loads(self.streamed_args_for_tool[index])
         except (json.JSONDecodeError, ValueError):
             parsed = {}
-        self.prev_tool_call_arr[index]["arguments"] = parsed if isinstance(parsed, dict) else {}
+        self.prev_tool_call_arr[index]["arguments"] = (
+            parsed if isinstance(parsed, dict) else {}
+        )
         self.current_tool_id += 1
         while len(self.streamed_args_for_tool) <= self.current_tool_id:
             self.streamed_args_for_tool.append("")
@@ -1275,7 +1398,9 @@ class Qwen25Detector(BaseFormatDetector):
 
     Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
     """
+
     toolcall_opener = "<tool_call>"
+
     def __init__(self):
         """
         Initializes the detector with necessary state variables.
@@ -1290,7 +1415,7 @@ class Qwen25Detector(BaseFormatDetector):
         """Check if the text contains a Qwen 2.5 format tool call."""
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -1312,11 +1437,15 @@ class Qwen25Detector(BaseFormatDetector):
                 parsed_call = json.loads(match_result.strip())
                 calls.extend(self.parse_base_json(parsed_call, tools))
             except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}")
+                logger.warning(
+                    f"Failed to parse JSON part: {match_result}, JSON parse error: {e!s}"
+                )
                 continue
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         """
         Streaming incremental parsing for Qwen 2.5 tool calls.
         Uses base class implementation with buffering to handle partial end tokens.
@@ -1330,17 +1459,23 @@ class Qwen25Detector(BaseFormatDetector):
             # Check if buffer contains complete end token (without leading newline)
             end_token_without_newline = self.eot_token  # "</tool_call>"
             if end_token_without_newline in self._normal_text_buffer:
-                cleaned_text = self._normal_text_buffer.replace(end_token_without_newline, "")
+                cleaned_text = self._normal_text_buffer.replace(
+                    end_token_without_newline, ""
+                )
                 self._normal_text_buffer = ""
                 result.normal_text = cleaned_text
             else:
                 # Check if buffer might contain partial end token at the end
-                partial_match_len = self._ends_with_partial_token(self._normal_text_buffer, end_token_without_newline)
+                partial_match_len = self._ends_with_partial_token(
+                    self._normal_text_buffer, end_token_without_newline
+                )
 
                 if partial_match_len:
                     # Keep potential partial match in buffer, return the rest
                     result.normal_text = self._normal_text_buffer[:-partial_match_len]
-                    self._normal_text_buffer = self._normal_text_buffer[-partial_match_len:]
+                    self._normal_text_buffer = self._normal_text_buffer[
+                        -partial_match_len:
+                    ]
                 else:
                     # No partial match, return all buffered text
                     result.normal_text = self._normal_text_buffer
@@ -1366,22 +1501,28 @@ class RippleDetector(Qwen25Detector):
         self._held_newline = ""
         self._calls_started = False
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         result = super().detect_and_parse(text, tools)
         idx = text.find(self.bot_token)
         if idx != -1:
             prefix = text[:idx]
-            result.normal_text = prefix[:-1] if prefix.endswith("\n") else prefix
+            result.normal_text = prefix.removesuffix("\n")
         return result
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         result = super().parse_streaming_increment(new_text, tools)
         if self._calls_started:
             return result
         text, self._held_newline = self._held_newline + result.normal_text, ""
-        self._calls_started = bool(result.calls) or self.current_tool_id >= 0 or self._buffer.startswith(self.bot_token)
+        self._calls_started = (
+            bool(result.calls)
+            or self.current_tool_id >= 0
+            or self._buffer.startswith(self.bot_token)
+        )
         if self._calls_started:
-            text = text[:-1] if text.endswith("\n") else text
+            text = text.removesuffix("\n")
         elif text.endswith("\n"):  # undecided until the next text arrives
             text, self._held_newline = text[:-1], "\n"
         result.normal_text = text
@@ -1421,7 +1562,7 @@ class MistralDetector(BaseFormatDetector):
         """Check if the text contains a Mistral format tool call."""
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -1449,7 +1590,9 @@ class MistralDetector(BaseFormatDetector):
                 function_call_arr = [function_call_arr]
             calls = self.parse_base_json(function_call_arr, tools)
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}")
+            logger.warning(
+                f"Failed to parse JSON part: {json_array_str}, JSON parse error: {e!s}"
+            )
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -1465,7 +1608,9 @@ class MistralDetector(BaseFormatDetector):
             return None
 
         # Start from the opening bracket after [TOOL_CALLS]
-        json_start = start_idx + len(self.bot_token) - 1  # -1 to include the opening bracket
+        json_start = (
+            start_idx + len(self.bot_token) - 1
+        )  # -1 to include the opening bracket
         bracket_count = 0
         in_string = False
         escape_next = False
@@ -1505,7 +1650,9 @@ class Llama32Detector(BaseFormatDetector):
     <python_tag>{"name":"xxx", "arguments":{...}}
     ```
     """
+
     toolcall_opener = "<|python_tag|>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<|python_tag|>"
@@ -1521,7 +1668,7 @@ class Llama32Detector(BaseFormatDetector):
         # prefix the output with the <|python_tag|> token
         return "<|python_tag|>" in text or text.startswith("{")
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text and not text.startswith("{"):
             return StreamingParseResult(normal_text=text, calls=[])
@@ -1544,7 +1691,9 @@ class Llama32Detector(BaseFormatDetector):
                 safe_idx = idx
             except json.JSONDecodeError as e:
                 # Find where next `{"name"` appears and try again
-                logger.warning(f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}")
+                logger.warning(
+                    f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {e!s}"
+                )
                 next_obj_start = action_text.find('{"name":', idx + 1)
                 if next_obj_start == -1:
                     break
@@ -1554,11 +1703,12 @@ class Llama32Detector(BaseFormatDetector):
         # Only process if we found valid JSON objects
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
-        trailing_text = action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
-        return StreamingParseResult(normal_text=normal_text + trailing_text, calls=calls)
-
-
-
+        trailing_text = (
+            action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
+        )
+        return StreamingParseResult(
+            normal_text=normal_text + trailing_text, calls=calls
+        )
 
 
 class Glm47Detector(BaseFormatDetector):
@@ -1595,7 +1745,9 @@ class Glm47Detector(BaseFormatDetector):
 
     Reference: https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/glm4_moe_tool_parser.py
     """
+
     toolcall_opener = "<tool_call>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
@@ -1609,10 +1761,13 @@ class Glm47Detector(BaseFormatDetector):
         # Function name can be followed by newline OR directly by <arg_key>
         # Pattern: <tool_call>function_name(\n|<arg_key>)...
         self.func_detail_regex = re.compile(
-            r"<tool_call>([^<\n]+?)(?:\n|(?=<arg_key>)|(?=</tool_call>))(.*?)</tool_call>", re.DOTALL
+            r"<tool_call>([^<\n]+?)(?:\n|(?=<arg_key>)|(?=</tool_call>))(.*?)</tool_call>",
+            re.DOTALL,
         )
         # Extract arg_key/arg_value pairs
-        self.func_arg_regex = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+        self.func_arg_regex = re.compile(
+            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+        )
 
         self._last_arguments = ""
         self._normal_text_buffer = ""
@@ -1621,7 +1776,9 @@ class Glm47Detector(BaseFormatDetector):
         """Check if the text contains a GLM-4.7 format tool call."""
         return self.bot_token in text
 
-    def _parse_xml_arguments(self, arg_text: str, param_config: Dict | None = None, func_name: str = "") -> dict:
+    def _parse_xml_arguments(
+        self, arg_text: str, param_config: dict | None = None, func_name: str = ""
+    ) -> dict:
         """
         Parse XML-style arguments into a dictionary.
 
@@ -1641,7 +1798,9 @@ class Glm47Detector(BaseFormatDetector):
             value = value.strip()
             if param_config and key in param_config:
                 # Schema-first: the declared type wins (a string-typed "5" stays "5").
-                args[key] = self._convert_param_value(value, key, param_config, func_name)
+                args[key] = self._convert_param_value(
+                    value, key, param_config, func_name
+                )
                 continue
             # Undeclared parameter: legacy loose typing.
             try:
@@ -1651,7 +1810,7 @@ class Glm47Detector(BaseFormatDetector):
                 args[key] = value
         return args
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -1683,8 +1842,12 @@ class Glm47Detector(BaseFormatDetector):
                 arg_text = func_detail.group(2) if func_detail.group(2) else ""
 
                 # Validate function name
-                if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                    logger.warning(f"Model attempted to call undefined function: {func_name}")
+                if func_name not in tool_indices and not _should_forward_unknown_tool(
+                    func_name
+                ):
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
                     continue
 
                 # Parse XML arguments to JSON (schema-first typing, loose fallback)
@@ -1696,11 +1859,15 @@ class Glm47Detector(BaseFormatDetector):
                     ToolCallItem(
                         tool_index=tool_indices.get(func_name, len(calls)),
                         name=func_name,
-                        parameters=json.dumps(func_args, ensure_ascii=False, allow_nan=False),
+                        parameters=json.dumps(
+                            func_args, ensure_ascii=False, allow_nan=False
+                        ),
                     )
                 )
             except Exception as e:
-                logger.warning(f"Failed to parse GLM-4.7 tool call: {match_result}, error: {str(e)}")
+                logger.warning(
+                    f"Failed to parse GLM-4.7 tool call: {match_result}, error: {e!s}"
+                )
                 continue
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -1714,10 +1881,12 @@ class Glm47Detector(BaseFormatDetector):
         self._g_mode = "idle"  # idle|name|invoke|invoke_skip|key|key_skip|preval|preval_skip|pstr|pbuf|pskip
         self._g_key = ""
         self._g_lead = "{"
-        self._g_config: Dict = {}
+        self._g_config: dict = {}
         self._g_lead_trimmed = False
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         """Value-level streaming for GLM-4.7: text outside blocks streams live;
         string-typed <arg_value> content streams char-by-char as JSON-escaped
         prefix-stable fragments; typed values buffer until the value closes."""
@@ -1727,14 +1896,16 @@ class Glm47Detector(BaseFormatDetector):
         if not hasattr(self, "_g_mode"):
             self._g_reset()
 
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
 
         def _emit(fragment: str) -> None:
             if fragment:
                 self.streamed_args_for_tool[self.current_tool_id] += fragment
                 calls.append(
-                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                    ToolCallItem(
+                        tool_index=self.current_tool_id, name=None, parameters=fragment
+                    )
                 )
 
         def _update_prev() -> None:
@@ -1763,25 +1934,33 @@ class Glm47Detector(BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                self._buffer = buf[len(self.bot_token):]
+                self._buffer = buf[len(self.bot_token) :]
                 self._g_mode = "name"
                 continue
 
             if mode == "name":
                 # The function name runs until a newline, the first <arg_key>, or
                 # the closing tag (whichever comes first).
-                ends = [p for p in (buf.find("\n"), buf.find(self._G_KEY_OPEN), buf.find(self.eot_token)) if p != -1]
+                ends = [
+                    p
+                    for p in (
+                        buf.find("\n"),
+                        buf.find(self._G_KEY_OPEN),
+                        buf.find(self.eot_token),
+                    )
+                    if p != -1
+                ]
                 if not ends:
                     break  # name still streaming (names are short — hold)
                 cut = min(ends)
                 func_name = buf[:cut].strip()
-                self._buffer = buf[cut + 1:] if buf[cut] == "\n" else buf[cut:]
+                self._buffer = buf[cut + 1 :] if buf[cut] == "\n" else buf[cut:]
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -1789,10 +1968,15 @@ class Glm47Detector(BaseFormatDetector):
                 while len(self.streamed_args_for_tool) <= self.current_tool_id:
                     self.streamed_args_for_tool.append("")
                 if func_name and (
-                    func_name in self._tool_indices or _should_forward_unknown_tool(func_name)
+                    func_name in self._tool_indices
+                    or _should_forward_unknown_tool(func_name)
                 ):
                     calls.append(
-                        ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters="")
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
                     )
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
@@ -1802,7 +1986,9 @@ class Glm47Detector(BaseFormatDetector):
                     self._g_config = self._get_param_config(func_name, tools)
                     self._g_mode = "invoke"
                 else:
-                    logger.warning(f"Model attempted to call undefined function: {func_name}")
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
                     self._g_mode = "invoke_skip"
                 continue
 
@@ -1816,11 +2002,11 @@ class Glm47Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self.eot_token):]
+                    self._buffer = buf[e + len(self.eot_token) :]
                     self._g_mode = "idle"
                     continue
                 if k != -1:
-                    self._buffer = buf[k + len(self._G_KEY_OPEN):]
+                    self._buffer = buf[k + len(self._G_KEY_OPEN) :]
                     self._g_mode = "key" if mode == "invoke" else "key_skip"
                     continue
                 hold = max(
@@ -1828,7 +2014,7 @@ class Glm47Detector(BaseFormatDetector):
                     self._ends_with_partial_token(buf, self.eot_token),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # whitespace between elements
+                    self._buffer = buf[len(buf) - hold :]  # whitespace between elements
                 break
 
             if mode in ("key", "key_skip"):
@@ -1836,7 +2022,7 @@ class Glm47Detector(BaseFormatDetector):
                 if end == -1:
                     break  # keys are short — hold until complete
                 self._g_key = buf[:end].strip()
-                self._buffer = buf[end + len(self._G_KEY_CLOSE):]
+                self._buffer = buf[end + len(self._G_KEY_CLOSE) :]
                 self._g_mode = "preval" if mode == "key" else "preval_skip"
                 continue
 
@@ -1845,9 +2031,11 @@ class Glm47Detector(BaseFormatDetector):
                 if v == -1:
                     hold = self._ends_with_partial_token(buf, self._G_VAL_OPEN)
                     if len(buf) - hold > 0:
-                        self._buffer = buf[len(buf) - hold:]  # whitespace between key and value
+                        self._buffer = buf[
+                            len(buf) - hold :
+                        ]  # whitespace between key and value
                     break
-                self._buffer = buf[v + len(self._G_VAL_OPEN):]
+                self._buffer = buf[v + len(self._G_VAL_OPEN) :]
                 if mode == "preval_skip":
                     self._g_mode = "pskip"
                     continue
@@ -1878,12 +2066,12 @@ class Glm47Detector(BaseFormatDetector):
                     emit_now = safe[: len(safe) - keep]
                     if emit_now:
                         _emit(self._json_escape_chunk(emit_now))
-                        self._buffer = buf[len(emit_now):]
+                        self._buffer = buf[len(emit_now) :]
                     break
                 tail = buf[:end].rstrip()
                 _emit(self._json_escape_chunk(tail) + '"')
                 _update_prev()
-                self._buffer = buf[end + len(self._G_VAL_CLOSE):]
+                self._buffer = buf[end + len(self._G_VAL_CLOSE) :]
                 self._g_mode = "invoke"
                 continue
 
@@ -1894,7 +2082,9 @@ class Glm47Detector(BaseFormatDetector):
                 if mode == "pbuf":
                     raw = buf[:end].strip()
                     if self._g_key in self._g_config:
-                        converted = self._convert_param_value(raw, self._g_key, self._g_config, "")
+                        converted = self._convert_param_value(
+                            raw, self._g_key, self._g_config, ""
+                        )
                     else:
                         try:
                             converted = _loads_finite_json(raw)
@@ -1907,7 +2097,7 @@ class Glm47Detector(BaseFormatDetector):
                         + json.dumps(converted, ensure_ascii=False, allow_nan=False)
                     )
                     _update_prev()
-                self._buffer = buf[end + len(self._G_VAL_CLOSE):]
+                self._buffer = buf[end + len(self._G_VAL_CLOSE) :]
                 self._g_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                 continue
 
@@ -1994,7 +2184,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         )
 
         self._last_arguments = ""
-        self._accumulated_params: List[tuple] = []
+        self._accumulated_params: list[tuple] = []
         self._in_function_calls = False  # Track if we're inside a function_calls block
         # Streaming state machine (vLLM deepseekv32-parser style):
         # idle | block | invoke | invoke_skip | pstr | pbuf | pskip
@@ -2029,7 +2219,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             + json.dumps(parsed, ensure_ascii=False, allow_nan=False)
         )
 
-    def _dsml_params_to_json(self, params: List[tuple]) -> str:
+    def _dsml_params_to_json(self, params: list[tuple]) -> str:
         """Convert DSML parameter tuples (name, is_str, value) to a JSON arguments string."""
         args = {}
         for name, is_str, value in params:
@@ -2042,7 +2232,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     args[name] = value
         return json.dumps(args, ensure_ascii=False, allow_nan=False)
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """One-time parsing for DSML format tool calls."""
         idx = _first_existing_pos(text, [self.bot_token, self.alt_bot_token])
         normal_text = text[:idx].strip() if idx != -1 else text
@@ -2054,15 +2244,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         invoke_matches = self.invoke_regex.findall(text)
         for func_name, invoke_body in invoke_matches:
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
+            if func_name not in tool_indices and not _should_forward_unknown_tool(
+                func_name
+            ):
+                logger.warning(
+                    f"Model attempted to call undefined function: {func_name}"
+                )
                 continue
 
             param_matches = self.param_regex.findall(invoke_body)
             try:
                 args_json = self._dsml_params_to_json(param_matches)
             except ValueError as e:
-                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                logger.warning(
+                    f"Refuse non-finite function.arguments for {func_name}: {e}"
+                )
                 continue
 
             calls.append(
@@ -2075,7 +2271,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         """Streaming incremental parsing for DSML tool calls, modeled on vLLM's
         deepseekv32 parser: text outside blocks streams live; ``string="true"``
         parameter VALUES stream char-by-char as JSON-escaped, prefix-stable
@@ -2086,8 +2284,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         param_open_token = self.param_start_prefix
 
         def _emit_args(fragment: str) -> None:
@@ -2126,19 +2324,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
-                        for e_token in (self.eot_token, self.alt_eot_token, self.invoke_end_token):
+                        for e_token in (
+                            self.eot_token,
+                            self.alt_eot_token,
+                            self.invoke_end_token,
+                        ):
                             if e_token in release:
                                 release = release.replace(e_token, "")
                         if release:
                             normal_parts.append(release)
-                        self._buffer = buf[len(buf) - hold:] if hold else ""
+                        self._buffer = buf[len(buf) - hold :] if hold else ""
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                opener = self.bot_token if buf.startswith(self.bot_token) else self.alt_bot_token
-                self._buffer = buf[len(opener):]
+                opener = (
+                    self.bot_token
+                    if buf.startswith(self.bot_token)
+                    else self.alt_bot_token
+                )
+                self._buffer = buf[len(opener) :]
                 self._in_function_calls = True
                 self._ds_mode = "block"
                 continue
@@ -2152,7 +2358,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         if buf[close : close + len(self.eot_token)] == self.eot_token
                         else self.alt_eot_token
                     )
-                    self._buffer = buf[close + len(matched):]
+                    self._buffer = buf[close + len(matched) :]
                     self._in_function_calls = False
                     self._ds_mode = "idle"
                     continue
@@ -2167,11 +2373,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.prev_tool_call_arr.append({})
                     while len(self.streamed_args_for_tool) <= self.current_tool_id:
                         self.streamed_args_for_tool.append("")
-                    self._buffer = buf[m.end():]
-                    if func_name in self._tool_indices or _should_forward_unknown_tool(func_name):
+                    self._buffer = buf[m.end() :]
+                    if func_name in self._tool_indices or _should_forward_unknown_tool(
+                        func_name
+                    ):
                         calls.append(
                             ToolCallItem(
-                                tool_index=self.current_tool_id, name=func_name, parameters=""
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
                             )
                         )
                         self.prev_tool_call_arr[self.current_tool_id] = {
@@ -2181,7 +2391,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self._args_started = False
                         self._ds_mode = "invoke"
                     else:
-                        logger.warning(f"Model attempted to call undefined function: {func_name}")
+                        logger.warning(
+                            f"Model attempted to call undefined function: {func_name}"
+                        )
                         self._ds_mode = "invoke_skip"
                     continue
                 hold = max(
@@ -2190,7 +2402,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._ends_with_partial_token(buf, self.alt_eot_token),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
+                    self._buffer = buf[len(buf) - hold :]  # inter-invoke whitespace
                 break
 
             if self._ds_mode in ("invoke", "invoke_skip"):
@@ -2203,14 +2415,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self.invoke_end_token):]
+                    self._buffer = buf[e + len(self.invoke_end_token) :]
                     self._ds_mode = "block"
                     continue
                 if p != -1:
                     m = self.param_open_regex.search(buf, p)
                     if m is None:
                         break  # parameter tag still streaming
-                    self._buffer = buf[m.end():]
+                    self._buffer = buf[m.end() :]
                     if self._ds_mode == "invoke_skip":
                         self._ds_mode = "pskip"
                         continue
@@ -2218,7 +2430,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     lead = "{" if not self._args_started else ","
                     self._args_started = True
                     if m.group(2) == "true":
-                        _emit_args(lead + json.dumps(self._param_name, ensure_ascii=False) + ':"')
+                        _emit_args(
+                            lead
+                            + json.dumps(self._param_name, ensure_ascii=False)
+                            + ':"'
+                        )
                         self._ds_mode = "pstr"
                     else:
                         self._param_lead = lead
@@ -2229,7 +2445,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._ends_with_partial_token(buf, self.invoke_end_token),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
+                    self._buffer = buf[
+                        len(buf) - hold :
+                    ]  # whitespace between parameters
                 break
 
             if self._ds_mode == "pstr":
@@ -2242,7 +2460,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self._buffer = buf[emit_len:]
                     break
                 _emit_args(json.dumps(buf[:end], ensure_ascii=False)[1:-1] + '"')
-                self._buffer = buf[end + len(self.param_end_token):]
+                self._buffer = buf[end + len(self.param_end_token) :]
                 _update_prev_args()
                 self._ds_mode = "invoke"
                 continue
@@ -2264,7 +2482,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         + json.dumps(parsed, ensure_ascii=False, allow_nan=False)
                     )
                     _update_prev_args()
-                self._buffer = buf[end + len(self.param_end_token):]
+                self._buffer = buf[end + len(self.param_end_token) :]
                 self._ds_mode = "invoke" if self._ds_mode == "pbuf" else "invoke_skip"
                 continue
 
@@ -2327,7 +2545,8 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
         # Regex patterns
         self.parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
+            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            re.DOTALL,
         )
         self._normal_text_buffer = ""
 
@@ -2346,12 +2565,14 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return "<function=" in text or self.bot_token in text
 
-    def finalize_streaming(self) -> List[ToolCallItem]:
+    def finalize_streaming(self) -> list[ToolCallItem]:
         """End-of-stream hook (FunctionCallParser.finalize_stream): close a call that
         max_tokens cut off mid-arguments."""
         return self._ps_finalize_open_call()
 
-    def _build_partial_arguments_json(self, func_name: str, partial_body: str, tools: List[Tool]) -> Optional[str]:
+    def _build_partial_arguments_json(
+        self, func_name: str, partial_body: str, tools: list[Tool]
+    ) -> str | None:
         """Build the current argument JSON from a partial XML tool-call body."""
         param_matches = self.parameter_regex.findall(partial_body)
         if not param_matches:
@@ -2369,10 +2590,8 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
             param_name = match[:idx].strip()
             param_value = match[idx + 1 :]
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+            param_value = param_value.removeprefix("\n")
+            param_value = param_value.removesuffix("\n")
 
             if param_value.strip():
                 has_visible_value = True
@@ -2386,7 +2605,9 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 # Parameter tag is present but its value has not started streaming yet.
                 continue
 
-            param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
+            param_dict[param_name] = self._convert_param_value(
+                param_value, param_name, param_config, func_name
+            )
 
         if not param_dict and not has_visible_value:
             return None
@@ -2397,13 +2618,13 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
             logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
             return None
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """One-shot parse by replaying the streaming state machine on a fresh
         detector, so text outside blocks (before, between and after calls, in
         order) and the calls are exactly what streaming emits for any chunking."""
         shadow = type(self)()
-        normal: List[str] = []
-        opened: List[List] = []  # [detector tool index, name, argument fragments]
+        normal: list[str] = []
+        opened: list[list] = []  # [detector tool index, name, argument fragments]
         chunk = text
         while True:
             step = shadow.parse_streaming_increment(chunk, tools)
@@ -2428,16 +2649,24 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
             except (json.JSONDecodeError, ValueError):
                 # Cut off mid-call: same fallback as the serving layer's stream close.
                 ledger = shadow.prev_tool_call_arr
-                args = ledger[index].get("arguments") if 0 <= index < len(ledger) else None
+                args = (
+                    ledger[index].get("arguments") if 0 <= index < len(ledger) else None
+                )
                 if args is not None:
                     params = json.dumps(args, ensure_ascii=False, allow_nan=False)
-            calls.append(ToolCallItem(tool_index=len(calls), name=name, parameters=params or "{}"))
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls), name=name, parameters=params or "{}"
+                )
+            )
         return StreamingParseResult(normal_text="".join(normal), calls=calls)
 
 
 class Gemma4Detector(BaseFormatDetector):
     """FreeToken serving adapter for Gemma4's compact tool-call format."""
+
     toolcall_opener = "<|tool_call>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<|tool_call>"
@@ -2450,22 +2679,32 @@ class Gemma4Detector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if idx == -1:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         tool_indices = self._get_tool_indices(tools)
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
         for func_name, arg_text in self.call_regex.findall(text):
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
+            if func_name not in tool_indices and not _should_forward_unknown_tool(
+                func_name
+            ):
+                logger.warning(
+                    f"Model attempted to call undefined function: {func_name}"
+                )
                 continue
             try:
-                arguments = json.dumps(_parse_gemma_call_args(arg_text), ensure_ascii=False, allow_nan=False)
+                arguments = json.dumps(
+                    _parse_gemma_call_args(arg_text),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
             except ValueError as e:
-                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                logger.warning(
+                    f"Refuse non-finite function.arguments for {func_name}: {e}"
+                )
                 continue
             calls.append(
                 ToolCallItem(
@@ -2485,7 +2724,9 @@ class Gemma4Detector(BaseFormatDetector):
         self._g4_depth = 0
         self._g4_in_str = False
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         """Value-level streaming for Gemma4's compact call syntax: text outside
         blocks streams live; ``<|"|>``-quoted string values stream char-by-char as
         JSON-escaped prefix-stable fragments; unquoted values (numbers, booleans,
@@ -2497,15 +2738,17 @@ class Gemma4Detector(BaseFormatDetector):
         if not hasattr(self, "_g4_mode"):
             self._g4_reset()
 
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         Q = self._G4_QUOTE
 
         def _emit(fragment: str) -> None:
             if fragment:
                 self.streamed_args_for_tool[self.current_tool_id] += fragment
                 calls.append(
-                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                    ToolCallItem(
+                        tool_index=self.current_tool_id, name=None, parameters=fragment
+                    )
                 )
 
         def _update_prev() -> None:
@@ -2534,13 +2777,13 @@ class Gemma4Detector(BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                self._buffer = buf[len(self.bot_token):]
+                self._buffer = buf[len(self.bot_token) :]
                 self._g4_mode = "header"
                 continue
 
@@ -2549,8 +2792,10 @@ class Gemma4Detector(BaseFormatDetector):
                 if brace == -1:
                     break  # header still streaming (short — hold)
                 header = buf[:brace].strip()
-                self._buffer = buf[brace + 1:]
-                func_name = header[len("call:"):].strip() if header.startswith("call:") else ""
+                self._buffer = buf[brace + 1 :]
+                func_name = (
+                    header[len("call:") :].strip() if header.startswith("call:") else ""
+                )
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -2558,10 +2803,15 @@ class Gemma4Detector(BaseFormatDetector):
                 while len(self.streamed_args_for_tool) <= self.current_tool_id:
                     self.streamed_args_for_tool.append("")
                 if func_name and (
-                    func_name in self._tool_indices or _should_forward_unknown_tool(func_name)
+                    func_name in self._tool_indices
+                    or _should_forward_unknown_tool(func_name)
                 ):
                     calls.append(
-                        ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters="")
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
                     )
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
@@ -2570,7 +2820,9 @@ class Gemma4Detector(BaseFormatDetector):
                     self._args_started = False
                     self._g4_mode = "key"
                 else:
-                    logger.warning(f"Model attempted to call undefined function: {func_name!r}")
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name!r}"
+                    )
                     self._g4_mode = "swallow"
                 continue
 
@@ -2592,7 +2844,7 @@ class Gemma4Detector(BaseFormatDetector):
                 if colon == -1:
                     break  # key still streaming (short — hold)
                 self._g4_key = buf[:colon].strip()
-                self._buffer = buf[colon + 1:]
+                self._buffer = buf[colon + 1 :]
                 self._g4_mode = "dispatch"
                 continue
 
@@ -2605,7 +2857,7 @@ class Gemma4Detector(BaseFormatDetector):
                 if buf.startswith(Q):
                     self._args_started = True
                     _emit(lead + json.dumps(self._g4_key, ensure_ascii=False) + ':"')
-                    self._buffer = buf[len(Q):]
+                    self._buffer = buf[len(Q) :]
                     self._g4_mode = "pstr"
                     continue
                 if self._ends_with_partial_token(buf, Q) == len(buf):
@@ -2625,11 +2877,11 @@ class Gemma4Detector(BaseFormatDetector):
                     emit_now = buf[: len(buf) - hold] if hold else buf
                     if emit_now:
                         _emit(self._json_escape_chunk(emit_now))
-                        self._buffer = buf[len(emit_now):]
+                        self._buffer = buf[len(emit_now) :]
                     break
                 _emit(self._json_escape_chunk(buf[:end]) + '"')
                 _update_prev()
-                self._buffer = buf[end + len(Q):]
+                self._buffer = buf[end + len(Q) :]
                 self._g4_mode = "key_sep"
                 continue
 
@@ -2682,7 +2934,7 @@ class Gemma4Detector(BaseFormatDetector):
                 _update_prev()
                 self._g4_scanned = 0
                 if buf[term] == ",":
-                    self._buffer = buf[term + 1:]
+                    self._buffer = buf[term + 1 :]
                     self._g4_mode = "key"
                 else:
                     self._buffer = buf[term:]
@@ -2694,14 +2946,14 @@ class Gemma4Detector(BaseFormatDetector):
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self.eot_token)
                     if len(buf) - hold > 0 and buf[: len(buf) - hold].strip() == "":
-                        self._buffer = buf[len(buf) - hold:]
+                        self._buffer = buf[len(buf) - hold :]
                         break
                     if hold:
                         break
                     # No closing marker and non-whitespace content: treat as done.
                     self._g4_mode = "idle"
                     continue
-                self._buffer = buf[pos + len(self.eot_token):]
+                self._buffer = buf[pos + len(self.eot_token) :]
                 self._g4_mode = "idle"
                 continue
 
@@ -2709,9 +2961,9 @@ class Gemma4Detector(BaseFormatDetector):
                 pos = buf.find(self.eot_token)
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self.eot_token)
-                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    self._buffer = buf[len(buf) - hold :] if hold else ""
                     break
-                self._buffer = buf[pos + len(self.eot_token):]
+                self._buffer = buf[pos + len(self.eot_token) :]
                 self._g4_mode = "idle"
                 continue
 
@@ -2746,8 +2998,12 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
         super().__init__()
         self.bot_token = "<minimax:tool_call>"
         self.eot_token = "</minimax:tool_call>"
-        self.invoke_regex = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL)
-        self.param_regex = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL)
+        self.invoke_regex = re.compile(
+            r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL
+        )
+        self.param_regex = re.compile(
+            r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL
+        )
 
         # InvokeParamStreamMixin grammar
         self._ps_outer_open = "<minimax:tool_call>"
@@ -2763,17 +3019,21 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if idx == -1:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         tool_indices = self._get_tool_indices(tools)
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
         for func_name, invoke_body in self.invoke_regex.findall(text):
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
+            if func_name not in tool_indices and not _should_forward_unknown_tool(
+                func_name
+            ):
+                logger.warning(
+                    f"Model attempted to call undefined function: {func_name}"
+                )
                 continue
             args = {}
             config = self._get_param_config(func_name, tools)
@@ -2787,7 +3047,9 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
             try:
                 arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
             except ValueError as e:
-                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                logger.warning(
+                    f"Refuse non-finite function.arguments for {func_name}: {e}"
+                )
                 continue
             calls.append(
                 ToolCallItem(
@@ -2797,7 +3059,6 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 )
             )
         return StreamingParseResult(normal_text=normal_text, calls=calls)
-
 
 
 class MiniMaxM3Detector(BaseFormatDetector):
@@ -2875,8 +3136,8 @@ class MiniMaxM3Detector(BaseFormatDetector):
         character. (Quoted invoke/wrapper markers are handled structurally by
         ``_scan_invoke_interior``.)
         """
-        items: List[tuple] = []
-        stray_parts: List[str] = []
+        items: list[tuple] = []
+        stray_parts: list[str] = []
         pos, n = 0, len(text)
         while pos < n:
             nxt = text.find(self.NS + "<", pos)
@@ -2961,7 +3222,11 @@ class MiniMaxM3Detector(BaseFormatDetector):
         order; verbatim text when only the string member (or nothing) matches."""
         s = raw.strip()
         for sub in subs:
-            t = str(sub.get("type", "")).strip().lower() if isinstance(sub, dict) else ""
+            t = (
+                str(sub.get("type", "")).strip().lower()
+                if isinstance(sub, dict)
+                else ""
+            )
             if t in ("integer", "int"):
                 try:
                     return int(s)
@@ -2988,7 +3253,9 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     return v
         return raw
 
-    def _nested_value(self, raw: str, schema: Any = None, root_schema: Any = None) -> Any:
+    def _nested_value(
+        self, raw: str, schema: Any = None, root_schema: Any = None
+    ) -> Any:
         if isinstance(schema, dict) and isinstance(root_schema, dict):
             schema = self._normalize_param_schema(schema, root_schema)
         items, stray = self._scan_elements(raw)
@@ -2996,7 +3263,13 @@ class MiniMaxM3Detector(BaseFormatDetector):
             return self._typed_leaf(raw, schema)
         return self._structure(items, schema, root_schema=root_schema, stray=stray)
 
-    def _structure(self, items: List[tuple], schema: Any = None, root_schema: Any = None, stray: str = "") -> Any:
+    def _structure(
+        self,
+        items: list[tuple],
+        schema: Any = None,
+        root_schema: Any = None,
+        stray: str = "",
+    ) -> Any:
         """Composite value from scanned elements, threading the JSON schema down
         (``properties`` / ``items`` / ``additionalProperties``). Only ``<item>``
         children render as a bare array -- the template's array convention;
@@ -3004,7 +3277,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
         key. Mixed text+children keeps the text under ``"$text"``."""
         if isinstance(schema, dict) and isinstance(root_schema, dict):
             schema = self._normalize_param_schema(schema, root_schema)
-        
+
         props = schema.get("properties") if isinstance(schema, dict) else None
         item_schema = schema.get("items") if isinstance(schema, dict) else None
 
@@ -3020,11 +3293,14 @@ class MiniMaxM3Detector(BaseFormatDetector):
 
         names = {k for k, _ in items}
         if names == {"item"}:
-            return [self._nested_value(raw, item_schema, root_schema=root_schema) for _, raw in items]
-        counts: Dict[str, int] = {}
+            return [
+                self._nested_value(raw, item_schema, root_schema=root_schema)
+                for _, raw in items
+            ]
+        counts: dict[str, int] = {}
         for k, _ in items:
             counts[k] = counts.get(k, 0) + 1
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         for key, raw in items:
             sub = _sub_schema(key)
             # A repeated key's elements are the array's members: unwrap its array
@@ -3047,16 +3323,23 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return out
 
     def _args_from_items(
-        self, func_name: str, items: List[tuple], tools: List[Tool],
-    ) -> Dict:
+        self,
+        func_name: str,
+        items: list[tuple],
+        tools: list[Tool],
+    ) -> dict:
         root_schema = self._get_tool_schema(func_name, tools)
         config = self._get_param_config(func_name, tools)
-        args: Dict[str, Any] = {}
+        args: dict[str, Any] = {}
         for key, raw in items:
-            prop = config.get(key) if isinstance(config, dict) and key in config else None
+            prop = (
+                config.get(key) if isinstance(config, dict) and key in config else None
+            )
             nested, stray = self._scan_elements(raw)
             if nested:
-                value: Any = self._structure(nested, prop, root_schema=root_schema, stray=stray)
+                value: Any = self._structure(
+                    nested, prop, root_schema=root_schema, stray=stray
+                )
             else:
                 if isinstance(prop, dict) and isinstance(root_schema, dict):
                     prop = self._normalize_param_schema(prop, root_schema)
@@ -3076,7 +3359,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
         Returns ``(items, end_pos, closer)`` with ``closer`` in
         {"invoke", "eot", None}; ``end_pos`` points at the closer marker
         (``len(text)`` when the text ran out -- truncation salvage)."""
-        items: List[tuple] = []
+        items: list[tuple] = []
         n = len(text)
         while pos < n:
             nxt = text.find(self.NS + "<", pos)
@@ -3120,7 +3403,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return items, n, None
 
     def _parse_block(
-        self, text: str, pos: int, tools: List[Tool], calls: List[ToolCallItem]
+        self, text: str, pos: int, tools: list[Tool], calls: list[ToolCallItem]
     ) -> int:
         """Parse a wrapper interior starting at ``pos`` (just past ``bot_token``),
         appending calls; returns the position just past the block's
@@ -3147,11 +3430,15 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     ToolCallItem(
                         tool_index=len(calls),
                         name=func_name,
-                        parameters=json.dumps(args, ensure_ascii=False, allow_nan=False),
+                        parameters=json.dumps(
+                            args, ensure_ascii=False, allow_nan=False
+                        ),
                     )
                 )
             else:
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                logger.warning(
+                    f"Model attempted to call undefined function: {func_name}"
+                )
             if closer == "invoke":
                 pos = end + len(self._invoke_close)
             elif closer == "eot":
@@ -3161,13 +3448,13 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return n
 
     # ---- one-shot -------------------------------------------------------------------
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """Parse EVERY wrapper block (text between and after blocks stays content).
         A block without ``</tool_call>`` (end-of-generation truncation) still
         yields its parseable calls -- recover_truncated_call appends the closer
         and re-enters here."""
-        calls: List[ToolCallItem] = []
-        normal_parts: List[str] = []
+        calls: list[ToolCallItem] = []
+        normal_parts: list[str] = []
         pos = 0
         while True:
             b = text.find(self.bot_token, pos)
@@ -3181,10 +3468,12 @@ class MiniMaxM3Detector(BaseFormatDetector):
         )
 
     # ---- streaming ------------------------------------------------------------------
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         self._buffer += new_text
-        calls: List[ToolCallItem] = []
-        normal_parts: List[str] = []
+        calls: list[ToolCallItem] = []
+        normal_parts: list[str] = []
         tool_indices = self._get_tool_indices(tools)
 
         while True:
@@ -3335,17 +3624,21 @@ class GptOssDetector(BaseFormatDetector):
                 best_pos, best_tok = pos, tok
         return best_pos, best_tok
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         idx = _first_existing_pos(text, ["<|start|>", "<|channel|>"])
         normal_text = text[:idx].strip() if idx != -1 else text
         if not self.has_tool_call(text):
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         tool_indices = self._get_tool_indices(tools)
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
         for func_name, payload in self.call_regex.findall(text):
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
+            if func_name not in tool_indices and not _should_forward_unknown_tool(
+                func_name
+            ):
+                logger.warning(
+                    f"Model attempted to call undefined function: {func_name}"
+                )
                 continue
             args = _parse_first_json_value(payload)
             if args is None:
@@ -3353,7 +3646,9 @@ class GptOssDetector(BaseFormatDetector):
             try:
                 arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
             except ValueError as e:
-                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                logger.warning(
+                    f"Refuse non-finite function.arguments for {func_name}: {e}"
+                )
                 continue
             calls.append(
                 ToolCallItem(
@@ -3364,12 +3659,14 @@ class GptOssDetector(BaseFormatDetector):
             )
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         self._buffer += new_text
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         while True:
             buf = self._buffer
             if not buf:
@@ -3383,7 +3680,7 @@ class GptOssDetector(BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
@@ -3393,11 +3690,12 @@ class GptOssDetector(BaseFormatDetector):
                 if msg == -1:
                     break  # header still streaming
                 header = buf[:msg]
-                self._buffer = buf[msg + len("<|message|>"):]
+                self._buffer = buf[msg + len("<|message|>") :]
                 m = self._name_regex.search(header) if "commentary" in header else None
                 func_name = m.group(1) if m else None
                 if func_name and (
-                    func_name in self._tool_indices or _should_forward_unknown_tool(func_name)
+                    func_name in self._tool_indices
+                    or _should_forward_unknown_tool(func_name)
                 ):
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
@@ -3407,7 +3705,9 @@ class GptOssDetector(BaseFormatDetector):
                         self.streamed_args_for_tool.append("")
                     calls.append(
                         ToolCallItem(
-                            tool_index=self.current_tool_id, name=func_name, parameters=""
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
                         )
                     )
                     self.prev_tool_call_arr[self.current_tool_id] = {
@@ -3433,13 +3733,15 @@ class GptOssDetector(BaseFormatDetector):
                         self.streamed_args_for_tool[self.current_tool_id] += piece
                         calls.append(
                             ToolCallItem(
-                                tool_index=self.current_tool_id, name=None, parameters=piece
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=piece,
                             )
                         )
                 break
             piece = buf[:pos]
             if tok in self._CLOSING_TOKENS:
-                self._buffer = buf[pos + len(tok):]
+                self._buffer = buf[pos + len(tok) :]
             else:
                 self._buffer = buf[pos:]  # an opener belongs to the NEXT block
             if self._mode == "tool_body":
@@ -3467,7 +3769,6 @@ class GptOssDetector(BaseFormatDetector):
         if mode != "text" or any(op in residual for op in self._BLOCK_OPENERS):
             return ""
         return residual
-
 
 
 class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
@@ -3511,7 +3812,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     # <atem:function_calls> is not a unique tool opener under the channel-scoped
     # execution rule (a to=user body may quote it), so no checkpoint anchor.
     toolcall_opener = None
-    _ps_trim = ""  # "spaces for string values are not stripped" (chat-template contract)
+    _ps_trim = (
+        ""  # "spaces for string values are not stripped" (chat-template contract)
+    )
     _ps_missing_type = "string"
     accepts_header_open = True  # FunctionCallParser passes the turn-start state
 
@@ -3546,7 +3849,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._truncated_channel = False
         # Dropped tool-channel prose, accumulated for ONE warning per channel
         # (a per-fragment warning logs once per generated character).
-        self._dropped_prose: List[str] = []
+        self._dropped_prose: list[str] = []
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -3596,7 +3899,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             return -1, None, None
         return best
 
-    def _finalize_truncated_invoke(self, reason: str = "tool channel closed") -> List[ToolCallItem]:
+    def _finalize_truncated_invoke(
+        self, reason: str = "tool channel closed"
+    ) -> list[ToolCallItem]:
         """The channel (or the whole stream) ended while the ATEM machinery was
         mid-flight. If an invoke already streamed its Start, close its argument
         JSON so the streamed fragments stay valid (never emit broken arguments),
@@ -3608,7 +3913,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         if mode == "idle":
             return []
         self._truncated_channel = True  # what follows is the broken channel's residue
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
         if mode in ("invoke", "pstr", "pbuf"):
             ledger = self.streamed_args_for_tool[self.current_tool_id]
             if mode == "pstr":
@@ -3619,7 +3924,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 frag = "{}"  # invoke opened, no parameter emitted yet
             self.streamed_args_for_tool[self.current_tool_id] += frag
             calls.append(
-                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=frag)
+                ToolCallItem(
+                    tool_index=self.current_tool_id, name=None, parameters=frag
+                )
             )
             try:
                 parsed = json.loads(self.streamed_args_for_tool[self.current_tool_id])
@@ -3634,11 +3941,13 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 self.streamed_args_for_tool.append("")
             logger.warning("muse_glimmer: %s mid-invoke; arguments truncated", reason)
         else:  # block / invoke_skip / pskip: no open call, just partial markup
-            logger.warning("muse_glimmer: %s mid-block; partial tool markup dropped", reason)
+            logger.warning(
+                "muse_glimmer: %s mid-block; partial tool markup dropped", reason
+            )
         self._ps_reset()
         return calls
 
-    def finalize_streaming(self) -> List[ToolCallItem]:
+    def finalize_streaming(self) -> list[ToolCallItem]:
         """End-of-stream hook (FunctionCallParser.finalize_stream): the generation
         ran out (max_tokens) while an invoke was still streaming -- close it the
         same way a channel boundary would, so the client's concatenated argument
@@ -3699,7 +4008,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             dropped,
         )
 
-    def _run_mixin(self, atem_part: str, remainder: str, tools: List[Tool]) -> StreamingParseResult:
+    def _run_mixin(
+        self, atem_part: str, remainder: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         """Feed ``atem_part`` through the invoke/parameter machinery; whatever the
         mixin leaves unconsumed stays buffered ahead of ``remainder``."""
         self._buffer = atem_part
@@ -3707,12 +4018,14 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._buffer += remainder
         return result
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
         self._buffer += new_text
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         while True:
             buf = self._buffer
             if not buf:
@@ -3741,18 +4054,18 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
                 if kind == "closer":
-                    self._buffer = buf[len(payload):]  # stray terminator: drop
+                    self._buffer = buf[len(payload) :]  # stray terminator: drop
                     continue
                 if kind == "inline":
                     self._enter_recipient(payload.group(1))
-                    self._buffer = buf[payload.end():]
+                    self._buffer = buf[payload.end() :]
                     continue
                 # kind == "start": parse the channel header. While the header-open
                 # seed is unconsumed it is the leftmost marker, so each consuming
@@ -3769,19 +4082,21 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     if not synthetic:
                         normal_parts.append(ATEM_START)
                     self._synthetic_open = False
-                    self._buffer = buf[len(ATEM_START):]
+                    self._buffer = buf[len(ATEM_START) :]
                     continue
                 if msg == -1:
                     # +len(<|message|>) slack: a protocol-legal header whose marker
                     # is still mid-arrival must not be cut at the nominal span.
-                    if len(buf) > len(ATEM_START) + ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
+                    if len(buf) > len(ATEM_START) + ATEM_HEADER_SPAN + len(
+                        ATEM_MESSAGE
+                    ):
                         # Past a plausible header span the marker cannot open a
                         # header anymore: release it as literal text and move on
                         # (mirrors the reasoning parser's bound).
                         if not synthetic:
                             normal_parts.append(ATEM_START)
                         self._synthetic_open = False
-                        self._buffer = buf[len(ATEM_START):]
+                        self._buffer = buf[len(ATEM_START) :]
                         continue
                     break  # header still streaming
                 if msg - len(ATEM_START) > ATEM_HEADER_SPAN:
@@ -3791,12 +4106,12 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     if not synthetic:
                         normal_parts.append(ATEM_START)
                     self._synthetic_open = False
-                    self._buffer = buf[len(ATEM_START):]
+                    self._buffer = buf[len(ATEM_START) :]
                     continue
-                m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
+                m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START) : msg])
                 self._enter_recipient(m.group(1) if m else "user")
                 self._synthetic_open = False
-                self._buffer = buf[msg + len(ATEM_MESSAGE):]
+                self._buffer = buf[msg + len(ATEM_MESSAGE) :]
                 continue
 
             pos, kind, payload = self._channel_boundary(buf)
@@ -3804,7 +4119,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             if self._ch_mode == "skip":
                 if pos == -1:
                     hold = atem_hold_len(buf)
-                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    self._buffer = buf[len(buf) - hold :] if hold else ""
                     break
                 # Drop the skipped body; transition exactly like text mode would.
                 self._buffer = buf[pos:]
@@ -3819,7 +4134,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 atem_part = buf[: len(buf) - hold] if hold else buf
                 if not atem_part:
                     break
-                result = self._run_mixin(atem_part, buf[len(atem_part):], tools)
+                result = self._run_mixin(atem_part, buf[len(atem_part) :], tools)
                 self._drop_channel_prose(result.normal_text)
                 calls.extend(result.calls)
                 if self._buffer == buf:
@@ -3839,7 +4154,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             # residue ahead of the boundary is markup debris and drops with it.
             calls.extend(self._finalize_truncated_invoke())
             if kind == "closer":
-                self._buffer = buf[pos + len(payload):]
+                self._buffer = buf[pos + len(payload) :]
                 self._ch_mode = "text"
                 # NOTE: the truncation mark (when finalize set it) survives the
                 # closer on purpose: on the production pipeline the broken
@@ -3849,7 +4164,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 # immediately while trailing closing tags are dropped.
             elif kind == "inline":
                 self._enter_recipient(payload.group(1))
-                self._buffer = buf[payload.end():]
+                self._buffer = buf[payload.end() :]
             else:  # abutting <|start|>: reprocess it in text mode
                 self._buffer = buf[pos:]
                 self._ch_mode = "text"
@@ -3867,7 +4182,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         if ch_mode != "text" or ps_mode != "idle" or truncated:
             return ""
         if synthetic:
-            residual = residual[len(ATEM_START):]  # the seed: never model output
+            residual = residual[len(ATEM_START) :]  # the seed: never model output
         # At end of stream a <|start|> that never received its <|message|> is NOT
         # a header: deliver the text, drop only the marker(s). Any capped discard
         # here diverged from the layer above -- its span runs on raw bytes while
@@ -3883,7 +4198,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     # ------------------------------------------------------------------
     # one-shot
     # ------------------------------------------------------------------
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """One-shot parse by replaying the streaming machinery on a fresh clone,
         so both paths share one definition of channel classification (a raw
         ``to=self`` body never leaks into content), execution scoping and value
@@ -3891,8 +4206,8 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         call truncated by end-of-input closes from the parse ledger, exactly as
         the serving layer would."""
         clone = type(self)(header_open=self._header_open)
-        raw_calls: List[ToolCallItem] = []
-        normal_parts: List[str] = []
+        raw_calls: list[ToolCallItem] = []
+        normal_parts: list[str] = []
         result = clone.parse_streaming_increment(text, tools)
         normal_parts.append(result.normal_text)
         raw_calls.extend(result.calls)
@@ -3905,8 +4220,8 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         raw_calls.extend(clone._finalize_truncated_invoke("input ended"))  # mid-invoke
         normal_parts.append(clone.finish_streaming())
 
-        order: List[int] = []
-        by_index: Dict[int, Dict[str, str]] = {}
+        order: list[int] = []
+        by_index: dict[int, dict[str, str]] = {}
         for item in raw_calls:
             if item.name is not None and item.tool_index not in by_index:
                 by_index[item.tool_index] = {"name": item.name, "params": ""}
@@ -3921,7 +4236,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             )
             for ordinal, idx in enumerate(order)
         ]
-        return StreamingParseResult(normal_text="".join(normal_parts).strip(), calls=calls)
+        return StreamingParseResult(
+            normal_text="".join(normal_parts).strip(), calls=calls
+        )
 
 
 class DeepSeekV41Detector(DeepSeekV32Detector):
@@ -3943,7 +4260,7 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+    ToolCallParserEnum: dict[str, type[BaseFormatDetector]] = {
         "deepseekv32": DeepSeekV32Detector,
         "deepseekv41": DeepSeekV41Detector,
         "gemma4": Gemma4Detector,
@@ -3961,8 +4278,10 @@ class FunctionCallParser:
         "ricursive": RippleDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, turn_starts_open: bool = False):
-        detector: Type[BaseFormatDetector] = None
+    def __init__(
+        self, tools: list[Tool], tool_call_parser: str, turn_starts_open: bool = False
+    ):
+        detector: type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class is None:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
@@ -4021,13 +4340,17 @@ class FunctionCallParser:
                 normal = parsed_result.normal_text or ""
                 # Only plain text: an unterminated final block would make the
                 # "last closer" precede it and leak markup into content.
-                if tail.strip() and tail.strip() not in normal and not self.detector.has_tool_call(tail):
+                if (
+                    tail.strip()
+                    and tail.strip() not in normal
+                    and not self.detector.has_tool_call(tail)
+                ):
                     parsed_result.normal_text = normal + tail
             return parsed_result
         else:
             return StreamingParseResult(normal_text=full_text, calls=[])
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_stream_chunk(self, chunk_text: str) -> tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
 
@@ -4061,20 +4384,25 @@ class FunctionCallParser:
         # (e.g. one complete invoke of several, leaving the rest and the closing tag
         # behind). Re-feed "" until the detector stops making progress.
         text = chunk_text
-        for _ in range(16):
+        max_steps = max(16, len(chunk_text) + 16)
+        for _ in range(max_steps):
             buffer_before = self.detector._buffer
             sp_result = self.detector.parse_streaming_increment(text, self.tools)
             if sp_result.normal_text:
                 segments.append(("text", sp_result.normal_text))
             if sp_result.calls:
                 segments.append(("calls", sp_result.calls))
-            if (text == "" and not sp_result.calls and not sp_result.normal_text
-                    and self.detector._buffer == buffer_before):
+            if (
+                text == ""
+                and not sp_result.calls
+                and not sp_result.normal_text
+                and self.detector._buffer == buffer_before
+            ):
                 break
             text = ""
         return segments
 
-    def recover_truncated_call(self) -> List[ToolCallItem]:
+    def recover_truncated_call(self) -> list[ToolCallItem]:
         """Best-effort parse of a tool call cut off by end-of-generation while its
         tag block was still open: append the closing tag and re-parse. Consumes the
         detector buffer on success; returns [] when nothing recoverable."""
@@ -4121,10 +4449,12 @@ class FunctionCallParser:
                 try:
                     return json.dumps(args, ensure_ascii=False, allow_nan=False)
                 except ValueError as e:
-                    logger.warning(f"Refuse non-finite function.arguments for tool {tool_ordinal}: {e}")
+                    logger.warning(
+                        f"Refuse non-finite function.arguments for tool {tool_ordinal}: {e}"
+                    )
         return None
 
-    def finalize_stream(self) -> List[ToolCallItem]:
+    def finalize_stream(self) -> list[ToolCallItem]:
         """End-of-stream finalize: argument fragments that CLOSE a call cut off
         mid-arguments, from detectors that can (muse_glimmer closes the streamed
         JSON so the fragments the client concatenated stay valid). The serving
@@ -4144,7 +4474,7 @@ def toolcall_opener_for(tool_call_parser: str) -> str | None:
     return detector.toolcall_opener if detector is not None else None
 
 
-def _coerce_tools(tools: List[Any] | None) -> List[Tool]:
+def _coerce_tools(tools: list[Any] | None) -> list[Tool]:
     return [_coerce_tool(tool) for tool in tools or []]
 
 

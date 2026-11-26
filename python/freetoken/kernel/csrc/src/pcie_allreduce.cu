@@ -54,6 +54,51 @@ __device__ __forceinline__ void st_global_wb_v4(uint4 *addr, uint4 val) {
                : "memory");
 }
 
+__device__ __forceinline__ uint4 ld_global_cv_v4(const uint4 *addr) {
+  uint4 val;
+  asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+               : "l"(addr)
+               : "memory");
+  return val;
+}
+
+template <typename T>
+__device__ __forceinline__ T ld_peer_elem(const T *addr) {
+  if constexpr (sizeof(T) == 2) {
+    uint16_t raw;
+    asm volatile("ld.global.cv.u16 %0, [%1];"
+                 : "=h"(raw)
+                 : "l"(addr)
+                 : "memory");
+    return *reinterpret_cast<const T *>(&raw);
+  } else {
+    uint32_t raw;
+    asm volatile("ld.global.cv.u32 %0, [%1];"
+                 : "=r"(raw)
+                 : "l"(addr)
+                 : "memory");
+    return *reinterpret_cast<const T *>(&raw);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void st_stage_elem(T *addr, T val) {
+  if constexpr (sizeof(T) == 2) {
+    uint16_t raw = *reinterpret_cast<const uint16_t *>(&val);
+    asm volatile("st.global.wb.u16 [%0], %1;"
+                 :
+                 : "l"(addr), "h"(raw)
+                 : "memory");
+  } else {
+    uint32_t raw = *reinterpret_cast<const uint32_t *>(&val);
+    asm volatile("st.global.wb.u32 [%0], %1;"
+                 :
+                 : "l"(addr), "r"(raw)
+                 : "memory");
+  }
+}
+
 __device__ __forceinline__ void st_flag_release(uint32_t *addr, uint32_t val) {
   asm volatile("st.release.sys.global.u32 [%1], %0;"
                :
@@ -172,8 +217,8 @@ template <> struct ElemTraits<int32_t> {
 
 template <typename T>
 __global__ void __launch_bounds__(kThreadsPerBlock, 1)
-    tp2_pcie_all_reduce_kernel(const T *local_in, T *out, T *__restrict__ s0,
-                               T *__restrict__ s1, Signal *__restrict__ sig0,
+    tp2_pcie_all_reduce_kernel(const T *local_in, T *out, T *s0, T *s1,
+                               Signal *__restrict__ sig0,
                                Signal *__restrict__ sig1, int rank,
                                size_t num_elems) {
   using Traits = ElemTraits<T>;
@@ -186,8 +231,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1)
 
   T *s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
   T *s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
-  T *__restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
-  const T *__restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
+  T *my_s = (rank == 0) ? s0_buf : s1_buf;
+  const T *peer_s = (rank == 0) ? s1_buf : s0_buf;
 
   const bool vec_ok =
       ((num_elems & static_cast<size_t>(kVec - 1)) == 0) &&
@@ -210,11 +255,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1)
       }
     } else {
       for (size_t idx = tid; idx < num_elems; idx += stride) {
-        my_s[idx] = local_in[idx];
+        st_stage_elem(my_s + idx, local_in[idx]);
       }
     }
-    __threadfence_system();
   }
+  __threadfence_system();
 
   barrier_epoch_release(sig0, sig1, self_sg, rank);
 
@@ -225,7 +270,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1)
     uint4 *out_v = reinterpret_cast<uint4 *>(out);
     for (size_t i = tid; i < num_vec; i += stride) {
       const uint4 lv = local_v[i];
-      const uint4 pv = peer_v[i];
+      const uint4 pv = ld_global_cv_v4(peer_v + i);
       const T *lt = reinterpret_cast<const T *>(&lv);
       const T *pt = reinterpret_cast<const T *>(&pv);
       uint4 ov;
@@ -242,7 +287,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1)
   } else {
     for (size_t idx = tid; idx < num_elems; idx += stride) {
       const Acc a_loc = Traits::to_acc(local_in[idx]);
-      const Acc a_peer = Traits::to_acc(peer_s[idx]);
+      const Acc a_peer = Traits::to_acc(ld_peer_elem(peer_s + idx));
       out[idx] = Traits::from_acc((rank == 0) ? (a_loc + a_peer)
                                               : (a_peer + a_loc));
     }

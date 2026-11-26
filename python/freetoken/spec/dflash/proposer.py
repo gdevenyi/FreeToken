@@ -5,7 +5,7 @@ The draft's context rows live in a per-table-row K/V ring (positions ``p % R``) 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -16,7 +16,12 @@ from freetoken.kernel.triton.dflash import ring_attention_workspace
 from freetoken.models.dflash.config import tp_heads
 from freetoken.models.gguf.reader import is_gguf_path
 from freetoken.spec.dflash.window import DFlashWindow
-from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
+from freetoken.spec.proposer import (
+    DraftContext,
+    Proposer,
+    SpecProposal,
+    check_draft_path,
+)
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -27,9 +32,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _write_tap(dst: torch.Tensor, col: int, x: torch.Tensor, residual: torch.Tensor | None, num_streams: int, hidden: int) -> None:
+def _write_tap(
+    dst: torch.Tensor,
+    col: int,
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    num_streams: int,
+    hidden: int,
+) -> None:
     """Column block ``col`` of ``dst`` takes the rows of ``x`` (plus ``residual`` when given), averaged over their ``num_streams`` residual streams."""
-    assert x.shape[1] == num_streams * hidden, f"a tapped layer gave {x.shape[1]} columns, expected {num_streams} x {hidden}"
+    assert x.shape[1] == num_streams * hidden, (
+        f"a tapped layer gave {x.shape[1]} columns, expected {num_streams} x {hidden}"
+    )
     out = dst[: x.shape[0], col * hidden : (col + 1) * hidden]
     if num_streams > 1:
         x = x if residual is None else x + residual
@@ -43,7 +57,14 @@ def _write_tap(dst: torch.Tensor, col: int, x: torch.Tensor, residual: torch.Ten
 class DFlashPrefillSink:
     """The tapped layers' outputs of each request's last ``m`` chunk rows, side by side in one feature block; ``spans`` holds each request's (cached_len, device_len, m) when the batch was formed."""
 
-    def __init__(self, taps: tuple[int, ...], rows_idx: torch.Tensor, aux: torch.Tensor, hidden: int, spans: List[tuple[int, int, int]]) -> None:
+    def __init__(
+        self,
+        taps: tuple[int, ...],
+        rows_idx: torch.Tensor,
+        aux: torch.Tensor,
+        hidden: int,
+        spans: list[tuple[int, int, int]],
+    ) -> None:
         self.wanted_layers = frozenset(taps)
         self.cols = {layer: j for j, layer in enumerate(taps)}
         self.rows_idx, self.aux, self.hidden, self.spans = rows_idx, aux, hidden, spans
@@ -52,16 +73,31 @@ class DFlashPrefillSink:
     def final_hidden(self, x: torch.Tensor) -> None:
         pass
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+    def layer_output(
+        self,
+        layer_id: int,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        num_streams: int = 1,
+    ) -> None:
         self.got.add(layer_id)
         kept = None if residual is None else residual.index_select(0, self.rows_idx)
-        _write_tap(self.aux, self.cols[layer_id], x.index_select(0, self.rows_idx), kept, num_streams, self.hidden)
+        _write_tap(
+            self.aux,
+            self.cols[layer_id],
+            x.index_select(0, self.rows_idx),
+            kept,
+            num_streams,
+            self.hidden,
+        )
 
 
 class DFlashVerifySink:
     """Every verify row's tapped outputs into the persistent feature buffer, so a captured verify graph writes it too."""
 
-    def __init__(self, taps: tuple[int, ...], buffer: torch.Tensor, hidden: int) -> None:
+    def __init__(
+        self, taps: tuple[int, ...], buffer: torch.Tensor, hidden: int
+    ) -> None:
         self.wanted_layers = frozenset(taps)
         self.cols = {layer: j for j, layer in enumerate(taps)}
         self.buffer, self.hidden = buffer, hidden
@@ -69,15 +105,25 @@ class DFlashVerifySink:
     def final_hidden(self, x: torch.Tensor) -> None:
         pass
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
-        _write_tap(self.buffer, self.cols[layer_id], x, residual, num_streams, self.hidden)
+    def layer_output(
+        self,
+        layer_id: int,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        num_streams: int = 1,
+    ) -> None:
+        _write_tap(
+            self.buffer, self.cols[layer_id], x, residual, num_streams, self.hidden
+        )
 
 
 def _draft_entry(config) -> tuple[str, str]:
     """(module, class name) of the target family's DFlash draft."""
     drafts = dict(config.model_spec.spec_drafts)
     if "dflash" not in drafts:
-        raise ValueError(f"DFlash is not supported for {config.hf_config.architectures[0]} yet")
+        raise ValueError(
+            f"DFlash is not supported for {config.hf_config.architectures[0]} yet"
+        )
     module, name = drafts["dflash"].split(":")
     return module, name
 
@@ -93,29 +139,62 @@ class DFlashProposer(Proposer):
     def adjust_config(cls, config, override) -> None:
         # not the base TP refusal: rank 0 decides the drafts (see _draft), and the draft shards by head like the target
         if config.speculative_token_map:
-            raise ValueError("--speculative-token-map only works with --speculative-algorithm mtp")
+            raise ValueError(
+                "--speculative-token-map only works with --speculative-algorithm mtp"
+            )
         module, name = _draft_entry(config)
         path = config.speculative_draft_model_path
         if not path:
-            raise ValueError("--speculative-algorithm dflash needs --speculative-draft-model-path: a DFlash 2 draft checkpoint")
+            raise ValueError(
+                "--speculative-algorithm dflash needs --speculative-draft-model-path: a DFlash 2 draft checkpoint"
+            )
         check_draft_path(path)
         if not is_gguf_path(path):
-            archs = list(getattr(cached_load_hf_config(path), "architectures", None) or [])
+            archs = list(
+                getattr(cached_load_hf_config(path), "architectures", None) or []
+            )
             if archs[:1] != [name]:
-                raise ValueError(f"{path}: expected a {name} checkpoint, got architectures {archs}")
-        draft, target, arch = cls._draft_config(config), config.model_config, config.hf_config.architectures[0]
+                raise ValueError(
+                    f"{path}: expected a {name} checkpoint, got architectures {archs}"
+                )
+        draft, target, arch = (
+            cls._draft_config(config),
+            config.model_config,
+            config.hf_config.architectures[0],
+        )
         if max(draft.target_layer_ids) >= target.num_layers:
-            raise ValueError(f"{path} reads target layers {list(draft.target_layer_ids)}, but {arch} has {target.num_layers} layers")
-        if draft.num_target_layers is not None and draft.num_target_layers != target.num_layers:
-            raise ValueError(f"{path} is a draft for a {draft.num_target_layers}-layer target, but {arch} has {target.num_layers} layers")
-        if (draft.hidden_size, draft.vocab_size) != (target.hidden_size, target.vocab_size) or draft.mask_token_id >= target.vocab_size:
+            raise ValueError(
+                f"{path} reads target layers {list(draft.target_layer_ids)}, but {arch} has {target.num_layers} layers"
+            )
+        if (
+            draft.num_target_layers is not None
+            and draft.num_target_layers != target.num_layers
+        ):
+            raise ValueError(
+                f"{path} is a draft for a {draft.num_target_layers}-layer target, but {arch} has {target.num_layers} layers"
+            )
+        if (draft.hidden_size, draft.vocab_size) != (
+            target.hidden_size,
+            target.vocab_size,
+        ) or draft.mask_token_id >= target.vocab_size:
             raise ValueError(
                 f"{path} (hidden {draft.hidden_size}, vocab {draft.vocab_size}, mask token {draft.mask_token_id}) does not fit "
                 f"{arch} (hidden {target.hidden_size}, vocab {target.vocab_size})"
             )
         tp_heads(draft, config.tp_info.size)
+        if config.tp_info.size > 1:
+            shard_vocab = -(-target.vocab_size // config.tp_info.size)
+            last_shard_vocab = (
+                target.vocab_size - (config.tp_info.size - 1) * shard_vocab
+            )
+            if last_shard_vocab < draft.selector_top_k:
+                raise ValueError(
+                    f"DFlash selector_top_k ({draft.selector_top_k}) exceeds the last TP rank's vocab shard ({last_shard_vocab}) at --tp-size {config.tp_info.size}"
+                )
         if config.tp_info.size > 1 and is_gguf_path(path):
-            raise ValueError(f"{path}: GGUF DFlash drafts load at --tp-size 1 only; use the safetensors draft at TP > 1")
+            raise ValueError(
+                f"{path}: GGUF DFlash drafts load at --tp-size 1 only; use the safetensors draft at TP > 1"
+            )
         if target.linear_attention_group() is None and config.cache_type != "naive":
             raise ValueError(
                 "DFlash keeps its context window on the target's GDN slots, which a prefix-cache hit restores; "
@@ -135,13 +214,28 @@ class DFlashProposer(Proposer):
     @classmethod
     def budget(cls, config) -> tuple[int, int]:
         c = cls._draft_config(config)
-        block, rows, item = config.speculative_num_steps + 1, config.max_running_req + 1, config.dtype.itemsize
+        block, rows, item = (
+            config.speculative_num_steps + 1,
+            config.max_running_req + 1,
+            config.dtype.itemsize,
+        )
         ring_len = DFlashWindow.length(c.window, block)
         # the ring and the scratch of this rank's heads, as the draft builds them
         heads, kv_heads = tp_heads(c, config.tp_info.size)
         kv = 2 * c.num_layers * rows * ring_len * kv_heads * c.head_dim * item
-        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, heads, kv_heads, c.head_dim, ring_len, torch.device("meta")))
-        aux = config.max_running_req * block * len(c.target_layer_ids) * c.hidden_size * item
+        scratch = sum(
+            t.nbytes
+            for t in ring_attention_workspace(
+                rows, block, heads, kv_heads, c.head_dim, ring_len, torch.device("meta")
+            )
+        )
+        aux = (
+            config.max_running_req
+            * block
+            * len(c.target_layer_ids)
+            * c.hidden_size
+            * item
+        )
         # the rope table is sized by the page table at attach; max_seq_len bounds its width
         rope = config.max_seq_len * c.head_dim * 4
         return kv + scratch + aux + rope, 0
@@ -152,7 +246,10 @@ class DFlashProposer(Proposer):
         if config.cache_type != "hybrid_radix":
             return ()
         c = cls._draft_config(config)
-        return DFlashWindow.slot_specs(DFlashWindow.length(c.window, config.speculative_num_steps + 1), c.hidden_size)
+        return DFlashWindow.slot_specs(
+            DFlashWindow.length(c.window, config.speculative_num_steps + 1),
+            c.hidden_size,
+        )
 
     def __init__(self, config, target_model) -> None:
         from freetoken.models.register import _load_attr
@@ -165,14 +262,22 @@ class DFlashProposer(Proposer):
         module, name = _draft_entry(config)
         path = config.speculative_draft_model_path
         self.draft_config = c = self._draft_config(config)
-        self.draft = _load_attr(module, name).load(c, target_model, path, self.device, self.dtype)
-        self.taps, self.hidden, self.block = c.target_layer_ids, c.hidden_size, self.k + 1
+        self.draft = _load_attr(module, name).load(
+            c, target_model, path, self.device, self.dtype
+        )
+        self.taps, self.hidden, self.block = (
+            c.target_layer_ids,
+            c.hidden_size,
+            self.k + 1,
+        )
         self.ring_len = DFlashWindow.length(c.window, self.block)
-        self._seen: Dict[int, int] = {}  # table row -> uid of the request whose chunks its ring holds
+        self._seen: dict[
+            int, int
+        ] = {}  # table row -> uid of the request whose chunks its ring holds
         self._prefill_sink: DFlashPrefillSink | None = None
         self.dflash_ring = self.window = self.aux_buf = None
-        self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
-        self._inject_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._inject_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         state = self.draft.state_dict()
         size = sum(t.nbytes for t in state.values()) / 2**20
         logger.info_rank0(
@@ -185,9 +290,20 @@ class DFlashProposer(Proposer):
     def attach(self, ctx: DraftContext) -> None:
         super().attach(ctx)
         mr = self.config.max_running_req
-        self.dflash_ring = self.draft.make_dflash_ring(mr + 1, self.block, self.ring_len, ctx.page_table.shape[1], ctx.device)
-        self.window = DFlashWindow(ctx.slot_states, self.ring_len, self.hidden) if DFlashWindow.NAME in ctx.slot_states else None
-        self.aux_buf = torch.zeros(mr * self.block, len(self.taps) * self.hidden, dtype=self.dtype, device=ctx.device)
+        self.dflash_ring = self.draft.make_dflash_ring(
+            mr + 1, self.block, self.ring_len, ctx.page_table.shape[1], ctx.device
+        )
+        self.window = (
+            DFlashWindow(ctx.slot_states, self.ring_len, self.hidden)
+            if DFlashWindow.NAME in ctx.slot_states
+            else None
+        )
+        self.aux_buf = torch.zeros(
+            mr * self.block,
+            len(self.taps) * self.hidden,
+            dtype=self.dtype,
+            device=ctx.device,
+        )
 
     def detach(self, *, keep_kv: bool) -> None:
         # the ring is keyed by table row and position, not by KV slot, and a rebuild finds no request running
@@ -201,13 +317,17 @@ class DFlashProposer(Proposer):
 
     # ------------------------------------------------------------------ draft step
 
-    def _draft(self, pending, starts, rows, temperature, greedy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _draft(
+        self, pending, starts, rows, temperature, greedy
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.draft.forward_block(pending, starts, rows, self.dflash_ring)
         # row 0 of each block is the pending token; rows 1..k predict the drafts
         pred = hidden.view(pending.shape[0], self.block, -1)[:, 1:]
         candidate_ids, unary_logits = self.draft.compute_candidates(pred)
         uniforms = torch.rand(pred.shape[:2], device=pred.device)
-        tokens, q = self.draft.candidate_selector.sample_path(candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms)
+        tokens, q = self.draft.candidate_selector.sample_path(
+            candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms
+        )
         if self._comm is not None:
             # every rank verifies the same drafts but walked its own path: rank 0's go to all, here so that every graph replay sends them
             if not self._tp_info.is_primary():
@@ -215,25 +335,36 @@ class DFlashProposer(Proposer):
             tokens = self._comm.all_reduce(tokens)
         return tokens, candidate_ids, q
 
-    def _inject(self, features: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor | None) -> None:
+    def _inject(
+        self,
+        features: torch.Tensor,
+        positions: torch.Tensor,
+        rows: torch.Tensor,
+        slots: torch.Tensor | None,
+    ) -> None:
         """The context rows of ``features`` into the ring rows ``rows`` and the window slots ``slots`` at ``positions``."""
         ctx = self.draft.context_rows(features)
         self.draft.store_context(ctx, positions, rows, self.dflash_ring)
         if self.window is not None:
             self.window.write(ctx, positions, slots)
 
-    def capture_graphs(self, bs_list: List[int], pool) -> None:
+    def capture_graphs(self, bs_list: list[int], pool) -> None:
         """One graph per batch size for the draft step (block forward + selector) and one for the verify's context inject."""
         if not bs_list:
             return
-        ctx, dev, k, top_k = self.ctx, self.ctx.device, self.k, self.draft_config.selector_top_k
+        ctx, dev, k, top_k = (
+            self.ctx,
+            self.ctx.device,
+            self.k,
+            self.draft_config.selector_top_k,
+        )
         max_bs, dummy = max(bs_list), ctx.dummy_req.table_idx
         self._in = (
-            torch.zeros(max_bs, dtype=torch.int64, device=dev),                 # bonus
-            torch.zeros(max_bs, dtype=torch.int64, device=dev),                 # starts
-            torch.full((max_bs,), dummy, dtype=torch.int64, device=dev),        # ring rows
-            torch.ones(max_bs, dtype=torch.float32, device=dev),                # temperature
-            torch.ones(max_bs, dtype=torch.bool, device=dev),                   # greedy
+            torch.zeros(max_bs, dtype=torch.int64, device=dev),  # bonus
+            torch.zeros(max_bs, dtype=torch.int64, device=dev),  # starts
+            torch.full((max_bs,), dummy, dtype=torch.int64, device=dev),  # ring rows
+            torch.ones(max_bs, dtype=torch.float32, device=dev),  # temperature
+            torch.ones(max_bs, dtype=torch.bool, device=dev),  # greedy
         )
         self._out = (
             torch.zeros(max_bs, k, dtype=torch.int64, device=dev),
@@ -242,9 +373,9 @@ class DFlashProposer(Proposer):
         )
         n = max_bs * self.block
         self._inject_in = (
-            torch.zeros(n, dtype=torch.int32, device=dev),                      # positions
-            torch.full((n,), dummy, dtype=torch.int64, device=dev),             # ring rows
-            torch.zeros(n, dtype=torch.int64, device=dev),                      # window slots
+            torch.zeros(n, dtype=torch.int32, device=dev),  # positions
+            torch.full((n,), dummy, dtype=torch.int64, device=dev),  # ring rows
+            torch.zeros(n, dtype=torch.int64, device=dev),  # window slots
         )
 
         def draft(bs: int) -> None:
@@ -266,20 +397,36 @@ class DFlashProposer(Proposer):
                 if pool is None:
                     pool = graph.pool()
                 graphs[bs] = graph
-        logger.info_rank0(f"speculative decoding: DFlash draft graphs captured for bs {sorted(self._graphs)}")
+        logger.info_rank0(
+            f"speculative decoding: DFlash draft graphs captured for bs {sorted(self._graphs)}"
+        )
 
-    def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
+    def propose(
+        self, reqs: list[Req], rows: torch.Tensor, pending: torch.Tensor
+    ) -> SpecProposal:
         bs = len(reqs)
         greedy = [r.sampling_params.is_greedy for r in reqs]
         padded = next((b for b in sorted(self._graphs) if b >= bs), None)
         pad = (padded or bs) - bs
         pin = dict(pin_memory=True)
-        starts = torch.tensor([r.cached_len for r in reqs] + [0] * pad, dtype=torch.int64, **pin)
+        starts = torch.tensor(
+            [r.cached_len for r in reqs] + [0] * pad, dtype=torch.int64, **pin
+        )
         flags = torch.tensor(greedy + [True] * pad, dtype=torch.bool, **pin)
-        temps = torch.tensor([1.0 if g else max(r.sampling_params.temperature, 1e-5) for r, g in zip(reqs, greedy)] + [1.0] * pad, dtype=torch.float32, **pin)
+        temps = torch.tensor(
+            [
+                1.0 if g else max(r.sampling_params.temperature, 1e-5)
+                for r, g in zip(reqs, greedy)
+            ]
+            + [1.0] * pad,
+            dtype=torch.float32,
+            **pin,
+        )
         if padded is None:
             to = lambda t: t.to(self.device, non_blocking=True)
-            tokens, cand, q = self._draft(pending.to(torch.int64), to(starts), rows, to(temps), to(flags))
+            tokens, cand, q = self._draft(
+                pending.to(torch.int64), to(starts), rows, to(temps), to(flags)
+            )
         else:
             bonus, g_starts, g_rows, g_temps, g_flags = self._in
             bonus[:bs].copy_(pending)
@@ -308,18 +455,30 @@ class DFlashProposer(Proposer):
             idx.extend(range(off + e - s - m, off + e - s))
             spans.append((s, e, m))
             off += e - s
-        aux = torch.empty(len(idx), len(self.taps) * self.hidden, dtype=self.dtype, device=self.device)
-        self._prefill_sink = DFlashPrefillSink(self.taps, make_device_tensor(idx, torch.int64, self.device), aux, self.hidden, spans)
+        aux = torch.empty(
+            len(idx), len(self.taps) * self.hidden, dtype=self.dtype, device=self.device
+        )
+        self._prefill_sink = DFlashPrefillSink(
+            self.taps,
+            make_device_tensor(idx, torch.int64, self.device),
+            aux,
+            self.hidden,
+            spans,
+        )
         return self._prefill_sink
 
-    def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:
+    def post_verify(
+        self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor
+    ) -> None:
         """Every verify row's context into the ring and the window; the rows past the accepted ones are overwritten by the next block before anything reads them."""
         padded, block = batch.padded_size, self.block
         n = padded * block
         rows = batch.active_table_idx.repeat_interleave(block)
         slots = None
         if self.window is not None:
-            slots = make_device_tensor([gdn_slot(r) for r in batch.padded_reqs], torch.int64, self.device).repeat_interleave(block)
+            slots = make_device_tensor(
+                [gdn_slot(r) for r in batch.padded_reqs], torch.int64, self.device
+            ).repeat_interleave(block)
         graph = self._inject_graphs.get(padded)
         if graph is None:
             self._inject(self.aux_buf[:n], batch.positions[:n], rows, slots)
@@ -354,16 +513,33 @@ class DFlashProposer(Proposer):
         if restore:
             # before this chunk's rows: with a long chunk they take the same ring slots
             self.draft.store_context(
-                torch.cat([window.read(slot, lo, hi - lo) for slot, lo, hi, _ in restore]),
-                make_device_tensor([p for _, lo, hi, _ in restore for p in range(lo, hi)], torch.int32, self.device),
-                make_device_tensor([row for _, lo, hi, row in restore for _ in range(lo, hi)], torch.int64, self.device),
+                torch.cat(
+                    [window.read(slot, lo, hi - lo) for slot, lo, hi, _ in restore]
+                ),
+                make_device_tensor(
+                    [p for _, lo, hi, _ in restore for p in range(lo, hi)],
+                    torch.int32,
+                    self.device,
+                ),
+                make_device_tensor(
+                    [row for _, lo, hi, row in restore for _ in range(lo, hi)],
+                    torch.int64,
+                    self.device,
+                ),
                 self.dflash_ring,
             )
         positions = make_device_tensor(pos, torch.int32, self.device)
-        self.draft.store_context(ctx, positions, make_device_tensor(rows, torch.int64, self.device), self.dflash_ring)
+        self.draft.store_context(
+            ctx,
+            positions,
+            make_device_tensor(rows, torch.int64, self.device),
+            self.dflash_ring,
+        )
         if window is None:
             return
-        window.write(ctx, positions, make_device_tensor(slots, torch.int64, self.device))
+        window.write(
+            ctx, positions, make_device_tensor(slots, torch.int64, self.device)
+        )
         fla = batch.fla_metadata
         if fla is not None and fla.track_dst is not None:
             # the snapshot at the tracked boundary b holds [b-W, b): inside the live window [e-R, e), since e - b <= R - W

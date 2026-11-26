@@ -122,19 +122,34 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+def allows_load_time_quant(config: ModelConfig, module: str = "") -> bool:
+    """False when ``config`` reads packed GGUF tensors directly without ``dense_emitter``."""
+    from freetoken.layers.quantization import GGUFConfig
+
+    if isinstance(config.quant, GGUFConfig):
+        from .gguf import gguf_float_dense
+
+        return gguf_float_dense()
+    return True
+
+
 def use_fp8_dense(config: ModelConfig, fused_module: str) -> bool:
     """Whether a mixer runs as load-time per-tensor FP8; the model builder and the weight reader must get one answer.
 
     ``fused_module`` is the mixer's input fusion (``<attn>.qkv_proj`` or ``<gdn>.in_proj_qkvz``). A scheme the checkpoint declares for it wins and goes through QuantConfig.
     """
-    if config.attn_quant != "fp8_dynamic":
+    if config.attn_quant != "fp8_dynamic" or not allows_load_time_quant(
+        config, fused_module
+    ):
         return False
     return config.quant is None or config.quant.scheme_for(fused_module) is None
 
 
 def use_int8_dense(config: ModelConfig, fused_module: str) -> bool:
     """Whether a mixer runs as load-time symmetric ``int8 g32`` W8A16 (``C4b``)."""
-    if config.attn_quant != "int8_g32":
+    if config.attn_quant != "int8_g32" or not allows_load_time_quant(
+        config, fused_module
+    ):
         return False
     return config.quant is None or config.quant.scheme_for(fused_module) is None
 
@@ -144,7 +159,11 @@ def use_fp8_lmhead(config: ModelConfig) -> bool:
 
     The head must be untied (a tied head shares the bf16 table). What counts is a scheme for lm_head itself, not a QuantConfig at all: this model ships NVFP4 experts with lm_head in the ignore list.
     """
-    if not fp8_lmhead_enabled() or config.tie_word_embeddings:
+    if (
+        not fp8_lmhead_enabled()
+        or config.tie_word_embeddings
+        or not allows_load_time_quant(config, "lm_head")
+    ):
         return False
     return config.quant is None or config.quant.scheme_for("lm_head") is None
 

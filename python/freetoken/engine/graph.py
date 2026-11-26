@@ -4,16 +4,18 @@ import ctypes
 import functools
 import gc
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
+from tqdm import tqdm
+
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
-from tqdm import tqdm
 
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
@@ -72,10 +74,10 @@ class GraphCaptureBuffer:
 
 
 def _determine_cuda_graph_bs(
-    cuda_graph_bs: List[int] | None,
+    cuda_graph_bs: list[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
-) -> List[int]:
+) -> list[int]:
     if cuda_graph_bs is not None:
         return cuda_graph_bs
 
@@ -130,7 +132,7 @@ class GraphRunner:
         device: torch.device,
         forward: Callable[[], Any],
         attn_backend: BaseAttnBackend,
-        cuda_graph_bs: List[int] | None,
+        cuda_graph_bs: list[int] | None,
         cuda_graph_max_bs: int | None,
         free_memory: int,
         max_seq_len: int,
@@ -140,7 +142,7 @@ class GraphRunner:
         *,
         rows_per_req: int = 1,
         phase: Literal["decode", "verify"] = "decode",
-        ctx_override: Dict[str, Any] | None = None,
+        ctx_override: dict[str, Any] | None = None,
         batch_hook: Callable[[Batch], None] | None = None,
         pool: Any = None,
         out_dtype: torch.dtype | None = None,
@@ -172,9 +174,9 @@ class GraphRunner:
         self.batch_hook = batch_hook
         self.graph_pool = pool
         self.out_dtype = out_dtype
-        self._out: List[torch.Tensor] | None = None
+        self._out: list[torch.Tensor] | None = None
         self._out_is_tuple = False
-        self._out_rows: Dict[int, tuple[int, ...]] = {}
+        self._out_rows: dict[int, tuple[int, ...]] = {}
         self._capture_graphs(max_seq_len)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -203,7 +205,7 @@ class GraphRunner:
         # reads it as an indeterminate phase and animates the bar. Must precede the
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
-        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.graph_map: dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -249,63 +251,87 @@ class GraphRunner:
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
         pool = self.graph_pool
-        for bs in pbar:
-            free_memory = get_free_memory(self.device)
-            pbar.desc = (
-                f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
-            )
-            pbar.refresh()
-            graph = torch.cuda.CUDAGraph()
-            batch = Batch(
-                reqs=[self.dummy_req] * bs,
-                phase=self.phase,
-                rows_per_req=self.rows_per_req,
-            )
-            batch.padded_reqs = batch.reqs
-            if self.batch_hook is not None:
-                self.batch_hook(batch)
-            self.attn_backend.prepare_for_capture(batch)
-            self.buffer.set_batch(batch)
-            if self.linear_backend is not None:
-                self.linear_backend.prepare_for_capture(batch)
-            with get_global_ctx().forward_batch(batch, **self.ctx_override):
-                self._store_output(bs, self.forward())
-                # Keep the offload cache warmed for capture. Resetting here forces
-                # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self._store_output(bs, self.forward())
-                _upload_graph(graph, self.stream)
-                self._reset_moe_offload_cache()
-            if pool is None:
-                pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
-        self.graph_pool = pool
+        l2_mb = int(ENV.L2_PERSIST_MB.value or 0) if self.device.type == "cuda" else 0
+        dev_idx = 0 if self.device.index is None else int(self.device.index)
+        l2_pinned = False
 
-        self._reset_moe_offload_cache()
-        if self.moe_offload_cache is not None and hasattr(
-            self.moe_offload_cache, "seed_hot_experts"
-        ):
-            self.moe_offload_cache.seed_hot_experts()
-        if int(ENV.L2_PERSIST_MB.value or 0) > 0 and self.device.type == "cuda":
+        def _maybe_arm_l2_window(cur_pool) -> bool:
+            nonlocal l2_pinned
+            if l2_pinned or l2_mb <= 0 or cur_pool is None:
+                return False
             from freetoken.kernel.l2_persist import (
                 find_graph_pool_window,
                 set_stream_persisting_l2_window,
             )
 
-            dev_idx = 0 if self.device.index is None else int(self.device.index)
-            win = find_graph_pool_window(self.graph_pool, dev_idx)
-            if win is not None:
-                pinned_bytes = set_stream_persisting_l2_window(
-                    self.stream,
-                    win[0],
-                    win[1],
-                    max_window_mb=int(ENV.L2_PERSIST_MB.value),
+            win = find_graph_pool_window(cur_pool, dev_idx)
+            if win is None:
+                return False
+            pinned_bytes = set_stream_persisting_l2_window(
+                self.stream,
+                win[0],
+                win[1],
+                max_window_mb=l2_mb,
+                device_index=dev_idx,
+            )
+            if pinned_bytes <= 0:
+                return False
+            l2_pinned = True
+            logger.info_rank0(
+                f"Pinned persisting L2 cache window: {pinned_bytes / (1 << 20):.2f} MiB "
+                f"(graph pool segment {win[1] / (1 << 20):.2f} MiB)"
+            )
+            return True
+
+        _maybe_arm_l2_window(pool)
+        try:
+            for bs in pbar:
+                free_memory = get_free_memory(self.device)
+                pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
+                pbar.refresh()
+                graph = torch.cuda.CUDAGraph()
+                batch = Batch(
+                    reqs=[self.dummy_req] * bs,
+                    phase=self.phase,
+                    rows_per_req=self.rows_per_req,
                 )
-                if pinned_bytes > 0:
-                    logger.info_rank0(
-                        f"Pinned persisting L2 cache window: {pinned_bytes / (1 << 20):.2f} MiB "
-                        f"(graph pool segment {win[1] / (1 << 20):.2f} MiB)"
-                    )
+                batch.padded_reqs = batch.reqs
+                if self.batch_hook is not None:
+                    self.batch_hook(batch)
+                self.attn_backend.prepare_for_capture(batch)
+                self.buffer.set_batch(batch)
+                if self.linear_backend is not None:
+                    self.linear_backend.prepare_for_capture(batch)
+                with get_global_ctx().forward_batch(batch, **self.ctx_override):
+                    self._store_output(bs, self.forward())
+                    # Keep the offload cache warmed for capture. Resetting here forces
+                    # CUDA graph capture to replay cold-cache expert copies.
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self._store_output(bs, self.forward())
+                    if pool is None:
+                        pool = graph.pool()  # reuse cuda graph handle to reduce memory
+                        if _maybe_arm_l2_window(pool):
+                            # Re-capture the initial graph with accessPolicyWindow active on self.stream
+                            # so every instantiated cudaGraphExec_t node inherits the L2 policy.
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                                self._store_output(bs, self.forward())
+                    _upload_graph(graph, self.stream)
+                    self._reset_moe_offload_cache()
+                self.graph_map[bs] = graph
+        finally:
+            if l2_pinned:
+                from freetoken.kernel.l2_persist import (
+                    clear_stream_persisting_l2_window,
+                )
+
+                # Clear stream attribute so eager prefill runs with normal streaming L2,
+                # while keeping cudaLimitPersistingL2CacheSize active for graph replays.
+                clear_stream_persisting_l2_window(
+                    self.stream, reset_device_limit=False, device_index=dev_idx
+                )
+        self.graph_pool = pool
+        self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(
             f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}"
@@ -351,7 +377,10 @@ class GraphRunner:
         if self.device.type == "cuda":
             from freetoken.kernel.l2_persist import clear_stream_persisting_l2_window
 
-            clear_stream_persisting_l2_window(self.stream)
+            dev_idx = 0 if self.device.index is None else int(self.device.index)
+            clear_stream_persisting_l2_window(
+                self.stream, reset_device_limit=True, device_index=dev_idx
+            )
         self.graph_map = {}
         self.buffer = None
         self._out = None

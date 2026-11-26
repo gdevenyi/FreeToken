@@ -81,10 +81,11 @@ class PcieSysmemDistributedImpl(DistributedImpl):
         if (
             x.is_cuda
             and x.is_contiguous()
+            and (x.data_ptr() & 15) == 0
             and x.dtype in self._SUPPORTED_DTYPES
             and x.nbytes <= self.max_bytes
         ):
-            self.pcie_comm.all_reduce(x)
+            self.pcie_comm.all_reduce(x.view(-1))
             return x
         return self.fallback.all_reduce(x)
 
@@ -148,4 +149,11 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
-    DistributedCommunicator.plugins = []
+    from .info import set_tp_cpu_group
+
+    for plugin in reversed(DistributedCommunicator.plugins):
+        pcie_comm = getattr(plugin, "pcie_comm", None)
+        if pcie_comm is not None and hasattr(pcie_comm, "close"):
+            pcie_comm.close()
+    DistributedCommunicator.plugins = [TorchDistributedImpl()]
+    set_tp_cpu_group(None)

@@ -197,7 +197,8 @@ def quantize_ple_directory(
                     sq_ref += float((chunk**2).sum().item())
         total_rows += nrows
         out_name = f"ple-lut4-{part:05d}-of-{len(shards):05d}.safetensors"
-        pfx = f"model.layers.1.ple.ple_embedding.ngram_embedding.shard_{part}"
+        base_pfx = key[: key.index(".shard_")]
+        pfx = f"{base_pfx}.shard_{part}"
         tensors = {
             f"{pfx}.weight_packed": packed_out,
             f"{pfx}.weight_scale": scale_out,
@@ -215,6 +216,21 @@ def quantize_ple_directory(
     )
     rel_rmse = math.sqrt(sq_err / max(sq_ref, 1e-12))
     return {"shards": len(shards), "total_rows": total_rows, "rel_rmse": rel_rmse}
+
+
+def _pread_exact(fd: int, nbytes: int, offset: int) -> bytearray:
+    buf = bytearray(nbytes)
+    mv = memoryview(buf)
+    read = 0
+    while read < nbytes:
+        chunk = os.pread(fd, nbytes - read, offset + read)
+        if not chunk:
+            raise EOFError(
+                f"short pread at offset={offset + read}: wanted {nbytes} B, got {read} B"
+            )
+        mv[read : read + len(chunk)] = chunk
+        read += len(chunk)
+    return buf
 
 
 def _drop_page_cache(fd: int, offset: int, length: int) -> None:
@@ -263,10 +279,10 @@ def quantize_ple_gguf(
             # Read a contiguous prefix of `take` rows per shard to avoid random seeks.
             nbytes = take * row_bytes
             off = info.offset + part * shard_rows * row_bytes
-            raw = os.pread(fd, nbytes, off)
+            raw = _pread_exact(fd, nbytes, off)
             _drop_page_cache(fd, off, nbytes)
             sub = (
-                torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+                torch.frombuffer(raw, dtype=torch.bfloat16)
                 .view(take, cols)
                 .to(torch.float32)
             )
@@ -287,10 +303,10 @@ def quantize_ple_gguf(
                 r1 = min(shard_rows, r0 + chunk_rows)
                 nbytes = (r1 - r0) * row_bytes
                 off = shard_base + r0 * row_bytes
-                raw = os.pread(fd, nbytes, off)
+                raw = _pread_exact(fd, nbytes, off)
                 _drop_page_cache(fd, off, nbytes)
                 chunk = (
-                    torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+                    torch.frombuffer(raw, dtype=torch.bfloat16)
                     .view(r1 - r0, cols)
                     .to(torch.float32)
                 )

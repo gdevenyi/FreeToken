@@ -39,7 +39,8 @@ effect; "400" means the server refuses the request with a clear message.
 | `include_stop_str_in_output` | honoured | honoured | `no_stop_trim` | no |
 | `skip_special_tokens` | honoured; default off here, the reasoning and tool parsers read the tags | honoured (default on) | honoured (default on) | n/a |
 | `n` | 400 unless 1 | honoured | honoured | `n_cmpl` |
-| `stream`, `stream_options.include_usage` | honoured | honoured | honoured | honoured |
+| `stream`, `stream_options.include_usage`, `stream_options.continuous_usage_stats` | honoured | honoured | honoured | honoured |
+| `timings_per_token` | honoured on streams when `--enable-timings-report` is set | no | no | honoured |
 | `logprobs`, `top_logprobs` | accepted, ignored on this route (`/v1/completions` honours `logprobs`) | honoured | honoured | `n_probs` |
 | `tools`, `tool_choice` (`auto` / `none` / `required` / named), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
 | `reasoning_effort`, `thinking`, `chat_template_kwargs` | honoured | `chat_template_kwargs` | honoured | honoured |
@@ -63,7 +64,7 @@ effect; "400" means the server refuses the request with a clear message.
 | `suffix` | honoured on models with fill-in-the-middle tokens (`<|fim_prefix|>` ... `<|fim_middle|>`): the prompt becomes prefix-suffix-middle | 400 | 400 | `/infill` |
 | `n` | 400 unless 1 | honoured | honoured | no |
 | `logprobs` | honoured, 0..32: raw pre-temperature logprobs of the sampled token and its top alternatives; -inf is sent as -9999. With speculative decoding (`--spec-algo`) only with `max_tokens=1` (400 otherwise) | honoured (`--max-logprobs`, default 20) | honoured | `n_probs` |
-| `allowed_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: sampling is masked to them at every position. With `logprobs` the values are renormalized over the set (vLLM's `processed_logprobs` at temperature 0), so `temperature > 0`, penalties, `min_tokens` and `logit_bias` are a 400 there; entries past the set are left out | honoured (raw logprobs unless `--logprobs-mode processed_logprobs`) | no | no |
+| `allowed_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: sampling is masked to them at every position. With `logprobs` the values are renormalized over the set (vLLM's `processed_logprobs` at temperature 0; `temperature` defaults to `0` when omitted), so `temperature > 0`, `min_p > 0`, penalties, `min_tokens` and `logit_bias` are a 400 there; entries past the set are left out | honoured (raw logprobs unless `--logprobs-mode processed_logprobs`) | no | no |
 | `return_tokens_as_token_ids` | honoured: `tokens` and the `top_logprobs` keys are `token_id:N`, so ids that decode to the same text stay apart | honoured | n/a | no |
 
 Set values of the vLLM fields this server does not implement (`logprob_token_ids`,
@@ -85,7 +86,7 @@ Empty prompts and more than 256 prompts are a 400. Ids in `allowed_token_ids`, `
 | `usage.prompt_tokens_details.cached_tokens` | with `--enable-cache-report` | vLLM, SGLang: always |
 | `usage.completion_tokens_details.reasoning_tokens` | yes, when the model emitted a reasoning end tag | vLLM, SGLang |
 | streaming: one `[DONE]`, an optional final usage chunk | yes | |
-| llama.cpp `timings` | no; `/v1/stats` and `/metrics` carry the server-side rates | |
+| llama.cpp `timings` | with `--enable-timings-report` (and per-chunk on streams with `timings_per_token: true`) | `/v1/stats` and `/metrics` carry the server-side rates |
 
 ## Tokenize / detokenize
 

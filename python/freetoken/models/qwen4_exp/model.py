@@ -260,10 +260,21 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 )
             return 0
 
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        from .weight import (
+            is_lut4_ple_path,
+            load_ple_table,
+            load_ple_table_gguf,
+            load_ple_table_lut4,
+        )
+
         override = getattr(engine_config, "ple_table", None)
         if override:
             _check_ple_override(override, ple_layers[0])
         if engine_config.ple_backend == "disk":
+            if is_lut4_ple_path(override or engine_config.model_path):
+                raise ValueError("lut4-gptq PLE tables require --ple-backend pinned")
             from .ple_disk import DiskRowTable, resolve_row_source, source_from_gguf
 
             # one WAIT node per captured graph: the flag protocol supports a single consume
@@ -303,23 +314,22 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.forward_host_ctx = disk_table.forward_host_ctx
             return 0
 
-        from freetoken.models.gguf.reader import is_gguf_path
-
-        from .weight import (
-            is_lut4_ple_path,
-            load_ple_table,
-            load_ple_table_gguf,
-            load_ple_table_lut4,
-        )
-
+        ple_kwargs = {
+            "device": self.device,
+            "tp_cpu_group": engine_config.tp_cpu_group,
+        }
         if override:
             if is_lut4_ple_path(override):
-                table = load_ple_table_lut4(override, self._config.qwen4_args)
+                table = load_ple_table_lut4(
+                    override, self._config.qwen4_args, **ple_kwargs
+                )
             else:
-                table = load_ple_table_gguf(override, self._config.qwen4_args)
+                table = load_ple_table_gguf(
+                    override, self._config.qwen4_args, **ple_kwargs
+                )
         elif is_lut4_ple_path(engine_config.model_path):
             table = load_ple_table_lut4(
-                engine_config.model_path, self._config.qwen4_args
+                engine_config.model_path, self._config.qwen4_args, **ple_kwargs
             )
         elif is_gguf_path(engine_config.model_path):
             raise ValueError(
@@ -327,7 +337,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "a GGUF serves its own packed table with --ple-backend disk"
             )
         else:
-            table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
+            table = load_ple_table(
+                engine_config.model_path, self._config.qwen4_args, **ple_kwargs
+            )
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
             ple.ple_embedding.attach_table(
@@ -340,15 +352,6 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 )
             )
         return table.bank.nbytes
-
-    def prepare_for_runtime(self) -> None:
-        """Repack any ``Int8G32Linear`` dense / ``hc8`` projections into Marlin ``uint8b128`` on CUDA."""
-        from freetoken.layers import iter_ops
-        from freetoken.layers.int8_g32 import Int8G32Linear
-
-        for op in iter_ops(self):
-            if isinstance(op, Int8G32Linear):
-                op.prepare_marlin()
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

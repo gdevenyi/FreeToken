@@ -104,6 +104,7 @@ def set_stream_persisting_l2_window(
     num_bytes: int,
     *,
     max_window_mb: int = 32,
+    device_index: int | None = None,
     cudart=None,
 ) -> int:
     """Attach a persisting L2 access policy window on ``stream`` covering ``[base_ptr, +window_bytes)``.
@@ -117,17 +118,25 @@ def set_stream_persisting_l2_window(
     if rt is None:
         return 0
 
-    dev = ctypes.c_int(0)
-    if rt.cudaGetDevice(ctypes.byref(dev)) != 0:
-        rt.cudaGetLastError()
-        return 0
+    if device_index is None:
+        stream_dev = getattr(stream, "device_index", None)
+        if isinstance(stream_dev, int) and stream_dev >= 0:
+            dev_idx = stream_dev
+        else:
+            dev = ctypes.c_int(0)
+            if rt.cudaGetDevice(ctypes.byref(dev)) != 0:
+                rt.cudaGetLastError()
+                return 0
+            dev_idx = int(dev.value)
+    else:
+        dev_idx = int(device_index)
 
     max_persisting = ctypes.c_int(0)
     if (
         rt.cudaDeviceGetAttribute(
             ctypes.byref(max_persisting),
             _CUDA_DEV_ATTR_MAX_PERSISTING_L2_CACHE_SIZE,
-            int(dev.value),
+            dev_idx,
         )
         != 0
     ):
@@ -141,7 +150,7 @@ def set_stream_persisting_l2_window(
         rt.cudaDeviceGetAttribute(
             ctypes.byref(max_policy_win),
             _CUDA_DEV_ATTR_MAX_ACCESS_POLICY_WINDOW_SIZE,
-            int(dev.value),
+            dev_idx,
         )
         != 0
     ):
@@ -154,38 +163,53 @@ def set_stream_persisting_l2_window(
     if limit_bytes <= 0:
         return 0
 
-    if (
-        rt.cudaDeviceSetLimit(
-            _CUDA_LIMIT_PERSISTING_L2_CACHE_SIZE,
-            limit_bytes,
-        )
-        != 0
-    ):
-        rt.cudaGetLastError()
-        return 0
+    ctx = (
+        torch.cuda.device(dev_idx)
+        if cudart is None and torch.cuda.is_available()
+        else None
+    )
+    if ctx is not None:
+        ctx.__enter__()
+    try:
+        if (
+            rt.cudaDeviceSetLimit(
+                _CUDA_LIMIT_PERSISTING_L2_CACHE_SIZE,
+                limit_bytes,
+            )
+            != 0
+        ):
+            rt.cudaGetLastError()
+            return 0
 
-    window_bytes = min(int(num_bytes), limit_bytes)
-    attr = _CudaStreamAttrValue()
-    attr.accessPolicyWindow.base_ptr = int(base_ptr)
-    attr.accessPolicyWindow.num_bytes = int(window_bytes)
-    attr.accessPolicyWindow.hitRatio = 1.0
-    attr.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_PERSISTING
-    attr.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_NORMAL
-    if (
-        rt.cudaStreamSetAttribute(
-            int(stream.cuda_stream),
-            _CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
-            ctypes.byref(attr),
-        )
-        != 0
-    ):
-        rt.cudaGetLastError()
-        return 0
-    return window_bytes
+        window_bytes = min(int(num_bytes), limit_bytes)
+        attr = _CudaStreamAttrValue()
+        attr.accessPolicyWindow.base_ptr = int(base_ptr)
+        attr.accessPolicyWindow.num_bytes = int(window_bytes)
+        attr.accessPolicyWindow.hitRatio = 1.0
+        attr.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_PERSISTING
+        attr.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_NORMAL
+        if (
+            rt.cudaStreamSetAttribute(
+                int(stream.cuda_stream),
+                _CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
+                ctypes.byref(attr),
+            )
+            != 0
+        ):
+            rt.cudaGetLastError()
+            return 0
+        return window_bytes
+    finally:
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
 
 
 def clear_stream_persisting_l2_window(
-    stream: torch.cuda.Stream | None, *, cudart=None
+    stream: torch.cuda.Stream | None,
+    *,
+    reset_device_limit: bool = False,
+    device_index: int | None = None,
+    cudart=None,
 ) -> None:
     """Reset any persisting L2 access policy window on ``stream`` back to normal."""
     if stream is None:
@@ -193,15 +217,37 @@ def clear_stream_persisting_l2_window(
     rt = cudart if cudart is not None else _load_cudart()
     if rt is None:
         return
-    attr = _CudaStreamAttrValue()
-    attr.accessPolicyWindow.base_ptr = 0
-    attr.accessPolicyWindow.num_bytes = 0
-    attr.accessPolicyWindow.hitRatio = 0.0
-    attr.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_NORMAL
-    attr.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_NORMAL
-    rt.cudaStreamSetAttribute(
-        int(stream.cuda_stream),
-        _CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
-        ctypes.byref(attr),
+    dev_idx = (
+        int(device_index)
+        if device_index is not None
+        else getattr(stream, "device_index", None)
     )
-    rt.cudaGetLastError()
+    ctx = (
+        torch.cuda.device(dev_idx)
+        if cudart is None
+        and isinstance(dev_idx, int)
+        and dev_idx >= 0
+        and torch.cuda.is_available()
+        else None
+    )
+    if ctx is not None:
+        ctx.__enter__()
+    try:
+        attr = _CudaStreamAttrValue()
+        attr.accessPolicyWindow.base_ptr = 0
+        attr.accessPolicyWindow.num_bytes = 0
+        attr.accessPolicyWindow.hitRatio = 0.0
+        attr.accessPolicyWindow.hitProp = _CUDA_ACCESS_PROPERTY_NORMAL
+        attr.accessPolicyWindow.missProp = _CUDA_ACCESS_PROPERTY_NORMAL
+        rt.cudaStreamSetAttribute(
+            int(stream.cuda_stream),
+            _CUDA_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
+            ctypes.byref(attr),
+        )
+        rt.cudaGetLastError()
+        if reset_device_limit:
+            rt.cudaDeviceSetLimit(_CUDA_LIMIT_PERSISTING_L2_CACHE_SIZE, 0)
+            rt.cudaGetLastError()
+    finally:
+        if ctx is not None:
+            ctx.__exit__(None, None, None)

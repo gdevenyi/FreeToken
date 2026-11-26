@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Generic, TypeVar
+from typing import Generic, TypeVar
 
 
 class BaseEnv:
@@ -27,22 +28,21 @@ class EnvVar(BaseEnv, Generic[T]):
             except Exception:
                 pass
 
-    def __bool__(self):
-        return self.value
+    def __bool__(self) -> bool:
+        return bool(self.value)
 
     def __str__(self):
         return str(self.value)
 
 
-_TO_BOOL = lambda x: x.lower() in ("1", "true", "yes")
+_TO_BOOL = lambda x: x.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _PARSE_MEM_BYTES(mem: str) -> int:
     mem = mem.strip().upper()
     if not mem[-1].isalpha():
         return int(mem)
-    if mem.endswith("B"):
-        mem = mem[:-1]
+    mem = mem.removesuffix("B")
     UNIT_MAP = {"K": 1024, "M": 1024**2, "G": 1024**3}
     return int(float(mem[:-1]) * UNIT_MAP[mem[-1]])
 

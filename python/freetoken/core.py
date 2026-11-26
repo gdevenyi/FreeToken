@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -62,6 +62,14 @@ class SamplingParams:
     # only by the /v1/internal/kld endpoint (--enable-kld-endpoint); see freetoken.benchmark.kld.
     kld: dict | None = None
 
+    def __post_init__(self) -> None:
+        if self.repetition_penalty <= 0.0 or not (
+            self.repetition_penalty == self.repetition_penalty
+        ):
+            raise ValueError(
+                f"repetition_penalty must be > 0, got {self.repetition_penalty}"
+            )
+
     def client_token_ids(self) -> list[tuple[str, list[int]]]:
         """The token ids a client supplied, by request field (empty ones left out): each
         must be checked against the tokenizer before the request reaches the engine."""
@@ -107,14 +115,16 @@ class ReqStats:
     predicted = first token -> last committed token. One instance is shared by
     every chunk Req of a request, so the stamps survive chunked prefill."""
 
-    enqueued_at: float | None = None     # entered the scheduler's waiting queue
+    enqueued_at: float | None = None  # entered the scheduler's waiting queue
     first_chunk_at: float | None = None  # first prefill chunk launched
     first_token_at: float | None = None  # first sampled token back on the host
-    last_token_at: float | None = None   # last committed token
-    cache_n: int = 0                     # prompt tokens served from the prefix cache at admission
-    prompt_n: int = 0                    # prompt tokens actually computed
-    draft_n: int = 0                     # drafted tokens summed over verify steps
-    draft_n_accepted: int = 0            # accepted drafts that were committed, after stop truncation
+    last_token_at: float | None = None  # last committed token
+    cache_n: int = 0  # prompt tokens served from the prefix cache at admission
+    prompt_n: int = 0  # prompt tokens actually computed
+    draft_n: int = 0  # drafted tokens summed over verify steps
+    draft_n_accepted: int = (
+        0  # accepted drafts that were committed, after stop truncation
+    )
 
     def stamp_token(self, now: float) -> None:
         if self.first_token_at is None:
@@ -128,13 +138,16 @@ class ReqStats:
             return None
         return {
             "queue_ms": (self.first_chunk_at - self.enqueued_at) * 1000.0
-            if self.enqueued_at is not None else 0.0,
+            if self.enqueued_at is not None
+            else 0.0,
             "cache_n": self.cache_n,
             "prompt_n": self.prompt_n,
             "prompt_ms": (self.first_token_at - self.first_chunk_at) * 1000.0,
             "predicted_n": completion_tokens,
             # 1 us floor as in llama.cpp: the first token can land in the same instant
-            "predicted_ms": max((self.last_token_at - self.first_token_at) * 1000.0, 0.001),
+            "predicted_ms": max(
+                (self.last_token_at - self.first_token_at) * 1000.0, 0.001
+            ),
             "draft_n": self.draft_n,
             "draft_n_accepted": self.draft_n_accepted,
         }
@@ -158,17 +171,27 @@ class Req:
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
-    linear_slot_idx: int | None = None              # live GDN state slot (sglang mamba_pool_idx)
-    mamba_ping_pong: tuple[int, int] | None = None  # 2 donatable track slots under overlap
-    mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
-    mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
-    mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
-    mamba_restore_host: int | None = None           # the same from the host bank (--mamba-host-slots), when the tree's copy is there
-    kv_restore: Any = None                          # --kv-host-tier-gb: the KVRestore copies before the first forward (first chunk only)
-    gdn_track: bool = True                          # this prefill chunk snapshots its deepest x64 boundary (structural policy: only at a snapshot point)
-    snapshot_pin: int | None = None                 # structural policy: the first turn boundary, whose snapshot is pinned
-    swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
-    decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
+    linear_slot_idx: int | None = None  # live GDN state slot (sglang mamba_pool_idx)
+    mamba_ping_pong: tuple[int, int] | None = (
+        None  # 2 donatable track slots under overlap
+    )
+    mamba_next_track_idx: int = 0  # which ping-pong slot is the next snapshot dst (0/1)
+    mamba_last_track_seqlen: int | None = (
+        None  # chunk-aligned committed len of the last snapshot
+    )
+    mamba_restore_src: int | None = (
+        None  # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
+    )
+    mamba_restore_host: int | None = (
+        None  # the same from the host bank (--mamba-host-slots), when the tree's copy is there
+    )
+    kv_restore: Any = None  # --kv-host-tier-gb: the KVRestore copies before the first forward (first chunk only)
+    gdn_track: bool = True  # this prefill chunk snapshots its deepest x64 boundary (structural policy: only at a snapshot point)
+    snapshot_pin: int | None = (
+        None  # structural policy: the first turn boundary, whose snapshot is pinned
+    )
+    swa_evicted_seqlen: int = 0  # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
+    decode_batch_idx: int = 0  # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
     # length just after that token (its index + 1). A client-side rewrite of the echoed tool
     # call diverges strictly after this point, so it is the deepest reuse boundary that
@@ -176,7 +199,9 @@ class Req:
     # reaches it (snapshot_toolcall_anchor) and donated at finish. SWA: caps the proactive
     # out-of-window eviction so the window ending here stays resumable.
     toolcall_anchor_len: int | None = None
-    toolcall_anchor_counted: bool = False            # KVSTATS: this anchor's outcome is counted (statistics only)
+    toolcall_anchor_counted: bool = (
+        False  # KVSTATS: this anchor's outcome is counted (statistics only)
+    )
     # Abort arrived while this request's forward was in flight (overlap scheduling). The abort
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
@@ -184,7 +209,9 @@ class Req:
     # Timing/draft counters shared with every other chunk Req of this request (set by
     # the PrefillManager from the PendingReq's instance; a default blank otherwise).
     stats: ReqStats = field(default_factory=ReqStats, init=False, repr=False)
-    output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
+    output_token_counts: torch.Tensor | None = field(
+        default=None, init=False, repr=False
+    )
     # [vocab] bool on the device: the prompt's ids, for repetition_penalty. Built once.
     prompt_token_mask: torch.Tensor | None = field(default=None, init=False, repr=False)
 
@@ -241,10 +268,9 @@ class Req:
         )
 
 
-
 @dataclass
 class Batch:
-    reqs: List[Req]
+    reqs: list[Req]
     phase: Literal["prefill", "decode", "verify"]
     # query rows per request: 1 on decode, more on verify, None on prefill (ragged)
     rows_per_req: int | None = None
@@ -257,13 +283,13 @@ class Batch:
     # Per-forward GatedDeltaNet metadata (cu_seqlens / cache_indices / continuation
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.
-    fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
-    padded_reqs: List[Req] = field(init=False)
+    fla_metadata: FLAMetadata | None = field(default=None, init=False)
+    padded_reqs: list[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read
     # positions anywhere in a request's history snapshot those rows before a captured replay
     # (DSV4), since the next batch's allocate_paged mutates the live table.
-    active_table_idx: "torch.Tensor | None" = None
+    active_table_idx: torch.Tensor | None = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
@@ -284,9 +310,11 @@ class Batch:
     # prepared prefill batch. The scheduler turns these into PromptAdmittedMsg only AFTER
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
-    prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    prompt_admissions: list[tuple[int, int, int]] = field(
+        default_factory=list, init=False
+    )
     # per-row hidden states a draft model reads from this forward; None when nothing reads them
-    features: "FeatureSink | None" = field(default=None, init=False)
+    features: FeatureSink | None = field(default=None, init=False)
     # the lm_head scores every row of this cold prefill against a KLD base chunk; None otherwise
     kld: KldCapture | None = field(default=None, init=False)
 
@@ -294,7 +322,9 @@ class Batch:
         if self.rows_per_req is None and self.phase == "decode":
             self.rows_per_req = 1
         # without it, input_mapping[0][::None] would read every row as its own request
-        assert self.phase != "verify" or self.rows_per_req is not None, "a verify batch needs rows_per_req"
+        assert self.phase != "verify" or self.rows_per_req is not None, (
+            "a verify batch needs rows_per_req"
+        )
 
     @property
     def is_prefill(self) -> bool:
@@ -305,7 +335,9 @@ class Batch:
         return self.phase == "decode"
 
     def get_attn_positions(self) -> torch.Tensor:
-        return self.mrope_positions if self.mrope_positions is not None else self.positions
+        return (
+            self.mrope_positions if self.mrope_positions is not None else self.positions
+        )
 
     @property
     def size(self) -> int:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -9,17 +8,17 @@ from .utils import deserialize_type, serialize_type
 @dataclass
 class BaseFrontendMsg:
     @staticmethod
-    def encoder(msg: BaseFrontendMsg) -> Dict:
+    def encoder(msg: BaseFrontendMsg) -> dict:
         return serialize_type(msg)
 
     @staticmethod
-    def decoder(json: Dict) -> BaseFrontendMsg:
+    def decoder(json: dict) -> BaseFrontendMsg:
         return deserialize_type(globals(), json)
 
 
 @dataclass
 class BatchFrontendMsg(BaseFrontendMsg):
-    data: List[BaseFrontendMsg]
+    data: list[BaseFrontendMsg]
 
 
 @dataclass
@@ -61,6 +60,9 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # True when generation stopped specifically on a client stop_token_id (not natural EOS).
+    # None when synthesized by unit-test doubles that do not populate this field.
+    hit_stop_token: bool | None = None
     # On the finished reply: tokens generated up to and including the reasoning end tag
     # (0 when the model emitted none) -> usage.completion_tokens_details.reasoning_tokens.
     reasoning_tokens: int = 0

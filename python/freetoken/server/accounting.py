@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from ipaddress import IPv6Address, ip_address
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -65,9 +66,13 @@ async def prepare_stop_accounting(
 
         maintenance = getattr(state, "maintenance_state", "serving")
         if maintenance == "rebuilding":
-            raise AccountingDrainError("cache rebuild is in progress; retry stop after it finishes")
+            raise AccountingDrainError(
+                "cache rebuild is in progress; retry stop after it finishes"
+            )
         if maintenance not in {"loading", "serving", "stopping", "failed"}:
-            raise AccountingDrainError(f"engine cannot prepare stop from state {maintenance!r}")
+            raise AccountingDrainError(
+                f"engine cannot prepare stop from state {maintenance!r}"
+            )
 
         # This assignment and FrontendManager.new_user's check run on the same event loop, making
         # the generation gate atomic with respect to every protocol adapter.
@@ -84,8 +89,10 @@ async def prepare_stop_accounting(
                 )
             try:
                 await asyncio.gather(*(state.abort_user(uid) for uid in inflight))
-            except Exception as exc:  # noqa: BLE001 -- preserve engine on any abort transport error
-                raise AccountingDrainError(f"failed to abort active requests: {exc}") from exc
+            except Exception as exc:
+                raise AccountingDrainError(
+                    f"failed to abort active requests: {exc}"
+                ) from exc
             if not await _wait_for_idle(stats, abort_timeout_s):
                 raise AccountingDrainError(
                     f"accounting abort barrier timed out with {stats.active} request(s) still active"
@@ -131,7 +138,17 @@ def _is_loopback(host: str | None) -> bool:
 
 
 def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> None:
-    async def _admission_closed(_: Request, exc: AdmissionClosedError) -> JSONResponse:
+    async def _admission_closed(
+        request: Request, exc: AdmissionClosedError
+    ) -> JSONResponse:
+        if request.url.path.startswith("/v1/messages"):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": str(exc)},
+                },
+            )
         return JSONResponse(status_code=503, content={"error": str(exc)})
 
     app.add_exception_handler(AdmissionClosedError, _admission_closed)
@@ -142,7 +159,9 @@ def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> No
         # remotely callable part of an engine bound to 0.0.0.0. The daemon/Desktop control plane
         # is intentionally colocated and always reaches it over loopback.
         if not _is_loopback(request.client.host if request.client else None):
-            return JSONResponse(status_code=403, content={"error": "loopback access required"})
+            return JSONResponse(
+                status_code=403, content={"error": "loopback access required"}
+            )
         body = body or PrepareStopBody()
         try:
             return await prepare_stop_accounting(
@@ -153,5 +172,9 @@ def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> No
         except AccountingDrainError as exc:
             return JSONResponse(
                 status_code=503,
-                content={"error": str(exc), "drain_complete": False, "engine_preserved": True},
+                content={
+                    "error": str(exc),
+                    "drain_complete": False,
+                    "engine_preserved": True,
+                },
             )

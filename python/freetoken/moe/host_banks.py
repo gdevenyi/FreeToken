@@ -88,6 +88,7 @@ _DEFAULT_CHUNK = 8 << 20
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
 
+
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
     v = os.environ.get("FREETOKEN_BANK_CUDA_ALLOC", "").strip().lower()
@@ -116,8 +117,14 @@ class HostBank:
 
     __slots__ = ("_buf", "_locked", "_pinned", "addr", "nbytes", "tensor")
 
-    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None, _shared_buf: mmap.mmap | None = None):
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        backing: str | None = None,
+        _shared_buf: mmap.mmap | None = None,
+    ):
         if _shared_buf is None:
             if backing is None:
                 plan = _requested_residency
@@ -142,16 +149,20 @@ class HostBank:
             raw = alloc_pinned_tensor(asize + _BLK, dtype=torch.uint8)  # cudaMallocHost
             raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
             off = (-raw.data_ptr()) % _BLK
-            self._buf = raw.numpy()[off:off + asize]
+            self._buf = raw.numpy()[off : off + asize]
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            self._buf = mmap.mmap(
+                -1, asize
+            )  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
-        self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
+        self.tensor = torch.frombuffer(
+            self._buf, dtype=dtype, count=self.nbytes // elsize
+        ).view(*shape)
         self._locked = False
 
     @property
@@ -171,7 +182,12 @@ class HostBank:
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
         if self._pinned:
             return
-        if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+        if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
             return
         from freetoken.kernel.pinned import host_register
 
@@ -180,7 +196,9 @@ class HostBank:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             refund_pin(len(self._buf))
-            raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
+            raise PinFailed(
+                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+            ) from exc
         self._pinned = True
 
     def unpin(self) -> None:
@@ -214,7 +232,9 @@ class HostBank:
             _os_lock(self.addr, len(self._buf))
         except (OSError, ImportError) as exc:
             _os_lock_failed = True
-            logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
+            logger.warning(
+                f"bank lock failed; leaving this and later banks pageable: {exc}"
+            )
             return
         self._locked = True
 
@@ -249,7 +269,9 @@ def _os_lock(addr: int, nbytes: int) -> None:
     _os_locked_total += nbytes
 
 
-def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
+def alloc_banks(
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+) -> dict[str, HostBank]:
     """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
 
@@ -305,15 +327,20 @@ def _settle(bank: HostBank, residency: str) -> None:
         bank.lock()
 
 
-def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]]) -> None:
+def pin_banks(
+    banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]],
+) -> None:
     """Settle every bank after it has been filled -- pin-after-fill by default.
     List-valued entries (indexed by layer id) and dict-valued ones (layer id -> bank) are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin."""
     plan = _requested_residency
     for bank in banks.values():
         if isinstance(bank, (list, dict)):
-            for layer_id, layer_bank in bank.items() if isinstance(bank, dict) else enumerate(bank):
+            for layer_id, layer_bank in (
+                bank.items() if isinstance(bank, dict) else enumerate(bank)
+            ):
                 residency = (
-                    HostResidency.PINNED.value if plan is None
+                    HostResidency.PINNED.value
+                    if plan is None
                     else plan.residency_for(layer_id)
                 )
                 if residency == HostResidency.DEFERRED.value:
@@ -327,7 +354,9 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]])
 
 
 def _wddm() -> bool:
-    return sys.platform == "win32" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower())
+    return sys.platform == "win32" or (
+        hasattr(os, "uname") and "microsoft" in os.uname().release.lower()
+    )
 
 
 def pin_capped() -> bool:
@@ -337,10 +366,15 @@ def pin_capped() -> bool:
 
 def _probe_margin() -> int:
     """FREETOKEN_PIN_PROBE_MARGIN_GB, else 3 GiB under WDDM (WSL and native Windows)."""
-    return int(float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "3" if _wddm() else "0")) * 2**30)
+    return int(
+        float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "3" if _wddm() else "0"))
+        * 2**30
+    )
 
 
-def probe_pin(plan: _ResidencyPlan, num_layers: int, margin_bytes: int | None = None) -> list[str]:
+def probe_pin(
+    plan: _ResidencyPlan, num_layers: int, margin_bytes: int | None = None
+) -> list[str]:
     """Settle the DEFERRED layers: pin middle layers first until a pin fails, OS-lock the rest; returns each layer's residency.
 
     After a refusal, the last pinned layers give back at least ``margin_bytes`` (default ``_probe_margin()``)."""
@@ -376,7 +410,9 @@ def probe_pin(plan: _ResidencyPlan, num_layers: int, margin_bytes: int | None = 
         for bank in banks:
             bank.lock()
         labels[layer] = (
-            HostResidency.LOCKED.value if all(b.residency is HostResidency.LOCKED for b in banks) else HostResidency.PAGEABLE.value
+            HostResidency.LOCKED.value
+            if all(b.residency is HostResidency.LOCKED for b in banks)
+            else HostResidency.PAGEABLE.value
         )
     return labels
 
@@ -393,7 +429,9 @@ class PinPipeline:
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
         # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
-        self._device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        self._device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        )
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -417,8 +455,13 @@ class PinPipeline:
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
-    def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
-               plan=None, layer_id: int | None = None) -> None:
+    def submit(
+        self,
+        bank: HostBank,
+        residency: str = HostResidency.PINNED.value,
+        plan=None,
+        layer_id: int | None = None,
+    ) -> None:
         self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
@@ -477,11 +520,19 @@ class LayerCompletionTracker:
             self._counts[layer_id] = n
             fire = n == self._expected
         if fire:
-            self._on_layer(layer_id, {name: per[layer_id] for name, per in self._banks.items()})
+            self._on_layer(
+                layer_id, {name: per[layer_id] for name, per in self._banks.items()}
+            )
 
 
-def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
-                   chunk: int = _DEFAULT_CHUNK, drop_cache: bool = True) -> int:
+def read_file_into(
+    buf: memoryview | mmap.mmap,
+    path: str,
+    *,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
+    drop_cache: bool = True,
+) -> int:
     """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
@@ -499,7 +550,7 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     def rd(o):
         want = min(chunk, len(mv) - o)
         want = min(want, ((size - o + _BLK - 1) // _BLK) * _BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        os.preadv(fd, [mv[o : o + want]], o)
 
     try:
         if len(offs) <= 1:
@@ -518,23 +569,35 @@ def _preadv_all(fd: int, dst: memoryview, offset: int, need: int) -> None:
     done = 0
     while done < need:
         if done % _BLK:  # a continuation read has to stay block-aligned on both sides
-            raise OSError(f"unaligned short O_DIRECT read: {done} of {need} bytes at {offset}")
+            raise OSError(
+                f"unaligned short O_DIRECT read: {done} of {need} bytes at {offset}"
+            )
         got = os.preadv(fd, [dst[done:]], offset + done)
         if got <= 0:
             raise OSError(f"short O_DIRECT read: {done} of {need} bytes at {offset}")
         done += got
 
 
-def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int, nbytes: int,
-                    dest_offset: int = 0, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
-                    drop_cache: bool = True) -> int:
+def read_range_into(
+    buf: memoryview | mmap.mmap,
+    path: str,
+    *,
+    file_offset: int,
+    nbytes: int,
+    dest_offset: int = 0,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
+    drop_cache: bool = True,
+) -> int:
     """Chunked multi-threaded O_DIRECT read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``. Returns ``nbytes``.
 
     Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. O_DIRECT needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
     """
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
     if dest_offset + nbytes > len(mv):
-        raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
+        raise ValueError(
+            f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}"
+        )
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
         try:
@@ -550,16 +613,18 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         n = min(chunk, nbytes - i)
         src, dst = file_offset + i, dest_offset + i
         if src % _BLK == 0 and (base + dst) % _BLK == 0 and n % _BLK == 0:
-            _preadv_all(fd, mv[dst:dst + n], src, n)
+            _preadv_all(fd, mv[dst : dst + n], src, n)
             return
         head = src % _BLK
         span = ((head + n + _BLK - 1) // _BLK) * _BLK
         bounce = getattr(scratch, "buf", None)
         if bounce is None or len(bounce) < span:
-            bounce = scratch.buf = mmap.mmap(-1, span)  # anonymous mmaps are page-aligned
+            bounce = scratch.buf = mmap.mmap(
+                -1, span
+            )  # anonymous mmaps are page-aligned
         bmv = memoryview(bounce)
         _preadv_all(fd, bmv[:span], src - head, head + n)
-        mv[dst:dst + n] = bmv[head:head + n]
+        mv[dst : dst + n] = bmv[head : head + n]
 
     try:
         offs = list(range(0, nbytes, chunk))
@@ -592,8 +657,14 @@ def parse_cpulist(spec: str) -> set[int]:
 def _device_pci_bdf(device: torch.device | int | None) -> str | None:
     if not torch.cuda.is_available():
         return None
-    idx = torch.cuda.current_device() if device is None else (
-        device if isinstance(device, int) else (device.index if device.type == "cuda" else None)
+    idx = (
+        torch.cuda.current_device()
+        if device is None
+        else (
+            device
+            if isinstance(device, int)
+            else (device.index if device.type == "cuda" else None)
+        )
     )
     if idx is None:
         return None
@@ -624,7 +695,9 @@ def _device_pci_bdf(device: torch.device | int | None) -> str | None:
     return None
 
 
-def device_numa_cpus(device: torch.device | int | None = None, *, sysfs: str = "/sys") -> set[int] | None:
+def device_numa_cpus(
+    device: torch.device | int | None = None, *, sysfs: str = "/sys"
+) -> set[int] | None:
     """Logical CPUs of ``device``'s PCIe NUMA node, restricted to the current affinity mask, or ``None``."""
     bdf = _device_pci_bdf(device)
     if not bdf:
@@ -634,7 +707,9 @@ def device_numa_cpus(device: torch.device | int | None = None, *, sysfs: str = "
             node = int(f.read().strip())
         if node < 0:
             return None
-        with open(os.path.join(sysfs, "devices", "system", "node", f"node{node}", "cpulist")) as f:
+        with open(
+            os.path.join(sysfs, "devices", "system", "node", f"node{node}", "cpulist")
+        ) as f:
             cpus = parse_cpulist(f.read())
     except (OSError, ValueError):
         return None
@@ -649,7 +724,11 @@ def device_numa_cpus(device: torch.device | int | None = None, *, sysfs: str = "
 @contextlib.contextmanager
 def thread_affinity(cpus: set[int] | None):
     """Temporarily bind the current thread (and worker threads it spawns) to ``cpus``."""
-    if not cpus or not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+    if (
+        not cpus
+        or not hasattr(os, "sched_getaffinity")
+        or not hasattr(os, "sched_setaffinity")
+    ):
         yield
         return
     try:
@@ -686,7 +765,12 @@ def rank_host_affinity():
 
 
 def _shared_ple_enabled() -> bool:
-    return os.environ.get("FREETOKEN_SHARED_PLE", "1").strip().lower() not in ("0", "false", "no", "off")
+    return os.environ.get("FREETOKEN_SHARED_PLE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def build_shared_bank(
@@ -726,9 +810,10 @@ def build_shared_bank(
 
     rank = dist.get_rank(group)
     nodename = os.uname().nodename if hasattr(os, "uname") else "localhost"
-    peers: list[tuple[int, str]] = [(0, "")] * world
-    dist.all_gather_object(peers, (rank, nodename), group=group)
-    same_host = sorted(r for r, n in peers if n == nodename)
+    numa_key = tuple(sorted(numa_cpus)) if numa_cpus else ()
+    peers: list[tuple[int, str, tuple[int, ...]]] = [(0, "", ())] * world
+    dist.all_gather_object(peers, (rank, nodename, numa_key), group=group)
+    same_host = sorted(r for r, n, nk in peers if n == nodename and nk == numa_key)
     leader = same_host[0]
 
     elsize = torch.empty((), dtype=dtype).element_size()
@@ -737,58 +822,87 @@ def build_shared_bank(
 
     offer: str | None = None
     shared_buf: mmap.mmap | None = None
-    if rank == leader and len(same_host) > 1:
-        try:
-            st = os.statvfs(shm_dir)
-            if st.f_bavail * st.f_frsize >= asize + (64 << 20):
-                path = os.path.join(shm_dir, f"freetoken-ple-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    attach_errs: list[str | None] = [None] * world
+    try:
+        if rank == leader and len(same_host) > 1:
+            try:
                 try:
-                    os.ftruncate(fd, asize)
-                    shared_buf = mmap.mmap(fd, asize, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-                except BaseException:
+                    for entry in os.listdir(shm_dir):
+                        if not entry.startswith("freetoken-ple-"):
+                            continue
+                        pid_s = entry[len("freetoken-ple-") :].split("-", 1)[0]
+                        try:
+                            pid_i = int(pid_s)
+                        except ValueError:
+                            continue
+                        try:
+                            os.kill(pid_i, 0)
+                        except ProcessLookupError:
+                            try:
+                                os.unlink(os.path.join(shm_dir, entry))
+                            except OSError:
+                                pass
+                        except PermissionError:
+                            continue
+                except OSError:
+                    pass
+                st = os.statvfs(shm_dir)
+                if st.f_bavail * st.f_frsize >= asize + (64 << 20):
+                    path = os.path.join(
+                        shm_dir, f"freetoken-ple-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                    )
+                    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                    offer = path
                     try:
-                        os.unlink(path)
+                        os.ftruncate(fd, asize)
+                        shared_buf = mmap.mmap(
+                            fd, asize, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+                        )
+                    finally:
+                        os.close(fd)
+            except OSError:
+                if offer is not None:
+                    try:
+                        os.unlink(offer)
                     except OSError:
                         pass
-                    raise
+                if shared_buf is not None:
+                    shared_buf.close()
+                shared_buf = None
+                offer = None
+
+        offers: list[str | None] = [None] * world
+        dist.all_gather_object(offers, offer, group=group)
+        shm_path = offers[leader]
+
+        attach_err: str | None = None
+        if shm_path is not None and rank != leader:
+            try:
+                fd = os.open(shm_path, os.O_RDWR)
+                try:
+                    shared_buf = mmap.mmap(
+                        fd, asize, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+                    )
                 finally:
                     os.close(fd)
-                offer = path
-        except OSError:
-            shared_buf = None
-            offer = None
+            except BaseException as exc:
+                attach_err = repr(exc)
 
-    offers: list[str | None] = [None] * world
-    dist.all_gather_object(offers, offer, group=group)
-    shm_path = offers[leader]
-
-    attach_err: str | None = None
-    if shm_path is not None and rank != leader:
-        try:
-            fd = os.open(shm_path, os.O_RDWR)
-            try:
-                shared_buf = mmap.mmap(fd, asize, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-            finally:
-                os.close(fd)
-        except BaseException as exc:
-            attach_err = repr(exc)
-
-    try:
-        attach_errs: list[str | None] = [None] * world
         dist.all_gather_object(attach_errs, attach_err, group=group)
     finally:
-        if shm_path is not None and rank == leader:
+        if offer is not None:
             try:
-                os.unlink(shm_path)
+                os.unlink(offer)
             except OSError:
                 pass
 
-    host_attach_errs = [attach_errs[r] for r in same_host if attach_errs[r] is not None]
-    if host_attach_errs:
+    all_attach_errs = [e for e in attach_errs if e is not None]
+    if all_attach_errs:
         if shared_buf is not None:
             shared_buf.close()
-        raise RuntimeError(f"shared host bank attach failed on {nodename}: {host_attach_errs[0]}")
+        raise RuntimeError(
+            f"shared host bank attach failed on {nodename}: {all_attach_errs[0]}"
+        )
 
     if shm_path is None:
         if len(same_host) > 1 and rank == leader:
@@ -806,7 +920,13 @@ def build_shared_bank(
         fill_errs: list[str | None] = [None] * world
         dist.all_gather_object(fill_errs, fill_err, group=group)
         if any(fill_errs):
-            raise RuntimeError(f"host bank fill failed: {next(e for e in fill_errs if e)}")
+            if bank._buf in _LIVE_BUFFERS:
+                _LIVE_BUFFERS.remove(bank._buf)
+            if hasattr(bank._buf, "close"):
+                bank._buf.close()
+            raise RuntimeError(
+                f"host bank fill failed: {next(e for e in fill_errs if e)}"
+            )
         return bank
 
     assert shared_buf is not None
@@ -821,7 +941,12 @@ def build_shared_bank(
     fill_errs = [None] * world
     dist.all_gather_object(fill_errs, fill_err, group=group)
     if any(fill_errs):
-        raise RuntimeError(f"shared host bank fill failed: {next(e for e in fill_errs if e)}")
+        if shared_buf in _LIVE_BUFFERS:
+            _LIVE_BUFFERS.remove(shared_buf)
+        shared_buf.close()
+        raise RuntimeError(
+            f"shared host bank fill failed: {next(e for e in fill_errs if e)}"
+        )
     logger.info_rank0(
         f"Shared host bank across {len(same_host)} local TP ranks: {bank.nbytes / 2**30:.2f} GiB in {shm_dir}"
     )

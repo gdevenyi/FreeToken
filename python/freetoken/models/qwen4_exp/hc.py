@@ -99,14 +99,25 @@ class GatedResidual(BaseOP):
         self.use_combine = use_combine
         width = args.ple_state_width
         self.hc_norm = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
-        use_hc8 = hc_int8_enabled() and (
+        from .config import allows_load_time_quant
+
+        hc8_allowed = hc_int8_enabled() and allows_load_time_quant(config, prefix)
+        down_name = (
+            f"{prefix}.input_mix_weight_down_block_inject"
+            if use_combine
+            else f"{prefix}.input_mix_weight_down"
+        )
+        use_hc8_down = hc8_allowed and (
+            config.quant is None or config.quant.scheme_for(down_name) is None
+        )
+        use_hc8_up = hc8_allowed and (
             config.quant is None
             or config.quant.scheme_for(f"{prefix}.input_mix_weight_up") is None
         )
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            if use_hc8:
+            if use_hc8_down:
                 self.input_mix_weight_down_block_inject = Int8G32Replicated(
                     width,
                     self.lowrank + self.hc_count + self.pad_size,
@@ -123,7 +134,7 @@ class GatedResidual(BaseOP):
                 )
         else:
             self.pad_size = 0
-            if use_hc8:
+            if use_hc8_down:
                 self.input_mix_weight_down = Int8G32Replicated(width, self.lowrank)
             else:
                 self.input_mix_weight_down = LinearReplicated(
@@ -133,7 +144,7 @@ class GatedResidual(BaseOP):
                     quant_config=config.quant,
                     prefix=f"{prefix}.input_mix_weight_down",
                 )
-        if use_hc8:
+        if use_hc8_up:
             self.input_mix_weight_up = Int8G32Replicated(self.lowrank, width)
         else:
             self.input_mix_weight_up = LinearReplicated(

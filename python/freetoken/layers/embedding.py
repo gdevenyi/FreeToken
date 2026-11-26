@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_ceil, init_logger, nvtx_annotate
@@ -205,7 +206,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         if export_hidden and (features := batch.features) is not None:
             features.final_hidden(x)
         if batch.is_prefill:
-            if batch.kld is not None:  # --enable-kld-endpoint: score every row, then serve the last as usual
+            if getattr(batch, "kld", None) is not None:  # --enable-kld-endpoint: score every row, then serve the last as usual
                 batch.kld.consume(x, self.logits)
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()

@@ -18,9 +18,10 @@ preserves the block for the tool-call parser.
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple, Type
 
 # DeepSeek-V4 / V3.2 protocol special-token strings. The detokenizer decodes with
 # skip_special_tokens=False (so the DSML tool markers survive for the tool parser),
@@ -33,7 +34,7 @@ THINK_START_TOKEN = "<think>"
 THINK_END_TOKEN = "</think>"
 DSML_TOKEN = "｜DSML｜"
 
-DSV4_SPECIAL_TOKENS: List[str] = [
+DSV4_SPECIAL_TOKENS: list[str] = [
     BOS_TOKEN,
     EOS_TOKEN,
     THINK_START_TOKEN,
@@ -41,7 +42,7 @@ DSV4_SPECIAL_TOKENS: List[str] = [
 ]
 
 
-def strip_special_tokens(text: str, tokens: List[str]) -> str:
+def strip_special_tokens(text: str, tokens: list[str]) -> str:
     """Remove special-token strings that leaked through the decode.
 
     Empty entries in ``tokens`` are ignored so they cannot corrupt the text.
@@ -108,7 +109,7 @@ class BaseReasoningParser:
     TOOL_HOLD_MAX = 512
 
     # How the generation ended, set by ReasoningParser before the end-of-generation parse.
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
 
     def __init__(
         self,
@@ -116,7 +117,7 @@ class BaseReasoningParser:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
-        tool_start_token: Optional[str] = None,
+        tool_start_token: str | None = None,
     ) -> None:
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -193,7 +194,11 @@ class BaseReasoningParser:
         # quoted marker inside reasoning), so commit "reasoning ended here" and
         # release it live — otherwise a long tool call streams nothing until
         # end-of-generation and trips client idle timeouts (codex: 300s).
-        if self._in_reasoning and self.tool_start_token and self.tool_start_token in current_text:
+        if (
+            self._in_reasoning
+            and self.tool_start_token
+            and self.tool_start_token in current_text
+        ):
             tool_idx = current_text.find(self.tool_start_token)
             self._buffer = current_text[tool_idx:]
             if len(self._buffer) > self.TOOL_HOLD_MAX:
@@ -288,7 +293,9 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
     three methods are overridden; the base ``<think>`` machinery is unused.
     """
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self, force_reasoning: bool = False, stream_reasoning: bool = True
+    ) -> None:
         super().__init__(
             think_start_token="",
             think_end_token="",
@@ -410,7 +417,7 @@ class ThinkReasoningParser(BaseReasoningParser):
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         *,
-        tool_start_token: Optional[str] = None,
+        tool_start_token: str | None = None,
     ) -> None:
         super().__init__(
             think_start_token=THINK_START_TOKEN,
@@ -423,7 +430,9 @@ class ThinkReasoningParser(BaseReasoningParser):
 
 _QWEN_TAG_NAME_RE = re.compile(r"[^<>\s]*")
 # A value ends at its closer. Any other call tag first means a quote ran into later text.
-_QWEN_VALUE_END_RE = re.compile(r"</parameter>|<parameter=|<function=|<tool_call>|</tool_call>")
+_QWEN_VALUE_END_RE = re.compile(
+    r"</parameter>|<parameter=|<function=|<tool_call>|</tool_call>"
+)
 # Strict block grammar, state -> {tag: next state}. A run may end only in "invoked" or "closed".
 _QWEN_RUN_GRAMMAR = {
     "start": {"<tool_call>": "opened"},
@@ -456,7 +465,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         *,
-        tool_names: Optional[Iterable[str]] = None,
+        tool_names: Iterable[str] | None = None,
     ) -> None:
         super().__init__(
             force_reasoning=force_reasoning,
@@ -465,7 +474,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
         )
         self._tool_names = frozenset(n for n in tool_names or () if n)
         # The generation start, held while it can still grow into ws* + "<think>".
-        self._head: Optional[str] = ""
+        self._head: str | None = ""
         self._trim_content = False
         self._reasoning_started = False
         self._content_started = False
@@ -492,7 +501,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             if head.startswith(self.think_start_token):
                 self._head = None
                 self._in_reasoning = True
-                return self._consume(head[len(self.think_start_token):], final=False)
+                return self._consume(head[len(self.think_start_token) :], final=False)
             if not head or self.think_start_token.startswith(head):
                 return ReasoningParseResult()
             new_text, self._head = self._head, None
@@ -525,7 +534,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             reasoning = self._reasoning_piece(buf[:end].rstrip(), closing=True)
             self._in_reasoning = False
             self._trim_content = True
-            buf = buf[end + len(self.think_end_token):]
+            buf = buf[end + len(self.think_end_token) :]
         if not self._trim_content:
             return ReasoningParseResult(reasoning_text=reasoning, normal_text=buf)
         if not self._content_started:
@@ -533,7 +542,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             self._content_started = bool(buf)
         body = buf.rstrip()
         if not final:
-            self._buffer = buf[len(body):]
+            self._buffer = buf[len(body) :]
         return ReasoningParseResult(reasoning_text=reasoning, normal_text=body)
 
     def _consume_open_reasoning(self, buf: str, final: bool) -> ReasoningParseResult:
@@ -549,7 +558,9 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             if status == "call" and self.finish_reason == "stop":
                 self._in_reasoning = False
                 return ReasoningParseResult(
-                    reasoning_text=self._reasoning_piece(buf[:tool].rstrip(), closing=True),
+                    reasoning_text=self._reasoning_piece(
+                        buf[:tool].rstrip(), closing=True
+                    ),
                     normal_text=buf[tool:],
                 )
             return ReasoningParseResult(
@@ -557,23 +568,50 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             )
         safe = buf[:tool] if tool != -1 else self._split_trailing_partial(buf)[0]
         body = safe.rstrip()
-        self._buffer = buf[len(body):]
-        return ReasoningParseResult(reasoning_text=self._reasoning_piece(body, closing=False))
+        self._buffer = buf[len(body) :]
+        return ReasoningParseResult(
+            reasoning_text=self._reasoning_piece(body, closing=False)
+        )
 
     def _tool_run_status(self, text: str, pos: int) -> str:
         """Classify the text from a marker at ``pos``: "call" if it is a run of whole blocks as
-        of now, "quote" if no more text can make it one, else "hold". Every form accepted here
-        parses the same in Qwen3CoderDetector; its lenient forms just stay in reasoning."""
+        of now, "quote" if no more text can make it one, else "hold". Supports both XML
+        ``<tool_call><function=...>`` (Qwen3Coder) and JSON ``<tool_call>{...}</tool_call>``
+        (Qwen2.5/Qwen3)."""
         state = "start"
         while True:
             while pos < len(text) and text[pos].isspace():
                 pos += 1
             if pos == len(text):
                 return "call" if state in ("invoked", "closed") else "hold"
+            if state == "opened" and text[pos] == "{":
+                close_idx = text.find("</tool_call>", pos)
+                if close_idx == -1:
+                    return (
+                        "quote"
+                        if "<tool_call>" in text[pos:]
+                        else "hold"
+                    )
+                raw_json = text[pos:close_idx].strip()
+                if "<tool_call>" in raw_json:
+                    return "quote"
+                try:
+                    parsed = json.loads(raw_json)
+                except (json.JSONDecodeError, ValueError):
+                    return "quote"
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("name") in self._tool_names
+                    and "arguments" in parsed
+                ):
+                    pos = close_idx + len("</tool_call>")
+                    state = "closed"
+                    continue
+                return "quote"
             tags = _QWEN_RUN_GRAMMAR[state]
             tag = next((t for t in tags if text.startswith(t, pos)), None)
             if tag is None:
-                partial = any(t.startswith(text[pos:pos + len(t)]) for t in tags)
+                partial = any(t.startswith(text[pos : pos + len(t)]) for t in tags)
                 return "hold" if partial else "quote"
             state = tags[tag]
             pos += len(tag)
@@ -582,7 +620,11 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
                 pos = name.end()
                 if pos == len(text):
                     return "hold"
-                valid = name.group() in self._tool_names if tag == "<function=" else name.group()
+                valid = (
+                    name.group() in self._tool_names
+                    if tag == "<function="
+                    else name.group()
+                )
                 if text[pos] != ">" or not valid:
                     return "quote"
                 pos += 1
@@ -607,8 +649,8 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
 
 def _drop_newline(text: str, *, lead: bool) -> str:
     if lead:
-        return text[1:] if text.startswith("\n") else text
-    return text[:-1] if text.endswith("\n") else text
+        return text.removeprefix("\n")
+    return text.removesuffix("\n")
 
 
 def _partial_suffix(text: str, token: str) -> int:
@@ -628,7 +670,9 @@ class RippleReasoningParser(BaseReasoningParser):
     instead of gaining a newline on each side per turn.
     """
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self, force_reasoning: bool = False, stream_reasoning: bool = True
+    ) -> None:
         # the generation prompt never opens <think>, so there is nothing to force
         super().__init__(
             think_start_token=THINK_START_TOKEN,
@@ -640,12 +684,13 @@ class RippleReasoningParser(BaseReasoningParser):
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
         if not text.startswith(self.think_start_token):
             return ReasoningParseResult(normal_text=text)
-        body = _drop_newline(text[len(self.think_start_token):], lead=True)
+        body = _drop_newline(text[len(self.think_start_token) :], lead=True)
         reasoning, end, content = body.partition(self.think_end_token)
         if not end:  # truncated inside reasoning
             return ReasoningParseResult(reasoning_text=reasoning)
         return ReasoningParseResult(
-            reasoning_text=_drop_newline(reasoning, lead=False), normal_text=_drop_newline(content, lead=True)
+            reasoning_text=_drop_newline(reasoning, lead=False),
+            normal_text=_drop_newline(content, lead=True),
         )
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
@@ -655,7 +700,10 @@ class RippleReasoningParser(BaseReasoningParser):
             buf = self._buffer
             if self._state == "start":
                 if buf.startswith(self.think_start_token):
-                    self._buffer, self._state = buf[len(self.think_start_token):], "lead"
+                    self._buffer, self._state = (
+                        buf[len(self.think_start_token) :],
+                        "lead",
+                    )
                 elif self.think_start_token.startswith(buf):
                     break
                 else:
@@ -666,14 +714,20 @@ class RippleReasoningParser(BaseReasoningParser):
                 end = buf.find(self.think_end_token)
                 if end >= 0:
                     reasoning += _drop_newline(buf[:end], lead=False)
-                    self._buffer, self._state = buf[end + len(self.think_end_token):], "after"
+                    self._buffer, self._state = (
+                        buf[end + len(self.think_end_token) :],
+                        "after",
+                    )
                     continue
                 if not self.stream_reasoning:
                     break
                 # hold back a possible "\n</think>": its newline is the separator, not reasoning
-                hold = max(_partial_suffix(buf, "\n" + self.think_end_token), _partial_suffix(buf, self.think_end_token))
-                reasoning += buf[:len(buf) - hold]
-                self._buffer = buf[len(buf) - hold:]
+                hold = max(
+                    _partial_suffix(buf, "\n" + self.think_end_token),
+                    _partial_suffix(buf, self.think_end_token),
+                )
+                reasoning += buf[: len(buf) - hold]
+                self._buffer = buf[len(buf) - hold :]
                 break
             elif self._state == "after":
                 self._buffer, self._state = _drop_newline(buf, lead=True), "content"
@@ -713,7 +767,9 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
     THINK_START = "<mm:think>"
     THINK_END = "</mm:think>"
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self, force_reasoning: bool = False, stream_reasoning: bool = True
+    ) -> None:
         super().__init__(
             think_start_token=self.THINK_START,
             think_end_token=self.THINK_END,
@@ -815,7 +871,9 @@ class GemmaThoughtReasoningParser(BaseReasoningParser):
     ``<|channel>thought\\n`` marker is injected by the template (implicit-think),
     so ``force_reasoning`` is set by the caller's thinking mode."""
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self, force_reasoning: bool = False, stream_reasoning: bool = True
+    ) -> None:
         super().__init__(
             think_start_token="<|channel>thought\n",
             think_end_token="<channel|>",
@@ -1037,8 +1095,8 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 m = ATEM_INLINE_HEADER_RE.search(buf)
                 if m is not None and (s == -1 or m.start() < s):
                     emit_seek(buf[: m.start()])
-                    self._buffer = buf[m.end():]
-                    begin_body(m.group(1), buf[m.start(): m.end()])
+                    self._buffer = buf[m.end() :]
+                    begin_body(m.group(1), buf[m.start() : m.end()])
                     continue
                 if s != -1:
                     # While the header-open seed is unconsumed it is the leftmost
@@ -1058,7 +1116,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         if not synthetic:
                             out_content.append(ATEM_START)
                         self._synthetic_open = False
-                        self._buffer = buf[s + len(ATEM_START):]
+                        self._buffer = buf[s + len(ATEM_START) :]
                         continue
                     if msg != -1 and msg - s - len(ATEM_START) > ATEM_HEADER_SPAN:
                         # The found <|message|> is too far away to belong to THIS
@@ -1070,11 +1128,11 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         if not synthetic:
                             out_content.append(ATEM_START)
                         self._synthetic_open = False
-                        self._buffer = buf[s + len(ATEM_START):]
+                        self._buffer = buf[s + len(ATEM_START) :]
                         continue
                     if msg != -1:
                         emit_seek(buf[:s])
-                        header = buf[s + len(ATEM_START): msg]
+                        header = buf[s + len(ATEM_START) : msg]
                         rm = ATEM_RECIPIENT_RE.search(header)
                         body_start = msg + len(ATEM_MESSAGE)
                         self._buffer = buf[body_start:]
@@ -1090,11 +1148,15 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                     # so a degenerate wire neither stalls nor eats the turn.
                     emit_seek(buf[:s])
                     self._buffer = buf[s:]
-                    if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
+                    if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN + len(
+                        ATEM_MESSAGE
+                    ):
                         if not synthetic:
-                            out_content.append(ATEM_START)  # verbatim: deliver, don't drop
+                            out_content.append(
+                                ATEM_START
+                            )  # verbatim: deliver, don't drop
                         self._synthetic_open = False
-                        self._buffer = self._buffer[len(ATEM_START):]
+                        self._buffer = self._buffer[len(ATEM_START) :]
                         continue
                     if final:
                         # At end of stream a candidate that never received its
@@ -1102,7 +1164,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         # the marker. (A capped discard here kept a drop window
                         # whose edge moved between layers; removing it makes the
                         # detector's agreement trivial -- both deliver.)
-                        emit_seek(self._buffer[len(ATEM_START):])
+                        emit_seek(self._buffer[len(ATEM_START) :])
                         self._synthetic_open = False
                         self._buffer = ""
                     break
@@ -1114,7 +1176,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 hold = 0 if final else atem_hold_len(buf)
                 piece = buf[: len(buf) - hold] if hold else buf
                 emit_seek(piece)
-                self._buffer = buf[len(piece):]
+                self._buffer = buf[len(piece) :]
                 break
 
             # self._mode == "body"
@@ -1124,7 +1186,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 hold = 0 if final else atem_hold_len(buf)
                 piece = buf[: len(buf) - hold] if hold else buf
                 emit(recipient, piece)
-                self._buffer = buf[len(piece):]
+                self._buffer = buf[len(piece) :]
                 break
             body = buf[:end]
             if recipient not in ("self", "user"):
@@ -1134,14 +1196,14 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 body += payload if kind == "closer" else "<|eom|>"
             emit(recipient, body)
             if kind == "closer":
-                self._buffer = buf[end + len(payload):]
+                self._buffer = buf[end + len(payload) :]
                 self._mode = "seek"
             elif kind == "start":
                 self._buffer = buf[end:]
                 self._mode = "seek"
             else:  # headerless switch: the next segment is fully known
-                self._buffer = buf[payload.end():]
-                begin_body(payload.group(1), buf[end: payload.end()])
+                self._buffer = buf[payload.end() :]
+                begin_body(payload.group(1), buf[end : payload.end()])
         return ReasoningParseResult(
             reasoning_text="".join(out_reasoning), normal_text="".join(out_content)
         )
@@ -1150,7 +1212,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
 class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
-    ReasoningParserEnum: Dict[str, Type[BaseReasoningParser]] = {
+    ReasoningParserEnum: dict[str, type[BaseReasoningParser]] = {
         "flint": ThinkReasoningParser,
         "ricursive": RippleReasoningParser,
         "deepseekv32": DeepSeekV32ReasoningParser,
@@ -1168,28 +1230,34 @@ class ReasoningParser:
         reasoning_parser: str,
         force_reasoning: bool = True,
         stream_reasoning: bool = True,
-        tool_names: Optional[Iterable[str]] = None,
+        tool_names: Iterable[str] | None = None,
     ) -> None:
         parser_class = self.ReasoningParserEnum.get(reasoning_parser)
         if parser_class is None:
             raise ValueError(f"Unsupported reasoning_parser: {reasoning_parser}")
-        extra = {"tool_names": tool_names} if issubclass(parser_class, Qwen3ReasoningParser) else {}
+        extra = (
+            {"tool_names": tool_names}
+            if issubclass(parser_class, Qwen3ReasoningParser)
+            else {}
+        )
         self.detector = parser_class(
             force_reasoning=force_reasoning, stream_reasoning=stream_reasoning, **extra
         )
 
-    def parse_non_stream(self, full_text: str, finish_reason: Optional[str] = None) -> Tuple[str, str]:
+    def parse_non_stream(
+        self, full_text: str, finish_reason: str | None = None
+    ) -> tuple[str, str]:
         """Return ``(reasoning_text, normal_text)`` for a complete completion."""
         self.detector.finish_reason = finish_reason
         result = self.detector.detect_and_parse(full_text)
         return result.reasoning_text, result.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, str]:
+    def parse_stream_chunk(self, chunk_text: str) -> tuple[str, str]:
         """Return ``(reasoning_delta, normal_delta)`` for one streaming chunk."""
         result = self.detector.parse_streaming_increment(chunk_text)
         return result.reasoning_text, result.normal_text
 
-    def flush(self, finish_reason: Optional[str] = None) -> Tuple[str, str]:
+    def flush(self, finish_reason: str | None = None) -> tuple[str, str]:
         """Drain buffered residue at end-of-stream as ``(reasoning_delta, normal_delta)``."""
         self.detector.finish_reason = finish_reason
         result = self.detector.flush()
@@ -1197,8 +1265,8 @@ class ReasoningParser:
 
 
 def build_reasoning_parser(
-    config, force_reasoning: bool, tool_names: Optional[Iterable[str]] = None
-) -> Optional[ReasoningParser]:
+    config, force_reasoning: bool, tool_names: Iterable[str] | None = None
+) -> ReasoningParser | None:
     """Construct the configured reasoning parser, or ``None`` when the server has
     no reasoning parser set. Shared by every protocol adapter's generation path."""
     name = getattr(config, "reasoning_parser", None)

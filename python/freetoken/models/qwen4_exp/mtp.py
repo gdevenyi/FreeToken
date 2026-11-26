@@ -177,7 +177,12 @@ def _check_sidecar(path: str, target_path: str) -> None:
         for name in gguf_tensor_index(path)
         if name.startswith("blk.")
     }
-    if len(blocks) != 1 or gguf_architecture(path) != "qwen4exp":
+    in_trunk = os.path.abspath(path) == os.path.abspath(target_path)
+    if (
+        gguf_architecture(path) != "qwen4exp"
+        or (not in_trunk and len(blocks) != 1)
+        or not blocks
+    ):
         raise ValueError(
             f"{path}: an MTP sidecar holds one qwen4exp nextn block, found blocks {sorted(blocks)[:4]}"
         )
@@ -208,7 +213,7 @@ def _iter_sidecar_emitted(
     from .gguf import iter_sidecar_weights
     from .weight import dense_emitter
 
-    emit, _, _ = dense_emitter(config, rank, world)
+    emit, _, _ = dense_emitter(config, rank, world, include_lmhead=False)
     for raw, tensor in iter_sidecar_weights(model_path, config):
         for name, out in emit(raw, tensor):
             yield name.removeprefix("mtp."), out
@@ -284,7 +289,9 @@ class Qwen4ExpMTPDraft(BaseOP):
         draft = draft_config(config)
         # a Strata pack carries its own ggml types
         self.config = draft = (
-            draft if quant is None else dataclasses.replace(draft, quant=quant)
+            draft
+            if quant is None
+            else dataclasses.replace(draft, quant=quant, attn_quant="none")
         )
         hidden = draft.hidden_size
         self.hc_count = draft.qwen4_args.hc_count

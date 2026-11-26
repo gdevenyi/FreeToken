@@ -49,6 +49,7 @@ from .generation import (
     count_prompt_tokens,
     generate_events,
     generate_full,
+    prerender_error,
     public_request_id,
     render_messages,
     resolve_sampling,
@@ -81,6 +82,16 @@ def _anthropic_stop(
     return STOP_REASON_MAP.get(finish_reason or "stop"), None
 
 
+def _maintenance_detail(mstate: str) -> str:
+    if mstate == "loading":
+        return "model is still loading"
+    if mstate == "stopping":
+        return "server is shutting down"
+    if mstate == "failed":
+        return "engine failed"
+    return "cache rebuild in progress"
+
+
 def register_anthropic_routes(
     app: FastAPI,
     get_state: Callable[[], Any],
@@ -92,12 +103,9 @@ def register_anthropic_routes(
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
         if mstate != "serving":
-            detail = (
-                "model is still loading"
-                if mstate == "loading"
-                else "cache rebuild in progress"
+            return _anthropic_error_response(
+                503, "overloaded_error", _maintenance_detail(mstate)
             )
-            return _anthropic_error_response(503, "overloaded_error", detail)
         return await handle_anthropic_messages(
             req, request, state, get_model_sampling()
         )
@@ -141,7 +149,29 @@ async def handle_anthropic_messages(
             ),
             thinking=getattr(state.config, "thinking", None),
         )
+    except GenerationError as exc:
+        status_code, err_type = _classify_generation_error(exc)
+        return _anthropic_error_response(
+            status_code, err_type, _sanitize_error_message(str(exc))
+        )
+    except ValueError as exc:
+        return _anthropic_error_response(400, "invalid_request_error", str(exc))
+
+    if req.stream:
+        err = await prerender_error(spec, state)
+        if err is not None:
+            status_code, err_type = _classify_generation_error(err)
+            return _anthropic_error_response(
+                status_code, err_type, _sanitize_error_message(str(err))
+            )
+
+    try:
         uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        status_code, err_type = _classify_generation_error(exc)
+        return _anthropic_error_response(
+            status_code, err_type, _sanitize_error_message(str(exc))
+        )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 
@@ -195,6 +225,11 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
             thinking=getattr(state.config, "thinking", None),
         )
+    except GenerationError as exc:
+        status_code, err_type = _classify_generation_error(exc)
+        return _anthropic_error_response(
+            status_code, err_type, _sanitize_error_message(str(exc))
+        )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     if not messages:
@@ -215,8 +250,11 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
         )
     except GenerationError as exc:
         # The chat template could not render this conversation (bad role ordering, an unmatched
-        # tool_result, ...) — a client error, exactly as /v1/messages classifies the same failure.
-        return _anthropic_error_response(400, "invalid_request_error", str(exc))
+        # tool_result, ...) — classify identically to /v1/messages.
+        status_code, err_type = _classify_generation_error(exc)
+        return _anthropic_error_response(
+            status_code, err_type, _sanitize_error_message(str(exc))
+        )
     except Exception as exc:  # noqa: BLE001 — tokenizer init / other failure -> server error
         return _anthropic_error_response(
             500, "api_error", f"token counting failed: {exc}"
@@ -229,13 +267,13 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 # Request conversion: Anthropic Messages -> GenSpec (the neutral generation spec;
 # built directly, like vLLM's Responses path — no ChatCompletionRequest pivot).
 # --------------------------------------------------------------------------- #
-_CCH_TOKEN_RE = re.compile(r"\bcch=[0-9a-fA-F]+;[ \t]*")
+_CCH_TOKEN_RE = re.compile(r"\bcch=[0-9a-fA-F]+;?[ \t]*")
 
 
 def strip_anthropic_billing_cch(text: str) -> str:
-    """Strip per-request ``cch=<hex>;`` tokens from ``x-anthropic-billing-header:`` lines
-    so Claude Code turns reuse the cached system-prompt prefix instead of invalidating it."""
-    if "x-anthropic-billing-header:" not in text:
+    """Strip per-request ``cch=<hex>;`` tokens from leading ``x-anthropic-billing-header:``
+    system blocks so Claude Code turns reuse the cached system-prompt prefix."""
+    if not text.lstrip().startswith("x-anthropic-billing-header:"):
         return text
     out: list[str] = []
     for line in text.split("\n"):
@@ -263,20 +301,26 @@ def convert_anthropic_prompt(
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
-            system_texts.append(strip_anthropic_billing_cch(req.system))
+            stripped = strip_anthropic_billing_cch(req.system)
+            if stripped:
+                system_texts.append(stripped)
         else:
-            system_texts.append(
-                strip_anthropic_billing_cch(
-                    "".join(b.text for b in req.system if b.type == "text" and b.text)
-                )
+            joined = "".join(
+                strip_anthropic_billing_cch(b.text)
+                for b in req.system
+                if b.type == "text" and b.text
             )
+            if joined:
+                system_texts.append(joined)
 
     other: list[dict[str, Any]] = []
     for msg in req.messages:
         if msg.role == "system":
-            text = strip_anthropic_billing_cch(_content_text(msg.content))
+            text = _content_text(msg.content)
             if not other:
-                system_texts.append(text)
+                stripped = strip_anthropic_billing_cch(text)
+                if stripped:
+                    system_texts.append(stripped)
             elif text:
                 other.append({"role": "system", "content": text})
             continue
@@ -379,21 +423,28 @@ def convert_anthropic_prompt(
     # output_config.effort folds in as the Responses API's reasoning.effort does;
     # an explicit thinking type still decides on/off ("disabled" wins over effort).
     from .model_meta import (
+        _DISABLE_THINKING_TYPES,
         effort_toggle_kwargs,
         thinking_override_kwargs,
         thinking_toggle_kwargs,
     )
 
     ctk: dict[str, Any] = {}
-    thinking_type = req.thinking.get("type") if isinstance(req.thinking, dict) else None
+    raw_thinking_type = (
+        req.thinking.get("type") if isinstance(req.thinking, dict) else None
+    )
+    thinking_type = (
+        raw_thinking_type.strip().lower()
+        if isinstance(raw_thinking_type, str) and raw_thinking_type.strip()
+        else None
+    )
     output_config = req.output_config if isinstance(req.output_config, dict) else {}
     effort = output_config.get("effort")
     if isinstance(effort, str) and effort.strip():
         ctk = effort_toggle_kwargs(effort, ctk, thinking_type=thinking_type)
-    elif thinking_type == "disabled":
+    elif thinking_type in _DISABLE_THINKING_TYPES:
         ctk = thinking_toggle_kwargs(False)
-    elif isinstance(thinking_type, str) and thinking_type.strip():
-        # Open thinking mode ("enabled", "adaptive", etc.) enables thinking unless explicitly "disabled".
+    elif thinking_type is not None:
         ctk = thinking_toggle_kwargs(True)
     ctk = thinking_override_kwargs(thinking, ctk)
 
@@ -670,11 +721,11 @@ async def anthropic_event_stream(
                 continue
             if not started:
                 yield _message_start(zero_usage)
-
             if ev is KEEPALIVE:
                 yield _event(AnthropicStreamEvent(type="ping"))
+                continue
 
-            elif isinstance(ev, ReasoningDelta):
+            if isinstance(ev, ReasoningDelta):
                 # Streamed as a native thinking block (Claude Code renders these).
                 if ev.text == "":
                     continue
@@ -790,7 +841,7 @@ async def anthropic_event_stream(
             AnthropicStreamEvent(
                 type="error",
                 error=AnthropicError(
-                    type="internal_error", message=_sanitize_error_message(str(exc))
+                    type="api_error", message=_sanitize_error_message(str(exc))
                 ),
             )
         )

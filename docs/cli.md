@@ -39,7 +39,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host` | 127.0.0.1 | Bind address |
+| `--host` | 127.0.0.1 | Bind address (single host or comma-separated list, e.g. `127.0.0.1,172.17.0.1`) |
 | `--port` | 1919 | Bind port |
 | `--http-keep-alive-s` | 360 | HTTP idle keep-alive timeout in seconds. Set above the longest client pool idle timeout (e.g. Bun/opencode: 300 s) so the client closes first; uvicorn does not advertise a `Keep-Alive` timeout or buffer the close |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
@@ -81,6 +81,10 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--logprob-read-snapshot-donate` | all | hybrid GDN models: snapshots a finished `max_tokens=1` + `logprobs` request donates to the prefix cache: `all` (x64 prefill boundary and final state), `boundary` (only the former) or `none` |
 | `--mamba-host-slots` | 0 | hybrid GDN models: GDN state snapshots kept in pinned host RAM. When the snapshot cache in VRAM needs a slot, its least recently used snapshot moves to host RAM and its prefix keeps its KV pages; a later request on that prefix copies it back. One slot holds one whole GDN state (about 69 MB per rank on Qwen3.8-Flash-Next with DFlash). Start-up fails when less than 32 GiB of `MemAvailable` would remain |
 | `--kv-host-tier-gb` | 0 | hybrid GDN models with a QSA KV pool: GiB of host RAM per TP rank for the KV pages of idle prefixes. When the KV pool needs pages, the least recently used idle prefix moves its pages to host RAM instead of losing them; a later request on that prefix copies them back. Start-up fails when this and `--mamba-host-slots` leave less than 32 GiB of `MemAvailable`. Not supported with `--speculative-algorithm mtp` |
+| `--gdn-state-dtype` | bf16 | hybrid GDN models: recurrent-state storage format (`bf16` or `wht_q8`, which compresses recurrent states 2x via block-128 Walsh-Hadamard Q8_0) |
+| `--kv-moe-elastic` | off | Share physical 2 MiB CUDA VMM slabs elastically between the KV cache and unified GPU MoE expert pool so idle KV slabs serve hot experts and active bursts borrow them back without restart |
+| `--ple-backend` | pinned | Qwen3.8-Flash-Next per-layer embedding backend: `pinned` (pinned `/dev/shm` UVA host bank, including `lut4-gptq` shards) or `disk` (NVMe `io_uring`/pread row table) |
+| `--ple-table` | — | Optional external PLE table path (lossless BF16/quantized `.gguf` or `lut4-gptq` directory) overriding the checkpoint's PLE shards |
 | `--logprob-read-isolate` | off | a `max_tokens=1` + `logprobs` request prefills in a pass of its own and neither resumes from nor stores prefix-cache entries, so its logprobs do not depend on other traffic; costs read throughput under concurrency and prefix reuse for reads |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 | `--kv-cache-dtype` | auto | How K and V are stored. `auto` keeps the compute dtype; `fp8` / `fp8_e4m3`, `int8` and `bf16` alias `fp8_per_token_head`, `int8_per_token_head` and `auto`. `fp8_per_token_head` (e4m3) and `int8_per_token_head` store 8 bits per element plus one fp32 scale per token and local head (two per MLA latent row, for ckv and kpe), about half the KV memory. The `triton`, `qsa_sparse`, `m3_sparse` and `dsa` backends read them; `auto` picks one of these. They need `--dtype bfloat16`. An `mtp` draft stores its KV in the same format. DeepSeek-V4 stores only `fp8_ds_mla` (window and compressed KV as e4m3 with one ue8m0 scale per 64 channels and bf16 rope, 584 B per row; indexer keys as MXFP4, 68 B) and DeepSeek-V4.1 only `nvfp4_ds_mla` (window KV as MXFP8, compressed KV as NVFP4, indexer keys as MXFP4); the names follow vLLM, and `auto` picks them on those models |
@@ -97,6 +101,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / memory such as `12GiB` / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
 | `--moe-cache-scope` | unified | `unified`: one LRU pool of slots per expert quant (quant type and bank layout), so all MoE layers share one pool when they share a quant format; `per-layer`: each layer has its own pool. `per-layer` does not combine with `--moe-strategy cpu` or `--moe-cpu-layers` |
 | `--moe-cache-split` | equal | How the pools share the slots: `equal` (in proportion to their layer counts), or `profile:<path>`: every pool keeps `top_k` slots and the rest go to the most used experts in the profile's per-layer expert counts. With `offload`, a pool smaller than the expert count lowers `--max-running-requests` to its slots / top_k |
+| `--moe-cache-policy` | lru | Eviction policy for the GPU expert slot cache: `lru` or `crf` (clock-decayed frequency + recency lease) |
+| `--moe-ep` | off | Expert parallelism across `--tp-size` ranks instead of tensor-sharding expert intermediate dimensions (keeps full expert width per rank and partitions `E / tp_size` experts per rank) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`/`hybrid`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for hosts that cap CUDA pinned memory (Windows/WSL): it pins layers from the middle out until CUDA refuses one and OS-locks the rest (`FREETOKEN_PIN_BUDGET_GB` and FTW checkpoints lock from a size estimate instead), see [models.md](models.md#hosts-that-cap-pinned-memory-wsl); every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs, except gpt-oss GGUF files whose per-expert biases decode on the GPU only) |
@@ -130,6 +136,8 @@ Speculative decoding needs `--tp 1`, except a Qwen3.8-Flash-Next `mtp` draft (th
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+| `--thinking` | auto | Operator override for reasoning/thinking mode across protocols: `auto` (honour request/template), `on`, or `off` |
+| `--enable-kld-endpoint` | off | Enable loopback/internal `POST /v1/internal/kld` endpoint for KLD divergence scoring |
 
 With `--enable-timings-report` every chat completion, completion and Responses response
 also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,

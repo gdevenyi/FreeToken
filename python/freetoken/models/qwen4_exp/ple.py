@@ -19,11 +19,13 @@ gathers rows over UVA, optionally started early on a side stream (``PLELayer.sta
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn.functional as F
+
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.mm import restore_placeholder
@@ -89,7 +91,12 @@ class GpuResidentTable:
     def lookup(
         self, row_ids: torch.Tensor, out: torch.Tensor | None = None
     ) -> torch.Tensor:
-        rows = self.weight.index_select(0, row_ids.reshape(-1)).to(self.dtype)
+        flat = row_ids.reshape(-1)
+        valid = (flat >= 0) & (flat < self.weight.shape[0])
+        rows = self.weight.index_select(0, flat.clamp(0, self.weight.shape[0] - 1)).to(
+            self.dtype
+        )
+        rows = torch.where(valid.unsqueeze(-1), rows, torch.zeros_like(rows))
         if self.scale != 1.0:
             rows = rows * self.scale
         rows = rows.view(*row_ids.shape[:-1], -1)
@@ -166,7 +173,7 @@ class PinnedUVATable:
         )
         if weight_lut is not None:
             assert weight.dtype == torch.uint8 and head_dim is not None
-            assert head_dim > 0 and head_dim % 2 == 0 and head_dim % group_size == 0
+            assert head_dim > 0 and head_dim % 4 == 0 and head_dim % group_size == 0
             expected_cols = head_dim // 2 + (head_dim // group_size) * 2
             assert weight.shape[1] == expected_cols, (weight.shape, expected_cols)
             assert weight_lut.numel() == 16, weight_lut.shape
@@ -197,7 +204,7 @@ class PinnedUVATable:
             self._stream = None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}
-        self._pending: Tuple[torch.Tensor, torch.Tensor] | None = None
+        self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def _stage(self, rows: int) -> torch.Tensor:
         # Captured graphs keep one buffer per size for good: growing the eager one would free the
@@ -319,7 +326,7 @@ def derive_ngram_hash_constants(
     ngram_vocab_size_base: int,
     ple_layer_index: int,
     seed: int = 1234,
-) -> Tuple[List[int], List[int], List[int]]:
+) -> tuple[list[int], list[int], list[int]]:
     """Recompute (multipliers, per-head vocab sizes, per-head offsets) the way HF derives them at init.
 
     The checkpoint ships these as int64 tensors, so serving loads them; this is the dummy-weight
@@ -333,8 +340,8 @@ def derive_ngram_hash_constants(
         + 1
         for i in range(ngram_size)
     ]
-    sizes: List[int] = []
-    offsets: List[int] = []
+    sizes: list[int] = []
+    offsets: list[int] = []
     total = 0
     for head in range(num_ngram_heads):
         global_head = ple_layer_index * num_ngram_heads + head
@@ -548,7 +555,7 @@ class NGramEmbedding(BaseOP):
         packed[req, col] = ids
         return packed, lambda t: t[req, col]
 
-    def _shift_ignore_eos(self, packed: torch.Tensor) -> List[torch.Tensor]:
+    def _shift_ignore_eos(self, packed: torch.Tensor) -> list[torch.Tensor]:
         """``out[s][b, p]`` = the token ``s`` places left of ``p``, or eos when the window crosses a boundary."""
         num_reqs, width = packed.shape
         pos = torch.arange(width, device=packed.device)
@@ -704,7 +711,7 @@ class PLELayer(BaseOP):
         assert self.state_len <= CHUNK_SIZE, (
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
-        self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        self._pending: tuple[PLEMetadata, torch.Tensor] | None = None
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
@@ -872,7 +879,7 @@ class PLELayer(BaseOP):
         )
         return F.silu(out.index_select(1, out_index), inplace=True).transpose(0, 1)
 
-    def _prefill_indices(self, lens: List[int], device: torch.device):
+    def _prefill_indices(self, lens: list[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""
         state_len = self.state_len
         counts = torch.tensor(lens, dtype=torch.int64)
@@ -986,13 +993,13 @@ class PLENgramVerify:
 __all__ = [
     "GpuResidentTable",
     "NGramEmbedding",
-    "ZeroTable",
     "PLEConvVerify",
     "PLELayer",
     "PLEMetadata",
     "PLENgramVerify",
     "PLETableBackend",
     "PinnedUVATable",
+    "ZeroTable",
     "build_ple_metadata",
     "derive_ngram_hash_constants",
     "short_conv_reference",

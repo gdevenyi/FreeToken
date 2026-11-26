@@ -585,8 +585,20 @@ def load_expert_banks(
                 layer_sink,
             )
         if method is not None and method.kind is QuantKind.GGUF:
+            from freetoken.distributed import try_get_tp_info
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
+            tp = try_get_tp_info()
+            ep_size = (
+                tp.size
+                if (tp is not None and getattr(model_config, "moe_ep", False))
+                else 1
+            )
+            ep_offset = (
+                tp.rank * (model_config.num_experts // ep_size)
+                if ep_size > 1
+                else 0
+            )
             # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
             return load_gguf_expert_banks(
                 model_path,
@@ -594,6 +606,8 @@ def load_expert_banks(
                 first_layer=model_config.first_k_dense_replace,
                 dummy=dummy,
                 device=device if resident else None,
+                ep_offset=ep_offset,
+                ep_size=ep_size,
             )
         if method is None:
             raise ValueError(

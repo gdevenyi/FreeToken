@@ -6,12 +6,13 @@ import os
 import threading
 from copy import deepcopy
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, Any
 
 import torch
+from transformers import PreTrainedTokenizerBase
+
 from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
-from transformers import PreTrainedTokenizerBase
 
 if TYPE_CHECKING:
     from freetoken.mm.processor import MMProcessor
@@ -23,12 +24,18 @@ from .effort import (
     probe_thinking_profile,
     quantize_effort,
 )
-from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
+from .inline_system import (
+    has_inline_system,
+    normalize_inline_system,
+    probe_inline_system,
+)
 
 logger = init_logger(__name__)
 
 
-def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
+def resolve_thinking_mode(
+    chat_template_kwargs: dict[str, Any] | None, tools: Any | None
+) -> str:
     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
 
     The single source of truth for this decision: the encode side
@@ -62,16 +69,38 @@ def join_system_contents(messages: list[dict[str, Any]]) -> str:
 
 
 def _map_developer_role(
-    messages: list[dict[str, Any]], chat_template: str | None
+    messages: list[dict[str, Any]],
+    chat_template: str | None,
+    *,
+    has_dsv4_encoder: bool = False,
+    preserve_inline_system: bool = False,
 ) -> list[dict[str, Any]]:
     """OpenAI's ``developer`` role is the current spelling of ``system`` (clients such as pi
-    send the system prompt that way by default). Most chat templates do not know it and raise
-    ("Unexpected message role"), so map it to ``system`` unless the template handles it."""
-    if "developer" in str(chat_template or "") or not any(
-        m.get("role") == "developer" for m in messages
+    and Codex send the system prompt that way by default). Most chat templates and the DSV4
+    encoder do not know it and raise ("Unexpected message role"), so map it to ``system``
+    unless a Jinja template explicitly handles ``developer``."""
+    if (
+        not has_dsv4_encoder
+        and "developer" in str(chat_template or "")
+        or not any(m.get("role") == "developer" for m in messages)
     ):
         return messages
-    mapped = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+    mapped = [
+        {**m, "role": "system"} if m.get("role") == "developer" else m for m in messages
+    ]
+    if preserve_inline_system:
+        # Merge only the leading run of system/developer messages; mid-turn system reminders
+        # stay in place for normalize_inline_system.
+        lead: list[dict[str, Any]] = []
+        idx = 0
+        while idx < len(mapped) and mapped[idx].get("role") == "system":
+            lead.append(mapped[idx])
+            idx += 1
+        if len(lead) <= 1:
+            return mapped
+        return [{"role": "system", "content": join_system_contents(lead)}] + mapped[
+            idx:
+        ]
     # Templates such as Qwen's raise on a system message that is not first, so merge every
     # system/developer message into one leading system message.
     system = [m for m in mapped if m.get("role") == "system"]
@@ -86,7 +115,11 @@ def _ids_below(ids: list[int], bound: int) -> bool:
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        mm_processor: MMProcessor | None = None,
+    ) -> None:
         self.tokenizer = tokenizer
         self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
@@ -97,20 +130,28 @@ class TokenizeManager:
         self._inline_system_lock = threading.Lock()
         self._inline_system_modes: dict[str, str] = {}
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
-        results: List[UserMsg] = []
+    def tokenize(self, msgs: list[TokenizeMsg]) -> list[UserMsg]:
+        results: list[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
             allowed = msg.sampling_params.allowed_token_ids
             # past the real vocabulary an id indexes the padded logits tail or beyond them
             if allowed and not _ids_below(allowed, len(self.tokenizer)):
-                raise ValueError(f"allowed_token_ids must be in [0, {len(self.tokenizer)})")
+                raise ValueError(
+                    f"allowed_token_ids must be in [0, {len(self.tokenizer)})"
+                )
             if msg.input_ids is not None:
                 # an id past the embedding rows would fault the engine, not just this request
                 if msg.input_ids and not _ids_below(msg.input_ids, len(self.tokenizer)):
-                    raise ValueError(f"prompt token ids must be in [0, {len(self.tokenizer)})")
+                    raise ValueError(
+                        f"prompt token ids must be in [0, {len(self.tokenizer)})"
+                    )
                 ids = torch.tensor(msg.input_ids, dtype=torch.int32)
-                results.append(UserMsg(uid=msg.uid, input_ids=ids, sampling_params=msg.sampling_params))
+                results.append(
+                    UserMsg(
+                        uid=msg.uid, input_ids=ids, sampling_params=msg.sampling_params
+                    )
+                )
                 continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
@@ -141,7 +182,11 @@ class TokenizeManager:
                 )
             else:
                 results.append(
-                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                    UserMsg(
+                        uid=msg.uid,
+                        input_ids=input_ids,
+                        sampling_params=msg.sampling_params,
+                    )
                 )
         return results
 
@@ -153,10 +198,17 @@ class TokenizeManager:
         if not isinstance(msg.text, list):
             return msg.text
         kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
-        messages = msg.text
+        messages = _map_developer_role(
+            msg.text,
+            getattr(self.tokenizer, "chat_template", None),
+            has_dsv4_encoder=self._dsv4_encoder is not None,
+            preserve_inline_system=msg.inline_system_policy is not None,
+        )
         if msg.inline_system_policy is not None:
             if msg.inline_system_policy not in ("auto", "preserve", "fold"):
-                raise ValueError(f"invalid inline system policy: {msg.inline_system_policy}")
+                raise ValueError(
+                    f"invalid inline system policy: {msg.inline_system_policy}"
+                )
             if has_inline_system(messages):
                 mode = msg.inline_system_policy
                 if mode == "auto":
@@ -164,12 +216,17 @@ class TokenizeManager:
                 messages = normalize_inline_system(messages, mode)
         return self._render(messages, msg.tools, kwargs, images=msg.images)
 
-    def inline_system_mode(self, tools: list[dict] | None, kwargs: dict[str, Any]) -> str:
+    def inline_system_mode(
+        self, tools: list[dict] | None, kwargs: dict[str, Any]
+    ) -> str:
         key = json.dumps([tools, kwargs], sort_keys=True)
         with self._inline_system_lock:
             if key not in self._inline_system_modes:
                 mode, reason = probe_inline_system(
-                    lambda messages: self._render(messages, deepcopy(tools), deepcopy(kwargs)), self.tokenizer
+                    lambda messages: self._render(
+                        messages, deepcopy(tools), deepcopy(kwargs)
+                    ),
+                    self.tokenizer,
                 )
                 if len(self._inline_system_modes) >= 128:
                     self._inline_system_modes.pop(next(iter(self._inline_system_modes)))
@@ -182,10 +239,16 @@ class TokenizeManager:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
-        *, images: list[bytes] | None = None,
+        *,
+        images: list[bytes] | None = None,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
+        messages = _map_developer_role(
+            messages,
+            getattr(self.tokenizer, "chat_template", None),
+            has_dsv4_encoder=self._dsv4_encoder is not None,
+        )
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs, images=images
@@ -201,7 +264,6 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
-        messages = _map_developer_role(messages, getattr(self.tokenizer, "chat_template", None))
         # continue_final_message (an OpenAI-compatible extra, as in vLLM / SGLang): the last
         # message is an assistant prefix the model must continue, so no generation prompt.
         chat_template_kwargs = dict(chat_template_kwargs)
@@ -237,7 +299,9 @@ class TokenizeManager:
         efforts = self.effort_profile()
         with self._effort_lock:
             if self._thinking_profile is None:
-                self._thinking_profile = probe_thinking_profile(self._probe_render, efforts)
+                self._thinking_profile = probe_thinking_profile(
+                    self._probe_render, efforts
+                )
             return self._thinking_profile
 
     def _probe_render(
@@ -269,15 +333,26 @@ class TokenizeManager:
         return sanitized
 
 
-def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleType | None:
+def _load_dsv4_encoder_if_needed(
+    tokenizer: PreTrainedTokenizerBase,
+) -> ModuleType | None:
     if getattr(tokenizer, "chat_template", None):
         return None
-    model_path = getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", "")
+    model_path = getattr(tokenizer, "name_or_path", None) or getattr(
+        tokenizer, "_name_or_path", ""
+    )
     if not model_path:
         return None
     # DeepSeek-V4 ships encoding/encoding_dsv4.py, V4.1 encoding/encoding.py; same encode_messages contract
     encoder_path = next(
-        (p for p in (os.path.join(str(model_path), "encoding", name) for name in ("encoding_dsv4.py", "encoding.py")) if os.path.isfile(p)),
+        (
+            p
+            for p in (
+                os.path.join(str(model_path), "encoding", name)
+                for name in ("encoding_dsv4.py", "encoding.py")
+            )
+            if os.path.isfile(p)
+        ),
         None,
     )
     if encoder_path is None:
@@ -297,7 +372,8 @@ def _apply_dsv4_chat_encoder(
     messages: list[dict],
     tools: list[dict] | None,
     chat_template_kwargs: dict,
-    *, images: list[bytes] | None = None,
+    *,
+    images: list[bytes] | None = None,
 ) -> str:
     rendered_messages = [dict(message) for message in messages]
     image_data = iter(images) if images is not None else None
@@ -313,7 +389,9 @@ def _apply_dsv4_chat_encoder(
                         try:
                             part = {"type": "image", "data": next(image_data)}
                         except StopIteration:
-                            raise ValueError("image blocks outnumber fetched images") from None
+                            raise ValueError(
+                                "image blocks outnumber fetched images"
+                            ) from None
                     elif ref is not None:
                         key = "data" if ref["kind"] == "b64" else "url"
                         part = {"type": "image", key: ref["data"]}

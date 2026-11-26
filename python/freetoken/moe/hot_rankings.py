@@ -102,9 +102,18 @@ class HotExpertRankings:
                             if sz > 0 and math.isfinite(rate):
                                 pts_map[sz] = min(1.0, max(0.0, rate))
                     num_exp = v.get("num_experts")
-                    if not isinstance(num_exp, int) or num_exp <= 0:
-                        num_exp = len(by_layer.get(layer_id, ())) or 512
-                    pts_map[int(num_exp)] = 1.0
+                    if (
+                        isinstance(num_exp, int)
+                        and not isinstance(num_exp, bool)
+                        and num_exp > 0
+                    ):
+                        pts_map[int(num_exp)] = 1.0
+                    else:
+                        inferred = max(
+                            len(by_layer.get(layer_id, ())), max(pts_map, default=0)
+                        )
+                        if inferred > max(pts_map, default=0):
+                            pts_map[int(inferred)] = 1.0
                     if len(pts_map) >= 3:
                         hit_curves[layer_id] = tuple(sorted(pts_map.items()))
             if by_layer:

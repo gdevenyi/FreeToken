@@ -5,7 +5,6 @@ import os
 import re
 from typing import Tuple
 
-
 _GFX_ARCH_RE = re.compile(r"gfx\d+[a-z]?")
 
 
@@ -90,6 +89,10 @@ def is_sm100_family() -> bool:
     """Exactly major 10 (datacenter Blackwell). For sm_100a/103a-only kernels
     (e.g. trtllm-gen) that consumer Blackwell (sm_120/121) cannot run."""
     return _is_arch_family(10)
+
+
+def is_sm70_supported() -> bool:
+    return is_arch_supported(7, 0)
 
 
 def is_sm90_supported() -> bool:

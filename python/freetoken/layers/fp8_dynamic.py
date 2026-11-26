@@ -18,11 +18,12 @@ Requires sm_89+ (``_scaled_mm``'s floor; Ampere has no FP8 tensor cores).
 
 from __future__ import annotations
 
-from typing import List
+import functools
 
 import torch
 import triton
 import triton.language as tl
+
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.kernel.triton.e4m3_compat import f32_to_e4m3
 from freetoken.utils import div_even
@@ -78,8 +79,14 @@ def _amax_partial_kernel(x_ptr, part_ptr, n, nprog, BLOCK: tl.constexpr):
 
 @triton.jit
 def _reduce_cast_kernel(
-    x_ptr, out_ptr, part_ptr, scale_ptr, n, nprog,
-    MAX_PARTS: tl.constexpr, BLOCK: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    part_ptr,
+    scale_ptr,
+    n,
+    nprog,
+    MAX_PARTS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     """Pass 2: fold the partials to the tensor amax, then cast this program's block.
 
@@ -114,7 +121,15 @@ def quant_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     part = torch.empty(nprog, dtype=torch.float32, device=x.device)
     _amax_partial_kernel[(nprog,)](x, part, n, nprog, BLOCK=_BLOCK, num_warps=8)
     _reduce_cast_kernel[(nblock,)](
-        x, out, part, scale, n, nprog, MAX_PARTS=_MAX_PARTS, BLOCK=_BLOCK, num_warps=8,
+        x,
+        out,
+        part,
+        scale,
+        n,
+        nprog,
+        MAX_PARTS=_MAX_PARTS,
+        BLOCK=_BLOCK,
+        num_warps=8,
     )
     return out, scale
 
@@ -127,7 +142,9 @@ def _quant_rows_kernel(x_ptr, out_ptr, scale_ptr, k, BLOCK: tl.constexpr):
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for start in range(0, k, BLOCK):
         offs = start + tl.arange(0, BLOCK)
-        acc = tl.maximum(acc, tl.abs(tl.load(x_row + offs, mask=offs < k, other=0.0).to(tl.float32)))
+        acc = tl.maximum(
+            acc, tl.abs(tl.load(x_row + offs, mask=offs < k, other=0.0).to(tl.float32))
+        )
     amax = tl.maximum(tl.max(acc, axis=0), 1e-12)
     tl.store(scale_ptr + row, amax / 448.0)
     inv = 448.0 / amax
@@ -174,6 +191,11 @@ def scale_rows_cols_(
     return y
 
 
+@functools.cache
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    return torch.ones((), dtype=torch.float32, device=device)
+
+
 def _fp8_channel_linear(
     x2: torch.Tensor,
     weight: torch.Tensor,
@@ -186,9 +208,11 @@ def _fp8_channel_linear(
     The cost is the multi-row per-tensor path's: same launches (row quant, unit-scale fill, GEMM, scale
     pass), same output bytes. Against the per-tensor one-row path (quant, GEMM) it adds two launches."""
     x8, row_scale = quant_per_row(x2)
-    one = weight_scale.new_ones(())
-    y = torch._scaled_mm(x8, weight.t(), scale_a=one, scale_b=one, out_dtype=out_dtype)
-    return scale_rows_cols_(y, row_scale, weight_scale)
+    one = _unit_scale(weight_scale.device)
+    mm_dtype = torch.float32 if out_dtype == torch.float16 else out_dtype
+    y = torch._scaled_mm(x8, weight.t(), scale_a=one, scale_b=one, out_dtype=mm_dtype)
+    y = scale_rows_cols_(y, row_scale, weight_scale)
+    return y.to(out_dtype) if y.dtype != out_dtype else y
 
 
 def fp8_dynamic_linear(
@@ -213,17 +237,36 @@ def fp8_dynamic_linear(
     out_dtype = x.dtype if out_dtype is None else out_dtype
     *lead, k = x.shape
     x2 = x.reshape(-1, k).contiguous()
+    if x2.shape[0] == 0:
+        return torch.empty((*lead, weight.shape[0]), dtype=out_dtype, device=x.device)
     if weight_scale.ndim == 1:
-        return _fp8_channel_linear(x2, weight, weight_scale, out_dtype).reshape(*lead, weight.shape[0])
-    if x2.shape[0] == 1:  # one row: per-tensor is per-row, and the scale rides in the GEMM epilogue
+        return _fp8_channel_linear(x2, weight, weight_scale, out_dtype).reshape(
+            *lead, weight.shape[0]
+        )
+    from freetoken.models.config import verify_invariant_enabled
+
+    if x2.shape[0] == 1 and not verify_invariant_enabled():
         x8, scale = quant_per_tensor(x2)
-        y = torch._scaled_mm(x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=out_dtype)
+        y = torch._scaled_mm(
+            x8, weight.t(), scale_a=scale, scale_b=weight_scale, out_dtype=out_dtype
+        )
         return y.reshape(*lead, weight.shape[0])
     x8, row_scale = quant_per_row(x2)
+    mm_dtype = (
+        torch.float32
+        if (out_dtype == torch.float16 or verify_invariant_enabled())
+        else out_dtype
+    )
     y = torch._scaled_mm(
-        x8, weight.t(), scale_a=weight_scale.new_ones(()), scale_b=weight_scale, out_dtype=out_dtype
+        x8,
+        weight.t(),
+        scale_a=_unit_scale(weight_scale.device),
+        scale_b=weight_scale,
+        out_dtype=mm_dtype,
     )
     y.mul_(row_scale)
+    if y.dtype != out_dtype:
+        y = y.to(out_dtype)
     return y.reshape(*lead, weight.shape[0])
 
 
@@ -231,7 +274,14 @@ class Fp8DynamicLinear(BaseOP):
     """FP8 linear over the local shard; ``all_reduce`` adds the TP sum (row-parallel).
     ``channel``: one weight scale per local output row instead of one per tensor."""
 
-    def __init__(self, local_isize: int, local_osize: int, *, all_reduce: bool = False, channel: bool = False):
+    def __init__(
+        self,
+        local_isize: int,
+        local_osize: int,
+        *,
+        all_reduce: bool = False,
+        channel: bool = False,
+    ):
         assert local_isize % 16 == 0 and local_osize % 16 == 0, (
             local_isize,
             local_osize,
@@ -239,12 +289,17 @@ class Fp8DynamicLinear(BaseOP):
         self.local_input_size = local_isize
         self.local_output_size = local_osize
         self.weight = torch.empty(local_osize, local_isize, dtype=FP8)
-        self.weight_scale = torch.empty((local_osize,) if channel else (), dtype=torch.float32)
+        self.weight_scale = torch.empty(
+            (local_osize,) if channel else (), dtype=torch.float32
+        )
         self._comm = (
             DistributedCommunicator() if all_reduce and get_tp_info().size > 1 else None
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def input_format(self, _x: torch.Tensor) -> str | None:
+        return None
+
+    def forward(self, x: torch.Tensor, _xq: torch.Tensor | None = None) -> torch.Tensor:
         y = fp8_dynamic_linear(x, self.weight, self.weight_scale)
         if self._comm is not None:
             y = self._comm.all_reduce(y)
@@ -258,8 +313,8 @@ class Fp8DynamicColMerged(Fp8DynamicLinear):
     def __init__(
         self,
         input_size: int,
-        output_sizes: List[int],
-        local_output_sizes: List[int] | None = None,
+        output_sizes: list[int],
+        local_output_sizes: list[int] | None = None,
         *,
         channel: bool = False,
     ):
@@ -277,7 +332,10 @@ class Fp8DynamicRowParallel(Fp8DynamicLinear):
 
     def __init__(self, input_size: int, output_size: int, *, channel: bool = False):
         super().__init__(
-            div_even(input_size, get_tp_info().size), output_size, all_reduce=True, channel=channel
+            div_even(input_size, get_tp_info().size),
+            output_size,
+            all_reduce=True,
+            channel=channel,
         )
 
 
@@ -297,9 +355,13 @@ class Fp8ParallelLMHead(ParallelLMHead):
         tp_rank: int | None = None,
         channel: bool = False,
     ):
-        super().__init__(num_embeddings, embedding_dim, tp_size=tp_size, tp_rank=tp_rank)
+        super().__init__(
+            num_embeddings, embedding_dim, tp_size=tp_size, tp_rank=tp_rank
+        )
         self.weight = torch.empty(self.num_embeddings_tp, embedding_dim, dtype=FP8)
-        self.weight_scale = torch.empty((self.num_embeddings_tp,) if channel else (), dtype=torch.float32)
+        self.weight_scale = torch.empty(
+            (self.num_embeddings_tp,) if channel else (), dtype=torch.float32
+        )
 
     def keep_rows(self, ids: torch.Tensor, quant_config=None) -> None:
         from freetoken.utils import div_ceil
@@ -308,7 +370,9 @@ class Fp8ParallelLMHead(ParallelLMHead):
         rows = ids.numel()
         channel = self.weight_scale.ndim == 1
         with torch.device("meta"):
-            head = Fp8ParallelLMHead(rows, self.embedding_dim, tp_size=1, tp_rank=0, channel=channel)
+            head = Fp8ParallelLMHead(
+                rows, self.embedding_dim, tp_size=1, tp_rank=0, channel=channel
+            )
         device = self.weight.device
         ids = ids.to(device)
         if channel:
@@ -320,10 +384,13 @@ class Fp8ParallelLMHead(ParallelLMHead):
             start, count = self.vocab_range
             in_shard = (ids >= start) & (ids < start + count)
             local_ids = ids[in_shard] - start
-            kept_bf16 = torch.zeros(rows, self.embedding_dim, dtype=torch.bfloat16, device=device)
+            kept_bf16 = torch.zeros(
+                rows, self.embedding_dim, dtype=torch.bfloat16, device=device
+            )
             if local_ids.numel():
                 kept_bf16[in_shard] = (
-                    self.weight.index_select(0, local_ids).to(torch.float32) * self.weight_scale
+                    self.weight.index_select(0, local_ids).to(torch.float32)
+                    * self.weight_scale
                 ).to(torch.bfloat16)
             kept_bf16 = self._comm.all_reduce(kept_bf16)
             w_f32 = kept_bf16.to(torch.float32)
@@ -359,17 +426,19 @@ class Fp8ParallelLMHead(ParallelLMHead):
     def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
         # fp32 logits: bf16 logits step by 0.125 at the magnitudes greedy decode compares, so ties are
         # common and a decode row and a verify row of the same token can pick different argmaxes
-        y = fp8_dynamic_linear(x, self.weight, self.weight_scale, out_dtype=torch.float32)
+        y = fp8_dynamic_linear(
+            x, self.weight, self.weight_scale, out_dtype=torch.float32
+        )
         return y if self.bias is None else y + self.bias
 
 
 __all__ = [
-    "FP8",
     "E4M3_MAX",
-    "Fp8ParallelLMHead",
+    "FP8",
     "Fp8DynamicColMerged",
     "Fp8DynamicLinear",
     "Fp8DynamicRowParallel",
+    "Fp8ParallelLMHead",
     "fp8_dynamic_linear",
     "quant_per_row",
     "quant_per_tensor",

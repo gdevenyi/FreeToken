@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 
 from freetoken.layers import (
     BaseOP,
@@ -96,7 +95,9 @@ class Qwen3_5MoE(BaseOP):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._fp32_router:
-            return F.linear(hidden_states.float(), self.gate.weight.float())
+            from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
+
+            return bf16_linear_fp32(hidden_states, self.gate.weight)
         return self.gate.forward(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

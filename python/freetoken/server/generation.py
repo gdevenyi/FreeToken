@@ -22,12 +22,17 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
-from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
-from freetoken.tokenizer.tokenize import join_system_contents, resolve_thinking_mode
+from freetoken.mm.media import (
+    collect_image_refs,
+    fetch_image_bytes,
+    image_reject_reason,
+)
 from freetoken.tokenizer.inline_system import InlineSystemError
+from freetoken.tokenizer.tokenize import join_system_contents, resolve_thinking_mode
+
+from . import request_ring
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -37,7 +42,7 @@ try:
 except Exception:  # pragma: no cover — jinja2 always ships with transformers
     _TemplateError = ()
 
-from .function_call_parser import FunctionCallParser, TOOLS_TAG_LIST, ToolCallItem
+from .function_call_parser import TOOLS_TAG_LIST, FunctionCallParser, ToolCallItem
 from .reasoning_parser import (
     DSV4_SPECIAL_TOKENS,
     ReasoningParser,
@@ -131,7 +136,15 @@ class GenDone:
     timings: dict[str, Any] | None = None
 
 
-GenEvent = PromptAdmitted | ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
+GenEvent = (
+    PromptAdmitted
+    | ReasoningDelta
+    | ContentDelta
+    | ToolCallStart
+    | ToolCallArgsDelta
+    | ToolCallsDelta
+    | GenDone
+)
 
 
 @dataclass
@@ -190,7 +203,9 @@ def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] 
         "predicted_n": predicted_n,
         "predicted_ms": predicted_ms,
         "predicted_per_token_ms": predicted_ms / gen_steps if gen_steps > 0 else 0.0,
-        "predicted_per_second": 1e3 / predicted_ms * gen_steps if predicted_ms > 0 else 0.0,
+        "predicted_per_second": 1e3 / predicted_ms * gen_steps
+        if predicted_ms > 0
+        else 0.0,
         "queue_ms": timings["queue_ms"],
     }
     if timings.get("draft_n", 0) > 0:
@@ -205,11 +220,15 @@ class GenSpec:
     into a GenSpec (like vLLM's to_sampling_params + _preprocess_chat) and the
     primitive consumes ONLY this — no wire request type reaches the engine path."""
 
-    messages: list[dict[str, Any]]                       # normalized, template-ready
+    messages: list[dict[str, Any]]  # normalized, template-ready
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
-    template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
-    parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    template_tools: list[dict[str, Any]] | None = (
+        None  # tools the model sees (TokenizeMsg.tools)
+    )
+    parser_tools: list[dict[str, Any]] | None = (
+        None  # tools for FunctionCallParser; None disables parsing
+    )
     inline_system_policy: str | None = None
 
     @property
@@ -271,7 +290,9 @@ def resolve_sampling(
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     resolved_temperature = pick(temperature, "temperature", 0.0)
     if not math.isfinite(resolved_temperature) or resolved_temperature < 0:
-        raise ValueError(f"temperature must be a finite number >= 0, got {resolved_temperature}")
+        raise ValueError(
+            f"temperature must be a finite number >= 0, got {resolved_temperature}"
+        )
     resolved_top_p = pick(top_p, "top_p", 1.0)
     if not math.isfinite(resolved_top_p) or not 0 < resolved_top_p <= 1:
         raise ValueError(f"top_p must be in (0, 1], got {resolved_top_p}")
@@ -286,7 +307,9 @@ def resolve_sampling(
         raise ValueError(f"min_p must be in [0, 1], got {resolved_min_p}")
     # not `<= 0`: NaN compares False and would poison every seen token's logit
     if not (math.isfinite(resolved_rep) and resolved_rep > 0.0):
-        raise ValueError(f"repetition_penalty must be a positive finite number, got {resolved_rep}")
+        raise ValueError(
+            f"repetition_penalty must be a positive finite number, got {resolved_rep}"
+        )
     if min_tokens < 0:
         raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
     bias: list[list[float]] | None = None
@@ -296,10 +319,14 @@ def resolve_sampling(
             try:
                 tid = int(key)
             except (TypeError, ValueError):
-                raise ValueError(f"logit_bias keys must be token ids, got {key!r}") from None
+                raise ValueError(
+                    f"logit_bias keys must be token ids, got {key!r}"
+                ) from None
             if tid < 0:
                 raise ValueError(f"logit_bias token id must be >= 0, got {tid}")
-            bias.append([tid, max(-100.0, min(100.0, float(value)))])  # the OpenAI range
+            bias.append(
+                [tid, max(-100.0, min(100.0, float(value)))]
+            )  # the OpenAI range
     ids = [int(t) for t in (stop_token_ids or [])]
     if any(t < 0 for t in ids):
         raise ValueError("stop_token_ids must be non-negative token ids")
@@ -318,7 +345,9 @@ def resolve_sampling(
         temperature=resolved_temperature,
         top_k=resolved_top_k,
         top_p=resolved_top_p,
-        stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        stop_strs=[
+            s for s in stop_list if s
+        ],  # drop empty strings (would match everything)
         min_p=resolved_min_p,
         presence_penalty=float(presence_penalty),
         frequency_penalty=float(frequency_penalty),
@@ -335,7 +364,9 @@ def resolve_sampling(
     return params
 
 
-def render_messages(messages: list[dict[str, Any]], *, hoist_system: bool = True) -> list[dict[str, Any]]:
+def render_messages(
+    messages: list[dict[str, Any]], *, hoist_system: bool = True
+) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
     ValueError on a non-text content part (text-only server). Shared by all adapters.
@@ -358,7 +389,9 @@ def render_messages(messages: list[dict[str, Any]], *, hoist_system: bool = True
     system_msgs = [m for m in rendered if m.get("role") == "system"]
     if len(system_msgs) > 1:
         non_system = [m for m in rendered if m.get("role") != "system"]
-        rendered = [{"role": "system", "content": join_system_contents(system_msgs)}] + non_system
+        rendered = [
+            {"role": "system", "content": join_system_contents(system_msgs)}
+        ] + non_system
     return rendered
 
 
@@ -443,7 +476,11 @@ def split_tool_lists(
     if not all_tool_dicts:
         return None, None
     if selected_name:
-        template = [t for t in all_tool_dicts if (t.get("function") or {}).get("name") == selected_name]
+        template = [
+            t
+            for t in all_tool_dicts
+            if (t.get("function") or {}).get("name") == selected_name
+        ]
     else:
         template = all_tool_dicts
     return template, all_tool_dicts
@@ -526,7 +563,9 @@ async def count_prompt_tokens(
         images=images,
         inline_system_policy=inline_system_policy,
     )
-    manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
+    manager = await asyncio.to_thread(
+        state.frontend_tokenizer
+    )  # init failure -> server fault
     try:
         (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
     except InlineSystemError as exc:
@@ -560,6 +599,8 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         manager = await asyncio.to_thread(build)
     except Exception:  # noqa: BLE001 -- server fault, not this request's problem
         return None
+    if manager is None:
+        return None
     try:
         await asyncio.to_thread(manager.render_prompt, msg)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
@@ -585,7 +626,9 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     elif parser_name == "glm":
         # GLM's template honors enable_thinking (default on) even with tools; the
         # generic fallback would force thinking and mislabel disabled output as reasoning.
-        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+        force_reasoning = (spec.chat_template_kwargs or {}).get(
+            "enable_thinking"
+        ) is not False
     elif parser_name == "gemma4":
         # Gemma4 defaults thinking off even when tools are present: its template injects an
         # empty thought channel before generation. Do not let Codex tool definitions make all
@@ -603,20 +646,36 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
         # model then emits just the closing tag); "adaptive" (default) leaves the
         # model to open the tag itself and "disabled" pre-closes it.
-        force_reasoning = (spec.chat_template_kwargs or {}).get("thinking_mode") == "enabled"
+        force_reasoning = (spec.chat_template_kwargs or {}).get(
+            "thinking_mode"
+        ) == "enabled"
     else:
         force_reasoning = (
-            resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"
+            resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools)
+            == "thinking"
         )
-    tool_names = [(tool.get("function") or {}).get("name") for tool in spec.parser_tools or []]
+    tool_names = [
+        (tool.get("function") or {}).get("name") for tool in spec.parser_tools or []
+    ]
     return build_reasoning_parser(state.config, force_reasoning, tool_names)
 
 
-def _reasoning_finish(spec: GenSpec, finish_reason: str | None, matched_stop: str | None) -> str | None:
+def _reasoning_finish(
+    spec: GenSpec,
+    finish_reason: str | None,
+    matched_stop: str | None,
+    hit_stop_token: bool | None = None,
+) -> str | None:
     """The finish reason the reasoning parser sees, before any adapter default."""
     # A client stop string or stop token cuts the text as max_tokens does: the model may not have
-    # ended the turn there. The scheduler reports a stop-token hit as a plain "stop", same as EOS.
-    if matched_stop is not None or getattr(spec.sampling_params, "stop_token_ids", None):
+    # ended the turn there. Real engine replies carry hit_stop_token (True/False); unit-test mocks
+    # leave it None, falling back to whether stop_token_ids were configured.
+    stopped_on_client_token = (
+        bool(getattr(spec.sampling_params, "stop_token_ids", None))
+        if hit_stop_token is None
+        else bool(hit_stop_token)
+    )
+    if matched_stop is not None or stopped_on_client_token:
         return None
     return finish_reason
 
@@ -635,7 +694,11 @@ def _split_reasoning(
 def _leaked_special_tokens(state: Any) -> list[str]:
     """Special-token strings to strip from output. Empty (no-op) unless the dsv4
     reasoning parser is configured, so non-dsv4 output is untouched."""
-    return DSV4_SPECIAL_TOKENS if getattr(state.config, "reasoning_parser", None) == "deepseekv32" else []
+    return (
+        DSV4_SPECIAL_TOKENS
+        if getattr(state.config, "reasoning_parser", None) == "deepseekv32"
+        else []
+    )
 
 
 def _make_tool_parser(spec: GenSpec, state: Any) -> FunctionCallParser:
@@ -646,7 +709,8 @@ def _make_tool_parser(spec: GenSpec, state: Any) -> FunctionCallParser:
     return FunctionCallParser(
         spec.parser_tools or [],
         getattr(state.config, "tool_call_parser", "llama3"),
-        turn_starts_open=getattr(state.config, "reasoning_parser", None) != "muse_glimmer",
+        turn_starts_open=getattr(state.config, "reasoning_parser", None)
+        != "muse_glimmer",
     )
 
 
@@ -655,11 +719,13 @@ def _parse_tool_response(
     spec: GenSpec,
     state: Any,
 ) -> tuple[str, list[ToolCallItem]] | None:
-    if not spec.parse_tools:
-        return None
-    if not any(tag in text for tag in TOOLS_TAG_LIST):
+    if not spec.parse_tools or not text:
         return None
     parser = _make_tool_parser(spec, state)
+    if not parser.has_tool_call(text) and not any(
+        tag in text for tag in TOOLS_TAG_LIST
+    ):
+        return None
     result = parser.parse_non_stream(text)
     # A detector that replays its stream can drop markup without producing a call
     # (an empty <tool_call> block): the one-shot content must drop it too.
@@ -695,7 +761,7 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
                 task = asyncio.ensure_future(aiter.__anext__())
             try:
                 ev = await asyncio.wait_for(asyncio.shield(task), interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield KEEPALIVE
                 continue
             except StopAsyncIteration:
@@ -733,7 +799,9 @@ def _record_generation(
             status=500 if error else 200,
             model=_served_model_name(),
             duration_ms=int((time.monotonic() - start) * 1000),
-            ttft_ms=int((first_token_at - start) * 1000) if first_token_at is not None else None,
+            ttft_ms=int((first_token_at - start) * 1000)
+            if first_token_at is not None
+            else None,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             stream=stream,
@@ -743,7 +811,12 @@ def _record_generation(
 
 
 async def generate_events(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, usage: GenUsage | None = None
+    uid: int,
+    spec: GenSpec,
+    state: Any,
+    *,
+    source: str | None = None,
+    usage: GenUsage | None = None,
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
@@ -768,8 +841,12 @@ async def generate_events(
         raise
     finally:
         _record_generation(
-            source=source, stream=True, start=start,
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
+            source=source,
+            stream=True,
+            start=start,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            error=error,
             first_token_at=first_token_at,
         )
 
@@ -790,7 +867,9 @@ async def generate_full(
         raise
     finally:
         _record_generation(
-            source=source, stream=False, start=start,
+            source=source,
+            stream=False,
+            start=start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
@@ -821,13 +900,17 @@ async def _generate_events_impl(
         try:
             candidate = _make_tool_parser(spec, state)
         except ValueError:
-            candidate = None  # unsupported parser name: keep the buffered path's behavior
+            candidate = (
+                None  # unsupported parser name: keep the buffered path's behavior
+            )
         if candidate is not None and candidate.supports_streaming():
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
     # A detector that replays its stream for the one-shot parse already decides which
     # whitespace after a call is a separator; dropping more here would split the modes.
-    detector_owns_ws = tool_parser is not None and tool_parser.detector.one_shot_replays_stream
+    detector_owns_ws = (
+        tool_parser is not None and tool_parser.detector.one_shot_replays_stream
+    )
 
     # Streaming tool-call assembly: detectors emit fragments (name first, then
     # argument diffs); they accumulate here and the call is emitted complete when
@@ -848,9 +931,13 @@ async def _generate_events_impl(
         # fall back to the detector's parse state when the stream was cut short.
         params = open_call["params"]
         if not _valid_json(params):
-            params = tool_parser.unstreamed_arguments(open_call["detector_index"]) or params
+            params = (
+                tool_parser.unstreamed_arguments(open_call["detector_index"]) or params
+            )
         call = ToolCallItem(
-            tool_index=open_call["ordinal"], name=open_call["name"], parameters=params or "{}"
+            tool_index=open_call["ordinal"],
+            name=open_call["name"],
+            parameters=params or "{}",
         )
         open_call = None
         calls_emitted += 1
@@ -891,18 +978,27 @@ async def _generate_events_impl(
                         "params": "",
                         "ordinal": calls_emitted,
                     }
-                    out.append(ToolCallStart(
-                        tool_index=calls_emitted, name=frag.name, args_prefix_stable=frag_stable,
-                    ))
+                    out.append(
+                        ToolCallStart(
+                            tool_index=calls_emitted,
+                            name=frag.name,
+                            args_prefix_stable=frag_stable,
+                        )
+                    )
                 if frag.parameters:
                     open_call["params"] += frag.parameters
                     out.append(
-                        ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
+                        ToolCallArgsDelta(
+                            tool_index=open_call["ordinal"], fragment=frag.parameters
+                        )
                     )
         return out
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    engine_hit_stop_token: bool | None = None
+    emitted_reasoning = False
+    emitted_content_or_tools = False
     timings: dict[str, Any] | None = None
     admitted = False
     async for ack in state.wait_for_ack(uid):
@@ -911,7 +1007,9 @@ async def _generate_events_impl(
         usage.prompt_tokens += ack.prompt_tokens_delta
         usage.completion_tokens += ack.completion_tokens_delta
         usage.cached_tokens += ack.cached_tokens
-        usage.reasoning_tokens = max(usage.reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
+        usage.reasoning_tokens = max(
+            usage.reasoning_tokens, getattr(ack, "reasoning_tokens", 0)
+        )
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
             usage.timings = timings
@@ -920,12 +1018,18 @@ async def _generate_events_impl(
             yield PromptAdmitted(usage.prompt_tokens, usage.cached_tokens)
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
-            reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
+            reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(
+                content_delta
+            )
             if reasoning_delta:
                 stripped_reasoning = strip_special_tokens(reasoning_delta, specials)
-                if stripped_reasoning:  # a bare special token must not open a thinking block
+                if (
+                    stripped_reasoning
+                ):  # a bare special token must not open a thinking block
+                    emitted_reasoning = True
                     yield ReasoningDelta(stripped_reasoning)
         if content_delta:
+            emitted_content_or_tools = True
             if tool_parser is not None:
                 for ev in _route_tool_text(content_delta):
                     yield ev
@@ -936,19 +1040,24 @@ async def _generate_events_impl(
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
+            engine_hit_stop_token = getattr(ack, "hit_stop_token", None)
             break
 
     # Drain residue held in the reasoning parser (a deferred tool block, or a
     # trailing partial token) so it is not silently dropped.
     if reasoning_parser is not None:
         flush_reasoning, flush_content = reasoning_parser.flush(
-            _reasoning_finish(spec, engine_finish_reason, engine_matched_stop)
+            _reasoning_finish(
+                spec, engine_finish_reason, engine_matched_stop, engine_hit_stop_token
+            )
         )
         if flush_reasoning:
             stripped_reasoning = strip_special_tokens(flush_reasoning, specials)
             if stripped_reasoning:
+                emitted_reasoning = True
                 yield ReasoningDelta(stripped_reasoning)
         if flush_content:
+            emitted_content_or_tools = True
             if tool_parser is not None:
                 for ev in _route_tool_text(flush_content):
                     yield ev
@@ -969,14 +1078,22 @@ async def _generate_events_impl(
         for frag in tool_parser.finalize_stream():
             if open_call is not None and frag.parameters:
                 open_call["params"] += frag.parameters
-                yield ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
+                yield ToolCallArgsDelta(
+                    tool_index=open_call["ordinal"], fragment=frag.parameters
+                )
         done = _close_open_call()
         if done is not None:
             yield done
         for item in tool_parser.recover_truncated_call():
             yield ToolCallStart(tool_index=calls_emitted, name=item.name)
             yield ToolCallsDelta(
-                [ToolCallItem(tool_index=calls_emitted, name=item.name, parameters=item.parameters)]
+                [
+                    ToolCallItem(
+                        tool_index=calls_emitted,
+                        name=item.name,
+                        parameters=item.parameters,
+                    )
+                ]
             )
             calls_emitted += 1
         residual = tool_parser.finish_stream()
@@ -1000,9 +1117,28 @@ async def _generate_events_impl(
         elif parse_tools and pending:
             yield ContentDelta(strip_special_tokens(pending, specials))
 
+    thinking_off = (
+        getattr(state.config, "thinking", None) == "off"
+        or getattr(state.config, "reasoning_parser", None) == "off"
+    )
+    if thinking_off:
+        usage.reasoning_tokens = 0
+    elif reasoning_parser is not None:
+        if not emitted_reasoning:
+            usage.reasoning_tokens = 0
+        elif (
+            usage.reasoning_tokens == 0
+            and not emitted_content_or_tools
+            and calls_emitted == 0
+        ):
+            usage.reasoning_tokens = usage.completion_tokens
+
     yield GenDone(
-        finish_reason, usage.prompt_tokens, usage.completion_tokens,
-        matched_stop=engine_matched_stop, cached_tokens=usage.cached_tokens,
+        finish_reason,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        matched_stop=engine_matched_stop,
+        cached_tokens=usage.cached_tokens,
         reasoning_tokens=usage.reasoning_tokens,
         timings=timings,
     )
@@ -1019,6 +1155,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     timings: dict[str, Any] | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    engine_hit_stop_token: bool | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -1032,10 +1169,19 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
+            engine_hit_stop_token = getattr(ack, "hit_stop_token", None)
             break
 
-    reasoning_text, content_text = _split_reasoning(
-        full_content, spec, state, _reasoning_finish(spec, engine_finish_reason, engine_matched_stop)
+    reasoning_parser = _make_reasoning_parser(spec, state)
+    reasoning_text, content_text = (
+        reasoning_parser.parse_non_stream(
+            full_content,
+            _reasoning_finish(
+                spec, engine_finish_reason, engine_matched_stop, engine_hit_stop_token
+            ),
+        )
+        if reasoning_parser is not None
+        else ("", full_content)
     )
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -1047,9 +1193,22 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
+    clean_reasoning = strip_special_tokens(reasoning_text, specials).strip()
+    clean_content = strip_special_tokens(content_text, specials)
+    thinking_off = (
+        getattr(state.config, "thinking", None) == "off"
+        or getattr(state.config, "reasoning_parser", None) == "off"
+    )
+    if thinking_off:
+        reasoning_tokens = 0
+    elif reasoning_parser is not None:
+        if not clean_reasoning:
+            reasoning_tokens = 0
+        elif reasoning_tokens == 0 and not clean_content and not tool_calls:
+            reasoning_tokens = completion_tokens
     return GenResult(
-        reasoning=strip_special_tokens(reasoning_text, specials).strip(),
-        content=strip_special_tokens(content_text, specials),
+        reasoning=clean_reasoning,
+        content=clean_content,
         tool_calls=tool_calls,
         finish_reason=finish_reason,
         prompt_tokens=prompt_tokens,

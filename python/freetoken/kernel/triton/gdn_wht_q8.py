@@ -61,13 +61,18 @@ def _wht128_q8_pack_slot_kernel(
     stride_layer,
     stride_slot,
     BLOCK_M: tl.constexpr,
+    IS_HIP: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    total_rows = num_layers * rows_per_layer
+    pid = tl.program_id(0).to(tl.int64)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rows_per_layer_i64 = rows_per_layer.to(tl.int64)
+    total_rows = num_layers.to(tl.int64) * rows_per_layer_i64
     mask_m = offs_m < total_rows
-    layer = offs_m // rows_per_layer
-    row_in_layer = offs_m - layer * rows_per_layer
+    layer = offs_m // rows_per_layer_i64
+    row_in_layer = offs_m - layer * rows_per_layer_i64
+    stride_layer_i64 = stride_layer.to(tl.int64)
+    stride_slot_i64 = stride_slot.to(tl.int64)
+    slot_idx_i64 = slot_idx.to(tl.int64)
     offs_k = tl.arange(0, 128)
 
     y = tl.zeros((BLOCK_M, 128), dtype=tl.float32)
@@ -75,8 +80,8 @@ def _wht128_q8_pack_slot_kernel(
         offs_ki = k0 + tl.arange(0, 32)
         row_ptrs = (
             states_ptr
-            + layer[:, None] * stride_layer
-            + slot_idx * stride_slot
+            + layer[:, None] * stride_layer_i64
+            + slot_idx_i64 * stride_slot_i64
             + row_in_layer[:, None] * 128
             + offs_ki[None, :]
         )
@@ -90,8 +95,13 @@ def _wht128_q8_pack_slot_kernel(
     scale_f32 = scale_bf16.to(tl.float32)
     inv_scale = tl.where(scale_f32 > 0.0, 1.0 / scale_f32, 0.0)
 
-    scaled = yg * inv_scale[:, :, None]
-    q_f32 = tl.extra.cuda.libdevice.rint(tl.minimum(tl.maximum(scaled, -127.0), 127.0))
+    scaled = tl.minimum(tl.maximum(yg * inv_scale[:, :, None], -127.0), 127.0)
+    if IS_HIP:
+        q_f32 = tl.where(
+            scaled >= 0.0, tl.floor(scaled + 0.5), -tl.floor(-scaled + 0.5)
+        )
+    else:
+        q_f32 = tl.extra.cuda.libdevice.rint(scaled)
     q_i8 = tl.reshape(q_f32.to(tl.int8), (BLOCK_M, 128))
 
     tl.store(
@@ -120,12 +130,16 @@ def _wht128_q8_unpack_slot_kernel(
     stride_slot,
     BLOCK_M: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    total_rows = num_layers * rows_per_layer
+    pid = tl.program_id(0).to(tl.int64)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rows_per_layer_i64 = rows_per_layer.to(tl.int64)
+    total_rows = num_layers.to(tl.int64) * rows_per_layer_i64
     mask_m = offs_m < total_rows
-    layer = offs_m // rows_per_layer
-    row_in_layer = offs_m - layer * rows_per_layer
+    layer = offs_m // rows_per_layer_i64
+    row_in_layer = offs_m - layer * rows_per_layer_i64
+    stride_layer_i64 = stride_layer.to(tl.int64)
+    stride_slot_i64 = stride_slot.to(tl.int64)
+    slot_idx_i64 = slot_idx.to(tl.int64)
     offs_k = tl.arange(0, 128)
     offs_g = tl.arange(0, 4)
 
@@ -153,8 +167,8 @@ def _wht128_q8_unpack_slot_kernel(
 
     row_ptrs = (
         states_ptr
-        + layer[:, None] * stride_layer
-        + slot_idx * stride_slot
+        + layer[:, None] * stride_layer_i64
+        + slot_idx_i64 * stride_slot_i64
         + row_in_layer[:, None] * 128
         + offs_k[None, :]
     )
@@ -198,6 +212,7 @@ def pack_slot_wht128_q8(
             recurrent_states.stride(0),
             recurrent_states.stride(1),
             BLOCK_M=block_m,
+            IS_HIP=torch.version.hip is not None,
             num_warps=4,
             num_stages=1,
         )

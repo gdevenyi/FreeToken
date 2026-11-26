@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple, TypeAlias
+from typing import Any, TypeAlias
 
 import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.utils import align_down
 
@@ -19,7 +21,7 @@ class RadixTreeNode:
 
     def __init__(self, key_fn: KEY_FN, tic: int | None = None) -> None:
         self.key_fn = key_fn
-        self.children: Dict[Any, RadixTreeNode] = {}
+        self.children: dict[Any, RadixTreeNode] = {}
         self._parent: RadixTreeNode | None = None
         self.ref_count: int = 0
         self.uuid = RadixTreeNode.counter
@@ -68,12 +70,16 @@ class RadixTreeNode:
         self._length = len(key)
 
     def set_host_value(self, host_value: torch.Tensor | None) -> None:
-        assert host_value is None or len(host_value) == self._length, "a host copy covers every token"
+        assert host_value is None or len(host_value) == self._length, (
+            "a host copy covers every token"
+        )
         self._host_value = host_value
 
     def drop_device_value(self) -> None:
         """The node's device pages were freed; its KV is now in the host copy only."""
-        assert self._host_value is not None, "a node without a host copy cannot leave the device"
+        assert self._host_value is not None, (
+            "a node without a host copy cannot leave the device"
+        )
         self._value = None
 
     @property
@@ -146,7 +152,7 @@ class RadixTreeNode:
         return new_node
 
     def __lt__(self, other: RadixTreeNode) -> bool:
-        return self.timestamp < other.timestamp
+        return (self.timestamp, self.uuid) < (other.timestamp, other.uuid)
 
 
 @dataclass(frozen=True)
@@ -155,7 +161,7 @@ class RadixCacheHandle(BaseCacheHandle):
 
     def get_matched_indices(self) -> torch.Tensor:
         node = self.node
-        value_list: List[torch.Tensor] = []
+        value_list: list[torch.Tensor] = []
         while not node.is_root():
             value_list.append(node.value)
             node = node.parent
@@ -170,13 +176,20 @@ class RadixPrefixCache(BasePrefixCache):
         # Explicit page_size beats the global ctx: a manager constructed with page_size!=ctx
         # (tests, future multi-granularity) must not silently split the two (the tree would
         # align by one granularity while the manager frees by the other -> orphaned pages).
-        self.page_size = get_global_ctx().page_size if page_size is None else int(page_size)
+        self.page_size = (
+            get_global_ctx().page_size if page_size is None else int(page_size)
+        )
         self.key_fn = _get_key_fn(self.page_size)
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
         self.protected_size = 0
-        self.root_node = RadixTreeNode(self.key_fn)
+        self._tic = 0
+        self.root_node = RadixTreeNode(self.key_fn, self._next_tic())
         self.root_node.ref_count = 1  # root is always protected
+
+    def _next_tic(self) -> int:
+        self._tic += 1
+        return self._tic
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
@@ -201,12 +214,14 @@ class RadixPrefixCache(BasePrefixCache):
         node, prefix_len = self._tree_walk(input_ids)
         return MatchResult(RadixCacheHandle(prefix_len, node))
 
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+    def insert_prefix(
+        self, input_ids: torch.Tensor, indices: torch.Tensor
+    ) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         node, prefix_len = self._tree_walk(input_ids)
         if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
-            new_node = RadixTreeNode(self.key_fn)
+            new_node = RadixTreeNode(self.key_fn, self._next_tic())
             # A view would keep the request's full output-budget token buffer alive.
             new_node.set_key_value(
                 input_ids[prefix_len:].clone(), indices[prefix_len:].clone()
@@ -219,19 +234,19 @@ class RadixPrefixCache(BasePrefixCache):
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
             return self.empty_tensor
-        assert (
-            size <= self.evictable_size
-        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
+        assert size <= self.evictable_size, (
+            f"Cannot evict {size}, only {self.evictable_size} is evictable"
+        )
 
         leave_nodes = self._collect_leave_nodes_for_evict()
         heapq.heapify(leave_nodes)
-        evicted_indices: List[torch.Tensor] = []
+        evicted_indices: list[torch.Tensor] = []
         evicted_size = 0
 
         while evicted_size < size:
-            assert (
-                leave_nodes
-            ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+            assert leave_nodes, (
+                f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+            )
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
             evicted_size += node.length
@@ -258,9 +273,9 @@ class RadixPrefixCache(BasePrefixCache):
     def check_integrity(self) -> None:
         pass
 
-    def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
-        nodes: List[RadixTreeNode] = [self.root_node]
-        leave_nodes: List[RadixTreeNode] = []
+    def _collect_leave_nodes_for_evict(self) -> list[RadixTreeNode]:
+        nodes: list[RadixTreeNode] = [self.root_node]
+        leave_nodes: list[RadixTreeNode] = []
 
         while len(nodes) > 0:
             node = nodes.pop()
@@ -273,11 +288,11 @@ class RadixPrefixCache(BasePrefixCache):
 
         return leave_nodes
 
-    def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+    def _tree_walk(self, input_ids: torch.Tensor) -> tuple[RadixTreeNode, int]:
         prefix_len = 0
         indice_len = len(input_ids)
         node = self.root_node
-        tic = time.monotonic_ns()
+        tic = self._next_tic()
 
         while prefix_len < indice_len:
             child_node = node.children.get(self.key_fn(input_ids[prefix_len:]))

@@ -48,14 +48,21 @@ def group_layers(scope: str, layouts: list, slot_bytes: list[int]) -> list[list[
     return sorted(pools, key=lambda layers: (-slot_bytes[layers[0]], layers[0]))
 
 
-def make_pools(groups: list[list[int]], num_experts: int, min_num_slots: int, slot_limit: int | None) -> list[PoolSpec]:
+def make_pools(
+    groups: list[list[int]],
+    num_experts: int,
+    min_num_slots: int,
+    slot_limit: int | None,
+) -> list[PoolSpec]:
     """Each group's slot range: at least ``min_num_slots``, at most one slot per expert of its layers and the kernel's ``slot_limit``."""
     pools = []
     for layers in groups:
         max_num_slots = len(layers) * num_experts
         if slot_limit is not None:
             max_num_slots = min(max_num_slots, slot_limit)
-        pools.append(PoolSpec(tuple(layers), min(min_num_slots, max_num_slots), max_num_slots))
+        pools.append(
+            PoolSpec(tuple(layers), min(min_num_slots, max_num_slots), max_num_slots)
+        )
     return pools
 
 
@@ -69,7 +76,9 @@ def pool_of_layer(pools: list[PoolSpec], num_layers: int) -> list[int]:
     return owner
 
 
-def split_slots(total: int, pools: list[PoolSpec], counts: torch.Tensor | None = None) -> list[int]:
+def split_slots(
+    total: int, pools: list[PoolSpec], counts: torch.Tensor | None = None
+) -> list[int]:
     """Slots per pool, each in [min_num_slots, max_num_slots], summing to ``total``.
 
     With ``counts`` (per-layer expert use from ``resolve_profile``) the slots follow expert use, else the pools' layer counts.
@@ -77,16 +86,24 @@ def split_slots(total: int, pools: list[PoolSpec], counts: torch.Tensor | None =
     if len(pools) == 1:
         return [total]
     _check_budget(total, pools)
-    return _split_equal(total, pools) if counts is None else _split_hot(total, pools, counts)
+    return (
+        _split_equal(total, pools)
+        if counts is None
+        else _split_hot(total, pools, counts)
+    )
 
 
 def _check_budget(total: int, pools: list[PoolSpec]) -> None:
     need = sum(p.min_num_slots for p in pools)
     room = sum(p.max_num_slots for p in pools)
     if total < need:
-        raise ValueError(f"MoE cache of {total} slots is below what the pools need ({need} slots)")
+        raise ValueError(
+            f"MoE cache of {total} slots is below what the pools need ({need} slots)"
+        )
     if total > room:
-        raise ValueError(f"MoE cache of {total} slots exceeds what the pools can hold ({room} slots)")
+        raise ValueError(
+            f"MoE cache of {total} slots exceeds what the pools can hold ({room} slots)"
+        )
 
 
 def _split_equal(total: int, pools: list[PoolSpec]) -> list[int]:
@@ -115,28 +132,63 @@ def _split_hot(total: int, pools: list[PoolSpec], counts: torch.Tensor) -> list[
     return sizes
 
 
-def resolve_profile(spec: str, model_path: str, num_layers: int, num_experts: int) -> torch.Tensor | None:
+def resolve_profile(
+    spec: str,
+    model_path: str,
+    num_layers: int,
+    num_experts: int,
+    *,
+    ep_offset: int = 0,
+    ep_size: int = 1,
+) -> torch.Tensor | None:
     """Expert use for ``--moe-cache-split``: None for ``equal``, else the profile at ``profile:<path>``."""
     if spec == "equal":
         return None
     path = Path(spec.removeprefix("profile:"))
     logger.info_rank0(f"MoE pool profile: {path}")
-    return load_profile(path, num_layers, num_experts, model_path)
+    return load_profile(
+        path,
+        num_layers,
+        num_experts,
+        model_path,
+        ep_offset=ep_offset,
+        ep_size=ep_size,
+    )
 
 
-def load_profile(path: str | Path, num_layers: int, num_experts: int, model_path: str = "") -> torch.Tensor:
+def load_profile(
+    path: str | Path,
+    num_layers: int,
+    num_experts: int,
+    model_path: str = "",
+    *,
+    ep_offset: int = 0,
+    ep_size: int = 1,
+) -> torch.Tensor:
     """Per-layer expert use ``[num_layers, num_experts]`` from a profile, each row scaled to sum to 1."""
     data = json.loads(Path(path).read_text())
     model = str(data.get("model", ""))
-    if model and model_path and not any(n.lower().startswith(model.lower()) for n in _model_names(model_path)):
-        logger.warning_rank0(f"MoE pool profile {path} was taken on {model!r}, not on {model_path}")
+    if (
+        model
+        and model_path
+        and not any(
+            n.lower().startswith(model.lower()) for n in _model_names(model_path)
+        )
+    ):
+        logger.warning_rank0(
+            f"MoE pool profile {path} was taken on {model!r}, not on {model_path}"
+        )
     if "expert_counts" not in data:
         from freetoken.moe.hot_rankings import HotExpertRankings
 
         rankings = HotExpertRankings.from_dict(data, source_path=str(path))
         if rankings is not None:
-            return rankings.to_pseudo_counts(num_layers, num_experts)
+            return rankings.to_pseudo_counts(
+                num_layers, num_experts, ep_offset=ep_offset, ep_size=ep_size
+            )
     counts = torch.tensor(data["expert_counts"], dtype=torch.float64)
+    if ep_size > 1 and tuple(counts.shape) == (num_layers, num_experts * ep_size):
+        counts = counts[:, ep_offset : ep_offset + num_experts]
     if tuple(counts.shape) != (num_layers, num_experts):
         raise ValueError(
             f"profile {path} has {tuple(counts.shape)} expert counts; this model needs ({num_layers}, {num_experts})"

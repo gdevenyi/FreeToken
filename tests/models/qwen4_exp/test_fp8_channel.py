@@ -697,10 +697,11 @@ def test_cuda_channel_linear_matches_the_dequantized_weight(rows, out_dtype):
     assert got.shape == (rows, 256) and got.dtype == out_dtype
     x8, xs = quant_per_row(x)
     exact = (x8.float() * xs) @ (w8.float() * s[:, None]).T
-    # bf16: the unit-scale GEMM output and the scaled result are each rounded once (2^-8 relative)
-    rtol = 2**-7 if out_dtype is torch.bfloat16 else 1e-5
+    # bf16: the unit-scale GEMM output and the scaled result are each rounded once (2^-8 relative);
+    # sm_89/sm_90 FP8 tensor cores accumulate 4 K-steps in ~13-bit mantissa (~2^-12) before fp32 promotion.
+    rtol = 2**-7 if out_dtype is torch.bfloat16 else 5e-4
     torch.testing.assert_close(
-        got.float(), exact, rtol=rtol, atol=1e-5 * exact.abs().max().item()
+        got.float(), exact, rtol=rtol, atol=5e-4 * exact.abs().max().item()
     )
 
 

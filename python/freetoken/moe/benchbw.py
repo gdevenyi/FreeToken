@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -68,7 +69,9 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here.
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block", "gguf", "gguf_scaled"})
+_CPU_MOE_FORMATS = frozenset(
+    {"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block", "gguf", "gguf_scaled"}
+)
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
@@ -114,7 +117,9 @@ class Workload:
     swiglu_alpha: float = 1.702
     swiglu_limit: float | None = None
     act_block: int | None = None  # ds_fp4 W4A8 activation quant block
-    options: tuple[tuple[str, int], ...] = ()  # CPU executor options of the format, e.g. the GGUF types
+    options: tuple[
+        tuple[str, int], ...
+    ] = ()  # CPU executor options of the format, e.g. the GGUF types
 
     def format_options(self, fmt: str) -> dict[str, int]:
         opts = dict(self.options)
@@ -126,19 +131,50 @@ class Workload:
 # Preset workloads. Dims from the model configs / benchmarks/bench_offload_cache_copy.py.
 # E/top_k/H/I are what drive the per-expert byte size and thus the bandwidths.
 WORKLOADS: dict[str, Workload] = {
-    "qwen3.6-moe": Workload("qwen3.6-moe", 2048, 512, 256, 8, ("bf16", "nvfp4", "fp8_block")),
+    "qwen3.6-moe": Workload(
+        "qwen3.6-moe", 2048, 512, 256, 8, ("bf16", "nvfp4", "fp8_block")
+    ),
     "qwen3-30b": Workload("qwen3-30b", 2048, 768, 128, 8, ("bf16",)),
-    "gemma4-26b": Workload("gemma4-26b", 2816, 704, 128, 8, ("bf16",), activation="gelu_tanh"),
-    "gpt-oss-120b": Workload("gpt-oss-120b", 2880, 2880, 128, 4, ("mxfp4_triton",),
-                             activation="gpt_oss_swiglu", swiglu_limit=7.0),
-    "gpt-oss-20b": Workload("gpt-oss-20b", 2880, 2880, 32, 4, ("mxfp4_triton",),
-                            activation="gpt_oss_swiglu", swiglu_limit=7.0),
-    "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128),
-    "dsv4.1-flash": Workload("dsv4.1-flash", 5120, 2304, 384, 6, ("ds_fp4",), swiglu_limit=10.0, act_block=32),
+    "gemma4-26b": Workload(
+        "gemma4-26b", 2816, 704, 128, 8, ("bf16",), activation="gelu_tanh"
+    ),
+    "gpt-oss-120b": Workload(
+        "gpt-oss-120b",
+        2880,
+        2880,
+        128,
+        4,
+        ("mxfp4_triton",),
+        activation="gpt_oss_swiglu",
+        swiglu_limit=7.0,
+    ),
+    "gpt-oss-20b": Workload(
+        "gpt-oss-20b",
+        2880,
+        2880,
+        32,
+        4,
+        ("mxfp4_triton",),
+        activation="gpt_oss_swiglu",
+        swiglu_limit=7.0,
+    ),
+    "dsv4": Workload(
+        "dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128
+    ),
+    "dsv4.1-flash": Workload(
+        "dsv4.1-flash", 5120, 2304, 384, 6, ("ds_fp4",), swiglu_limit=10.0, act_block=32
+    ),
     "glm4.7-nvfp4": Workload("glm4.7-nvfp4", 5120, 1536, 160, 8, ("nvfp4",)),
     "glm5.3-flash-nvfp4": Workload(
-        "glm5.3-flash-nvfp4", 4096, 2048, 288, 8, ("nvfp4",),
-        activation="swiglu_clamp", swiglu_alpha=1.0, swiglu_limit=10.0,
+        "glm5.3-flash-nvfp4",
+        4096,
+        2048,
+        288,
+        8,
+        ("nvfp4",),
+        activation="swiglu_clamp",
+        swiglu_alpha=1.0,
+        swiglu_limit=10.0,
     ),
     "minimax-m2.5": Workload("minimax-m2.5", 3072, 1536, 256, 8, ("nvfp4",)),
 }
@@ -152,9 +188,19 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "bf16": Workload("dtype:bf16", 2048, 768, 128, 8, ("bf16",)),
     "nvfp4": Workload("dtype:nvfp4", 3072, 1536, 128, 8, ("nvfp4",)),
     "fp8_block": Workload("dtype:fp8", 2048, 512, 128, 8, ("fp8_block",)),
-    "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
-                             activation="gpt_oss_swiglu", swiglu_limit=7.0),
-    "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128),
+    "mxfp4_triton": Workload(
+        "dtype:mxfp4",
+        2880,
+        2880,
+        128,
+        4,
+        ("mxfp4_triton",),
+        activation="gpt_oss_swiglu",
+        swiglu_limit=7.0,
+    ),
+    "ds_fp4": Workload(
+        "dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128
+    ),
 }
 
 
@@ -224,8 +270,12 @@ def measure_cpu_mem_bw(
     per = n_elems // n_threads
     total_bytes = n_elems * 4
 
-    buf = torch.empty(n_elems, dtype=torch.float32)  # workers first-touch their own slice
-    results: list[float] = []  # keeps the reductions reachable (no dead-code elimination)
+    buf = torch.empty(
+        n_elems, dtype=torch.float32
+    )  # workers first-touch their own slice
+    results: list[
+        float
+    ] = []  # keeps the reductions reachable (no dead-code elimination)
 
     prev_threads = torch.get_num_threads()
     torch.set_num_threads(1)  # each Python worker runs a single-threaded reduction
@@ -246,7 +296,9 @@ def measure_cpu_mem_bw(
         done.wait()
         results.append(acc)
 
-    threads = [threading.Thread(target=worker, args=(i, c)) for i, c in enumerate(cores)]
+    threads = [
+        threading.Thread(target=worker, args=(i, c)) for i, c in enumerate(cores)
+    ]
     for t in threads:
         t.start()
     try:
@@ -267,7 +319,9 @@ def measure_cpu_mem_bw(
     }
 
 
-def measure_pcie_bw(device: torch.device, nbytes: int = 256 << 20, iters: int = 30) -> dict:
+def measure_pcie_bw(
+    device: torch.device, nbytes: int = 256 << 20, iters: int = 30
+) -> dict:
     """Linear pinned<->device copy bandwidth (GB/s) for H2D and D2H, via CUDA events."""
     n = max(1, nbytes // 2)  # bf16 elements
     moved = n * 2
@@ -296,55 +350,85 @@ def measure_pcie_bw(device: torch.device, nbytes: int = 256 << 20, iters: int = 
 # ============================== bank geometry ==============================
 
 
-def _gguf_bank_shapes(fmt: str, opts: dict, H: int, I: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def _gguf_bank_shapes(
+    fmt: str, opts: dict, H: int, I: int
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Per-expert (row shape, dtype) of the GGUF banks: ggml rows as bytes, float rows in their dtype."""
     from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes
 
     def rows(ggml_type: int, n: int, k: int):
         dtype = float_dtype(ggml_type)
-        return ((n, k), dtype) if dtype is not None else ((n, row_bytes(ggml_type, k)), torch.uint8)
+        return (
+            ((n, k), dtype)
+            if dtype is not None
+            else ((n, row_bytes(ggml_type, k)), torch.uint8)
+        )
 
-    shapes = {"gate_up": rows(opts["gate_up_type"], 2 * I, H), "down": rows(opts["down_type"], H, I)}
+    shapes = {
+        "gate_up": rows(opts["gate_up_type"], 2 * I, H),
+        "down": rows(opts["down_type"], H, I),
+    }
     if fmt == "gguf_scaled":
         shapes["global"] = ((4,), torch.float32)
     return shapes
 
 
-def _offload_bank_specs(fmt: str, H: int, I: int, opts: dict | None = None) -> dict[str, tuple[int, torch.dtype]]:
+def _offload_bank_specs(
+    fmt: str, H: int, I: int, opts: dict | None = None
+) -> dict[str, tuple[int, torch.dtype]]:
     """Per-bank (elems_per_expert, dtype) for the flat offload host banks (the gather)."""
     u8, bf16, f32, f8 = torch.uint8, torch.bfloat16, torch.float32, torch.float8_e4m3fn
     if fmt in ("gguf", "gguf_scaled"):
-        return {name: (math.prod(shape), dtype) for name, (shape, dtype) in _gguf_bank_shapes(fmt, opts, H, I).items()}
+        return {
+            name: (math.prod(shape), dtype)
+            for name, (shape, dtype) in _gguf_bank_shapes(fmt, opts, H, I).items()
+        }
     if fmt == "bf16":
         return {"gate_up": (2 * I * H, bf16), "down": (H * I, bf16)}
     if fmt == "fp8_block":
         # pad the scale banks like the loader: an unaligned per-expert row (2560x640 down_scale, 200 B) disables the fused copy
         return {
-            "gate_up": (2 * I * H, f8), "gate_up_scale": ((2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128), bf16),
-            "down": (H * I, f8), "down_scale": ((H // 128) * fp8_block_scale_pad(H // 128, I // 128), bf16),
+            "gate_up": (2 * I * H, f8),
+            "gate_up_scale": (
+                (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128),
+                bf16,
+            ),
+            "down": (H * I, f8),
+            "down_scale": ((H // 128) * fp8_block_scale_pad(H // 128, I // 128), bf16),
         }
     if fmt == "nvfp4":
         return {
-            "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 16), u8),
-            "gate_up_global": (2 * I, f32), "down_packed": (H * (I // 2), u8),
-            "down_scale": (H * (I // 16), u8), "down_global": (H, f32),
+            "gate_up_packed": (2 * I * (H // 2), u8),
+            "gate_up_scale": (2 * I * (H // 16), u8),
+            "gate_up_global": (2 * I, f32),
+            "down_packed": (H * (I // 2), u8),
+            "down_scale": (H * (I // 16), u8),
+            "down_global": (H, f32),
         }
     if fmt == "mxfp4_triton":
         return {
-            "gate_up_blocks": (2 * I * (H // 2), u8), "gate_up_scales": (2 * I * (H // 32), u8),
-            "gate_up_bias": (2 * I, bf16), "down_blocks": (H * (I // 2), u8),
-            "down_scales": (H * (I // 32), u8), "down_bias": (H, bf16),
+            "gate_up_blocks": (2 * I * (H // 2), u8),
+            "gate_up_scales": (2 * I * (H // 32), u8),
+            "gate_up_bias": (2 * I, bf16),
+            "down_blocks": (H * (I // 2), u8),
+            "down_scales": (H * (I // 32), u8),
+            "down_bias": (H, bf16),
         }
     if fmt == "ds_fp4":
         return {
-            "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 32), u8),
-            "down_packed": (H * (I // 2), u8), "down_scale": (H * (I // 32), u8),
+            "gate_up_packed": (2 * I * (H // 2), u8),
+            "gate_up_scale": (2 * I * (H // 32), u8),
+            "down_packed": (H * (I // 2), u8),
+            "down_scale": (H * (I // 32), u8),
         }
     raise NotImplementedError(fmt)
 
 
 def _expert_bytes(fmt: str, H: int, I: int, opts: dict | None = None) -> int:
-    return sum(elems * dt.itemsize for elems, dt in _offload_bank_specs(fmt, H, I, opts).values())
+    return sum(
+        elems * dt.itemsize
+        for elems, dt in _offload_bank_specs(fmt, H, I, opts).values()
+    )
 
 
 def _synth_experts(E: int, expert_bytes: int) -> int:
@@ -355,7 +439,9 @@ def _synth_experts(E: int, expert_bytes: int) -> int:
     return min(E, max(1, _SYNTH_BANK_BUDGET // max(1, expert_bytes)))
 
 
-def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = None) -> dict:
+def _cpu_moe_bank_sources(
+    fmt: str, H: int, I: int, E: int, opts: dict | None = None
+) -> dict:
     """3D pinned banks in the exact layout ``CpuMoeExecutor`` expects for ``fmt``.
 
     Scale banks that decode through an e8m0 exponent (mxfp4/ds_fp4) are set to a unit
@@ -363,6 +449,7 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
     GEMV and skew the timing); packed e2m1 codes are finite for any byte, so they're left
     as-is. Values otherwise don't affect the kernel's work.
     """
+
     def pin(*shape, dtype):
         return alloc_pinned_tensor(*shape, dtype=dtype)
 
@@ -375,26 +462,45 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
             if name == "global":
                 b[name].fill_(1.0)
             elif dtype == torch.uint8:
-                b[name].zero_()  # zero ggml blocks: every fp16 block scale is 0, never denormal
-                if opts["gate_up_type" if name == "gate_up" else "down_type"] == GGMLQuantizationType.MXFP4:
+                b[
+                    name
+                ].zero_()  # zero ggml blocks: every fp16 block scale is 0, never denormal
+                if (
+                    opts["gate_up_type" if name == "gate_up" else "down_type"]
+                    == GGMLQuantizationType.MXFP4
+                ):
                     # each block starts with an e8m0 scale byte; 0 decodes to 2^-127, a denormal that slows the CPU kernel
-                    b[name].view(E, -1, GGML_QUANT_SIZES[GGMLQuantizationType.MXFP4][1])[..., 0] = 127
+                    b[name].view(
+                        E, -1, GGML_QUANT_SIZES[GGMLQuantizationType.MXFP4][1]
+                    )[..., 0] = 127
             else:
                 b[name].fill_(0.02)
         return b
     if fmt == "bf16":
-        gate_up, down = pin(E, 2 * I, H, dtype=torch.bfloat16), pin(E, H, I, dtype=torch.bfloat16)
+        gate_up, down = (
+            pin(E, 2 * I, H, dtype=torch.bfloat16),
+            pin(E, H, I, dtype=torch.bfloat16),
+        )
         gate_up.fill_(0.02)  # uninitialized bf16 can be denormal -> x86 FP slowdown
         down.fill_(0.02)
         return {"gate_up": gate_up, "down": down}
     if fmt == "fp8_block":
+
         def nb(n):
             return (n + 127) // 128
+
         b = {
             "gate_up": pin(E, 2 * I, H, dtype=torch.float8_e4m3fn),
-            "gate_up_scale": pin(E, nb(2 * I), fp8_block_scale_pad(nb(2 * I), nb(H)), dtype=torch.bfloat16),
+            "gate_up_scale": pin(
+                E,
+                nb(2 * I),
+                fp8_block_scale_pad(nb(2 * I), nb(H)),
+                dtype=torch.bfloat16,
+            ),
             "down": pin(E, H, I, dtype=torch.float8_e4m3fn),
-            "down_scale": pin(E, nb(H), fp8_block_scale_pad(nb(H), nb(I)), dtype=torch.bfloat16),
+            "down_scale": pin(
+                E, nb(H), fp8_block_scale_pad(nb(H), nb(I)), dtype=torch.bfloat16
+            ),
         }
         # e4m3 0x00 is a clean zero and the scales are unit-ish, so nothing lands in
         # the fp32 denormal range (which would slow the GEMV and skew the timing).
@@ -455,17 +561,25 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     H, I, opts = wl.hidden, wl.inter, wl.format_options(fmt)
     E = _synth_experts(wl.experts, _expert_bytes(fmt, H, I, opts))
     specs = _offload_bank_specs(fmt, H, I, opts)
-    cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt
+    )
     total_bytes = 0
     sources = {}
     for name, (elems, dtype) in specs.items():
-        sources[name] = [alloc_pinned_tensor(E, elems, dtype=dtype)]  # cudaHostAlloc (mapped) like the loaders
+        sources[name] = [
+            alloc_pinned_tensor(E, elems, dtype=dtype)
+        ]  # cudaHostAlloc (mapped) like the loaders
         total_bytes += E * elems * dtype.itemsize
-    cache.set_bank_sources(sources)  # builds the fused copy plan (production default) when aligned
+    cache.set_bank_sources(
+        sources
+    )  # builds the fused copy plan (production default) when aligned
 
     cache.evict_slots[:E].copy_(torch.arange(E, dtype=torch.int32, device=device))
     cache.src_indices[:E].copy_(torch.randperm(E, device=device).to(torch.int32))
-    cache.num_indices.fill_(E)  # int64, allocated by the cache -> matches the kernel contract
+    cache.num_indices.fill_(
+        E
+    )  # int64, allocated by the cache -> matches the kernel contract
     # copy_missing resolves the per-layer source through this (normally set by
     # ensure_experts/materialize_layer, bypassed here since this bench pokes the
     # evict/src/num_indices state directly).
@@ -473,7 +587,9 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     return cache, total_bytes
 
 
-def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: int = 20) -> dict:
+def measure_pcie_gather_bw(
+    fmt: str, wl: Workload, device: torch.device, iters: int = 20
+) -> dict:
     """Real PCIe gather bandwidth (GB/s): pinned host banks -> GPU slot cache.
 
     Drives the production ``OffloadMoeCache.copy_missing`` (fused multi-bank
@@ -491,7 +607,9 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     if hasattr(torch.cuda, "_sleep"):
-        torch.cuda._sleep(10**7)  # keep the CPU from running the launches ahead of the timer
+        torch.cuda._sleep(
+            10**7
+        )  # keep the CPU from running the launches ahead of the timer
     start.record()
     for _ in range(iters):
         cache.copy_missing()
@@ -506,21 +624,31 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     }
 
 
-def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: int, E: int):
+def _build_cpu_moe_executor(
+    fmt: str, wl: Workload, banks: dict, num_threads: int, E: int
+):
     """A production ``CpuMoeExecutor`` over synthetic banks (via a minimal cache stand-in)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     cache = SimpleNamespace(
         quant_format=fmt,
         bank_sources={name: [t] for name, t in banks.items()},
-        num_layers=1, num_experts=E,
-        decode_target="cpu", cpu_executor=None,
+        num_layers=1,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
     )
     return CpuMoeExecutor(
-        cache, top_k=wl.top_k, activation=wl.activation,
-        apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
-        device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
-        swiglu_limit=wl.swiglu_limit, layer_formats=[(fmt, wl.format_options(fmt))] * cache.num_layers,
+        cache,
+        top_k=wl.top_k,
+        activation=wl.activation,
+        apply_router_weight_on_input=False,
+        num_threads=num_threads,
+        max_tokens=1,
+        device=torch.device("cuda"),
+        swiglu_alpha=wl.swiglu_alpha,
+        swiglu_limit=wl.swiglu_limit,
+        layer_formats=[(fmt, wl.format_options(fmt))] * cache.num_layers,
     )
 
 
@@ -554,7 +682,9 @@ def _time_cpu_moe(ex, wl: Workload, eb: int, E: int, iters: int) -> float:
         run()
     samples = []
     for i in range(iters):
-        set_ids(warmup + i)  # continue the sweep so timed steps don't re-touch warmed experts
+        set_ids(
+            warmup + i
+        )  # continue the sweep so timed steps don't re-touch warmed experts
         t0 = time.perf_counter()
         run()
         samples.append(time.perf_counter() - t0)
@@ -562,8 +692,13 @@ def _time_cpu_moe(ex, wl: Workload, eb: int, E: int, iters: int) -> float:
     return (wl.top_k * eb) / (ms / 1e3) / 1e9
 
 
-def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int = 0,
-                       isas: list[str] | None = None) -> dict:
+def measure_cpu_moe_bw(
+    fmt: str,
+    wl: Workload,
+    iters: int = 64,
+    num_threads: int = 0,
+    isas: list[str] | None = None,
+) -> dict:
     """Real CPU MoE GEMV bandwidth (GB/s) at bs=1, reading experts from pinned host banks.
 
     ``bw_gbs``/``isa`` are ALWAYS the kernel's auto-picked (best supported) tier -- what
@@ -585,17 +720,30 @@ def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int
         del ex
         return label, bw, cores
 
-    auto_isa, auto_bw, cores = run(None)  # recommendation basis: the tier production would pick
+    auto_isa, auto_bw, cores = run(
+        None
+    )  # recommendation basis: the tier production would pick
     sweep = {auto_isa: auto_bw}
     for isa in isas or []:
         label, bw, _ = run(isa)
         sweep[label] = max(sweep.get(label, 0.0), bw)  # dedupe clamped tiers, keep best
-    return {"bw_gbs": auto_bw, "isa": auto_isa, "isa_sweep": sweep, "cores": cores,
-            "expert_bytes": eb, "synth_experts": E}
+    return {
+        "bw_gbs": auto_bw,
+        "isa": auto_isa,
+        "isa_sweep": sweep,
+        "cores": cores,
+        "expert_bytes": eb,
+        "synth_experts": E,
+    }
 
 
-def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
-                       num_threads: int = 0, seconds: float = 2.0) -> dict:
+def measure_overlap_bw(
+    fmt: str,
+    wl: Workload,
+    device: torch.device,
+    num_threads: int = 0,
+    seconds: float = 2.0,
+) -> dict:
     """Concurrent achieved bandwidths (GB/s): the CPU MoE GEMV and the PCIe gather running
     at the same time -- the contention regime hybrid decode's overlap actually lives in.
 
@@ -614,7 +762,9 @@ def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
     H, I, opts = wl.hidden, wl.inter, wl.format_options(fmt)
     eb = _expert_bytes(fmt, H, I, opts)
     E = _synth_experts(wl.experts, eb)
-    ex = _build_cpu_moe_executor(fmt, wl, _cpu_moe_bank_sources(fmt, H, I, E, opts), num_threads, E)
+    ex = _build_cpu_moe_executor(
+        fmt, wl, _cpu_moe_bank_sources(fmt, H, I, E, opts), num_threads, E
+    )
     set_ids, run_step = _cpu_moe_step_fns(ex, wl, E)
     cache, gather_bytes = _build_gather_rig(fmt, wl, device)
 
@@ -666,18 +816,29 @@ def _note(entry: dict, msg: str) -> None:
     entry["note"] = f"{entry['note']} | {msg}" if entry.get("note") else msg
 
 
-def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float,
-                  cpu_threads: int, cpu_iters: int, pcie_iters: int,
-                  isas: list[str] | None = None) -> dict:
+def _bench_format(
+    fmt: str,
+    wl: Workload,
+    device: torch.device,
+    threshold: float,
+    cpu_threads: int,
+    cpu_iters: int,
+    pcie_iters: int,
+    isas: list[str] | None = None,
+) -> dict:
     """Per (workload, format): real PCIe gather + real CPU MoE GEMV + hybrid/offload verdict.
 
     Expected degradations (extension not built, OOM, JIT failure) are caught per bench so
     one format can't kill the run; an unexpected exception is left to propagate.
     """
     entry: dict = {
-        "cpu_moe_gbs": None, "cpu_moe_isa": None,
-        "cpu_cores": None, "isa_sweep": None, "pcie_gather_gbs": None,
-        "cpu_moe_overlap_gbs": None, "pcie_gather_overlap_gbs": None,
+        "cpu_moe_gbs": None,
+        "cpu_moe_isa": None,
+        "cpu_cores": None,
+        "isa_sweep": None,
+        "pcie_gather_gbs": None,
+        "cpu_moe_overlap_gbs": None,
+        "pcie_gather_overlap_gbs": None,
         "recommended": None,
         "note": None,
     }
@@ -703,15 +864,24 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                 # The tier label comes from the bf16 dot chooser, so it can over-report tiers
                 # the actual per-format kernel doesn't distinguish. Disclose the real story.
                 if fmt == "nvfp4":  # nvfp4 is the only use_vnni format
-                    _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
-                                 "(avx512 runs W4A8 with AVX512-VNNI, avx2 with AVX-VNNI; "
-                                 "a tier without its VNNI runs fp32 W4A16)")
+                    _note(
+                        entry,
+                        "isa tier labels are nominal: avx512bf16 == avx512f here "
+                        "(avx512 runs W4A8 with AVX512-VNNI, avx2 with AVX-VNNI; "
+                        "a tier without its VNNI runs fp32 W4A16)",
+                    )
                 elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block"):
-                    _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
-                                 "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
+                    _note(
+                        entry,
+                        "isa tier labels are nominal: avx512bf16 == avx512f here "
+                        "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)",
+                    )
                 elif fmt in ("gguf", "gguf_scaled"):
-                    _note(entry, "isa tier labels are nominal: GGUF rows run on the ggml-cpu variant "
-                                 "picked at load, regardless of the forced tier")
+                    _note(
+                        entry,
+                        "isa tier labels are nominal: GGUF rows run on the ggml-cpu variant "
+                        "picked at load, regardless of the forced tier",
+                    )
         except (ImportError, RuntimeError) as e:
             logger.warning(f"benchbw: CPU MoE bench failed for {wl.name}/{fmt}: {e}")
             _note(entry, f"cpu moe unavailable ({e})")
@@ -740,10 +910,18 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
 
 def _kind(fmt: str, wl: Workload) -> tuple:
     """A layer kind without the CPU thread count, which the row key adds once the executor has sized its pool."""
-    return (fmt, tuple(sorted(wl.format_options(fmt).items())), wl.hidden, wl.inter, wl.top_k)
+    return (
+        fmt,
+        tuple(sorted(wl.format_options(fmt).items())),
+        wl.hidden,
+        wl.inter,
+        wl.top_k,
+    )
 
 
-def checkpoint_layer_kinds(model_path: str, device: torch.device) -> dict[tuple, Workload]:
+def checkpoint_layer_kinds(
+    model_path: str, device: torch.device, *, moe_ep: bool = False
+) -> dict[tuple, Workload]:
     """Each distinct MoE layer kind of a checkpoint as hybrid decode would serve it: kind -> workload."""
     from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
     from freetoken.engine.config import EngineConfig
@@ -753,7 +931,13 @@ def checkpoint_layer_kinds(model_path: str, device: torch.device) -> dict[tuple,
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     tp = try_get_tp_info()
-    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size), dtype=torch.bfloat16, moe_strategy="hybrid")
+    cfg = EngineConfig(
+        model_path=model_path,
+        tp_info=DistributedInfo(tp.rank, tp.size),
+        dtype=torch.bfloat16,
+        moe_strategy="hybrid",
+        moe_ep=moe_ep,
+    )
     if not getattr(cfg.model_config, "is_moe", False):
         raise RuntimeError(f"{model_path} has no MoE layers")
     set_rope_device(device)
@@ -765,8 +949,16 @@ def checkpoint_layer_kinds(model_path: str, device: torch.device) -> dict[tuple,
         fmt, opts = m.cpu_spec()
         c = m.cfg
         wl = Workload(
-            f"{os.path.basename(model_path.rstrip('/'))}:{fmt}", c.hidden, c.local_intermediate, c.num_experts, c.top_k, (fmt,),
-            activation=c.activation, swiglu_alpha=float(c.alpha), swiglu_limit=c.limit, options=tuple(sorted(opts.items())),
+            f"{os.path.basename(model_path.rstrip('/'))}:{fmt}",
+            c.hidden,
+            c.local_intermediate,
+            c.num_experts,
+            c.top_k,
+            (fmt,),
+            activation=c.activation,
+            swiglu_alpha=float(c.alpha),
+            swiglu_limit=c.limit,
+            options=tuple(sorted(opts.items())),
         )
         kinds.setdefault(_kind(fmt, wl), wl)
     return kinds
@@ -777,10 +969,23 @@ def _freetoken_build() -> dict:
     from freetoken.version import __version__
 
     try:
-        commit = subprocess.run(
-            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "--short=12", "HEAD"],
-            capture_output=True, text=True, timeout=5, check=True,
-        ).stdout.strip() or None
+        commit = (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "rev-parse",
+                    "--short=12",
+                    "HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+            or None
+        )
     except (OSError, subprocess.SubprocessError):
         commit = None
     return {"version": __version__, "commit": commit}
@@ -790,14 +995,32 @@ def _cpu_info() -> dict:
     model = numa = None
     try:
         with open("/proc/cpuinfo") as f:
-            model = next((line.split(":", 1)[1].strip() for line in f if line.startswith("model name")), None)
+            model = next(
+                (
+                    line.split(":", 1)[1].strip()
+                    for line in f
+                    if line.startswith("model name")
+                ),
+                None,
+            )
     except OSError:
         pass
     try:
-        numa = sum(1 for n in os.listdir("/sys/devices/system/node") if n.startswith("node") and n[4:].isdigit()) or None
+        numa = (
+            sum(
+                1
+                for n in os.listdir("/sys/devices/system/node")
+                if n.startswith("node") and n[4:].isdigit()
+            )
+            or None
+        )
     except OSError:
         pass
-    return {"model": model, "physical_cores": len(physical_core_cpus()), "numa_nodes": numa}
+    return {
+        "model": model,
+        "physical_cores": len(physical_core_cpus()),
+        "numa_nodes": numa,
+    }
 
 
 def _merge_previous(result: dict, path: str) -> None:
@@ -807,7 +1030,11 @@ def _merge_previous(result: dict, path: str) -> None:
             prev = json.load(f)
     except (OSError, ValueError):
         return
-    if not isinstance(prev, dict) or prev.get("version") != result["version"] or (prev.get("gpu") or {}).get("uuid") != result["gpu"]["uuid"]:
+    if (
+        not isinstance(prev, dict)
+        or prev.get("version") != result["version"]
+        or (prev.get("gpu") or {}).get("uuid") != result["gpu"]["uuid"]
+    ):
         return
     prev_rows = prev.get("layer_kinds")
     if not isinstance(prev_rows, dict):
@@ -845,7 +1072,9 @@ def run_benchbw(
     kernel_cpu_iters: int = 64,
     kernel_pcie_iters: int = 20,
     checkpoints: tuple[str, ...] = (),
+    moe_ep: bool = False,
 ) -> dict:
+    from freetoken.distributed import try_get_tp_info
     from freetoken.moe.bench_profile import layer_kind_key
     from freetoken.moe.cpu_executor import _format_label
 
@@ -874,14 +1103,30 @@ def run_benchbw(
         if source not in sources:
             sources.append(source)
 
+    tp = try_get_tp_info()
+    tp_world = 1 if tp is None else tp.size
+
+    def _apply_parallel(wl: Workload) -> Workload:
+        if tp_world <= 1:
+            return wl
+        if moe_ep:
+            return dataclasses.replace(wl, experts=max(1, wl.experts // tp_world))
+        if wl.inter % tp_world == 0:
+            return dataclasses.replace(wl, inter=wl.inter // tp_world)
+        return wl
+
     for fmt in dtypes or ():
-        add(fmt, DTYPE_WORKLOADS[fmt], f"dtype:{_FORMAT_DISPLAY.get(fmt, fmt)}")
+        add(
+            fmt,
+            _apply_parallel(DTYPE_WORKLOADS[fmt]),
+            f"dtype:{_FORMAT_DISPLAY.get(fmt, fmt)}",
+        )
     for mname in models:
         for fmt in formats or WORKLOADS[mname].formats:
-            add(fmt, WORKLOADS[mname], f"preset:{mname}")
+            add(fmt, _apply_parallel(WORKLOADS[mname]), f"preset:{mname}")
     for path in checkpoints:
         logger.info(f"benchbw: reading the MoE layer kinds of {path} ...")
-        for kind, wl in checkpoint_layer_kinds(path, device).items():
+        for kind, wl in checkpoint_layer_kinds(path, device, moe_ep=moe_ep).items():
             add(kind[0], wl, path)
 
     # Machine-parseable progress on stdout (opt-in), so the daemon/Desktop can stream feedback
@@ -914,16 +1159,36 @@ def run_benchbw(
             label = f"{_format_label(fmt, opts)} {hidden}x{inter} top{top_k}"
             _prog(label)
             logger.info(f"benchbw: {label} real kernels ...")
-            entry = _bench_format(fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas)
+            entry = _bench_format(
+                fmt,
+                wl,
+                device,
+                threshold,
+                cpu_threads,
+                kernel_cpu_iters,
+                kernel_pcie_iters,
+                isas,
+            )
             done += 1
             if not entry["cpu_cores"]:
-                logger.warning(f"benchbw: no CPU MoE result for {label}, so no row: {entry['note']}")
+                logger.warning(
+                    f"benchbw: no CPU MoE result for {label}, so no row: {entry['note']}"
+                )
                 continue
             threads = len(entry["cpu_cores"])
             rows[layer_kind_key(fmt, dict(opts), hidden, inter, top_k, threads)] = {
-                "format": fmt, "options": dict(opts), "hidden": hidden, "inter": inter, "top_k": top_k,
-                "cpu_threads": threads, "activation": wl.activation, "sources": sources,
-                "threshold": threshold, "measured_at": now, "freetoken": build, **entry,
+                "format": fmt,
+                "options": dict(opts),
+                "hidden": hidden,
+                "inter": inter,
+                "top_k": top_k,
+                "cpu_threads": threads,
+                "activation": wl.activation,
+                "sources": sources,
+                "threshold": threshold,
+                "measured_at": now,
+                "freetoken": build,
+                **entry,
             }
     finally:
         exec_log.setLevel(prev_level)
@@ -965,19 +1230,25 @@ def _gbs(x) -> str:
 
 
 def _print_kernels(kernels: dict, iw: int) -> None:
-    print(f"    {'format':<8} {'expert':>9} {'CPU-MoE':>13} {'PCIe-gather':>13} "
-          f"{'CPU/PCIe':>9}  backend")
+    print(
+        f"    {'format':<8} {'expert':>9} {'CPU-MoE':>13} {'PCIe-gather':>13} "
+        f"{'CPU/PCIe':>9}  backend"
+    )
     for fmt, e in kernels.items():
         disp = _FORMAT_DISPLAY.get(fmt, fmt)
         eb = f"{_expert_bytes(fmt, e['hidden'], e['inter'], e['options']) / 2**20:.2f} MB"
         cpu_g, pcie_g = e["cpu_moe_gbs"], e["pcie_gather_gbs"]
         ratio = f"{cpu_g / pcie_g:.2f}x" if cpu_g is not None and pcie_g else "—"
-        print(f"    {disp:<8} {eb:>9} {_gbs(e['cpu_moe_gbs'])} {_gbs(e['pcie_gather_gbs'])} "
-              f"{ratio:>9}  {e['recommended']}")
+        print(
+            f"    {disp:<8} {eb:>9} {_gbs(e['cpu_moe_gbs'])} {_gbs(e['pcie_gather_gbs'])} "
+            f"{ratio:>9}  {e['recommended']}"
+        )
         c_ov, p_ov = e.get("cpu_moe_overlap_gbs"), e.get("pcie_gather_overlap_gbs")
         if c_ov and p_ov:
-            print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
-                  f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses")
+            print(
+                f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
+                f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses"
+            )
         if e.get("isa_sweep"):
             tiers = sorted(e["isa_sweep"].items(), key=lambda kv: -kv[1])
             for i, (k, v) in enumerate(tiers):
@@ -992,20 +1263,31 @@ def _print_report(r: dict) -> None:
 
     c, cpu, rows = r["ceilings"], r["cpu"], r["layer_kinds"]
     print()
-    print(f"  host {r['host']}   gpu cuda:{r['gpu']['index']} ({r['gpu']['name']})   "
-          f"cpu {cpu['model']} ({cpu['physical_cores']}c, {cpu['numa_nodes']} NUMA)")
-    print(f"  ceilings: CPU STREAM read {c['cpu_stream_read_gbs']:.1f}  |  "
-          f"PCIe linear H2D {c['pcie_linear_h2d_gbs']:.1f}  D2H {c['pcie_linear_d2h_gbs']:.1f}  GB/s")
+    print(
+        f"  host {r['host']}   gpu cuda:{r['gpu']['index']} ({r['gpu']['name']})   "
+        f"cpu {cpu['model']} ({cpu['physical_cores']}c, {cpu['numa_nodes']} NUMA)"
+    )
+    print(
+        f"  ceilings: CPU STREAM read {c['cpu_stream_read_gbs']:.1f}  |  "
+        f"PCIe linear H2D {c['pcie_linear_h2d_gbs']:.1f}  D2H {c['pcie_linear_d2h_gbs']:.1f}  GB/s"
+    )
     benched = [rows[key] for key in r["benched"]]
     # one global ISA-name width so every sweep's GB/s lands in the same column
-    iw = max((len(k.split("(")[0]) for e in benched for k in (e.get("isa_sweep") or {})), default=0)
+    iw = max(
+        (len(k.split("(")[0]) for e in benched for k in (e.get("isa_sweep") or {})),
+        default=0,
+    )
     for e in benched:
         label = _format_label(e["format"], tuple(sorted(e["options"].items())))
         sources = ", ".join(os.path.basename(s.rstrip("/")) for s in e["sources"])
-        print(f"\n  {label}  H={e['hidden']} I={e['inter']} top_k={e['top_k']} threads={e['cpu_threads']} "
-              f" ({sources}; threshold {e['threshold']}x)")
+        print(
+            f"\n  {label}  H={e['hidden']} I={e['inter']} top_k={e['top_k']} threads={e['cpu_threads']} "
+            f" ({sources}; threshold {e['threshold']}x)"
+        )
         _print_kernels({e["format"]: e}, iw)
-    print(f"\n  saved: {r['out_path']} ({len(benched)} rows benched, {len(rows)} in the profile)\n")
+    print(
+        f"\n  saved: {r['out_path']} ({len(benched)} rows benched, {len(rows)} in the profile)\n"
+    )
 
 
 # ================================ CLI plumbing ================================
@@ -1048,7 +1330,9 @@ def _model_list(s: str) -> tuple[str, ...]:
 def _dtype_list(s: str) -> tuple[str, ...]:
     if s.strip() == "all":
         return tuple(DTYPE_WORKLOADS)
-    items = [_FORMAT_ALIASES.get(x.strip(), x.strip()) for x in s.split(",") if x.strip()]
+    items = [
+        _FORMAT_ALIASES.get(x.strip(), x.strip()) for x in s.split(",") if x.strip()
+    ]
     bad = [x for x in items if x not in DTYPE_WORKLOADS]
     if bad or not items:
         raise argparse.ArgumentTypeError(
@@ -1059,7 +1343,9 @@ def _dtype_list(s: str) -> tuple[str, ...]:
 
 
 def _format_list(s: str) -> tuple[str, ...]:
-    items = [_FORMAT_ALIASES.get(x.strip(), x.strip()) for x in s.split(",") if x.strip()]
+    items = [
+        _FORMAT_ALIASES.get(x.strip(), x.strip()) for x in s.split(",") if x.strip()
+    ]
     bad = [x for x in items if x not in _BUILDABLE_FORMATS]
     if bad or not items:
         raise argparse.ArgumentTypeError(
@@ -1077,48 +1363,120 @@ def _isa_list(s: str) -> list[str] | None:
     items = [x.strip() for x in s.split(",") if x.strip()]
     bad = [x for x in items if x not in _ISA_TIERS]
     if bad or not items:
-        raise argparse.ArgumentTypeError(f"'auto', 'all', or a subset of {list(_ISA_TIERS)}, got {s!r}")
+        raise argparse.ArgumentTypeError(
+            f"'auto', 'all', or a subset of {list(_ISA_TIERS)}, got {s!r}"
+        )
     return list(dict.fromkeys(items))
 
 
 def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
-    p = argparse.ArgumentParser(prog=prog, description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dtype", type=_dtype_list, default=None,
-                   help=f"tuning bench: 'all' (default when no --model), or comma-separated from "
-                        f"{sorted(DTYPE_WORKLOADS)} -- one bench per expert format at a canonical geometry")
-    p.add_argument("--model", type=_model_list, default=None,
-                   help=f"per-model detail instead of/in addition to --dtype: 'all', or comma-"
-                        f"separated presets from {sorted(WORKLOADS)} and checkpoint paths (a "
-                        f"checkpoint benches each of its MoE layer kinds, which the hybrid fetch "
-                        f"split matches per layer)")
-    p.add_argument("--formats", type=_format_list, default=None,
-                   help="override a --model's native expert formats (comma-separated)")
-    p.add_argument("--isa", type=_isa_list, default=None, dest="isas",
-                   help=f"CPU MoE ISA: 'auto' (default, best), 'all', or a subset of "
-                        f"{list(_ISA_TIERS)} to sweep (kernel caps down to hw support)")
-    p.add_argument("-o", "--out", default=None,
-                   help=f"JSON output path (default {default_out_path('<gpu-uuid>')})")
-    p.add_argument("--threshold", type=_positive_float, default=2.0,
-                   help="recommend hybrid when CPU BW > threshold x PCIe BW (default 2.0)")
-    p.add_argument("--gpu", type=single_gpu_arg, default=None,
-                   help="GPU to bench: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or an "
-                        "nvidia-smi index (default: the first visible GPU)")
-    p.add_argument("--cpu-threads", type=_nonneg_int, default=0,
-                   help="CPU worker threads (0 = one per physical core)")
-    p.add_argument("--tp-size", type=_positive_int, default=1,
-                   help="bench one rank of a tensor-parallel server: its expert shard (the MoE intermediate "
-                        "divided by the TP size, which the row keys) and its block of the physical cores. "
-                        "For production's split, run one bench per GPU at the same time, each with its own "
-                        "--gpu and --tp-rank, so the ranks share the host as the server's do")
-    p.add_argument("--tp-rank", type=_nonneg_int, default=0, help="the rank --tp-size benches (default 0)")
-    p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
-    p.add_argument("--pcie-mib", type=_positive_int, default=256, help="linear PCIe copy size in MiB")
-    p.add_argument("--pcie-iters", type=_positive_int, default=30, help="linear PCIe copies to time")
-    p.add_argument("--kernel-cpu-iters", type=_positive_int, default=64,
-                   help="CPU MoE decode steps to time")
-    p.add_argument("--kernel-pcie-iters", type=_positive_int, default=20,
-                   help="fast_index_copy gather passes to time")
+    p = argparse.ArgumentParser(
+        prog=prog,
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--dtype",
+        type=_dtype_list,
+        default=None,
+        help=f"tuning bench: 'all' (default when no --model), or comma-separated from "
+        f"{sorted(DTYPE_WORKLOADS)} -- one bench per expert format at a canonical geometry",
+    )
+    p.add_argument(
+        "--model",
+        type=_model_list,
+        default=None,
+        help=f"per-model detail instead of/in addition to --dtype: 'all', or comma-"
+        f"separated presets from {sorted(WORKLOADS)} and checkpoint paths (a "
+        f"checkpoint benches each of its MoE layer kinds, which the hybrid fetch "
+        f"split matches per layer)",
+    )
+    p.add_argument(
+        "--formats",
+        type=_format_list,
+        default=None,
+        help="override a --model's native expert formats (comma-separated)",
+    )
+    p.add_argument(
+        "--isa",
+        type=_isa_list,
+        default=None,
+        dest="isas",
+        help=f"CPU MoE ISA: 'auto' (default, best), 'all', or a subset of "
+        f"{list(_ISA_TIERS)} to sweep (kernel caps down to hw support)",
+    )
+    p.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help=f"JSON output path (default {default_out_path('<gpu-uuid>')})",
+    )
+    p.add_argument(
+        "--threshold",
+        type=_positive_float,
+        default=2.0,
+        help="recommend hybrid when CPU BW > threshold x PCIe BW (default 2.0)",
+    )
+    p.add_argument(
+        "--gpu",
+        type=single_gpu_arg,
+        default=None,
+        help="GPU to bench: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or an "
+        "nvidia-smi index (default: the first visible GPU)",
+    )
+    p.add_argument(
+        "--cpu-threads",
+        type=_nonneg_int,
+        default=0,
+        help="CPU worker threads (0 = one per physical core)",
+    )
+    p.add_argument(
+        "--tp-size",
+        type=_positive_int,
+        default=1,
+        help="bench one rank of a tensor-parallel server: its expert shard (the MoE intermediate "
+        "divided by the TP size, which the row keys) and its block of the physical cores. "
+        "For production's split, run one bench per GPU at the same time, each with its own "
+        "--gpu and --tp-rank, so the ranks share the host as the server's do",
+    )
+    p.add_argument(
+        "--tp-rank",
+        type=_nonneg_int,
+        default=0,
+        help="the rank --tp-size benches (default 0)",
+    )
+    p.add_argument(
+        "--moe-ep",
+        action="store_true",
+        help="bench expert-parallel MoE layout (full intermediate width, E/tp_size experts per rank)",
+    )
+    p.add_argument(
+        "--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time"
+    )
+    p.add_argument(
+        "--pcie-mib",
+        type=_positive_int,
+        default=256,
+        help="linear PCIe copy size in MiB",
+    )
+    p.add_argument(
+        "--pcie-iters",
+        type=_positive_int,
+        default=30,
+        help="linear PCIe copies to time",
+    )
+    p.add_argument(
+        "--kernel-cpu-iters",
+        type=_positive_int,
+        default=64,
+        help="CPU MoE decode steps to time",
+    )
+    p.add_argument(
+        "--kernel-pcie-iters",
+        type=_positive_int,
+        default=20,
+        help="fast_index_copy gather passes to time",
+    )
     ns = p.parse_args(argv)
     if ns.tp_rank >= ns.tp_size:
         p.error(f"--tp-rank {ns.tp_rank} must be below --tp-size {ns.tp_size}")
@@ -1144,11 +1502,21 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
 
     try:
         result = run_benchbw(
-            out_path=ns.out, threshold=ns.threshold, device_index=device_index, models=models,
-            dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
-            cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
-            kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,
+            out_path=ns.out,
+            threshold=ns.threshold,
+            device_index=device_index,
+            models=models,
+            dtypes=dtypes,
+            formats=ns.formats,
+            isas=ns.isas,
+            cpu_threads=ns.cpu_threads,
+            cpu_iters=ns.cpu_iters,
+            pcie_bytes=ns.pcie_mib << 20,
+            pcie_iters=ns.pcie_iters,
+            kernel_cpu_iters=ns.kernel_cpu_iters,
+            kernel_pcie_iters=ns.kernel_pcie_iters,
             checkpoints=checkpoints,
+            moe_ep=ns.moe_ep,
         )
     except (RuntimeError, OSError) as e:
         print(f"error: {e}")

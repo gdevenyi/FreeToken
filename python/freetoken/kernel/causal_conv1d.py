@@ -27,8 +27,9 @@ def causal_conv1d_varlen(
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
     in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
     from freetoken.kernel.backend import is_sgl_kernel_installed
+    from freetoken.models.config import verify_invariant_enabled
 
-    if not is_sgl_kernel_installed():
+    if verify_invariant_enabled() or not is_sgl_kernel_installed():
         from freetoken.kernel.triton.causal_conv1d_triton import (
             causal_conv1d_varlen as triton_causal_conv1d_varlen,
         )

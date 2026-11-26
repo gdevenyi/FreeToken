@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
 from freetoken.kernel.triton.bf16_gemv import bf16_gemv
 
 
@@ -23,7 +22,7 @@ def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     Returns ``[..., N]`` fp32. Bit-exact to ``F.linear(x.float(), weight.float())``
     up to fp32 accumulation order; for M>1 it *is* that call (prefill)."""
     M = x.numel() // x.shape[-1]
-    if M != 1:
+    if M != 1 or not x.is_cuda or weight.dtype != torch.bfloat16:
         return F.linear(x.float(), weight.float())
     return bf16_gemv(x, weight, torch.float32)
 

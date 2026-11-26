@@ -110,7 +110,7 @@ def _int8_g32_w8a16_gemm_kernel(
             g_idx = gk // GROUP_SIZE
             sc = tl.load(
                 sc_ptr + offs_n * stride_sn + g_idx * stride_sg,
-                mask=mask_n,
+                mask=mask_n & (gk < K),
                 other=0.0,
             ).to(tl.float32)
             w_deq = (qw.to(tl.float32) * sc[None, :]).to(a.dtype)
@@ -124,22 +124,87 @@ def _int8_g32_w8a16_gemm_kernel(
     )
 
 
+@triton.jit
+def _int8_g32_gemv_kernel(
+    x_ptr,
+    qw_ptr,
+    sc_ptr,
+    y_ptr,
+    N,
+    K,
+    stride_wn,
+    stride_wk,
+    stride_sn,
+    stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0).to(tl.int64)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
+    mask_n = offs_n < N
+    w_row = qw_ptr + offs_n[:, None] * stride_wn
+    s_row = sc_ptr + offs_n[:, None] * stride_sn
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    NUM_GROUPS_PER_STEP: tl.constexpr = BLOCK_K // GROUP_SIZE
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        xk = tl.load(x_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        qw = tl.load(
+            w_row + offs_k[None, :] * stride_wk,
+            mask=mask_n[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.float32)
+        offs_g = (k0 // GROUP_SIZE) + tl.arange(0, NUM_GROUPS_PER_STEP)
+        mask_g = (offs_g * GROUP_SIZE) < K
+        sc = tl.load(
+            s_row + offs_g[None, :] * stride_sg,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        qw_g = tl.reshape(qw, (BLOCK_N, NUM_GROUPS_PER_STEP, GROUP_SIZE))
+        xk_g = tl.reshape(xk, (1, NUM_GROUPS_PER_STEP, GROUP_SIZE))
+        grp_dot = tl.sum(qw_g * xk_g, axis=2)
+        acc += tl.sum(grp_dot * sc, axis=1)
+
+    tl.store(y_ptr + offs_n, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+
+
 def int8_g32_triton_linear(
     x2: torch.Tensor,
     qweight: torch.Tensor,
     scale: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """CUDA-graph-safe Triton W8A16 GEMM for ``qweight [N, K] int8`` and ``scale [N, K//32] fp16``."""
+    """CUDA-graph-safe Triton W8A16 GEMM/GEMV for ``qweight [N, K] int8`` and ``scale [N, K//32] fp16``."""
     m, k = x2.shape
     n = qweight.shape[0]
     y = torch.empty((m, n), dtype=out_dtype, device=x2.device)
     if m == 0 or n == 0:
         return y
     if m == 1:
-        # M=1 decode/verify skinny path: vectorized group dot avoids tensor-core M-padding overhead
-        block_m, block_n, block_k, warps = 16, 64, 64, 4
-    elif m <= 16:
+        block_n = 4
+        block_k = min(max(GROUP_SIZE, triton.next_power_of_2(k)), 1024)
+        _int8_g32_gemv_kernel[(triton.cdiv(n, block_n),)](
+            x2,
+            qweight,
+            scale,
+            y,
+            n,
+            k,
+            qweight.stride(0),
+            qweight.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            GROUP_SIZE=GROUP_SIZE,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=4,
+        )
+        return y
+    if m <= 16:
         block_m, block_n, block_k, warps = 16, 64, 64, 4
     else:
         block_m, block_n, block_k, warps = 64, 64, 64, 4
@@ -179,24 +244,32 @@ def _shared_marlin_workspace(device_index: int) -> torch.Tensor:
 
 
 def _try_pack_marlin_u8b128(
-    qweight: torch.Tensor, scale: torch.Tensor
+    qweight: torch.Tensor,
+    scale: torch.Tensor,
+    act_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
     """Attempt to repack ``int8 [N, K]`` + ``fp16 [N, K//32]`` into vLLM Marlin ``uint8b128`` layout.
 
     Pads ``N`` up to a multiple of 64 if needed (`hc.down` `336 -> 384`). Returns
     ``(marlin_qweight, marlin_scales, workspace, padded_n)`` or ``None`` if Marlin is unavailable.
     """
-    if not qweight.is_cuda:
+    if not qweight.is_cuda or qweight.ndim != 2 or qweight.numel() == 0:
         return None
     n, k = qweight.shape
     if k % 64 != 0:
         return None
+    scale_dtype = (
+        act_dtype if act_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+    )
     try:
-        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.quantization.utils import marlin_utils
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            apply_gptq_marlin_linear,
             marlin_permute_scales,
         )
         from vllm.scalar_type import scalar_types
+
+        from vllm import _custom_ops as ops
     except Exception:  # noqa: BLE001
         return None
 
@@ -204,6 +277,28 @@ def _try_pack_marlin_u8b128(
         return None
 
     padded_n = ((n + 63) // 64) * 64
+    if k % 128 != 0 and padded_n % 256 != 0:
+        padded_n = ((n + 255) // 256) * 256
+
+    dev_idx = (
+        torch.cuda.current_device()
+        if qweight.device.index is None
+        else int(qweight.device.index)
+    )
+    try:
+        if hasattr(marlin_utils, "check_marlin_supported"):
+            cap = torch.cuda.get_device_capability(dev_idx)
+            cap_int = cap[0] * 10 + cap[1]
+            if not marlin_utils.check_marlin_supported(
+                quant_type=scalar_types.uint8b128,
+                group_size=GROUP_SIZE,
+                has_zp=False,
+                device_capability=cap_int,
+            ):
+                return None
+    except Exception:  # noqa: BLE001
+        pass
+
     if padded_n != n:
         pad_rows = padded_n - n
         qw_use = F.pad(qweight, (0, 0, 0, pad_rows), value=0)
@@ -224,27 +319,36 @@ def _try_pack_marlin_u8b128(
     ).contiguous()
 
     try:
-        marlin_qw = ops.gptq_marlin_repack(
-            b_q_weight=packed_i32,
-            perm=torch.empty(0, dtype=torch.int, device=qweight.device),
-            size_k=k,
-            size_n=padded_n,
-            num_bits=8,
-        )
-        marlin_sc = marlin_permute_scales(
-            sc_use.to(qweight.dtype if qweight.is_floating_point() else torch.bfloat16)
-            .t()
-            .contiguous(),
-            size_k=k,
-            size_n=padded_n,
-            group_size=GROUP_SIZE,
-        )
-        dev_idx = (
-            torch.cuda.current_device()
-            if qweight.device.index is None
-            else int(qweight.device.index)
-        )
-        workspace = _shared_marlin_workspace(dev_idx)
+        with torch.cuda.device(qweight.device):
+            empty_i32 = torch.empty(0, dtype=torch.int, device=qweight.device)
+            marlin_qw = ops.gptq_marlin_repack(
+                b_q_weight=packed_i32,
+                perm=empty_i32,
+                size_k=k,
+                size_n=padded_n,
+                num_bits=8,
+            )
+            marlin_sc = marlin_permute_scales(
+                sc_use.to(scale_dtype).t().contiguous(),
+                size_k=k,
+                size_n=padded_n,
+                group_size=GROUP_SIZE,
+            )
+            workspace = _shared_marlin_workspace(dev_idx)
+            probe_x = torch.zeros((1, k), dtype=scale_dtype, device=qweight.device)
+            _ = apply_gptq_marlin_linear(
+                input=probe_x,
+                weight=marlin_qw,
+                weight_scale=marlin_sc,
+                weight_zp=empty_i32,
+                g_idx=empty_i32,
+                g_idx_sort_indices=empty_i32,
+                workspace=workspace,
+                w_type=scalar_types.uint8b128,
+                output_size_per_partition=padded_n,
+                input_size_per_partition=k,
+                is_k_full=True,
+            )
     except Exception:  # noqa: BLE001
         return None
     return marlin_qw, marlin_sc, workspace, padded_n
@@ -291,17 +395,27 @@ class Int8G32Linear(BaseOP):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None
         ) = None
         self._marlin_checked = False
+        self._act_dtype = torch.get_default_dtype()
         self._comm = (
             DistributedCommunicator() if all_reduce and get_tp_info().size > 1 else None
         )
 
+    def input_format(self, _x: torch.Tensor) -> str | None:
+        return None
+
     def finalize_quant(self) -> None:
         self.prepare_marlin()
 
-    def prepare_marlin(self) -> bool:
+    def prepare_marlin(self, act_dtype: torch.dtype | None = None) -> bool:
         """Optionally repack ``(weight, weight_scale)`` into Marlin ``uint8b128`` layout on GPU."""
+        if self._marlin_pack is not None:
+            return True
+        if self._marlin_checked or self.weight.ndim != 2 or self.weight.numel() == 0:
+            return False
         self._marlin_checked = True
-        packed = _try_pack_marlin_u8b128(self.weight, self.weight_scale)
+        packed = _try_pack_marlin_u8b128(
+            self.weight, self.weight_scale, act_dtype or self._act_dtype
+        )
         if packed is None:
             return False
         mqw, msc, ws, padded_n = packed
@@ -312,13 +426,13 @@ class Int8G32Linear(BaseOP):
         self.weight_scale = torch.empty(0, dtype=torch.float16, device=dev)
         return True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, _xq: torch.Tensor | None = None) -> torch.Tensor:
         if (
             not self._marlin_checked
             and x.is_cuda
             and not torch.cuda.is_current_stream_capturing()
         ):
-            self.prepare_marlin()
+            self.prepare_marlin(act_dtype=x.dtype)
         if self._marlin_pack is not None:
             from vllm.model_executor.layers.quantization.utils.marlin_utils import (
                 apply_gptq_marlin_linear,
@@ -327,23 +441,32 @@ class Int8G32Linear(BaseOP):
 
             mqw, msc, ws, empty_i32, padded_n = self._marlin_pack
             *lead, k = x.shape
-            x2 = x.reshape(-1, k)
-            y = apply_gptq_marlin_linear(
-                input=x2,
-                weight=mqw,
-                weight_scale=msc,
-                weight_zp=empty_i32,
-                g_idx=empty_i32,
-                g_idx_sort_indices=empty_i32,
-                workspace=ws,
-                w_type=scalar_types.uint8b128,
-                output_size_per_partition=padded_n,
-                input_size_per_partition=self.local_input_size,
-                is_k_full=True,
-            )
-            if padded_n != self.local_output_size:
-                y = y[:, : self.local_output_size]
-            y = y.reshape(*lead, self.local_output_size)
+            x2 = x.reshape(-1, k).contiguous()
+            if x2.shape[0] == 0:
+                y = torch.empty(
+                    (*lead, self.local_output_size), dtype=x.dtype, device=x.device
+                )
+            else:
+                if x2.dtype != msc.dtype:
+                    x2 = x2.to(msc.dtype)
+                y_m = apply_gptq_marlin_linear(
+                    input=x2,
+                    weight=mqw,
+                    weight_scale=msc,
+                    weight_zp=empty_i32,
+                    g_idx=empty_i32,
+                    g_idx_sort_indices=empty_i32,
+                    workspace=ws,
+                    w_type=scalar_types.uint8b128,
+                    output_size_per_partition=padded_n,
+                    input_size_per_partition=self.local_input_size,
+                    is_k_full=True,
+                )
+                if padded_n != self.local_output_size:
+                    y_m = y_m[:, : self.local_output_size]
+                if y_m.dtype != x.dtype:
+                    y_m = y_m.to(x.dtype)
+                y = y_m.reshape(*lead, self.local_output_size)
         else:
             y = int8_g32_linear(x, self.weight, self.weight_scale)
         if self._comm is not None:
@@ -396,18 +519,66 @@ class Int8G32Replicated(Int8G32Linear):
 class Int8G32ParallelLMHead(ParallelLMHead):
     """Vocabulary-parallel ``lm_head`` backed by ``int8 g32`` W8A16 weights."""
 
-    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
-        super().__init__(num_embeddings, embedding_dim, tie_word_embeddings=False)
-        local_vocab = self.weight.shape[0]
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        tp_size: int | None = None,
+        tp_rank: int | None = None,
+    ) -> None:
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            tie_word_embeddings=False,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
+        local_vocab = self.num_embeddings_tp
         self.weight = torch.empty((local_vocab, embedding_dim), dtype=torch.int8)
         self.weight_scale = torch.empty(
             (local_vocab, embedding_dim // GROUP_SIZE), dtype=torch.float16
         )
 
-    def _project(self, x: torch.Tensor) -> torch.Tensor:
-        return int8_g32_linear(
-            x, self.weight, self.weight_scale, out_dtype=torch.float32
-        )
+    def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        y = int8_g32_linear(x, self.weight, self.weight_scale, out_dtype=torch.float32)
+        return y if self.bias is None else y + self.bias
+
+    def keep_rows(self, ids: torch.Tensor, quant_config=None) -> None:
+        from freetoken.utils import div_ceil
+
+        ids = ids[torch.arange(div_ceil(ids.numel(), 128) * 128) % ids.numel()]
+        rows = ids.numel()
+        with torch.device("meta"):
+            head = Int8G32ParallelLMHead(rows, self.embedding_dim, tp_size=1, tp_rank=0)
+        device = self.weight.device
+        ids = ids.to(device=device, dtype=torch.long)
+        if self.tp_size == 1:
+            head.weight = self.weight.index_select(0, ids)
+            head.weight_scale = self.weight_scale.index_select(0, ids)
+        else:
+            start, count = self.vocab_range
+            in_shard = (ids >= start) & (ids < start + count)
+            local_ids = ids[in_shard] - start
+            codes = torch.zeros(
+                rows, self.embedding_dim, dtype=torch.int32, device=device
+            )
+            scales = torch.zeros(
+                rows,
+                self.embedding_dim // GROUP_SIZE,
+                dtype=torch.float32,
+                device=device,
+            )
+            if local_ids.numel():
+                codes[in_shard] = self.weight.index_select(0, local_ids).to(torch.int32)
+                scales[in_shard] = self.weight_scale.index_select(0, local_ids).to(
+                    torch.float32
+                )
+            codes = self._comm.all_reduce(codes)
+            scales = self._comm.all_reduce(scales)
+            head.weight = codes.to(torch.int8)
+            head.weight_scale = scales.to(torch.float16)
+        self.kept_rows = head, ids
 
 
 __all__ = [

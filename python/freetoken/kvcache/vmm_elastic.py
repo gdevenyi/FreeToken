@@ -129,7 +129,55 @@ class CudaDriverVmmBackend:
         self.device = device
         self.device_index = 0 if device.index is None else int(device.index)
         torch.cuda.init()
-        self._lib = ctypes.CDLL("libcuda.so.1")
+        lib = ctypes.CDLL("libcuda.so.1")
+        lib.cuMemGetAllocationGranularity.argtypes = [
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(_CUmemAllocationProp),
+            ctypes.c_int,
+        ]
+        lib.cuMemGetAllocationGranularity.restype = ctypes.c_int
+        lib.cuGetErrorString.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        lib.cuGetErrorString.restype = ctypes.c_int
+        lib.cuMemAddressReserve.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.cuMemAddressReserve.restype = ctypes.c_int
+        lib.cuMemAddressFree.argtypes = [ctypes.c_uint64, ctypes.c_size_t]
+        lib.cuMemAddressFree.restype = ctypes.c_int
+        lib.cuMemCreate.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+            ctypes.POINTER(_CUmemAllocationProp),
+            ctypes.c_uint64,
+        ]
+        lib.cuMemCreate.restype = ctypes.c_int
+        lib.cuMemRelease.argtypes = [ctypes.c_uint64]
+        lib.cuMemRelease.restype = ctypes.c_int
+        lib.cuMemMap.argtypes = [
+            ctypes.c_uint64,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.cuMemMap.restype = ctypes.c_int
+        lib.cuMemSetAccess.argtypes = [
+            ctypes.c_uint64,
+            ctypes.c_size_t,
+            ctypes.POINTER(_CUmemAccessDesc),
+            ctypes.c_size_t,
+        ]
+        lib.cuMemSetAccess.restype = ctypes.c_int
+        lib.cuMemUnmap.argtypes = [ctypes.c_uint64, ctypes.c_size_t]
+        lib.cuMemUnmap.restype = ctypes.c_int
+        self._lib = lib
 
         self._prop = _CUmemAllocationProp()
         self._prop.type = _CU_MEM_ALLOCATION_TYPE_PINNED
@@ -504,6 +552,10 @@ def compute_elastic_geometry(
     )
     va_moe_slots = max(effective_min_moe, va_moe_blocks * moe_quantum_slots)
     va_moe_slots = min(max_moe_slots, va_moe_slots)
+    if va_moe_blocks * moe_quantum_slots >= hard_min_moe_slots:
+        va_moe_slots = min(va_moe_slots, va_moe_blocks * moe_quantum_slots)
+    else:
+        va_moe_blocks = _div_ceil(va_moe_slots, moe_quantum_slots)
 
     return ElasticGeometry(
         granularity=granularity,
@@ -548,48 +600,58 @@ class ElasticKvMoePool:
         total_kv_blocks = geometry.va_kv_pages // geometry.kv_quantum_pages
         self._total_kv_blocks = total_kv_blocks
         self._kv_plane_bytes = total_kv_blocks * geometry.kv_slabs_per_plane_block * g
-        self._kv_total_va_bytes = geometry.num_kv_planes * self._kv_plane_bytes
-        self._kv_va = self.backend.reserve_va(self._kv_total_va_bytes, g)
-
+        self._kv_total_va_bytes = 0
+        self._kv_va = 0
         self._moe_vas: dict[str, tuple[int, int]] = {}
-        for bank_name in geometry.elastic_moe_banks:
-            bank_bytes = (
-                geometry.va_moe_blocks
-                * geometry.moe_slabs_per_bank_block[bank_name]
-                * g
-            )
-            va = self.backend.reserve_va(bank_bytes, g)
-            self._moe_vas[bank_name] = (va, bank_bytes)
-
-        fixed_kv_blocks = geometry.floor_kv_blocks + (
-            total_kv_blocks - geometry.elastic_end_kv_block
-        )
-        total_slabs = (
-            (fixed_kv_blocks + geometry.num_elastic_kv_blocks)
-            * geometry.kv_slabs_per_block
-            + geometry.floor_moe_blocks * geometry.moe_slabs_per_block
-        )
-        self._all_slabs: list[int] = [
-            self.backend.create_slab() for _ in range(total_slabs)
-        ]
-        self._free_slabs: list[int] = list(self._all_slabs)
+        self._all_slabs: list[int] = []
+        self._free_slabs: list[int] = []
         self._va_to_handle: dict[int, int] = {}
-
-        # Map permanent KV blocks: [0 : floor_kv_blocks) and [elastic_end_kv_block : total_kv_blocks).
         self._kv_block_mapped: list[bool] = [False] * total_kv_blocks
-        for b in range(geometry.floor_kv_blocks):
-            self._map_kv_block(b)
-        for b in range(geometry.elastic_end_kv_block, total_kv_blocks):
-            self._map_kv_block(b)
-
-        # Map permanent + extra lent MoE blocks: [0 : va_moe_blocks).
         self._moe_block_mapped: list[bool] = [False] * geometry.va_moe_blocks
         self._active_moe_blocks = 0
-        for mb in range(geometry.va_moe_blocks):
-            if len(self._free_slabs) < geometry.moe_slabs_per_block:
-                break
-            self._map_moe_block(mb)
-            self._active_moe_blocks = mb + 1
+
+        try:
+            kv_va_bytes = geometry.num_kv_planes * self._kv_plane_bytes
+            self._kv_va = self.backend.reserve_va(kv_va_bytes, g)
+            self._kv_total_va_bytes = kv_va_bytes
+
+            for bank_name in geometry.elastic_moe_banks:
+                bank_bytes = (
+                    geometry.va_moe_blocks
+                    * geometry.moe_slabs_per_bank_block[bank_name]
+                    * g
+                )
+                va = self.backend.reserve_va(bank_bytes, g)
+                self._moe_vas[bank_name] = (va, bank_bytes)
+
+            fixed_kv_blocks = geometry.floor_kv_blocks + (
+                total_kv_blocks - geometry.elastic_end_kv_block
+            )
+            total_slabs = (
+                (fixed_kv_blocks + geometry.num_elastic_kv_blocks)
+                * geometry.kv_slabs_per_block
+                + geometry.floor_moe_blocks * geometry.moe_slabs_per_block
+            )
+            for _ in range(total_slabs):
+                h = self.backend.create_slab()
+                self._all_slabs.append(h)
+                self._free_slabs.append(h)
+
+            # Map permanent KV blocks: [0 : floor_kv_blocks) and [elastic_end_kv_block : total_kv_blocks).
+            for b in range(geometry.floor_kv_blocks):
+                self._map_kv_block(b)
+            for b in range(geometry.elastic_end_kv_block, total_kv_blocks):
+                self._map_kv_block(b)
+
+            # Map permanent + extra lent MoE blocks: [0 : va_moe_blocks).
+            for mb in range(geometry.va_moe_blocks):
+                if len(self._free_slabs) < geometry.moe_slabs_per_block:
+                    break
+                self._map_moe_block(mb)
+                self._active_moe_blocks = mb + 1
+        except BaseException:
+            self.close()
+            raise
 
     def _kv_block_va(self, plane: int, block: int) -> int:
         block_bytes = self.geo.kv_slabs_per_plane_block * self.geo.granularity
@@ -758,9 +820,12 @@ class ElasticKvMoePool:
             )
             if new_active_blocks < self._active_moe_blocks:
                 new_slots = new_active_blocks * self.geo.moe_quantum_slots
+                # Drain any in-flight forward MoE kernels before retiring slots, then drain
+                # the retirement kernel before unmapping physical slabs.
+                self.backend.synchronize()
                 if self.moe_cache is not None:
                     self.moe_cache.set_active_slots(new_slots)
-                self.backend.synchronize()
+                    self.backend.synchronize()
                 for mb in range(self._active_moe_blocks - 1, new_active_blocks - 1, -1):
                     self._unmap_moe_block(mb)
                 self._active_moe_blocks = new_active_blocks

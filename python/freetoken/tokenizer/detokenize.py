@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List
+
+from transformers import PreTrainedTokenizerBase
 
 from freetoken.message import DetokenizeMsg
-from transformers import PreTrainedTokenizerBase
 
 # Borrowed from sglang
 
@@ -19,14 +19,14 @@ def _is_chinese_char(cp: int):
     # like the all of the other languages.
     if (
         (cp >= 0x4E00 and cp <= 0x9FFF)
-        or (cp >= 0x3400 and cp <= 0x4DBF)  #
-        or (cp >= 0x20000 and cp <= 0x2A6DF)  #
-        or (cp >= 0x2A700 and cp <= 0x2B73F)  #
-        or (cp >= 0x2B740 and cp <= 0x2B81F)  #
-        or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
+        or (cp >= 0x3400 and cp <= 0x4DBF)
+        or (cp >= 0x20000 and cp <= 0x2A6DF)
+        or (cp >= 0x2A700 and cp <= 0x2B73F)
+        or (cp >= 0x2B740 and cp <= 0x2B81F)
+        or (cp >= 0x2B820 and cp <= 0x2CEAF)
         or (cp >= 0xF900 and cp <= 0xFAFF)
-        or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
-    ):  #
+        or (cp >= 0x2F800 and cp <= 0x2FA1F)
+    ):
         return True
 
     return False
@@ -37,10 +37,7 @@ def find_printable_text(text: str):
     # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
 
     # After the symbol for a new line, we flush the cache.
-    if text.endswith("\n"):
-        return text
-    # If the last token is a CJK character, we print the characters.
-    elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
+    if text.endswith("\n") or len(text) > 0 and _is_chinese_char(ord(text[-1])):
         return text
     # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
     elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
@@ -66,32 +63,52 @@ def _stop_prefix_holdback(text: str, stop_strs: list[str]) -> int:
 
 @dataclass
 class DecodeStatus:
-    decoded_ids: List[int]
+    decoded_ids: list[int]
     decoded_str: str
     read_offset: int  # length of read ids
     surr_offset: int  # length of surr ids
     sent_offset: int  # length of sent out string
     skip_special: bool = False  # decode this request with skip_special_tokens
-    think_end_at: int | None = None  # generated tokens up to and incl. the reasoning end tag
-    output_len: int = 0  # decoded text so far, before holdback: where the next token starts
+    think_end_at: int | None = (
+        None  # generated tokens up to and incl. the reasoning end tag
+    )
+    output_len: int = (
+        0  # decoded text so far, before holdback: where the next token starts
+    )
 
 
 class DetokenizeManager:
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
-        eos_token_ids: FrozenSet[int] | None = None,
-        think_end_id: int | None = None,
+        eos_token_ids: frozenset[int] | None = None,
+        think_end_id: int | frozenset[int] | set[int] | None = None,
     ) -> None:
         # uid -> DecodeStatus
-        self.decode_map: Dict[int, DecodeStatus] = {}
+        self.decode_map: dict[int, DecodeStatus] = {}
         self.tokenizer = tokenizer
         self.eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else frozenset({tokenizer.eos_token_id})
+            eos_token_ids
+            if eos_token_ids is not None
+            else frozenset({tokenizer.eos_token_id})
         )
-        # The reasoning end tag's id (e.g. ``</think>``): tokens generated up to and
-        # including it are reported as usage.completion_tokens_details.reasoning_tokens.
-        self.think_end_id = think_end_id if think_end_id is None else int(think_end_id)
+        # The reasoning end tag id(s) (e.g. ``</think>``, ``<channel|>``, ``</mm:think>``):
+        # tokens generated up to and including the first closing tag are reported as
+        # usage.completion_tokens_details.reasoning_tokens.
+        if isinstance(think_end_id, (set, frozenset)):
+            self._think_end_ids = frozenset(int(x) for x in think_end_id)
+            self.think_end_id = (
+                min(self._think_end_ids) if self._think_end_ids else None
+            )
+        else:
+            self.think_end_id = (
+                think_end_id if think_end_id is None else int(think_end_id)
+            )
+            self._think_end_ids = (
+                frozenset({self.think_end_id})
+                if self.think_end_id is not None
+                else frozenset()
+            )
 
     def discard(self, uid: int) -> None:
         """Drop a uid's decode state without a finished DetokenizeMsg. An aborted or errored
@@ -99,31 +116,33 @@ class DetokenizeManager:
         accumulated ids and text stay in ``decode_map`` for the life of the worker."""
         self.decode_map.pop(uid, None)
 
-    def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+    def detokenize(self, msgs: list[DetokenizeMsg]) -> list[str]:
         return self.detokenize_with_meta(msgs)[0]
 
-    def _batch_decode(self, ids: List[List[int]], skip: List[bool]) -> List[str]:
+    def _batch_decode(self, ids: list[list[int]], skip: list[bool]) -> list[str]:
         """batch_decode honouring a per-request skip_special_tokens flag (one call per
         distinct flag value, results back in order)."""
-        out: List[str | None] = [None] * len(ids)
+        out: list[str | None] = [None] * len(ids)
         for flag in (False, True):
             idx = [i for i, f in enumerate(skip) if f == flag]
             if idx:
-                texts = self.tokenizer.batch_decode([ids[i] for i in idx], skip_special_tokens=flag)
+                texts = self.tokenizer.batch_decode(
+                    [ids[i] for i in idx], skip_special_tokens=flag
+                )
                 for i, t in zip(idx, texts, strict=True):
                     out[i] = t
         return [t if t is not None else "" for t in out]
 
     def detokenize_with_meta(
-        self, msgs: List[DetokenizeMsg]
+        self, msgs: list[DetokenizeMsg]
     ) -> tuple[list[str], list[int], list[int]]:
         """Incremental text per message; for a finished message, its reasoning token count
         (0 otherwise or when the model emitted no reasoning end tag); and where each message's
         first token starts in the generated text. That offset ignores stop-string holdback,
         which delays when text is sent but not where it lands."""
-        read_ids: List[List[int]] = []
-        surr_ids: List[List[int]] = []
-        skip: List[bool] = []
+        read_ids: list[list[int]] = []
+        surr_ids: list[list[int]] = []
+        skip: list[bool] = []
         for msg in msgs:
             if msg.uid not in self.decode_map:
                 self.decode_map[msg.uid] = DecodeStatus(
@@ -136,10 +155,27 @@ class DetokenizeManager:
                 )
             s = self.decode_map[msg.uid]
             tokens = msg.next_tokens
-            if msg.finished and tokens and tokens[-1] in self.eos_token_ids:
-                tokens = tokens[:-1]
-            if s.think_end_at is None and self.think_end_id in tokens:
-                s.think_end_at = len(s.decoded_ids) + tokens.index(self.think_end_id) + 1
+            trim_last = getattr(msg, "trim_last_token", None)
+            if msg.finished and tokens:
+                should_trim = (
+                    (tokens[-1] in self.eos_token_ids)
+                    if trim_last is None
+                    else bool(trim_last)
+                )
+                if should_trim:
+                    tokens = tokens[:-1]
+            think_ends = getattr(self, "_think_end_ids", None)
+            if think_ends is None:
+                think_ends = (
+                    frozenset({self.think_end_id})
+                    if self.think_end_id is not None
+                    else frozenset()
+                )
+            if s.think_end_at is None and think_ends:
+                for offset, tok_id in enumerate(tokens):
+                    if tok_id in think_ends:
+                        s.think_end_at = len(s.decoded_ids) + offset + 1
+                        break
             s.decoded_ids.extend(tokens)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
@@ -148,8 +184,8 @@ class DetokenizeManager:
         read_texts = self._batch_decode(read_ids, skip)
         surr_texts = self._batch_decode(surr_ids, skip)
 
-        incremental_strs: List[str] = []
-        reasoning_tokens: List[int] = []
+        incremental_strs: list[str] = []
+        reasoning_tokens: list[int] = []
         text_offsets: list[int] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
@@ -182,10 +218,14 @@ class DetokenizeManager:
                     emit_end = len(output_str)
             elif msg.stop_strs:
                 # Hold back a trailing suffix that could still grow into a stop string.
-                emit_end = len(output_str) - _stop_prefix_holdback(output_str, msg.stop_strs)
+                emit_end = len(output_str) - _stop_prefix_holdback(
+                    output_str, msg.stop_strs
+                )
             else:
                 emit_end = len(output_str)
-            incremental_output = output_str[prev_sent:emit_end] if emit_end > prev_sent else ""
+            incremental_output = (
+                output_str[prev_sent:emit_end] if emit_end > prev_sent else ""
+            )
             s.sent_offset = max(prev_sent, emit_end)
             incremental_strs.append(incremental_output)
             reasoning_tokens.append((s.think_end_at or 0) if msg.finished else 0)
@@ -218,7 +258,14 @@ def build_logprobs_entry(
     top = []
     for tid, logprob in zip(top_ids or [], top_logprobs or []):
         text, data = _fields(int(tid))
-        top.append({"token_id": int(tid), "token": text, "bytes": data, "logprob": float(logprob)})
+        top.append(
+            {
+                "token_id": int(tid),
+                "token": text,
+                "bytes": data,
+                "logprob": float(logprob),
+            }
+        )
     return {
         "token_id": token_id,
         "token": token,

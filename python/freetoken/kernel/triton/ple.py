@@ -16,7 +16,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
 
 # Latency-bound over PCIe, so keep the block small and let many of them be in flight.
@@ -44,14 +43,20 @@ def _ple_gather_kernel(
     if IS_FP8:
         if e4m3_native_cx():
             base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-            values = tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0.0).to(tl.float32)
+            values = tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
         else:
             # pre-sm_89 has no fp8e4nv type: load raw bytes and decode in software
             base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
-            values = e4m3_u8_to_f32(tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0))
+            values = e4m3_u8_to_f32(
+                tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0)
+            )
     else:
         base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-        values = tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0.0).to(tl.float32)
+        values = tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
     values = tl.where(in_range, values * scale, 0.0)
     tl.store(
         out_ptr + row * EMB_DIM + offsets,
@@ -181,6 +186,7 @@ def ple_gather_lut4_rows(
 ) -> torch.Tensor:
     """Gather ``lut4-gptq`` rows (`[80B nibbles | 10B fp16 scales]`) over UVA into ``out``."""
     n = row_ids.numel()
+    assert embed_dim % 4 == 0 and embed_dim % group_size == 0, (embed_dim, group_size)
     assert out.shape == (n, embed_dim) and out.is_contiguous(), out.shape
     packed_bytes = embed_dim // 2
     row_bytes = packed_bytes + (embed_dim // group_size) * 2

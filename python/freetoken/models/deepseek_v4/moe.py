@@ -8,7 +8,12 @@ import torch.nn.functional as F
 
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
-from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
+from freetoken.layers import (
+    BaseOP,
+    LinearColParallelMerged,
+    LinearRowParallel,
+    OffloadMoELayer,
+)
 from freetoken.mm import MM_PAD_SHIFT_VALUE
 
 from .args import DeepseekV4Args
@@ -31,12 +36,18 @@ class Gate(BaseOP):
         vl = args.vision_n_layers > 0
         self.weight = torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16)
         if self.hash:
-            self.tid2eid = torch.empty(args.vocab_size, args.n_activated_experts, dtype=torch.int64)
+            self.tid2eid = torch.empty(
+                args.vocab_size, args.n_activated_experts, dtype=torch.int64
+            )
             # present on hash layers of a vision checkpoint, loaded but never applied
-            self.bias = torch.empty(args.n_routed_experts, dtype=torch.float32) if vl else None
+            self.bias = (
+                torch.empty(args.n_routed_experts, dtype=torch.float32) if vl else None
+            )
         else:
             self.bias = torch.empty(args.n_routed_experts, dtype=torch.float32)
-        self.bias_vl = torch.empty(args.n_routed_experts, dtype=torch.float32) if vl else None
+        self.bias_vl = (
+            torch.empty(args.n_routed_experts, dtype=torch.float32) if vl else None
+        )
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor):
         scores = bf16_linear_fp32(x, self.weight)
@@ -48,19 +59,25 @@ class Gate(BaseOP):
             scores = F.softplus(scores).sqrt()
         original_scores = scores
         # image rows are the content pad ids of an expanded image span
-        image_mask = input_ids >= MM_PAD_SHIFT_VALUE if self.bias_vl is not None else None
+        image_mask = (
+            input_ids >= MM_PAD_SHIFT_VALUE if self.bias_vl is not None else None
+        )
         if self.hash:
             if image_mask is None:
                 indices = self.tid2eid[input_ids]
             else:
                 indices = self.tid2eid[torch.where(image_mask, 0, input_ids)]
                 vl_indices = (scores + self.bias_vl).topk(self.topk, dim=-1)[1]
-                indices = torch.where(image_mask.unsqueeze(-1), vl_indices.to(indices.dtype), indices)
+                indices = torch.where(
+                    image_mask.unsqueeze(-1), vl_indices.to(indices.dtype), indices
+                )
         else:
             if image_mask is None:
                 scores = scores + self.bias
             else:
-                scores = scores + torch.where(image_mask.unsqueeze(-1), self.bias_vl, self.bias)
+                scores = scores + torch.where(
+                    image_mask.unsqueeze(-1), self.bias_vl, self.bias
+                )
             indices = scores.topk(self.topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func != "softmax":
@@ -72,14 +89,42 @@ class Gate(BaseOP):
 class Expert(BaseOP):
     """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4)."""
 
-    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""):
-        self.w1 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
-        self.w2 = LinearRowParallel(inter_dim, dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2")
-        self.w3 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
+    def __init__(
+        self,
+        dim: int,
+        inter_dim: int,
+        swiglu_limit: float,
+        *,
+        quant_config=None,
+        prefix: str = "",
+    ):
+        self.w1 = LinearColParallelMerged(
+            dim,
+            [inter_dim],
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w1",
+        )
+        self.w2 = LinearRowParallel(
+            inter_dim,
+            dim,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
+        )
+        self.w3 = LinearColParallelMerged(
+            dim,
+            [inter_dim],
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w3",
+        )
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = fused_swiglu(self.w1.forward(x), self.w3.forward(x), self.swiglu_limit, x.dtype)
+        h = fused_swiglu(
+            self.w1.forward(x), self.w3.forward(x), self.swiglu_limit, x.dtype
+        )
         return self.w2.forward(h)
 
 
@@ -89,7 +134,17 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     below the route crossover) and slot-cache / cpu / hybrid decode paths
     (per-route dequant GEMV)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        quant_config=None,
+        prefix: str = "",
+        moe_ep: bool = False,
+    ):
         super().__init__(
             layer_id=layer_id,
             num_experts=args.n_routed_experts,
@@ -105,6 +160,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             decode_target=decode_target,
             quant_config=quant_config,
             prefix=prefix,
+            moe_ep=moe_ep,
         )
 
     def _prefill_routed(
@@ -124,7 +180,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which load_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
         # one threshold for all layers (the smallest pool): with overlap prefill, the layers of a chunk must all stream or all take the slot path
         if (
-            hidden_states.shape[0] * self.top_k >= min(self.num_experts, *cache.pool_sizes)
+            self.ep_size > 1
+            or hidden_states.shape[0] * self.top_k
+            >= min(self.num_experts, *cache.pool_sizes)
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
@@ -146,11 +204,33 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
 class MoE(BaseOP):
     """Sparse MoE: hash/score router -> offloaded MXFP4 routed experts + shared expert."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        quant_config=None,
+        prefix: str = "",
+    ):
         self.dim = args.dim
         self.gate = Gate(layer_id, args)
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
-        self.experts = DSV4OffloadMoELayer(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.experts")
+        self.shared_experts = Expert(
+            args.dim,
+            args.moe_inter_dim,
+            args.swiglu_limit,
+            quant_config=quant_config,
+            prefix=f"{prefix}.shared_experts",
+        )
+        self.experts = DSV4OffloadMoELayer(
+            layer_id,
+            args,
+            strategy=strategy,
+            decode_target=decode_target,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+        )
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()

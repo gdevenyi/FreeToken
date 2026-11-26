@@ -109,9 +109,58 @@ class PcieSysmemCommunicator:
     max_bytes: int
     rank: int
     block_cap: int
+    shared_buf: Any = None
 
     def all_reduce(self, x: torch.Tensor) -> None:
         self.wrapper.all_reduce(x)
+
+    def close(self) -> None:
+        if self.bank is not None:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                self.bank.unpin()
+            except Exception:  # noqa: BLE001
+                pass
+            self.bank = None
+        if self.shared_buf is not None:
+            try:
+                from freetoken.moe.host_banks import _LIVE_BUFFERS
+
+                if self.shared_buf in _LIVE_BUFFERS:
+                    _LIVE_BUFFERS.remove(self.shared_buf)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.shared_buf.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.shared_buf = None
+
+
+def _reap_stale_shm_files(shm_dir: str, prefix: str = "freetoken-pcie-ar-") -> None:
+    try:
+        entries = os.listdir(shm_dir)
+    except OSError:
+        return
+    for name in entries:
+        if not name.startswith(prefix):
+            continue
+        rest = name[len(prefix) :]
+        pid_str = rest.split("-", 1)[0]
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            try:
+                os.unlink(os.path.join(shm_dir, name))
+            except OSError:
+                pass
+        except PermissionError:
+            continue
 
 
 def _pick_shm_dir(required_bytes: int) -> str | None:
@@ -123,6 +172,7 @@ def _pick_shm_dir(required_bytes: int) -> str | None:
         try:
             if not os.path.isdir(d):
                 continue
+            _reap_stale_shm_files(d)
             st = os.statvfs(d)
             if st.f_bavail * st.f_frsize >= required_bytes + (16 << 20):
                 return d
@@ -176,63 +226,63 @@ def init_pcie_allreduce(
 
     offer_path: str | None = None
     shared_buf: mmap.mmap | None = None
-    if tp_rank == 0:
-        shm_dir = _pick_shm_dir(total_bytes)
-        if shm_dir is not None:
-            path = os.path.join(
-                shm_dir, f"freetoken-pcie-ar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-            )
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            try:
-                os.ftruncate(fd, total_bytes)
-                shared_buf = mmap.mmap(
-                    fd, total_bytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-                )
-            except BaseException:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                raise
-            finally:
-                os.close(fd)
-            with thread_affinity(device_numa_cpus(dev_idx)):
-                mv = memoryview(shared_buf)
-                # Touch all pages on GPU's PCIe NUMA node before pinning.
-                mv[:] = b"\x00" * total_bytes
-                init_arena_signals(mv, cap)
-                del mv
-            offer_path = path
-
-    offers: list[str | None] = [None] * tp_size
-    dist.all_gather_object(offers, offer_path, group=tp_cpu_group)
-    shm_path = offers[0]
-    if shm_path is None:
-        logger.warning_rank0(
-            "FREETOKEN_PCIE_ALLREDUCE=1 skipped: no shared-memory directory had enough free space"
-        )
-        return None
-
-    attach_err: str | None = None
-    if tp_rank != 0:
-        try:
-            fd = os.open(shm_path, os.O_RDWR)
-            try:
-                shared_buf = mmap.mmap(
-                    fd, total_bytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-                )
-            finally:
-                os.close(fd)
-        except BaseException as exc:  # noqa: BLE001
-            attach_err = repr(exc)
-
+    errs: list[str | None] = [None] * tp_size
     try:
-        errs: list[str | None] = [None] * tp_size
+        if tp_rank == 0:
+            shm_dir = _pick_shm_dir(total_bytes)
+            if shm_dir is not None:
+                path = os.path.join(
+                    shm_dir, f"freetoken-pcie-ar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                )
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                offer_path = path
+                try:
+                    os.ftruncate(fd, total_bytes)
+                    shared_buf = mmap.mmap(
+                        fd,
+                        total_bytes,
+                        mmap.MAP_SHARED,
+                        mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                finally:
+                    os.close(fd)
+                with thread_affinity(device_numa_cpus(dev_idx)):
+                    mv = memoryview(shared_buf)
+                    # Touch all pages on GPU's PCIe NUMA node before pinning.
+                    mv[:] = b"\x00" * total_bytes
+                    init_arena_signals(mv, cap)
+                    del mv
+
+        offers: list[str | None] = [None] * tp_size
+        dist.all_gather_object(offers, offer_path, group=tp_cpu_group)
+        shm_path = offers[0]
+        if shm_path is None:
+            logger.warning_rank0(
+                "FREETOKEN_PCIE_ALLREDUCE=1 skipped: no shared-memory directory had enough free space"
+            )
+            return None
+
+        attach_err: str | None = None
+        if tp_rank != 0:
+            try:
+                fd = os.open(shm_path, os.O_RDWR)
+                try:
+                    shared_buf = mmap.mmap(
+                        fd,
+                        total_bytes,
+                        mmap.MAP_SHARED,
+                        mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                finally:
+                    os.close(fd)
+            except BaseException as exc:  # noqa: BLE001
+                attach_err = repr(exc)
+
         dist.all_gather_object(errs, attach_err, group=tp_cpu_group)
     finally:
-        if tp_rank == 0:
+        if offer_path is not None:
             try:
-                os.unlink(shm_path)
+                os.unlink(offer_path)
             except OSError:
                 pass
 
@@ -257,32 +307,53 @@ def init_pcie_allreduce(
         block_cap,
     )
     # Paired hardware self-test across Tier 1 (< 64 KiB) and Tier 2 (>= 64 KiB).
-    test_err: str | None = None
-    try:
-        dev = torch.device("cuda", dev_idx)
-        for n_elems in (128, min(cap // 2, 40960)):
-            if n_elems <= 0:
-                continue
+    # Synchronize across ranks between shapes so one rank never enters a second collective alone.
+    probe_errs: list[str | None] = [None] * tp_size
+    dev = torch.device("cuda", dev_idx)
+    for n_elems in (128, min(cap // 2, 40960)):
+        if n_elems <= 0:
+            continue
+        step_err: str | None = None
+        try:
             val = 1.25 if tp_rank == 0 else 2.5
             probe = torch.full((n_elems,), val, dtype=torch.bfloat16, device=dev)
+        except BaseException as exc:  # noqa: BLE001
+            step_err = repr(exc)
+            probe = None
+        alloc_errs: list[str | None] = [None] * tp_size
+        dist.all_gather_object(alloc_errs, step_err, group=tp_cpu_group)
+        if any(alloc_errs):
+            probe_errs = alloc_errs
+            break
+        try:
+            assert probe is not None
             wrapper.all_reduce(probe)
             torch.cuda.synchronize(dev)
             expected = torch.full((n_elems,), 3.75, dtype=torch.bfloat16, device=dev)
             if not torch.equal(probe, expected):
-                test_err = f"self-test mismatch at n_elems={n_elems}"
-                break
-    except BaseException as exc:  # noqa: BLE001
-        test_err = repr(exc)
+                step_err = f"self-test mismatch at n_elems={n_elems}"
+        except BaseException as exc:  # noqa: BLE001
+            step_err = repr(exc)
+        step_errs: list[str | None] = [None] * tp_size
+        dist.all_gather_object(step_errs, step_err, group=tp_cpu_group)
+        if any(step_errs):
+            probe_errs = step_errs
+            break
 
-    probe_errs: list[str | None] = [None] * tp_size
-    dist.all_gather_object(probe_errs, test_err, group=tp_cpu_group)
     dist.barrier(group=tp_cpu_group)
     if any(probe_errs):
         logger.warning_rank0(
             f"FREETOKEN_PCIE_ALLREDUCE=1 self-test failed ({probe_errs}); falling back to PyNCCL"
         )
-        bank.unpin()
-        shared_buf.close()
+        comm_tmp = PcieSysmemCommunicator(
+            wrapper=wrapper,
+            bank=bank,
+            max_bytes=cap,
+            rank=tp_rank,
+            block_cap=block_cap,
+            shared_buf=shared_buf,
+        )
+        comm_tmp.close()
         return None
 
     logger.info_rank0(
@@ -295,6 +366,7 @@ def init_pcie_allreduce(
         max_bytes=cap,
         rank=tp_rank,
         block_cap=block_cap,
+        shared_buf=shared_buf,
     )
 
 
