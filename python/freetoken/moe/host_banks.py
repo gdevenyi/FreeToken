@@ -402,6 +402,20 @@ def probe_pin(
             for bank in plan.deferred[layer]:
                 freed += len(bank._buf) if bank._pinned else 0
                 bank.unpin()
+    from freetoken.distributed import try_get_tp_cpu_group
+
+    group = try_get_tp_cpu_group()
+    if group is not None and torch.distributed.is_initialized():
+        world = torch.distributed.get_world_size(group)
+        if world > 1:
+            all_kept: list[set[int]] = [set() for _ in range(world)]
+            torch.distributed.all_gather_object(all_kept, set(pinned), group=group)
+            common_kept = set.intersection(*all_kept)
+            for layer in pinned:
+                if layer not in common_kept:
+                    for bank in plan.deferred[layer]:
+                        bank.unpin()
+            pinned = [layer for layer in pinned if layer in common_kept]
     labels = [HostResidency.PINNED.value] * num_layers
     kept = set(pinned)
     for layer, banks in plan.deferred.items():

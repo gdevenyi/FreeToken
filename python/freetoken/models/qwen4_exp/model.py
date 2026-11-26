@@ -350,12 +350,20 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 PinnedUVATable(
                     table.bank.tensor,
                     float(table.weight_scale),
+                    device=ple_device,
                     weight_lut=table.weight_lut,
                     group_size=table.group_size,
                     head_dim=table.head_dim,
                 )
             )
         return table.bank.nbytes
+
+    def clear_graph_staging(self) -> None:
+        for layer in self.model.layers.op_list:
+            ple = getattr(layer, "ple", None)
+            table = getattr(getattr(ple, "ple_embedding", None), "_table", None)
+            if table is not None and hasattr(table, "clear_graph_staging"):
+                table.clear_graph_staging()
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

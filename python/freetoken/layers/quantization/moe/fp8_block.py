@@ -5,8 +5,18 @@ from __future__ import annotations
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_size
-from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from ..scheme import FP8_BLOCK as BLOCK
+from ..scheme import QuantKind, fp8_block_size
+from .base import (
+    BankSpec,
+    ExpertView,
+    MoEConfig,
+    MoEKernel,
+    MoEMethod,
+    fused_piece,
+    gated_epilogue_reason,
+    limit_or_inf,
+)
 
 FP8 = torch.float8_e4m3fn
 
@@ -23,7 +33,9 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(
+            cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False
+        )
         if reason:
             return reason
         if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
@@ -39,9 +51,13 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         i, h, b = cfg.intermediate, cfg.hidden, BLOCK
         return {
             "gate_up": BankSpec((2 * i, h), FP8),
-            "gate_up_scale": BankSpec((2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16),
+            "gate_up_scale": BankSpec(
+                (2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16
+            ),
             "down": BankSpec((h, i), FP8),
-            "down_scale": BankSpec((h // b, _pad_scale(h // b, i // b)), torch.bfloat16),
+            "down_scale": BankSpec(
+                (h // b, _pad_scale(h // b, i // b)), torch.bfloat16
+            ),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
@@ -54,15 +70,46 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         out["down_scale"][:, :, : ds.shape[2]].copy_(ds)
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block, fused_experts_fp8_block
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
+        from freetoken.moe.fused_fp8_block import (
+            fused_experts_decode_fp8_block,
+            fused_experts_fp8_block,
+        )
 
         t = view.tensors
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
             n = view.n if view.n is not None else layer.num_experts
-            return fused_experts_fp8_block(x, t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"], topk_weights, topk_ids, n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
-        return fused_experts_decode_fp8_block(x, t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+            return fused_experts_fp8_block(
+                x,
+                t["gate_up"],
+                t["gate_up_scale"],
+                t["down"],
+                t["down_scale"],
+                topk_weights,
+                topk_ids,
+                n,
+                layer.activation,
+                layer.apply_router_weight_on_input,
+                alpha,
+                limit,
+                has_inactive=layer.ep_size > 1,
+            )
+        return fused_experts_decode_fp8_block(
+            x,
+            t["gate_up"],
+            t["gate_up_scale"],
+            t["down"],
+            t["down_scale"],
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+            alpha,
+            limit,
+        )
 
 
 @register_method(QuantKind.FP8_BLOCK, LayerKind.MOE)

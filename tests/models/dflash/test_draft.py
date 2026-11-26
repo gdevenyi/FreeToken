@@ -1077,7 +1077,7 @@ def test_collectives_match_across_ranks(tmp_path, monkeypatch):
     assert seen[0]["greedy"] == seen[0]["sampled"] and seen[0]["greedy"][-1] == (
         "all_reduce",
         (2, K),
-        torch.int64,
+        torch.int32,
     )
 
 

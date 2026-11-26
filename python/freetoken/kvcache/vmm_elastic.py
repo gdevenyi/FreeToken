@@ -29,7 +29,8 @@ from typing import Protocol
 
 import torch
 
-RETIRED_SLOT_USAGE = 1 << 62
+from freetoken.moe.offload_cache import RETIRED_SLOT_USAGE as RETIRED_SLOT_USAGE
+
 _ELASTIC_MOE_MIN_ROW_BYTES = 16384
 
 _CU_MEM_ALLOCATION_TYPE_PINNED = 1

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -72,9 +72,13 @@ class SpecRunner:
                     f"{proposer_cls.__name__} does not"
                 )
             if gate < 1:
-                raise ValueError(f"--speculative-max-batch-size must be >= 1, got {gate}")
+                raise ValueError(
+                    f"--speculative-max-batch-size must be >= 1, got {gate}"
+                )
             if gate >= config.max_running_req:
-                override("speculative_max_batch_size", None)  # every batch drafts: the gate never fires
+                override(
+                    "speculative_max_batch_size", None
+                )  # every batch drafts: the gate never fires
 
     @classmethod
     def prepare_target(cls, config, model) -> None:
@@ -95,19 +99,37 @@ class SpecRunner:
     def attach(self, engine) -> None:
         """Second construction phase, after the pools and before graph capture."""
         self.engine = engine
-        self._host = torch.zeros(self.config.max_running_req + 1, self.k + 2, dtype=torch.int64, pin_memory=True)
+        self._host = torch.zeros(
+            self.config.max_running_req + 1,
+            self.k + 2,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
         pool = engine.linear_state_pool
-        states = {s.name: pool.slot_state(s.name) for s in self.config.spec_slot_states} if pool is not None else {}
-        self.proposer.attach(DraftContext(
-            page_table=engine.page_table, num_pages=engine.num_pages, device=engine.device,
-            stream=engine.stream, dummy_req=engine.dummy_req, slot_states=states, kv_cache=engine.kv_cache,
-            dummy_req_narrow=getattr(engine, "dummy_req_narrow", None),
-        ))
+        states = (
+            {s.name: pool.slot_state(s.name) for s in self.config.spec_slot_states}
+            if pool is not None
+            else {}
+        )
+        self.proposer.attach(
+            DraftContext(
+                page_table=engine.page_table,
+                num_pages=engine.num_pages,
+                device=engine.device,
+                stream=engine.stream,
+                dummy_req=engine.dummy_req,
+                slot_states=states,
+                kv_cache=engine.kv_cache,
+                dummy_req_narrow=getattr(engine, "dummy_req_narrow", None),
+            )
+        )
 
     def detach(self, *, keep_kv: bool) -> None:
         self.proposer.detach(keep_kv=keep_kv)
 
-    def capture_graphs(self, bs_list: List[int], pool, rows_per_req: int | None = None) -> None:
+    def capture_graphs(
+        self, bs_list: list[int], pool, rows_per_req: int | None = None
+    ) -> None:
         """The draft's graphs next to the target's; ``rows_per_req`` 1 is the no-draft family of --speculative-max-batch-size."""
         if rows_per_req is None:
             self.proposer.capture_graphs(bs_list, pool)
@@ -120,15 +142,21 @@ class SpecRunner:
     def on_prefill(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
         self.proposer.on_prefill(batch, next_tokens_gpu)
 
-    def propose_into(self, reqs: List[Req], token_pool: torch.Tensor) -> None:
+    def propose_into(self, reqs: list[Req], token_pool: torch.Tensor) -> None:
         """Draft k tokens per request into token_pool after its pending token at cached_len."""
         rows = make_device_tensor([r.table_idx for r in reqs], torch.int64, self.device)
-        cols = make_device_tensor([r.cached_len for r in reqs], torch.int64, self.device)
+        cols = make_device_tensor(
+            [r.cached_len for r in reqs], torch.int64, self.device
+        )
         self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
         cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
-        token_pool[rows.unsqueeze(1), cols] = self._proposal.draft_token_ids.to(token_pool.dtype)
+        token_pool[rows.unsqueeze(1), cols] = self._proposal.draft_token_ids.to(
+            token_pool.dtype
+        )
 
-    def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput:
+    def verify_step(
+        self, batch: Batch, sample_args: BatchSamplingArgs
+    ) -> SpecForwardOutput:
         engine = self.engine
         # k + 1, or 1 on a step past --speculative-max-batch-size (no drafts, no proposal)
         bs, width = batch.size, batch.rows_per_req
@@ -139,15 +167,23 @@ class SpecRunner:
         proposal, self._proposal = self._proposal, None
         if proposal is not None and proposal.draft_support_probs is not None:
             out, emitted = reject_with_draft_probs(
-                logits, drafts, proposal.draft_support_ids, proposal.draft_support_probs, sample_args, engine.sampler,
+                logits,
+                drafts,
+                proposal.draft_support_ids,
+                proposal.draft_support_probs,
+                sample_args,
+                engine.sampler,
             )
         else:
             out, emitted = reject(logits, drafts, sample_args, engine.sampler)
         packed = torch.cat([out, emitted.unsqueeze(1)], dim=1)
         if self._comm is not None:
-            if not self._tp_info.is_primary():
-                packed.zero_()
-            packed = self._comm.all_reduce(packed)
+            packed_i32 = (
+                packed.to(torch.int32).contiguous()
+                if self._tp_info.is_primary()
+                else torch.zeros(packed.shape, dtype=torch.int32, device=packed.device)
+            )
+            packed = self._comm.all_reduce(packed_i32).to(packed.dtype)
             out, emitted = packed[:, :width], packed[:, width]
         # one contiguous block of the pinned buffer: a strided slice (width < k + 1) would make the non-blocking copy go
         # through a pageable temporary and block the host

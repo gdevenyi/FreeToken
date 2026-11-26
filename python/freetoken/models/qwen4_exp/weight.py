@@ -55,7 +55,12 @@ from freetoken.utils import (
 )
 from freetoken.utils.progress import byte_bar
 
-from .config import parse_config, use_fp8_dense, use_fp8_lmhead
+from .config import (
+    allows_load_time_quant,
+    parse_config,
+    use_fp8_dense,
+    use_fp8_lmhead,
+)
 
 logger = init_logger(__name__)
 
@@ -604,7 +609,9 @@ def dense_emitter(config, rank: int, world: int, *, include_lmhead: bool = True)
             return
         if hc8 and name.endswith(_HC_INT8_SUFFIXES):
             prefix = name[: -len(".weight")]
-            if config.quant is None or config.quant.scheme_for(prefix) is None:
+            if allows_load_time_quant(config, prefix) and (
+                config.quant is None or config.quant.scheme_for(prefix) is None
+            ):
                 yield from _int8_dense_emit(name, tensor, config, world)
                 return
         dense = fp8 and _fp8_dense_applies(name, config)

@@ -19,7 +19,7 @@ _HYBRID_FETCH_BY_CRF = _HYBRID_FETCH_MODE == "crf"
 _CRF_HALF_LIFE = 128.0
 _CRF_LEASE_SCALE = 32.0
 _CRF_MAX_LEASE = 512
-_STEP_LOCK_USAGE = (1 << 62) - 1
+_STEP_LOCK_USAGE = (1 << 42) - 1
 # How fetch_fraction * misses becomes a fetch count: "min-wait" (default) picks the integer
 # that makes the PCIe fetch and the CPU compute finish closest together, "stochastic" rounds
 # up with probability equal to the fractional part, "prefer-fetch" always rounds up.
@@ -121,6 +121,45 @@ def ensure_experts_hybrid(
     return routes
 
 
+def admit_experts_crf_step(
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    clamp: bool = False,
+    record_stats: bool = True,
+) -> HybridRoutes:
+    """Admit all routed experts in one CRF step (GPU Triton kernel or CPU reference), rewriting ``expert_ids`` in place."""
+    if not expert_ids.is_cuda:
+        return crf_hybrid_step_reference(
+            cache,
+            layer_id,
+            expert_ids,
+            weights,
+            cache.num_experts,
+            clamp=clamp,
+            record_stats=record_stats,
+        )
+    weights = weights.contiguous()
+    routes = HybridRoutes(
+        expert_ids, torch.empty_like(weights), torch.empty_like(expert_ids)
+    )
+    _ensure_experts_hybrid_gpu(
+        cache,
+        layer_id,
+        expert_ids,
+        weights,
+        routes,
+        clamp,
+        cache.num_experts,
+        0,
+        cache.num_experts,
+        record_stats=record_stats,
+    )
+    return routes
+
+
 def prefill_hit_compact(cache, layer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
@@ -177,6 +216,8 @@ def _ensure_experts_hybrid_gpu(
     max_fetch: int,
     frac_q16: int,
     fetch_cap: int,
+    *,
+    record_stats: bool = True,
 ) -> None:
     id_of_slot, usage = cache.pool_state(layer_id)
     num_slots = id_of_slot.numel()
@@ -185,6 +226,7 @@ def _ensure_experts_hybrid_gpu(
     # with 4 warps a 4096+ chunk spills on sm80-sm89
     num_warps = 8 if chunk >= 4096 else 4
     by_crf = _HYBRID_FETCH_BY_CRF or getattr(cache, "cache_policy", "lru") == "crf"
+    stats_on = bool(cache.collect_stats and record_stats)
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -201,7 +243,7 @@ def _ensure_experts_hybrid_gpu(
         weights,
         routes.cpu_ids,
         routes.gpu_w,
-        *(cache.hybrid_stats if cache.collect_stats else (expert_ids,) * 2),
+        *(cache.hybrid_stats if stats_on else (expert_ids,) * 2),
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
@@ -217,7 +259,8 @@ def _ensure_experts_hybrid_gpu(
         BY_CRF=by_crf,
         ROUND=_HYBRID_FETCH_ROUND,
         CLAMP=clamp,
-        STATS=cache.collect_stats,
+        STATS=stats_on,
+        STEP_LOCK_USAGE=_STEP_LOCK_USAGE,
         num_warps=num_warps,
     )
 
@@ -365,6 +408,7 @@ def _ensure_experts_hybrid_kernel(
     ROUND: tl.constexpr,
     CLAMP: tl.constexpr,
     STATS: tl.constexpr,
+    STEP_LOCK_USAGE: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -446,10 +490,10 @@ def _ensure_experts_hybrid_kernel(
         )
         new_crf = tl.where(is_active & e_mask, decayed_crf + 1.0, decayed_crf)
         lease = tl.minimum((new_crf * 32.0).to(tl.int64), 512)
-        # Lock current-step hit slots with _STEP_LOCK_USAGE during Phase 2 victim scan so even if
+        # Lock current-step hit slots with STEP_LOCK_USAGE during Phase 2 victim scan so even if
         # non-hit slots hold forward ClassLRU leases > step + lease, a current-step hit is NEVER evicted.
         prev_hit_u = tl.load(usage_ptr + slot, mask=is_hit, other=0).to(tl.int64)
-        tl.store(usage_ptr + slot, 4611686018427387903, mask=is_hit)
+        tl.store(usage_ptr + slot, STEP_LOCK_USAGE, mask=is_hit)
         crf_q = tl.minimum((decayed_crf * 1024.0).to(tl.int64), 1048575)
         rec_term = (tl.maximum(old_rec, 0) & 0x3FFFFFFF) * num_experts
         score = tl.where(
@@ -486,7 +530,7 @@ def _ensure_experts_hybrid_kernel(
             if SMALL:
                 victim = tl.argmin(u_reg, axis=0).to(tl.int32)
                 u_reg = tl.where(
-                    off_k == victim, 4611686018427387903 if BY_CRF else step, u_reg
+                    off_k == victim, STEP_LOCK_USAGE if BY_CRF else step, u_reg
                 )
             else:
                 best_u = tl.full((), 9223372036854775807, tl.int64)
@@ -514,7 +558,7 @@ def _ensure_experts_hybrid_kernel(
                 e = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
             tl.store(id_of_slot_ptr + victim, base + e)
             tl.store(slot_for_id_ptr + base + e, victim)
-            tl.store(usage_ptr + victim, 4611686018427387903 if BY_CRF else step)
+            tl.store(usage_ptr + victim, STEP_LOCK_USAGE if BY_CRF else step)
             tl.store(evict_slots_ptr + i, victim)
             tl.store(src_indices_ptr + i, e)  # layer-local row
             tl.debug_barrier()  # the next scan must see this victim's stamp
@@ -570,6 +614,7 @@ def crf_hybrid_step_reference(
     max_fetch: int,
     *,
     clamp: bool = False,
+    record_stats: bool = True,
 ) -> HybridRoutes:
     """CPU reference implementation of ``_ensure_experts_hybrid_kernel`` with ``BY_CRF=True``."""
     step = int(cache.step.item()) + 1
@@ -654,6 +699,16 @@ def crf_hybrid_step_reference(
     gpu_w = torch.where(on_gpu, weights, torch.zeros_like(weights))
     gpu_slots = slots.clamp(min=0) if clamp else slots
     expert_ids.copy_(gpu_slots)
+    if getattr(cache, "collect_stats", False) and record_stats:
+        stats, stats_layer = cache.hybrid_stats
+        stats[0] += num_missing
+        stats[1] += num_fetch
+        stats[2] += len(active_list)
+        stats[3] += 1
+        stats_layer[layer_id, 0] += num_missing
+        stats_layer[layer_id, 1] += num_fetch
+        stats_layer[layer_id, 2] += len(active_list)
+        stats_layer[layer_id, 3] += 1
     return HybridRoutes(expert_ids, gpu_w, cpu_ids)
 
 

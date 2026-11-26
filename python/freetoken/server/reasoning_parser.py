@@ -585,28 +585,45 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
             if pos == len(text):
                 return "call" if state in ("invoked", "closed") else "hold"
             if state == "opened" and text[pos] == "{":
-                close_idx = text.find("</tool_call>", pos)
-                if close_idx == -1:
-                    return (
-                        "quote"
-                        if "<tool_call>" in text[pos:]
-                        else "hold"
-                    )
-                raw_json = text[pos:close_idx].strip()
-                if "<tool_call>" in raw_json:
-                    return "quote"
                 try:
-                    parsed = json.loads(raw_json)
-                except (json.JSONDecodeError, ValueError):
+                    parsed, end_pos = json.JSONDecoder().raw_decode(text, pos)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    if isinstance(exc, json.JSONDecodeError):
+                        tail = text[exc.pos :]
+                        if "Unterminated string" in exc.msg and all(
+                            ord(ch) >= 0x20 for ch in tail
+                        ):
+                            return "hold"
+                        if (
+                            exc.pos >= len(text)
+                            or tail.isspace()
+                            or any(
+                                lit.startswith(tail)
+                                for lit in ("true", "false", "null")
+                            )
+                            or re.fullmatch(
+                                r"-?(?:0|[1-9]\d*)(?:\.\d*)?(?:[eE][+-]?)?", tail
+                            )
+                            is not None
+                        ):
+                            return "hold"
                     return "quote"
-                if (
+                if not (
                     isinstance(parsed, dict)
                     and parsed.get("name") in self._tool_names
                     and "arguments" in parsed
                 ):
-                    pos = close_idx + len("</tool_call>")
+                    return "quote"
+                while end_pos < len(text) and text[end_pos].isspace():
+                    end_pos += 1
+                if text.startswith("</tool_call>", end_pos):
+                    pos = end_pos + len("</tool_call>")
                     state = "closed"
                     continue
+                if "</tool_call>".startswith(
+                    text[end_pos : end_pos + len("</tool_call>")]
+                ):
+                    return "hold"
                 return "quote"
             tags = _QWEN_RUN_GRAMMAR[state]
             tag = next((t for t in tags if text.startswith(t, pos)), None)

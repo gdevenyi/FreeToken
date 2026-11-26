@@ -93,7 +93,7 @@ def moe_align_block_size(
     """
     from freetoken.kernel.backend import is_rocm, is_sgl_kernel_installed
 
-    if is_rocm():
+    if is_rocm() and not has_inactive:
         import triton
         from packaging.version import Version
 

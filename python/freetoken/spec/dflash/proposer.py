@@ -330,9 +330,12 @@ class DFlashProposer(Proposer):
         )
         if self._comm is not None:
             # every rank verifies the same drafts but walked its own path: rank 0's go to all, here so that every graph replay sends them
-            if not self._tp_info.is_primary():
-                tokens.zero_()
-            tokens = self._comm.all_reduce(tokens)
+            tokens_i32 = (
+                tokens.to(torch.int32).contiguous()
+                if self._tp_info.is_primary()
+                else torch.zeros(tokens.shape, dtype=torch.int32, device=tokens.device)
+            )
+            tokens = self._comm.all_reduce(tokens_i32).to(tokens.dtype)
         return tokens, candidate_ids, q
 
     def _inject(

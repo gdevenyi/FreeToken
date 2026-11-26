@@ -243,24 +243,36 @@ class _QSAHostArena:
             try:
                 from freetoken.kernel.batch_memcpy import batch_memcpy_jit
 
-                dst_list: list[int] = []
-                src_list: list[int] = []
-                sz_list: list[int] = []
+                # CUDA 13.0 cudaMemcpyBatchAsync blocks the host thread when one batch mixes
+                # >= 256 KiB and < 253 KiB entries on cudaHostRegister memory (offload_cache.py:23).
+                big_dst, big_src, big_sz = [], [], []
+                small_dst, small_src, small_sz = [], [], []
                 for dev_b, host_b, fb in zip(
                     self.dev_banks, self.host_banks, self.feat_bytes, strict=True
                 ):
                     d_base = host_b.data_ptr()
                     s_base = dev_b.data_ptr()
                     for s0, d0, n in runs:
-                        dst_list.append(d_base + d0 * fb)
-                        src_list.append(s_base + s0 * fb)
-                        sz_list.append(n * fb)
-                batch_memcpy_jit(
-                    torch.tensor(dst_list, dtype=torch.int64),
-                    torch.tensor(src_list, dtype=torch.int64),
-                    torch.tensor(sz_list, dtype=torch.int64),
-                    self.copy_stream.cuda_stream,
-                )
+                        sz = n * fb
+                        if sz >= 256 * 1024:
+                            big_dst.append(d_base + d0 * fb)
+                            big_src.append(s_base + s0 * fb)
+                            big_sz.append(sz)
+                        else:
+                            small_dst.append(d_base + d0 * fb)
+                            small_src.append(s_base + s0 * fb)
+                            small_sz.append(sz)
+                for dst_list, src_list, sz_list in (
+                    (big_dst, big_src, big_sz),
+                    (small_dst, small_src, small_sz),
+                ):
+                    if dst_list:
+                        batch_memcpy_jit(
+                            torch.tensor(dst_list, dtype=torch.int64),
+                            torch.tensor(src_list, dtype=torch.int64),
+                            torch.tensor(sz_list, dtype=torch.int64),
+                            self.copy_stream.cuda_stream,
+                        )
                 self._batch_memcpy_ok = True
                 self.pending_d2h = True
                 return

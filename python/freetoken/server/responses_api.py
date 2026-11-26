@@ -836,7 +836,9 @@ async def responses_stream_generator(
         current = None
         return frames
 
-    def open_function_call(name: str, ordinal: int | None) -> list[str]:
+    def open_function_call(
+        name: str, ordinal: int | None, *, stable: bool = True
+    ) -> list[str]:
         nonlocal current
         frames = close_current()
         item_id = f"fc_{uuid.uuid4().hex}"
@@ -848,6 +850,7 @@ async def responses_stream_generator(
             "name": name,
             "args": "",
             "ordinal": ordinal,
+            "stable": stable,
         }
         frames.append(
             _sse(
@@ -979,12 +982,18 @@ async def responses_stream_generator(
                 )
 
             elif isinstance(ev, ToolCallStart):
-                for f in open_function_call(ev.name or "", ev.tool_index):
+                for f in open_function_call(
+                    ev.name or "", ev.tool_index, stable=ev.args_prefix_stable
+                ):
                     yield f
 
             elif isinstance(ev, ToolCallArgsDelta):
-                if current is None or current["kind"] != "function_call":
-                    continue  # defensive: fragment without an open call
+                if (
+                    current is None
+                    or current["kind"] != "function_call"
+                    or not current.get("stable", True)
+                ):
+                    continue  # defensive: fragment without an open call or unstable prefix
                 current["args"] += ev.fragment
                 yield args_delta_frame(ev.fragment)
 

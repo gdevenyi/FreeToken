@@ -197,6 +197,8 @@ def set_stream_persisting_l2_window(
             != 0
         ):
             rt.cudaGetLastError()
+            rt.cudaDeviceSetLimit(_CUDA_LIMIT_PERSISTING_L2_CACHE_SIZE, 0)
+            rt.cudaGetLastError()
             return 0
         return window_bytes
     finally:

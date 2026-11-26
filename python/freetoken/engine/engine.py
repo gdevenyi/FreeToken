@@ -2141,6 +2141,8 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         if narrow is not None:
             narrow.destroy_cuda_graphs()
+        if hasattr(getattr(self, "model", None), "clear_graph_staging"):
+            self.model.clear_graph_staging()
         if self.spec is not None:
             # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
             self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
@@ -2355,7 +2357,7 @@ class Engine:
         next_tokens_gpu = self.sampler.sample(
             batch_logits, args, record_counts=False
         ).to(torch.int32)
-        if spec_prefill and self._comm is not None:
+        if self._comm is not None:
             next_tokens_gpu = (
                 next_tokens_gpu.contiguous()
                 if self.config.tp_info.is_primary()
@@ -2524,9 +2526,20 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if (
+            getattr(self, "device", None) is not None
+            and self.device.type == "cuda"
+            and torch.cuda.is_initialized()
+        ):
+            torch.cuda.synchronize(self.device)
         self.graph_runner.destroy_cuda_graphs()
         if self.narrow_graph_runner is not None:
             self.narrow_graph_runner.destroy_cuda_graphs()
+        if getattr(self, "spec", None) is not None:
+            self.spec.detach(keep_kv=False)
+        if hasattr(getattr(self, "model", None), "clear_graph_staging"):
+            self.model.clear_graph_staging()
+        gc.collect()
         if getattr(self, "kv_cache", None) is not None and hasattr(
             self.kv_cache, "close"
         ):

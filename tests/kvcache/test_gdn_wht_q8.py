@@ -114,3 +114,35 @@ def test_linear_state_pool_wht128_q8_host_roundtrip(monkeypatch):
     assert torch.equal(pool.conv_states[:, 2], src_conv)
     assert torch.equal(pool.slot_states["ple_conv"][:, 2], src_ple)
     assert _rel_rmse(pool.recurrent_states[:, 2], src_rec) < 0.0065
+
+
+def test_wht128_q8_subnormal_bf16_scale_and_nan_free():
+    """Subnormal BF16 scales (<= 2^-131) combined with exact zeros in a WHT group must not
+    overflow 1/scale_f32 to +inf and produce 0 * inf = NaN."""
+    from freetoken.kernel.triton.gdn_wht_q8 import _hadamard_128
+
+    h = _hadamard_128(torch.device("cpu"))
+    # Construct y in WHT domain directly via inverse Hadamard (H is symmetric involutory: x = y @ H):
+    y_target = torch.zeros(4, 128, dtype=torch.float32)
+    # Row 0, group 0: 1 subnormal-scale value (amax/127 ~ 2^-131) + 31 exact zeros -> previously NaN!
+    y_target[0, 0] = float.fromhex("0x1p-124")
+    # Row 1: normal values
+    y_target[1] = torch.linspace(-0.5, 0.5, 128)
+    # Row 2: non-finite poison in unused/corrupt slot -> clamped cleanly without NaN propagation
+    x_states = (y_target @ h).view(2, 1, 2, 128)
+    x_states[1, 0, 0, 0] = float("nan")
+    x_states[1, 0, 0, 1] = float("inf")
+
+    q = torch.empty((4, 128), dtype=torch.int8)
+    s = torch.empty((4, 4), dtype=torch.bfloat16)
+    pack_slot_wht128_q8(x_states, 0, q, s)
+
+    assert torch.all(q[0, :32] == 0)
+    assert float(s[0, 0].item()) == 0.0
+    assert torch.isfinite(s.float()).all()
+
+    rec = torch.zeros_like(x_states)
+    unpack_slot_wht128_q8(q, s, rec, 0)
+    assert torch.isfinite(rec).all()
+    assert torch.all(rec[0, 0, 0] == 0.0)
+    assert _rel_rmse(rec[0, 0, 1], x_states[0, 0, 1]) < 0.01

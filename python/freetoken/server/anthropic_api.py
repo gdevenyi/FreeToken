@@ -444,6 +444,8 @@ def convert_anthropic_prompt(
         ctk = effort_toggle_kwargs(effort, ctk, thinking_type=thinking_type)
     elif thinking_type in _DISABLE_THINKING_TYPES:
         ctk = thinking_toggle_kwargs(False)
+    elif thinking_type == "auto":
+        pass
     elif thinking_type is not None:
         ctk = thinking_toggle_kwargs(True)
     ctk = thinking_override_kwargs(thinking, ctk)

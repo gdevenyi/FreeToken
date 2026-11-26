@@ -115,7 +115,9 @@ _BANK_BYTES_PER_EXPERT = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
-RETIRED_SLOT_USAGE = 1 << 62
+# 2^42 (~4.4e12 steps) keeps (RETIRED_SLOT_USAGE << SLOT_BITS) strictly positive in signed int64
+# inside flashlib's _lru_ensure_insert_kernel when cache_size >= 40000 (up to 2^20 slots).
+RETIRED_SLOT_USAGE = 1 << 42
 
 
 def placeholder_bank(num_experts: int) -> torch.Tensor:
@@ -567,6 +569,13 @@ class OffloadMoeCache:
 
     def pool_slots(self, layer_id: int) -> int:
         return self.pool_sizes[self.pool_of_layer[layer_id]]
+
+    def active_pool_slots(self, layer_id: int) -> int:
+        p = self.pool_of_layer[layer_id]
+        return min(
+            self.pool_sizes[p],
+            max(0, self.active_cache_size - self.pool_bases[p]),
+        )
 
     def pool_bank_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Per-bank slot views of the pool that serves ``layer_id``, indexed by its local slot ids."""
@@ -1361,6 +1370,9 @@ class OffloadMoeCache:
         )
 
         if topk_ids.numel() <= ENSURE_ONE_CALL_WIDTH:
+            if self.cache_policy == "crf":
+                self.admit_experts_crf(layer_id, topk_ids)
+                return topk_ids
             self.ensure_experts(layer_id, topk_ids)
             self.copy_missing()
             return topk_ids
@@ -1373,6 +1385,10 @@ class OffloadMoeCache:
         ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
         ordered = ordered[: min(self.num_experts, topk_ids.numel())]
         query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        if self.cache_policy == "crf":
+            self._admit_crf_inplace(layer_id, query, record_stats=self.collect_stats)
+            self.copy_missing()
+            return self.slot_for_id[layer_id][topk_ids.long()]
         missed = torch.zeros((), dtype=torch.int64, device=self.device)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
@@ -1386,6 +1402,27 @@ class OffloadMoeCache:
             stats[Stat.MISS] += missed
             stats[Stat.CALLS] += 1
         return self.slot_for_id[layer_id][topk_ids.long()]
+
+    def _admit_crf_inplace(
+        self, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+    ) -> None:
+        from freetoken.moe.offload_kernels import admit_experts_crf_step
+
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        self._pending_fetch_cap = None
+        dummy_w = torch.ones(
+            expert_ids.shape, dtype=torch.float32, device=expert_ids.device
+        )
+        admit_experts_crf_step(
+            self, layer_id, expert_ids, dummy_w, record_stats=record_stats
+        )
+
+    def admit_experts_crf(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Single-pass CRF admission + H2D copy for ``expert_ids`` (rewritten to slot ids in place)."""
+        self._count_routing(layer_id, expert_ids)
+        self._admit_crf_inplace(layer_id, expert_ids, record_stats=self.collect_stats)
+        self.copy_missing()
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
@@ -1584,7 +1621,11 @@ class OffloadMoeCache:
         """
 
     def decode_miss_stats(self) -> dict:
-        if self.decode_target == "hybrid" or self.ep_size > 1:
+        if (
+            self.decode_target == "hybrid"
+            or self.ep_size > 1
+            or self.cache_policy == "crf"
+        ):
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
@@ -1608,7 +1649,11 @@ class OffloadMoeCache:
 
     def decode_stats_line(self) -> str | None:
         """Decode stats since the last call by layer group (pinned, locked with slots, CPU-only), as one log line; zeroes the counters."""
-        if self.decode_target == "hybrid" or self.ep_size > 1:
+        if (
+            self.decode_target == "hybrid"
+            or self.ep_size > 1
+            or self.cache_policy == "crf"
+        ):
             rows = torch.stack(
                 [
                     self.stat_steps_layer,
@@ -1655,7 +1700,11 @@ class OffloadMoeCache:
         lists indexed by MoE-layer id: missing/active experts per step and the realized
         miss_rate (missing/active) -- i.e. how cacheable each layer's routing actually was
         under the running LRU. Reads device tensors once (no per-step host sync)."""
-        if self.decode_target == "hybrid" or self.ep_size > 1:
+        if (
+            self.decode_target == "hybrid"
+            or self.ep_size > 1
+            or self.cache_policy == "crf"
+        ):
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()
@@ -1761,11 +1810,22 @@ class OffloadMoeCache:
             )
             return
 
-        from freetoken.kernel import fast_index_copy_jit
-
         views = (
             self.stage_views(layer_id, 0) if whole else self.pool_bank_views(layer_id)
         )
+        if self.device.type != "cuda":
+            k = int(self.num_indices.item())
+            if k > 0:
+                dst = self.evict_slots[:k].long()
+                src = self.src_indices[:k].long()
+                for (per_layer, _), cache in zip(self.banks, views):
+                    if cache.numel() == 0:
+                        continue
+                    cache.index_copy_(0, dst, per_layer[layer_id].index_select(0, src))
+            return
+
+        from freetoken.kernel import fast_index_copy_jit
+
         for (per_layer, _), cache in zip(self.banks, views):
             if cache.numel() == 0:
                 continue

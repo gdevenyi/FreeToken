@@ -81,11 +81,15 @@ class PcieSysmemDistributedImpl(DistributedImpl):
         if (
             x.is_cuda
             and x.is_contiguous()
-            and (x.data_ptr() & 15) == 0
             and x.dtype in self._SUPPORTED_DTYPES
             and x.nbytes <= self.max_bytes
         ):
-            self.pcie_comm.all_reduce(x.view(-1))
+            if (x.data_ptr() & 15) == 0:
+                self.pcie_comm.all_reduce(x.view(-1))
+            else:
+                staged = x.clone()
+                self.pcie_comm.all_reduce(staged.view(-1))
+                x.copy_(staged)
             return x
         return self.fallback.all_reduce(x)
 

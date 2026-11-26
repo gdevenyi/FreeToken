@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import signal
@@ -354,6 +355,18 @@ class FrontendManager:
                             request_id=request_id, status="failed", error=message
                         )
                     )
+            for uid, queue in list(self.ack_map.items()):
+                queue.append(
+                    UserReply(
+                        uid=uid,
+                        incremental_output="",
+                        finished=True,
+                        error=f"backend worker exited: {message}",
+                        error_code="internal_error",
+                    )
+                )
+                if (ev := self.event_map.get(uid)) is not None:
+                    ev.set()
 
         try:
             loop.call_soon_threadsafe(_resolve_all)
@@ -1110,7 +1123,9 @@ class KldRequest(BaseModel):
     bos_token_id: int | None = Field(None, ge=0)
 
 
-async def run_kld(state: Any, req: KldRequest) -> JSONResponse:
+async def run_kld(
+    state: Any, req: KldRequest, http_request: Request | None = None
+) -> JSONResponse:
     """Score base chunks one after another, each as its own max_tokens=1 token-id request."""
     from freetoken.benchmark.kld import KldBase, new_chunk_result, summarize
 
@@ -1126,6 +1141,8 @@ async def run_kld(state: Any, req: KldRequest) -> JSONResponse:
         )
     results: list[dict[str, Any]] = []
     for chunk in chunks:
+        if http_request is not None and await http_request.is_disconnected():
+            break
         ids = base.tokens(chunk).tolist()
         if ids and req.bos_token_id is not None:
             ids[0] = req.bos_token_id
@@ -1186,7 +1203,7 @@ async def run_kld(state: Any, req: KldRequest) -> JSONResponse:
 
 
 @app.post("/v1/internal/kld")
-async def internal_kld(req: KldRequest):
+async def internal_kld(req: KldRequest, request: Request):
     state = get_global_state()
     if not getattr(state.config, "kld_endpoint", False):
         return JSONResponse(
@@ -1195,6 +1212,8 @@ async def internal_kld(req: KldRequest):
         )
     if (rejection := _maintenance_rejection(state, "score KLD chunks")) is not None:
         return rejection
+    if "http_request" in inspect.signature(run_kld).parameters:
+        return await run_kld(state, req, http_request=request)
     return await run_kld(state, req)
 
 

@@ -35,10 +35,10 @@ def _compute_type(dtype: torch.dtype):
 
 
 def _grouped_decode(
-    a: torch.Tensor,            # [A_rows, K] compute dtype
+    a: torch.Tensor,  # [A_rows, K] compute dtype
     packed_cache: torch.Tensor,  # [S, N, K//2] uint8
-    scale_cache: torch.Tensor,   # [S, N, K//32] e8m0
-    slots: torch.Tensor,         # [T, top_k] int32 -> cache slot
+    scale_cache: torch.Tensor,  # [S, N, K//32] e8m0
+    slots: torch.Tensor,  # [T, top_k] int32 -> cache slot
     topk_weights: torch.Tensor | None,
     *,
     a_row_is_route: bool,
@@ -70,16 +70,31 @@ def _grouped_decode(
     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
     grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))
     _decode_dsfp4_moe_kernel[grid](
-        a, packed_cache, scale_u8, out, topk_weights, slots,
+        a,
+        packed_cache,
+        scale_u8,
+        out,
+        topk_weights,
+        slots,
         _e2m1_lut(a.device.index),
-        total_routes, N, K,
-        a.stride(0), a.stride(1),
-        packed_cache.stride(0), packed_cache.stride(1), packed_cache.stride(2),
-        scale_u8.stride(0), scale_u8.stride(1), scale_u8.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
+        total_routes,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        packed_cache.stride(0),
+        packed_cache.stride(1),
+        packed_cache.stride(2),
+        scale_u8.stride(0),
+        scale_u8.stride(1),
+        scale_u8.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
         topk_weights.stride(0) if topk_weights.ndim == 2 else 0,
         topk_weights.stride(1) if topk_weights.ndim == 2 else 0,
-        slots.stride(0), slots.stride(1),
+        slots.stride(0),
+        slots.stride(1),
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_KB=BLOCK_SIZE_KB,
         TOP_K=top_k,
@@ -92,13 +107,13 @@ def _grouped_decode(
 
 
 def routed_experts_fp4(
-    x: torch.Tensor,             # [T, H] compute dtype
-    slots: torch.Tensor,         # [T, top_k] int32 -> cache slot
+    x: torch.Tensor,  # [T, H] compute dtype
+    slots: torch.Tensor,  # [T, top_k] int32 -> cache slot
     topk_weights: torch.Tensor,  # [T, top_k] fp32 (incl. route_scale + renorm)
     gate_up_packed: torch.Tensor,  # [S, 2I, H//2] uint8
-    gate_up_scale: torch.Tensor,   # [S, 2I, H//32] e8m0
-    down_packed: torch.Tensor,     # [S, H, I//2] uint8
-    down_scale: torch.Tensor,      # [S, H, I//32] e8m0
+    gate_up_scale: torch.Tensor,  # [S, 2I, H//32] e8m0
+    down_packed: torch.Tensor,  # [S, H, I//2] uint8
+    down_scale: torch.Tensor,  # [S, H, I//32] e8m0
     swiglu_limit: float,
     act_block: int = 128,
 ) -> torch.Tensor:
@@ -115,16 +130,28 @@ def routed_experts_fp4(
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
 
-    x = act_quant_fp8_roundtrip(x, act_block)  # gate_up activation -> FP8 round-trip (no clone)
+    x = act_quant_fp8_roundtrip(
+        x, act_block
+    )  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = _grouped_decode(
-        x, gate_up_packed, gate_up_scale, slots, None,
-        a_row_is_route=False, mul_routed_weight=False,
+        x,
+        gate_up_packed,
+        gate_up_scale,
+        slots,
+        None,
+        a_row_is_route=False,
+        mul_routed_weight=False,
     )  # [T, top_k, 2I]
     # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
     act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(T * top_k, I)
     down = _grouped_decode(
-        act, down_packed, down_scale, slots, topk_weights,
-        a_row_is_route=True, mul_routed_weight=True,
+        act,
+        down_packed,
+        down_scale,
+        slots,
+        topk_weights,
+        a_row_is_route=True,
+        mul_routed_weight=True,
     )  # [T, top_k, H]
     return down.sum(dim=1)  # [T, H]
 
@@ -138,11 +165,11 @@ _GROUPED_MIN_ROUTES = 768
 
 
 def _grouped_prefill(
-    a: torch.Tensor,             # [A_rows, K] compute dtype (FP8 round-tripped)
+    a: torch.Tensor,  # [A_rows, K] compute dtype (FP8 round-tripped)
     packed_cache: torch.Tensor,  # [S, N, K//2] uint8
-    scale_cache: torch.Tensor,   # [S, N, K//32] e8m0
-    c: torch.Tensor,             # [T, top_k, N] output, flat-indexed over routes
-    tw_flat: torch.Tensor,       # [T*top_k] fp32
+    scale_cache: torch.Tensor,  # [S, N, K//32] e8m0
+    c: torch.Tensor,  # [T, top_k, N] output, flat-indexed over routes
+    tw_flat: torch.Tensor,  # [T*top_k] fp32
     sorted_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -155,17 +182,32 @@ def _grouped_prefill(
     K = packed_cache.shape[2] * 2
     EM = sorted_ids.shape[0]
     scale_u8 = scale_cache.view(torch.uint8)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     _prefill_dsfp4_moe_kernel[grid](
-        a, packed_cache, scale_u8, c, tw_flat,
-        sorted_ids, expert_ids, num_tokens_post_padded,
-        N, K, EM, num_valid,
-        a.stride(0), a.stride(1),
-        packed_cache.stride(0), packed_cache.stride(1), packed_cache.stride(2),
-        scale_u8.stride(0), scale_u8.stride(1), scale_u8.stride(2),
-        c.stride(-2), c.stride(-1),
+        a,
+        packed_cache,
+        scale_u8,
+        c,
+        tw_flat,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        EM,
+        num_valid,
+        a.stride(0),
+        a.stride(1),
+        packed_cache.stride(0),
+        packed_cache.stride(1),
+        packed_cache.stride(2),
+        scale_u8.stride(0),
+        scale_u8.stride(1),
+        scale_u8.stride(2),
+        c.stride(-2),
+        c.stride(-1),
         BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
         BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
@@ -179,16 +221,18 @@ def _grouped_prefill(
 
 
 def routed_experts_fp4_prefill(
-    x: torch.Tensor,             # [T, H] compute dtype
-    slots: torch.Tensor,         # [T, top_k] int32 -> bank row in [0, num_rows)
+    x: torch.Tensor,  # [T, H] compute dtype
+    slots: torch.Tensor,  # [T, top_k] int32 -> bank row in [0, num_rows)
     topk_weights: torch.Tensor,  # [T, top_k] fp32 (incl. route_scale + renorm)
     gate_up_packed: torch.Tensor,  # [S, 2I, H//2] uint8
-    gate_up_scale: torch.Tensor,   # [S, 2I, H//32] e8m0
-    down_packed: torch.Tensor,     # [S, H, I//2] uint8
-    down_scale: torch.Tensor,      # [S, H, I//32] e8m0
+    gate_up_scale: torch.Tensor,  # [S, 2I, H//32] e8m0
+    down_packed: torch.Tensor,  # [S, H, I//2] uint8
+    down_scale: torch.Tensor,  # [S, H, I//32] e8m0
     swiglu_limit: float,
     num_rows: int,
     act_block: int = 128,
+    *,
+    has_inactive: bool = False,
 ) -> torch.Tensor:
     """Grouped-GEMM counterpart of :func:`routed_experts_fp4` for dense prefill
     chunks: one moe_align sort shared by both GEMMs, each expert's weights
@@ -198,8 +242,15 @@ def routed_experts_fp4_prefill(
     T, top_k = slots.shape
     if T * top_k < _GROUPED_MIN_ROUTES:
         return routed_experts_fp4(
-            x, slots, topk_weights,
-            gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit, act_block=act_block,
+            x,
+            slots,
+            topk_weights,
+            gate_up_packed,
+            gate_up_scale,
+            down_packed,
+            down_scale,
+            swiglu_limit,
+            act_block=act_block,
         )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
@@ -209,26 +260,55 @@ def routed_experts_fp4_prefill(
     # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
     # as tighter tiles while keeping the wgmma-wide M tile on sm_90.
     cfg = dict(
-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
-        num_warps=8, num_stages=1,
+        BLOCK_SIZE_M=64,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=64,
+        GROUP_SIZE_M=8,
+        num_warps=8,
+        num_stages=1,
     )
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
+    sorted_ids, expert_ids, ntpp = moe_align_block_size(
+        slots, cfg["BLOCK_SIZE_M"], num_rows, has_inactive=has_inactive
+    )
     tw = topk_weights.reshape(-1).contiguous()
+    alloc = torch.zeros if has_inactive else torch.empty
 
-    x = act_quant_fp8_roundtrip(x, act_block)  # gate_up activation -> FP8 round-trip (no clone)
-    gate_up = torch.empty((T, top_k, two_I), dtype=x.dtype, device=x.device)
+    x = act_quant_fp8_roundtrip(
+        x, act_block
+    )  # gate_up activation -> FP8 round-trip (no clone)
+    gate_up = alloc((T, top_k, two_I), dtype=x.dtype, device=x.device)
     _grouped_prefill(
-        x, gate_up_packed, gate_up_scale, gate_up, tw,
-        sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
+        x,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        routes,
+        top_k,
+        False,
+        cfg,
     )
     # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
     act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(routes, I)
-    down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
+    down = alloc((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
-        act, down_packed, down_scale, down, tw,
-        sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,
+        act,
+        down_packed,
+        down_scale,
+        down,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        routes,
+        1,
+        True,
+        cfg,
     )
     return down.sum(dim=1)  # [T, H]
 
 
-__all__ = ["routed_experts_fp4", "routed_experts_fp4_prefill", "_grouped_decode"]
+__all__ = ["_grouped_decode", "routed_experts_fp4", "routed_experts_fp4_prefill"]

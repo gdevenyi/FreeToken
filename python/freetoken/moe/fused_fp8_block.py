@@ -14,9 +14,20 @@ from __future__ import annotations
 
 
 def fused_experts_fp8_block(
-    hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, num_experts, activation="silu",
-    apply_router_weight_on_input=False, act_alpha=1.0, act_limit=float("inf"),
+    hidden_states,
+    gate_up,
+    gate_up_scale,
+    down,
+    down_scale,
+    topk_weights,
+    topk_ids,
+    num_experts,
+    activation="silu",
+    apply_router_weight_on_input=False,
+    act_alpha=1.0,
+    act_limit=float("inf"),
+    *,
+    has_inactive: bool = False,
 ):
     """Prefill: W8A8 fused grouped GEMM over the materialized-layer banks
     (``[num_experts, ...]``, position == expert id)."""
@@ -24,25 +35,53 @@ def fused_experts_fp8_block(
     from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_fp8_blockscale
 
     return fused_experts_fp8_blockscale(
-        hidden_states, gate_up, gate_up_scale, down, down_scale,
-        topk_weights, topk_ids, num_experts, activation, act_alpha, act_limit,
+        hidden_states,
+        gate_up,
+        gate_up_scale,
+        down,
+        down_scale,
+        topk_weights,
+        topk_ids,
+        num_experts,
+        activation,
+        act_alpha,
+        act_limit,
+        has_inactive=has_inactive,
     )
 
 
 def fused_experts_decode_fp8_block(
-    hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, activation="silu", apply_router_weight_on_input=False,
-    act_alpha=1.0, act_limit=float("inf"),
+    hidden_states,
+    gate_up,
+    gate_up_scale,
+    down,
+    down_scale,
+    topk_weights,
+    topk_ids,
+    activation="silu",
+    apply_router_weight_on_input=False,
+    act_alpha=1.0,
+    act_limit=float("inf"),
 ):
     """Decode: W8A16 fused inline-dequant grouped GEMV -- reads the routed experts' fp8 rows
     directly (``topk_ids`` index the banks) and dequantizes in the K-loop. CUDA-graph safe."""
     assert not apply_router_weight_on_input
-    from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_decode_fp8_blockscale
+    from freetoken.kernel.triton.fp8_blockscale_moe import (
+        fused_experts_decode_fp8_blockscale,
+    )
 
     return fused_experts_decode_fp8_blockscale(
-        hidden_states, gate_up, gate_up_scale, down, down_scale,
-        topk_weights, topk_ids, activation, act_alpha, act_limit,
+        hidden_states,
+        gate_up,
+        gate_up_scale,
+        down,
+        down_scale,
+        topk_weights,
+        topk_ids,
+        activation,
+        act_alpha,
+        act_limit,
     )
 
 
-__all__ = ["fused_experts_fp8_block", "fused_experts_decode_fp8_block"]
+__all__ = ["fused_experts_decode_fp8_block", "fused_experts_fp8_block"]

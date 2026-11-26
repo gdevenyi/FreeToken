@@ -15,26 +15,37 @@ import triton.language as tl
 
 @triton.jit
 def _bf16_gemv_kernel(
-    x_ptr, w_ptr, out_ptr, N, K,
-    stride_wn, stride_wk,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    N,
+    K,
+    stride_wn,
+    stride_wk,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    pid = tl.program_id(0).to(tl.int64)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     n_mask = offs_n < N
     w_row = w_ptr + offs_n[:, None] * stride_wn
     acc = tl.zeros((BLOCK_N,), tl.float32)
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
-        w = tl.load(w_row + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+        w = tl.load(
+            w_row + offs_k[None, :] * stride_wk,
+            mask=n_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
         xk = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
         acc += tl.sum(w * xk[None, :], axis=1)
     tl.store(out_ptr + offs_n, acc.to(out_ptr.dtype.element_ty), mask=n_mask)
 
 
-def bf16_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+def bf16_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
     """``x @ weight.T`` for a single row: ``x`` ``[..., K]`` holding one row, ``weight`` ``[N, K]``
     bf16; returns ``[..., N]`` in ``out_dtype``."""
     *lead, K = x.shape
@@ -48,9 +59,16 @@ def bf16_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> 
     BLOCK_N = 2
     BLOCK_K = min(triton.next_power_of_2(K), 4096)
     _bf16_gemv_kernel[(triton.cdiv(N, BLOCK_N),)](
-        x1, weight, out, N, K,
-        weight.stride(0), weight.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4,
+        x1,
+        weight,
+        out,
+        N,
+        K,
+        weight.stride(0),
+        weight.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
     )
     return out.reshape(*lead, N)
 

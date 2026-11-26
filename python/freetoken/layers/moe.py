@@ -520,17 +520,22 @@ class OffloadMoELayer(MoELayer):
         n = uniq.numel()
         # Each ensure stamps a newer LRU step, so a later chunk evicts the earlier chunks' slots
         # only once every other slot of the layer's pool is gone.
-        pool = cache.pool_slots(self.layer_id)
+        pool = cache.active_pool_slots(self.layer_id)
         assert n <= pool, (
             f"{n} routed experts exceed layer {self.layer_id}'s {pool}-slot pool"
         )
         uniq = uniq.to(torch.int32)
-        for start in range(0, n, _ENSURE_CHUNK_IDS):
-            part = uniq[
-                start : start + _ENSURE_CHUNK_IDS
-            ]  # a contiguous view: ensure rewrites it in place
-            cache.ensure_experts(self.layer_id, part)
-            cache.copy_missing()
+        if cache.cache_policy == "crf":
+            # CRF stores forward ClassLRU leases in usage; chunked lru_ensure would overwrite
+            # Chunk 0's usage with bare step and let Chunk 1 self-evict Chunk 0's slots mid-layer.
+            cache.admit_experts_crf(self.layer_id, uniq)
+        else:
+            for start in range(0, n, _ENSURE_CHUNK_IDS):
+                part = uniq[
+                    start : start + _ENSURE_CHUNK_IDS
+                ]  # a contiguous view: ensure rewrites it in place
+                cache.ensure_experts(self.layer_id, part)
+                cache.copy_missing()
         if valid is not None:
             out[valid] = uniq[inverse]
             return out.view_as(topk_ids)

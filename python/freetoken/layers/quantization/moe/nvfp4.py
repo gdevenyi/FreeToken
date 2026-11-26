@@ -222,6 +222,21 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
 # ---------------------------------------------------------------------------
 
 
+def _import_fused_marlin_moe():
+    try:
+        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+
+        return fused_marlin_moe
+    except ImportError:
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            fused_marlin_moe,
+        )
+
+        return fused_marlin_moe
+
+
 def _marlin_symbols_ok() -> bool:
     """Probe the exact vLLM symbols the pack/forward paths below use.
 
@@ -231,9 +246,6 @@ def _marlin_symbols_ok() -> bool:
     """
     try:
         from vllm import _custom_ops  # noqa: F401
-        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (  # noqa: F401
-            fused_marlin_moe,
-        )
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (  # noqa: F401
             marlin_permute_scales,
         )
@@ -242,6 +254,8 @@ def _marlin_symbols_ok() -> bool:
             nvfp4_marlin_process_scales,
         )
         from vllm.scalar_type import scalar_types  # noqa: F401
+
+        _import_fused_marlin_moe()
     except Exception as exc:
         logger.warning_once(
             f"NVFP4 marlin backend is installed but unusable ({exc!r}); "
@@ -271,6 +285,8 @@ def _marlin_pack_proj(
     the ratio is folded into the fp16 block scales before they are re-encoded
     (exact when all rows share one global, <=1 scale ulp otherwise).
     """
+    import inspect
+
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         marlin_permute_scales,
@@ -281,12 +297,16 @@ def _marlin_pack_proj(
     )
 
     assert size_n % 64 == 0, f"Marlin requires N % 64 == 0, got {size_n}"
+    repack_kw = {
+        "b_q_weight": packed.view(torch.int32).T.contiguous(),
+        "perm": torch.empty(0, dtype=torch.int, device=packed.device),
+        "size_k": size_k,
+        "size_n": size_n,
+        "num_bits": 4,
+    }
+    accepted = inspect.signature(ops.gptq_marlin_repack).parameters
     qweight = ops.gptq_marlin_repack(
-        b_q_weight=packed.view(torch.int32).T.contiguous(),
-        perm=torch.empty(0, dtype=torch.int, device=packed.device),
-        size_k=size_k,
-        size_n=size_n,
-        num_bits=4,
+        **{k: v for k, v in repack_kw.items() if k in accepted}
     )
 
     g = row_global.to(torch.float32)
@@ -327,10 +347,33 @@ def marlin_fused_experts(
     vLLM's implementation is device-side only (no host syncs), so the decode call is
     CUDA-graph capturable.
     """
-    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
+    import inspect
+
     from vllm.scalar_type import scalar_types
 
     assert activation == "silu", "Marlin NVFP4 backend supports gated silu only"
+    fused_marlin_moe = _import_fused_marlin_moe()
+    accepted = inspect.signature(fused_marlin_moe).parameters
+    act_arg: object = activation
+    if "gating_output" not in accepted:
+        try:
+            from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+            act_arg = MoEActivation.SILU
+        except ImportError:
+            pass
+    kwargs = {
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "quant_type_id": scalar_types.float4_e2m1f.id,
+        "apply_router_weight_on_input": apply_router_weight_on_input,
+        "global_num_experts": gate_up_q.size(0),
+        "activation": act_arg,
+        "global_scale1": gate_up_alpha,
+        "global_scale2": down_alpha,
+    }
+    if "gating_output" in accepted:
+        kwargs["gating_output"] = None
     return fused_marlin_moe(
         hidden_states,
         gate_up_q,
@@ -339,15 +382,7 @@ def marlin_fused_experts(
         None,  # bias2
         gate_up_s,
         down_s,
-        gating_output=None,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        quant_type_id=scalar_types.float4_e2m1f.id,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        global_num_experts=gate_up_q.size(0),
-        activation=activation,
-        global_scale1=gate_up_alpha,
-        global_scale2=down_alpha,
+        **kwargs,
     )
 
 
@@ -360,6 +395,8 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if backend.is_rocm():
             return "Marlin is CUDA-only and unavailable on ROCm; use triton"
+        if cfg.ep_size > 1:
+            return "Marlin NVFP4 MoE kernel does not support --moe-ep; use triton"
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
         reason = self._common_reject(
@@ -664,6 +701,8 @@ class B12xNvfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if backend.is_rocm():
             return "b12x is CUDA-only and unavailable on ROCm; use triton"
+        if cfg.ep_size > 1:
+            return "b12x NVFP4 MoE kernel does not support --moe-ep; use triton"
         cc = backend.device_capability()
         if cc < (12, 0):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"

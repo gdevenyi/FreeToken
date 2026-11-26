@@ -90,12 +90,16 @@ def _wht128_q8_pack_slot_kernel(
         y += tl.dot(xk, hk, allow_tf32=False)
 
     yg = tl.reshape(y, (BLOCK_M, 4, 32))
+    yg = tl.where(yg == yg, tl.minimum(tl.maximum(yg, -3.4e38), 3.4e38), 0.0)  # noqa: PLR0124
     amax = tl.max(tl.abs(yg), axis=2)
-    scale_bf16 = (amax * (1.0 / 127.0)).to(tl.bfloat16)
-    scale_f32 = scale_bf16.to(tl.float32)
-    inv_scale = tl.where(scale_f32 > 0.0, 1.0 / scale_f32, 0.0)
-
-    scaled = tl.minimum(tl.maximum(yg * inv_scale[:, :, None], -127.0), 127.0)
+    raw_bf16 = (amax * (1.0 / 127.0)).to(tl.bfloat16)
+    scale_f32 = raw_bf16.to(tl.float32)
+    # Flush subnormal BF16 scales (< 2^-126): 1/scale_f32 overflows FP32 at <= 2^-128 (0 * inf = NaN).
+    valid_scale = scale_f32 >= 1.1754944e-38
+    scale_bf16 = tl.where(valid_scale, raw_bf16, 0.0).to(tl.bfloat16)
+    safe_scale = tl.where(valid_scale, scale_f32, 1.0)
+    scaled = tl.where(valid_scale[:, :, None], yg / safe_scale[:, :, None], 0.0)
+    scaled = tl.minimum(tl.maximum(scaled, -127.0), 127.0)
     if IS_HIP:
         q_f32 = tl.where(
             scaled >= 0.0, tl.floor(scaled + 0.5), -tl.floor(-scaled + 0.5)
@@ -221,12 +225,22 @@ def pack_slot_wht128_q8(
     slot_data = (
         recurrent_states[:, slot_idx].contiguous().view(total_rows, WHT_DIM).float()
     )
-    y = (slot_data @ h).view(total_rows, GROUPS_PER_WHT, Q8_GROUP)
+    y = torch.nan_to_num(
+        (slot_data @ h).view(total_rows, GROUPS_PER_WHT, Q8_GROUP),
+        nan=0.0,
+        posinf=3.4e38,
+        neginf=-3.4e38,
+    )
     amax = y.abs().amax(dim=-1)
-    sc_bf16 = (amax * (1.0 / 127.0)).to(torch.bfloat16)
-    sc_f32 = sc_bf16.float()
-    inv = torch.where(sc_f32 > 0.0, 1.0 / sc_f32, torch.zeros_like(sc_f32))
-    q = torch.round(y * inv.unsqueeze(-1)).clamp_(-127.0, 127.0).to(torch.int8)
+    raw_bf16 = (amax * (1.0 / 127.0)).to(torch.bfloat16)
+    sc_f32 = raw_bf16.float()
+    valid = sc_f32 >= 1.1754944e-38
+    sc_bf16 = torch.where(valid, raw_bf16, torch.zeros_like(raw_bf16))
+    safe_sc = torch.where(valid, sc_f32, torch.ones_like(sc_f32))
+    scaled = torch.where(
+        valid.unsqueeze(-1), y / safe_sc.unsqueeze(-1), torch.zeros_like(y)
+    )
+    q = torch.round(scaled).clamp_(-127.0, 127.0).to(torch.int8)
     q_2d.copy_(q.view(total_rows, WHT_DIM))
     s_2d.copy_(sc_bf16)
 

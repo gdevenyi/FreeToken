@@ -206,6 +206,9 @@ class PinnedUVATable:
         self._graph_staging: dict[int, torch.Tensor] = {}
         self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
 
+    def clear_graph_staging(self) -> None:
+        self._graph_staging.clear()
+
     def _stage(self, rows: int) -> torch.Tensor:
         # Captured graphs keep one buffer per size for good: growing the eager one would free the
         # block a replay still writes to.

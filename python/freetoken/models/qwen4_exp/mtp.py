@@ -219,6 +219,18 @@ def _iter_sidecar_emitted(
             yield name.removeprefix("mtp."), out
 
 
+def _iter_pack_emitted(
+    model_path: str, config: ModelConfig
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Strata MTP pack dense tensors passed through ``dense_emitter`` so ``hc8`` matches ``GatedResidual``."""
+    from .weight import dense_emitter
+
+    emit, _, _ = dense_emitter(config, 0, 1, include_lmhead=False)
+    for name, tensor in _iter_pack_weights(model_path, config):
+        for out_name, out in emit(f"mtp.{name}", tensor):
+            yield out_name.removeprefix("mtp."), out
+
+
 def draft_config(config: ModelConfig, *, tp_size: int | None = None) -> ModelConfig:
     """The target config cut to one QSA layer (layer id 0) without PLE."""
     if tp_size is None:
@@ -354,7 +366,7 @@ class Qwen4ExpMTPDraft(BaseOP):
             weights = _iter_sidecar_emitted(model_path, draft.config, tp.rank, tp.size)
         else:
             weights = (
-                _iter_pack_weights(model_path, draft.config)
+                _iter_pack_emitted(model_path, draft.config)
                 if pack
                 else iter_mtp_weights(model_path, device)
             )

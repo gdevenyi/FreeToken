@@ -15,6 +15,7 @@ Execution paths (selected automatically per device/runtime, zero host syncs, CUD
 from __future__ import annotations
 
 import functools
+import inspect
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,7 @@ import triton
 import triton.language as tl
 
 from freetoken.distributed import DistributedCommunicator, get_tp_info
+from freetoken.models.config import verify_invariant_enabled
 from freetoken.utils import div_even
 
 from .base import BaseOP
@@ -82,10 +84,10 @@ def _int8_g32_w8a16_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1).to(tl.int64)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     mask_m = offs_m < M
     mask_n = offs_n < N
 
@@ -184,7 +186,8 @@ def int8_g32_triton_linear(
     y = torch.empty((m, n), dtype=out_dtype, device=x2.device)
     if m == 0 or n == 0:
         return y
-    if m == 1:
+    inv = verify_invariant_enabled()
+    if m == 1 and not inv:
         block_n = 4
         block_k = min(max(GROUP_SIZE, triton.next_power_of_2(k)), 1024)
         _int8_g32_gemv_kernel[(triton.cdiv(n, block_n),)](
@@ -204,7 +207,7 @@ def int8_g32_triton_linear(
             num_warps=4,
         )
         return y
-    if m <= 16:
+    if m <= 16 or (inv and m <= 64):
         block_m, block_n, block_k, warps = 16, 64, 64, 4
     else:
         block_m, block_n, block_k, warps = 64, 64, 64, 4
@@ -243,6 +246,63 @@ def _shared_marlin_workspace(device_index: int) -> torch.Tensor:
     return marlin_utils.marlin_make_workspace_new(dev, max_blocks)
 
 
+@functools.cache
+def _marlin_accepted_params(fn) -> frozenset[str]:
+    return frozenset(inspect.signature(fn).parameters)
+
+
+def _call_gptq_marlin_repack(
+    repack_fn,
+    *,
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    accepted = _marlin_accepted_params(repack_fn)
+    kwargs = {
+        "b_q_weight": b_q_weight,
+        "perm": perm,
+        "size_k": size_k,
+        "size_n": size_n,
+        "num_bits": num_bits,
+    }
+    return repack_fn(**{k: v for k, v in kwargs.items() if k in accepted})
+
+
+def _call_gptq_marlin_linear(
+    apply_fn,
+    *,
+    input_t: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    empty_i32: torch.Tensor,
+    workspace: torch.Tensor,
+    w_type,
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+) -> torch.Tensor:
+    accepted = _marlin_accepted_params(apply_fn)
+    kwargs = {
+        "input": input_t,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "weight_zp": empty_i32,
+        "g_idx": empty_i32,
+        "g_idx_sort_indices": empty_i32,
+        "workspace": workspace,
+        "output_size_per_partition": output_size_per_partition,
+        "input_size_per_partition": input_size_per_partition,
+        "is_k_full": True,
+    }
+    if "w_type" in accepted:
+        kwargs["w_type"] = w_type
+    elif "wtype" in accepted:
+        kwargs["wtype"] = w_type
+    return apply_fn(**{k: v for k, v in kwargs.items() if k in accepted})
+
+
 def _try_pack_marlin_u8b128(
     qweight: torch.Tensor,
     scale: torch.Tensor,
@@ -262,14 +322,13 @@ def _try_pack_marlin_u8b128(
         act_dtype if act_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
     )
     try:
+        from vllm import _custom_ops as ops
         from vllm.model_executor.layers.quantization.utils import marlin_utils
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
             apply_gptq_marlin_linear,
             marlin_permute_scales,
         )
         from vllm.scalar_type import scalar_types
-
-        from vllm import _custom_ops as ops
     except Exception:  # noqa: BLE001
         return None
 
@@ -321,7 +380,8 @@ def _try_pack_marlin_u8b128(
     try:
         with torch.cuda.device(qweight.device):
             empty_i32 = torch.empty(0, dtype=torch.int, device=qweight.device)
-            marlin_qw = ops.gptq_marlin_repack(
+            marlin_qw = _call_gptq_marlin_repack(
+                ops.gptq_marlin_repack,
                 b_q_weight=packed_i32,
                 perm=empty_i32,
                 size_k=k,
@@ -336,18 +396,16 @@ def _try_pack_marlin_u8b128(
             )
             workspace = _shared_marlin_workspace(dev_idx)
             probe_x = torch.zeros((1, k), dtype=scale_dtype, device=qweight.device)
-            _ = apply_gptq_marlin_linear(
-                input=probe_x,
+            _ = _call_gptq_marlin_linear(
+                apply_gptq_marlin_linear,
+                input_t=probe_x,
                 weight=marlin_qw,
                 weight_scale=marlin_sc,
-                weight_zp=empty_i32,
-                g_idx=empty_i32,
-                g_idx_sort_indices=empty_i32,
+                empty_i32=empty_i32,
                 workspace=workspace,
                 w_type=scalar_types.uint8b128,
                 output_size_per_partition=padded_n,
                 input_size_per_partition=k,
-                is_k_full=True,
             )
     except Exception:  # noqa: BLE001
         return None
@@ -408,6 +466,8 @@ class Int8G32Linear(BaseOP):
 
     def prepare_marlin(self, act_dtype: torch.dtype | None = None) -> bool:
         """Optionally repack ``(weight, weight_scale)`` into Marlin ``uint8b128`` layout on GPU."""
+        if verify_invariant_enabled():
+            return False
         if self._marlin_pack is not None:
             return True
         if self._marlin_checked or self.weight.ndim != 2 or self.weight.numel() == 0:
@@ -449,18 +509,16 @@ class Int8G32Linear(BaseOP):
             else:
                 if x2.dtype != msc.dtype:
                     x2 = x2.to(msc.dtype)
-                y_m = apply_gptq_marlin_linear(
-                    input=x2,
+                y_m = _call_gptq_marlin_linear(
+                    apply_gptq_marlin_linear,
+                    input_t=x2,
                     weight=mqw,
                     weight_scale=msc,
-                    weight_zp=empty_i32,
-                    g_idx=empty_i32,
-                    g_idx_sort_indices=empty_i32,
+                    empty_i32=empty_i32,
                     workspace=ws,
                     w_type=scalar_types.uint8b128,
                     output_size_per_partition=padded_n,
                     input_size_per_partition=self.local_input_size,
-                    is_k_full=True,
                 )
                 if padded_n != self.local_output_size:
                     y_m = y_m[:, : self.local_output_size]

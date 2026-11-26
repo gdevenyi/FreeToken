@@ -339,6 +339,8 @@ class BaseFormatDetector(ABC):
 
         results = []
         for act in action:
+            if not isinstance(act, dict):
+                continue
             name = act.get("name")
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
@@ -746,6 +748,14 @@ class BaseFormatDetector(ABC):
                 is_current_complete = _is_complete_json(
                     current_text[start_idx : start_idx + end_idx]
                 )
+
+                if not isinstance(obj, dict):
+                    if is_current_complete:
+                        rem = current_text[start_idx + end_idx :]
+                        if self.eot_token and rem.startswith(self.eot_token):
+                            rem = rem[len(self.eot_token) :]
+                        self._buffer = rem
+                    return StreamingParseResult()
 
                 # Validate tool name if present
                 if (
@@ -1217,7 +1227,16 @@ class InvokeParamStreamMixin:
             if mode in ("invoke", "invoke_skip"):
                 p = buf.find(self._ps_param_open_prefix)
                 e = buf.find(self._ps_invoke_close)
-                if e != -1 and (p == -1 or e < p):
+                c = (
+                    buf.find(self._ps_outer_close)
+                    if (
+                        self._ps_outer_close
+                        and not self._ps_bare
+                        and self._ps_outer_close != self._ps_invoke_close
+                    )
+                    else -1
+                )
+                if e != -1 and (p == -1 or e < p) and (c == -1 or e < c):
                     if mode == "invoke":
                         _emit("}" if self._args_started else "{}")
                         _update_prev()
@@ -1233,6 +1252,18 @@ class InvokeParamStreamMixin:
                         self._ps_after_bare = True
                     else:
                         self._ps_mode = "block"
+                    continue
+                if c != -1 and (p == -1 or c < p):
+                    # Model omitted </function> before </tool_call>: close both invoke and outer block.
+                    if mode == "invoke":
+                        _emit("}" if self._args_started else "{}")
+                        _update_prev()
+                        self.current_tool_id += 1
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+                    self._buffer = buf[c + len(self._ps_outer_close) :]
+                    self._ps_mode = "idle"
+                    self._ps_after_block = self._ps_trim_after_block
                     continue
                 if p != -1:
                     m = self._ps_param_open_re.search(buf, p)
@@ -1262,11 +1293,13 @@ class InvokeParamStreamMixin:
                 hold = max(
                     self._ends_with_partial_token(buf, self._ps_param_open_prefix),
                     self._ends_with_partial_token(buf, self._ps_invoke_close),
+                    self._ends_with_partial_token(buf, self._ps_outer_close)
+                    if (self._ps_outer_close and not self._ps_bare)
+                    else 0,
                 )
-                if len(buf) - hold > 0:
-                    self._buffer = buf[
-                        len(buf) - hold :
-                    ]  # whitespace between parameters
+                prefix = buf[: len(buf) - hold] if hold else buf
+                if prefix and prefix.isspace():
+                    self._buffer = buf[len(prefix) :]  # whitespace between parameters
                 break
 
             if mode == "pstr":

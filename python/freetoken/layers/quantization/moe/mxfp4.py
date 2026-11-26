@@ -5,8 +5,18 @@ from __future__ import annotations
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import MX_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_piece, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from ..scheme import MX_GROUP as GROUP
+from ..scheme import QuantKind
+from .base import (
+    BankSpec,
+    ExpertView,
+    MoEConfig,
+    MoEKernel,
+    MoEMethod,
+    fused_piece,
+    is_resident,
+    limit_or_inf,
+)
 
 E8M0 = torch.float8_e8m0fnu
 
@@ -47,7 +57,9 @@ class TritonMxfp4MoEKernel(MoEKernel):
         out["down_scale"].copy_(pieces["down_scale"].view(E8M0))
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
         limit = limit_or_inf(layer)
@@ -55,10 +67,21 @@ class TritonMxfp4MoEKernel(MoEKernel):
         if is_prefill and view.n is not None:
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
 
-            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n, act_block=act_block)
+            return routed_experts_fp4_prefill(
+                x,
+                topk_ids,
+                topk_weights,
+                *banks,
+                limit,
+                view.n,
+                act_block=act_block,
+                has_inactive=layer.ep_size > 1,
+            )
         from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
-        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block)
+        return routed_experts_fp4(
+            x, topk_ids, topk_weights, *banks, limit, act_block=act_block
+        )
 
 
 class TritonGptossMxfp4MoEKernel(MoEKernel):
@@ -70,6 +93,8 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not cfg.has_bias:
             return "gpt-oss kernel needs the expert biases"
+        if cfg.ep_size > 1:
+            return "gpt-oss MXFP4 kernel does not support --moe-ep"
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
@@ -90,24 +115,45 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
             return t.reshape(e, n, -1).permute(0, 2, 1)
 
         out["gate_up"].copy_(blocks_t(fused_piece(pieces, "gate_up")))
-        out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale").permute(0, 2, 1))
+        out["gate_up_scale"].copy_(
+            fused_piece(pieces, "gate_up_scale").permute(0, 2, 1)
+        )
         out["gate_up_bias"].copy_(fused_piece(pieces, "gate_up_bias"))
         out["down"].copy_(blocks_t(pieces["down"]))
         out["down_scale"].copy_(pieces["down_scale"].permute(0, 2, 1))
         out["down_bias"].copy_(pieces["down_bias"])
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        from freetoken.moe.fused_mxfp4 import MXFP4_DECODE_MAX_TOKENS, run_mxfp4_prefill_experts_t, run_mxfp4_splitk_decode_experts
+    def apply(
+        self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool
+    ):
+        from freetoken.moe.fused_mxfp4 import (
+            MXFP4_DECODE_MAX_TOKENS,
+            run_mxfp4_prefill_experts_t,
+            run_mxfp4_splitk_decode_experts,
+        )
 
         t = view.tensors
         # the resident layer picks the split-K decode kernel by token count, not by phase
-        decode = x.shape[0] <= MXFP4_DECODE_MAX_TOKENS if is_resident(layer) else not is_prefill
+        decode = (
+            x.shape[0] <= MXFP4_DECODE_MAX_TOKENS
+            if is_resident(layer)
+            else not is_prefill
+        )
         run = run_mxfp4_splitk_decode_experts if decode else run_mxfp4_prefill_experts_t
         return run(
-            x, topk_weights, topk_ids,
-            t["gate_up"], t["gate_up_scale"], t["gate_up_bias"], t["down"], t["down_scale"], t["down_bias"],
-            top_k=layer.top_k, hidden_act_alpha=float(layer.alpha), swiglu_limit=layer.limit,
+            x,
+            topk_weights,
+            topk_ids,
+            t["gate_up"],
+            t["gate_up_scale"],
+            t["gate_up_bias"],
+            t["down"],
+            t["down_scale"],
+            t["down_bias"],
+            top_k=layer.top_k,
+            hidden_act_alpha=float(layer.alpha),
+            swiglu_limit=layer.limit,
         )
 
 
