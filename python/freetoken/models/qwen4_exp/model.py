@@ -314,9 +314,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.forward_host_ctx = disk_table.forward_host_ctx
             return 0
 
+        from freetoken.distributed import try_get_tp_cpu_group
+
+        ple_device = ple_layers[0].ple_embedding.layer_multipliers.device
         ple_kwargs = {
-            "device": self.device,
-            "tp_cpu_group": engine_config.tp_cpu_group,
+            "device": ple_device if ple_device.type == "cuda" else None,
+            "tp_cpu_group": getattr(engine_config, "tp_cpu_group", None)
+            or try_get_tp_cpu_group(),
         }
         if override:
             if is_lut4_ple_path(override):

@@ -149,3 +149,31 @@ def test_quantize_ple_gguf_streams_bf16_to_lut4_shards(tmp_path, monkeypatch):
     table = load_ple_table_lut4(str(out_dir), args, pin=False, shm_dir=str(tmp_path))
     assert table.bank.tensor.shape == (total_rows, 90)
     assert table.weight_lut is not None and table.weight_lut.shape == (16,)
+
+    # Verify Qwen4ExpForCausalLM.load_host_tables resolves device/tp_cpu_group without Engine attributes
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    attached = []
+    fake_emb = SimpleNamespace(
+        layer_multipliers=torch.tensor([1], dtype=torch.int64),
+        ngram_heads_vocab_sizes=torch.tensor([total_rows], dtype=torch.int64),
+        ngram_heads_offsets=torch.tensor([0], dtype=torch.int64),
+        attach_table=attached.append,
+    )
+    fake_ple = SimpleNamespace(
+        ple_embedding=fake_emb,
+        args=SimpleNamespace(ngram_head_dim=head_dim),
+    )
+    fake_self = SimpleNamespace(
+        model=SimpleNamespace(ple_layers=[fake_ple]),
+        _config=SimpleNamespace(qwen4_args=args),
+    )
+    fake_ecfg = SimpleNamespace(
+        use_dummy_weight=False,
+        ple_table=str(out_dir),
+        ple_backend="pinned",
+        model_path=str(out_dir),
+    )
+    nbytes = Qwen4ExpForCausalLM.load_host_tables(fake_self, fake_ecfg)
+    assert nbytes == total_rows * 90
+    assert len(attached) == 1
