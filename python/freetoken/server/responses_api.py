@@ -127,7 +127,7 @@ class ResponsesRequest(BaseModel):
     logit_bias: dict[str, float] | None = None
     stop: str | list[str] | None = None
     stop_token_ids: list[int] | None = None
-    seed: int | None = None
+    seed: Any | None = None
     # Stateful features are accepted but ignored in this subset.
     store: bool = False
     previous_response_id: str | None = None
@@ -271,7 +271,7 @@ async def handle_responses(
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
     except ValueError as exc:
-        return _error_response(400, str(exc))
+        return _error_response(400, str(exc), param=getattr(exc, "param", None))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:

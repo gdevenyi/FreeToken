@@ -38,13 +38,13 @@ def softmax(
 
 
 __all__ = [
-    "softmax",
     "sampling_from_probs",
+    "softmax",
     "top_k_renorm_probs",
-    "top_p_renorm_probs",
     "top_k_sampling_from_probs",
-    "top_p_sampling_from_probs",
     "top_k_top_p_sampling_from_probs",
+    "top_p_renorm_probs",
+    "top_p_sampling_from_probs",
 ]
 
 
@@ -74,17 +74,24 @@ def top_k_renorm_probs(probs: torch.Tensor, top_k) -> torch.Tensor:
 
     Values tied with the k-th are kept, so a row can retain more than ``k`` entries --
     the same behaviour as the threshold-based kernel path, which cannot separate ties
-    either.
+    either. Rows with ``k >= vocab`` are returned unchanged so solo and mixed batches
+    produce bit-identical distributions.
     """
     probs = probs.float()
     rows, vocab = probs.shape
     k = _per_row(top_k, rows, probs.device, torch.long).clamp_(1, vocab)
     kth = probs.sort(dim=-1, descending=True).values.gather(1, k - 1)
-    return _renormalize(probs.masked_fill(probs < kth, 0.0))
+    active = k < vocab
+    kept = probs.masked_fill(active & (probs < kth), 0.0)
+    return torch.where(active, _renormalize(kept), probs)
 
 
 def top_p_renorm_probs(probs: torch.Tensor, top_p) -> torch.Tensor:
-    """Keep the shortest descending prefix whose mass reaches ``top_p``, renormalize."""
+    """Keep the shortest descending prefix whose mass reaches ``top_p``, renormalize.
+
+    Rows with ``top_p >= 1.0`` are returned unchanged so solo and mixed batches produce
+    bit-identical distributions.
+    """
     probs = probs.float()
     rows, _ = probs.shape
     p = _per_row(top_p, rows, probs.device, torch.float32)
@@ -92,20 +99,34 @@ def top_p_renorm_probs(probs: torch.Tensor, top_p) -> torch.Tensor:
     # Exclusive cumulative mass: an entry is dropped only once everything *before* it
     # already reached p, which keeps the element that crosses the threshold.
     drop = (ordered.cumsum(-1) - ordered) >= p
+    drop[:, 0] = False
+    active = p < 1.0
+    drop = drop & active
     kept = torch.zeros_like(probs).scatter_(1, order, ordered.masked_fill(drop, 0.0))
-    return _renormalize(kept)
+    return torch.where(active, _renormalize(kept), probs)
 
 
-def _draw(probs: torch.Tensor, seed=None, offset=None) -> torch.Tensor:
+def _draw(
+    probs: torch.Tensor,
+    seed=None,
+    offset=None,
+    uniforms: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Inverse-CDF draw, one token per row.
 
     ``searchsorted`` over the cumulative distribution rather than ``torch.multinomial``:
-    it stays capturable in a CUDA graph and never syncs to the host. Seeding mirrors
-    ``triton.sampling._gen_u`` -- and like it, a capturing stream takes the plain
-    ``torch.rand`` path, since a graph replays whatever generator state it captured.
+    it stays capturable in a CUDA graph and never syncs to the host. When ``uniforms``
+    (``[rows]`` float32 in ``[0, 1)``) is supplied, each row draws from its own uniform
+    independently of other rows in the batch.
     """
     rows, vocab = probs.shape
-    if seed is not None and not torch.cuda.is_current_stream_capturing():
+    if uniforms is not None:
+        u = (
+            uniforms.to(device=probs.device, dtype=torch.float32)
+            .reshape(rows, 1)
+            .clamp(0.0, 1.0 - 2.0**-24)
+        )
+    elif seed is not None and not torch.cuda.is_current_stream_capturing():
         generator = torch.Generator(device=probs.device)
         s = int(seed if not isinstance(seed, torch.Tensor) else seed.view(-1)[0])
         o = (
@@ -125,7 +146,11 @@ def _draw(probs: torch.Tensor, seed=None, offset=None) -> torch.Tensor:
     idx = torch.searchsorted(
         cdf.contiguous(), (u * cdf[:, -1:]).contiguous(), right=True
     )
-    return idx.squeeze(-1).clamp_(max=vocab - 1).to(torch.int32)
+    # Guard against fp32 rounding past the last positive-mass token (e.g. masked tails).
+    ar = torch.arange(vocab, device=probs.device).unsqueeze(0)
+    last_nz = torch.where(probs > 0, ar, -1).amax(dim=-1, keepdim=True).clamp_min(0)
+    idx = torch.minimum(idx, last_nz)
+    return idx.squeeze(-1).to(torch.int32)
 
 
 def _finish(out: torch.Tensor, indices, return_valid: bool):
@@ -147,9 +172,10 @@ def sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     src = _source(probs, indices)
-    return _finish(_draw(src, seed, offset), indices, return_valid)
+    return _finish(_draw(src, seed, offset, uniforms=uniforms), indices, return_valid)
 
 
 def top_k_sampling_from_probs(
@@ -162,10 +188,13 @@ def top_k_sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     src = _source(probs, indices)
     return _finish(
-        _draw(top_k_renorm_probs(src, top_k), seed, offset), indices, return_valid
+        _draw(top_k_renorm_probs(src, top_k), seed, offset, uniforms=uniforms),
+        indices,
+        return_valid,
     )
 
 
@@ -179,10 +208,13 @@ def top_p_sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     src = _source(probs, indices)
     return _finish(
-        _draw(top_p_renorm_probs(src, top_p), seed, offset), indices, return_valid
+        _draw(top_p_renorm_probs(src, top_p), seed, offset, uniforms=uniforms),
+        indices,
+        return_valid,
     )
 
 
@@ -198,7 +230,10 @@ def top_k_top_p_sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     src = _source(probs, indices)
     renormed = top_p_renorm_probs(top_k_renorm_probs(src, top_k), top_p)
-    return _finish(_draw(renormed, seed, offset), indices, return_valid)
+    return _finish(
+        _draw(renormed, seed, offset, uniforms=uniforms), indices, return_valid
+    )

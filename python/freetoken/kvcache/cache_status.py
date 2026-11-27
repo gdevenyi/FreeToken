@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 
 def window_pool_spec(config):
@@ -13,7 +13,7 @@ def _supports_swa_ratio(config) -> bool:
     return window_pool_spec(config) is not None
 
 
-def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
+def compute_cache_unit_bytes(engine: Engine) -> dict[str, int]:
     """Per-unit VRAM byte cost of each runtime cache, measured from the real allocated pool
     tensors so the desktop cache panel can show a true VRAM delta per slider step:
 
@@ -74,7 +74,7 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
     return out
 
 
-def _pool_budget_free_vram_bytes(engine: "Engine") -> int:
+def _pool_budget_free_vram_bytes(engine: Engine) -> int:
     """The pool-budget baseline captured in ``Engine.__init__``: free VRAM after weights
     loaded, before any runtime cache pool was allocated (``_post_weights_free``). This is the
     honest "spend it all on one pool" budget for the desktop slider upper bounds — stable for
@@ -86,7 +86,7 @@ def _pool_budget_free_vram_bytes(engine: "Engine") -> int:
         return 0
 
 
-def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
+def compute_cache_floors(engine: Engine) -> dict[str, int]:
     """Per-pool minimum (floor) unit counts the runtime cache-rebuild path enforces, in the
     units the desktop sliders use (KV tokens, MoE experts, usable mamba slots). Every floor is
     derived live from the model config / engine validation logic -- never a baked-in constant:
@@ -139,7 +139,7 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
     return floors
 
 
-def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
+def compute_cache_pools(engine: Engine) -> dict[str, int]:
     """The ACTUAL pool sizes allocated at load, in API units. The frontend otherwise only
     learns them from per-generation UserReply snapshots — i.e. not until the first chat —
     so this seeds /v1/cache/status geometry with truth from the moment the server is ready.
@@ -169,13 +169,13 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     return pools
 
 
-def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
+def compute_cache_status_meta(engine: Engine) -> dict[str, Any]:
     """Full readiness ("meta", …) payload for the desktop cache panel: the per-unit VRAM costs
     (compute_cache_unit_bytes) plus the post-weights pre-pool free-VRAM baseline (the sliders'
     ideal-max budget), the per-pool floors, and the actual pool sizes allocated at load.
     Best-effort/total -- each piece independently degrades to 0/{} and this never raises
     (it runs on readiness)."""
-    meta: Dict[str, Any] = dict(compute_cache_unit_bytes(engine))
+    meta: dict[str, Any] = dict(compute_cache_unit_bytes(engine))
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
@@ -197,4 +197,5 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
         meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         meta["cache_budget_bytes"] = 0
+    meta["system_fingerprint"] = getattr(engine, "system_fingerprint", None)
     return meta

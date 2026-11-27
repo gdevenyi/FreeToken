@@ -38,15 +38,15 @@ effect; "400" means the server refuses the request with a clear message.
 | `stop` (strings), `stop_token_ids` | honoured | honoured | honoured | `stop` only |
 | `include_stop_str_in_output` | honoured | honoured | `no_stop_trim` | no |
 | `skip_special_tokens` | honoured; default off here, the reasoning and tool parsers read the tags | honoured (default on) | honoured (default on) | n/a |
-| `n` | 400 unless 1 | honoured | honoured | `n_cmpl` |
+| `n` | honoured, `1..32` (streaming and non-streaming; with `seed`, choice `i` derives a collision-free seed via SplitMix64 while choice `0` keeps `seed`) | honoured | honoured | `n_cmpl` |
 | `stream`, `stream_options.include_usage`, `stream_options.continuous_usage_stats` | honoured | honoured | honoured | honoured |
 | `timings_per_token` | honoured on streams when `--enable-timings-report` is set | no | no | honoured |
-| `logprobs`, `top_logprobs` | accepted, ignored on this route (`/v1/completions` honours `logprobs`) | honoured | honoured | `n_probs` |
-| `tools`, `tool_choice` (`auto` / `none` / `required` / named), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
+| `logprobs`, `top_logprobs` | honoured (`top_logprobs` `0..20`, plus `logprob_token_ids` and `return_tokens_as_token_ids`) | honoured | honoured | `n_probs` |
+| `tools`, `tool_choice` (`auto` / `none` / `required` / named / `allowed_tools`), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
 | `reasoning_effort`, `thinking`, `chat_template_kwargs` | honoured | `chat_template_kwargs` | honoured | honoured |
 | `continue_final_message` | honoured (the last assistant message is continued, no generation prompt) | honoured | honoured | no |
-| `response_format` `json_object` / `json_schema`, guided decoding | accepted, not enforced (no constrained decoding); other types 400 | honoured (xgrammar / guidance) | honoured (xgrammar / outlines / llguidance) | `grammar`, `json_schema` |
-| `seed` | accepted, not honoured (one batched sampling kernel, no per-request generator) | honoured | `sampling_seed` | honoured |
+| `response_format` `text` / `json_object` / `json_schema` | accepted, prompt-guided (validates `json_schema.schema`, injects format directive, strips markdown JSON fences); no grammar-constrained decoding yet; other types 400 | honoured (xgrammar / guidance) | honoured (xgrammar / outlines / llguidance) | `grammar`, `json_schema` |
+| `seed` | honoured (signed 64-bit integer `[-2^63, 2^63-1]`; non-int / bool / out-of-range is 400 `param="seed"`); vectorized batch-invariant inverse-CDF sampling across decode and speculative verify | honoured | `sampling_seed` | honoured |
 | `user`, `metadata`, `store`, `service_tier` | accepted, ignored | accepted, ignored | accepted, ignored | accepted, ignored |
 | `request_id` | honoured: becomes the response id | honoured | `rid` | `id_slot` (different meaning) |
 | `function_call` (legacy) | 400 | 400 | 400 | no |
@@ -56,20 +56,21 @@ effect; "400" means the server refuses the request with a clear message.
 ## Legacy completions: request
 
 `prompt` as a string, a list of strings, a list of token ids or a list of token-id lists
-(each id in `[0, len(tokenizer))`; not with `echo` or `suffix`; a stream takes one prompt only); the same sampling parameters as above; plus:
+(each id in `[0, len(tokenizer))`; not with `echo` or `suffix`; streaming supports single or multiple prompts and `n > 1`); the same sampling parameters as above; plus:
 
 | parameter | FreeToken | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | `echo` | honoured (the prompt leads the text; not with `logprobs`) | honoured | honoured | no |
 | `suffix` | honoured on models with fill-in-the-middle tokens (`<|fim_prefix|>` ... `<|fim_middle|>`): the prompt becomes prefix-suffix-middle | 400 | 400 | `/infill` |
-| `n` | 400 unless 1 | honoured | honoured | no |
-| `logprobs` | honoured, 0..32: raw pre-temperature logprobs of the sampled token and its top alternatives; -inf is sent as -9999. With speculative decoding (`--spec-algo`) only with `max_tokens=1` (400 otherwise) | honoured (`--max-logprobs`, default 20) | honoured | `n_probs` |
+| `n` | honoured, `1..32` (streaming and non-streaming; collision-free per-choice seed derivation) | honoured | honoured | no |
+| `logprobs` | honoured, `0..32`: raw pre-temperature logprobs of the sampled token and its top alternatives (including multi-token speculative verify steps); `-inf` is sent as `-9999` | honoured (`--max-logprobs`, default 20) | honoured | `n_probs` |
 | `allowed_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: sampling is masked to them at every position. With `logprobs` the values are renormalized over the set (vLLM's `processed_logprobs` at temperature 0; `temperature` defaults to `0` when omitted), so `temperature > 0`, `min_p > 0`, penalties, `min_tokens` and `logit_bias` are a 400 there; entries past the set are left out | honoured (raw logprobs unless `--logprobs-mode processed_logprobs`) | no | no |
+| `logprob_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: returns raw logprobs for the requested candidate token ids at every generated position without masking sampling | honoured | no | no |
 | `return_tokens_as_token_ids` | honoured: `tokens` and the `top_logprobs` keys are `token_id:N`, so ids that decode to the same text stay apart | honoured | n/a | no |
 
-Set values of the vLLM fields this server does not implement (`logprob_token_ids`,
-`prompt_logprobs`, `guided_*`, `structured_outputs`, `bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
-Empty prompts and more than 256 prompts are a 400. Ids in `allowed_token_ids`, `logit_bias`,
+Set values of the vLLM fields this server does not implement (`prompt_logprobs`,
+`guided_*`, `structured_outputs`, `bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
+Empty prompts and more than 256 prompts are a 400. Ids in `allowed_token_ids`, `logprob_token_ids`, `logit_bias`,
 `stop_token_ids` and token-id prompts must be below `len(tokenizer)` (a 400 otherwise).
 
 ## Responses
@@ -78,7 +79,7 @@ Empty prompts and more than 256 prompts are a 400. Ids in `allowed_token_ids`, `
 |---|---|---|
 | `id` | `chatcmpl-<uid>` / `cmpl-<uuid>`, or `<prefix>-<request_id>` when the client sent one | |
 | `created`, `model`, `object` | yes | |
-| `system_fingerprint` | `null` | vLLM and SGLang also send `null` |
+| `system_fingerprint` | `fp_<12-hex>` | deterministic hash of engine build, model checkpoint, dtype/quant/precision flags, TP size, speculative config, and `FREETOKEN_VERIFY_INVARIANT`; emitted on chat, completions, and streaming chunks |
 | `choices[].message.reasoning_content` | yes, when the model reasoned | vLLM `reasoning_content`, llama.cpp `reasoning_content` |
 | `choices[].message.tool_calls` | yes | |
 | `choices[].finish_reason` | `stop`, `length`, `tool_calls` | |
@@ -100,10 +101,16 @@ POST /detokenize    {"tokens": [...], "skip_special_tokens": false} -> {"prompt"
 `messages` are rendered through the model's chat template exactly as a generation would
 render them, so `count` equals the `prompt_tokens` that generation reports.
 
+## Reproducibility and Determinism Tiers
+
+FreeToken separates two determinism guarantees:
+
+- **Sampler determinism (always active when `seed` is passed):** Each request derives an exact 24-bit float32 uniform per step from SplitMix64`(seed, step)` and uses a single unified inverse-CDF draw across non-speculative decode (`Sampler.sample`), MTP verification (`Sampler.sample_verify`), and DFlash2 verification (`reject_with_draft_probs`). Given identical logits, the drawn token is strictly independent of batch size, slot position, concurrent traffic, and speculative draft proposals. For `n > 1`, choice `0` keeps `seed` and choice `i >= 1` uses domain-separated `mix_choice_seed(seed, i)`.
+- **End-to-end logit determinism (opt-in via `FREETOKEN_VERIFY_INVARIANT=1`):** Parallel GPU reductions (GEMMs, MoE, attention, TP AllReduce) can still vary in the lowest floating-point bits across batch sizes or 1-row decode vs. multi-row verify. Set `FREETOKEN_VERIFY_INVARIANT=1` on supported architectures (e.g., `qwen4_exp`) and compare `system_fingerprint` across runs to detect backend configuration shifts.
+
 ## Not implemented, on purpose
 
 - Constrained decoding (enforcing `response_format` json / json_schema, regex, grammar): needs
   a grammar engine on the sampling path.
 - Prompt logprobs and `echo` with `logprobs`: need the prefill logits.
-- Per-request `seed`: the batched sampling kernel draws from one generator.
 - Embeddings, reranking, scoring, audio: not generation.

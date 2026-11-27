@@ -11,7 +11,11 @@ import torch
 
 from freetoken.attention.linear import gdn_slot
 from freetoken.distributed import DistributedCommunicator
-from freetoken.engine.sample import make_device_tensor
+from freetoken.engine.sample import (
+    _DRAFT_SEED_DOMAIN,
+    make_device_tensor,
+    step_uniform,
+)
 from freetoken.kernel.triton.dflash import ring_attention_workspace
 from freetoken.models.dflash.config import tp_heads
 from freetoken.models.gguf.reader import is_gguf_path
@@ -318,13 +322,20 @@ class DFlashProposer(Proposer):
     # ------------------------------------------------------------------ draft step
 
     def _draft(
-        self, pending, starts, rows, temperature, greedy
+        self,
+        pending,
+        starts,
+        rows,
+        temperature,
+        greedy,
+        uniforms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.draft.forward_block(pending, starts, rows, self.dflash_ring)
         # row 0 of each block is the pending token; rows 1..k predict the drafts
         pred = hidden.view(pending.shape[0], self.block, -1)[:, 1:]
         candidate_ids, unary_logits = self.draft.compute_candidates(pred)
-        uniforms = torch.rand(pred.shape[:2], device=pred.device)
+        if uniforms is None:
+            uniforms = torch.rand(pred.shape[:2], device=pred.device)
         tokens, q = self.draft.candidate_selector.sample_path(
             candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms
         )
@@ -368,6 +379,7 @@ class DFlashProposer(Proposer):
             torch.full((max_bs,), dummy, dtype=torch.int64, device=dev),  # ring rows
             torch.ones(max_bs, dtype=torch.float32, device=dev),  # temperature
             torch.ones(max_bs, dtype=torch.bool, device=dev),  # greedy
+            torch.zeros(max_bs, k, dtype=torch.float32, device=dev),  # uniforms
         )
         self._out = (
             torch.zeros(max_bs, k, dtype=torch.int64, device=dev),
@@ -404,17 +416,63 @@ class DFlashProposer(Proposer):
             f"speculative decoding: DFlash draft graphs captured for bs {sorted(self._graphs)}"
         )
 
+    def _draft_uniforms(
+        self, reqs: list[Req], greedy: list[bool], total_rows: int
+    ) -> torch.Tensor:
+        """Build ``[total_rows, k]`` float32 uniforms on ``self.device``.
+
+        Seeded non-greedy requests get domain-separated deterministic uniforms keyed by
+        ``(seed, gen_len + j)`` so DFlash drafts at the request's real temperature while
+        keeping exact target-deterministic verify invariance in ``reject_with_draft_probs``.
+        """
+        if all(greedy):
+            return torch.zeros(total_rows, self.k, dtype=torch.float32, device=self.device)
+        seeded_idx: list[int] = []
+        seeded_vals: list[list[float]] = []
+        has_unseeded = False
+        for i, (r, g) in enumerate(zip(reqs, greedy)):
+            if g:
+                continue
+            seed = r.sampling_params.seed
+            if seed is None:
+                has_unseeded = True
+                continue
+            # propose() runs after req.widen_pending(k); cached_len + 1 - prompt_len matches
+            # Sampler.prepare()'s pre-widening gen_len.
+            prompt_len = r.max_device_len - r.output_len
+            gen_len = max(0, r.cached_len + 1 - prompt_len)
+            seeded_idx.append(i)
+            seeded_vals.append(
+                [
+                    step_uniform(seed, gen_len + j, domain=_DRAFT_SEED_DOMAIN)
+                    for j in range(self.k)
+                ]
+            )
+        if not has_unseeded:
+            u_host = [[0.0] * self.k for _ in range(total_rows)]
+            for idx, vals in zip(seeded_idx, seeded_vals):
+                u_host[idx] = vals
+            return make_device_tensor(u_host, torch.float32, self.device)
+        uniforms = torch.rand(
+            total_rows, self.k, dtype=torch.float32, device=self.device
+        )
+        if seeded_idx:
+            uniforms.index_copy_(
+                0,
+                make_device_tensor(seeded_idx, torch.int64, self.device),
+                make_device_tensor(seeded_vals, torch.float32, self.device),
+            )
+        return uniforms
+
     def propose(
         self, reqs: list[Req], rows: torch.Tensor, pending: torch.Tensor
     ) -> SpecProposal:
         bs = len(reqs)
-        greedy = [
-            r.sampling_params.is_greedy or r.sampling_params.seed is not None
-            for r in reqs
-        ]
+        greedy = [r.sampling_params.is_greedy for r in reqs]
         padded = next((b for b in sorted(self._graphs) if b >= bs), None)
-        pad = (padded or bs) - bs
-        pin = dict(pin_memory=True)
+        total = padded or bs
+        pad = total - bs
+        pin = {"pin_memory": True} if self.device.type == "cuda" else {}
         starts = torch.tensor(
             [r.cached_len for r in reqs] + [0] * pad, dtype=torch.int64, **pin
         )
@@ -428,13 +486,19 @@ class DFlashProposer(Proposer):
             dtype=torch.float32,
             **pin,
         )
+        uniforms = self._draft_uniforms(reqs, greedy, total)
         if padded is None:
-            to = lambda t: t.to(self.device, non_blocking=True)
+            to = lambda t: t.to(self.device, non_blocking=self.device.type == "cuda")
             tokens, cand, q = self._draft(
-                pending.to(torch.int64), to(starts), rows, to(temps), to(flags)
+                pending.to(torch.int64),
+                to(starts),
+                rows,
+                to(temps),
+                to(flags),
+                uniforms,
             )
         else:
-            bonus, g_starts, g_rows, g_temps, g_flags = self._in
+            bonus, g_starts, g_rows, g_temps, g_flags, g_uniforms = self._in
             bonus[:bs].copy_(pending)
             g_rows[:bs].copy_(rows)
             if pad:
@@ -444,6 +508,7 @@ class DFlashProposer(Proposer):
             g_starts[:padded].copy_(starts, non_blocking=True)
             g_temps[:padded].copy_(temps, non_blocking=True)
             g_flags[:padded].copy_(flags, non_blocking=True)
+            g_uniforms[:padded].copy_(uniforms)
             self._graphs[padded].replay()
             tokens, cand, q = (t[:bs] for t in self._out)
         return SpecProposal(tokens) if all(greedy) else SpecProposal(tokens, cand, q)
