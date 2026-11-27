@@ -151,7 +151,7 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: list[int] | None = None
     include_stop_str_in_output: bool = False
     skip_special_tokens: bool | None = None
-    seed: int | None = None
+    seed: Any | None = None
     user: str | None = None
     # A client-chosen id echoed as the response id (vLLM request_id / SGLang rid).
     request_id: str | None = None
@@ -162,7 +162,7 @@ class ChatCompletionRequest(BaseModel):
         return _drop_nulls(data, _CHAT_NON_NULL_DEFAULTS)
 
     @model_validator(mode="after")
-    def _sync_max_completion_tokens(self) -> "ChatCompletionRequest":
+    def _sync_max_completion_tokens(self) -> ChatCompletionRequest:
         if self.max_completion_tokens is not None:
             self.max_tokens = self.max_completion_tokens
         if self.continue_final_message and (
@@ -222,7 +222,7 @@ class CompletionRequest(BaseModel):
     stop_token_ids: list[int] | None = None
     include_stop_str_in_output: bool = False
     skip_special_tokens: bool | None = None
-    seed: int | None = None
+    seed: Any | None = None
     user: str | None = None
     # A client-chosen id echoed as the response id (vLLM request_id / SGLang rid).
     request_id: str | None = None
@@ -233,7 +233,7 @@ class CompletionRequest(BaseModel):
         return _drop_nulls(data, _COMPLETION_NON_NULL_DEFAULTS)
 
     @model_validator(mode="after")
-    def _sync_max_completion_tokens(self) -> "CompletionRequest":
+    def _sync_max_completion_tokens(self) -> CompletionRequest:
         if self.max_completion_tokens is not None:
             self.max_tokens = self.max_completion_tokens
         return self

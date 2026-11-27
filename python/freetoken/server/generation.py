@@ -65,6 +65,18 @@ class GenerationError(ValueError):
         self.code = code
 
 
+class SamplingParamError(ValueError):
+    """Invalid sampling parameter carrying the offending OpenAI wire ``param`` name."""
+
+    def __init__(self, message: str, param: str | None = None):
+        super().__init__(message)
+        self.param = param
+
+
+INT64_MIN = -(1 << 63)
+INT64_MAX = (1 << 63) - 1
+
+
 # --------------------------------------------------------------------------- #
 # Protocol-neutral generation events.
 #
@@ -364,6 +376,19 @@ def resolve_sampling(
             if ti not in seen_lp:
                 seen_lp.add(ti)
                 lp_targets.append(ti)
+    resolved_seed: int | None = None
+    if seed is not None:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise SamplingParamError(
+                f"seed must be a 64-bit integer, got {type(seed).__name__}",
+                param="seed",
+            )
+        if seed < INT64_MIN or seed > INT64_MAX:
+            raise SamplingParamError(
+                f"seed must be within signed 64-bit integer bounds [{INT64_MIN}, {INT64_MAX}]",
+                param="seed",
+            )
+        resolved_seed = seed
     params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
@@ -382,7 +407,7 @@ def resolve_sampling(
         stop_token_ids=ids,
         include_stop_str_in_output=bool(include_stop_str_in_output),
         timings_per_token=timings_per_token,
-        seed=int(seed) if seed is not None else None,
+        seed=resolved_seed,
         allowed_token_ids=allowed,
         logprob_token_ids=lp_targets,
     )

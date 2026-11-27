@@ -113,10 +113,40 @@ def test_chat_validates_n_bounds_and_supports_multi_choice():
     assert multi["usage"]["completion_tokens"] == 4
 
 
-def test_chat_reports_reasoning_tokens_and_the_null_fingerprint():
-    body = run(handle_chat_completion(chat(), None, FakeState(reasoning_tokens=2), {}))
+def test_chat_reports_reasoning_tokens_and_system_fingerprint():
+    state = FakeState(reasoning_tokens=2)
+    body = run(handle_chat_completion(chat(), None, state, {}))
     assert body["usage"]["completion_tokens_details"] == {"reasoning_tokens": 2}
     assert body["system_fingerprint"] is None
+
+    state.system_fingerprint = "fp_0123456789ab"
+    body_fp = run(handle_chat_completion(chat(), None, state, {}))
+    assert body_fp["system_fingerprint"] == "fp_0123456789ab"
+
+    stream_resp = run(handle_chat_completion(chat(stream=True), None, state, {}))
+    stream_events = [
+        ev for ev in parse_sse(run(_collect(stream_resp.body_iterator))) if ev != "[DONE]"
+    ]
+    assert stream_events
+    assert all(ev["system_fingerprint"] == "fp_0123456789ab" for ev in stream_events)
+
+    cmpl_req = CompletionRequest(model="unit-model", prompt="hi")
+    cmpl_body = run(handle_completion(cmpl_req, None, state, {}))
+    assert cmpl_body["system_fingerprint"] == "fp_0123456789ab"
+
+    cmpl_stream = run(
+        handle_completion(
+            CompletionRequest(model="unit-model", prompt="hi", stream=True),
+            None,
+            state,
+            {},
+        )
+    )
+    cmpl_events = [
+        ev for ev in parse_sse(run(_collect(cmpl_stream.body_iterator))) if ev != "[DONE]"
+    ]
+    assert cmpl_events
+    assert all(ev["system_fingerprint"] == "fp_0123456789ab" for ev in cmpl_events)
 
 
 # ---- completions: echo, suffix -----------------------------------------------------------

@@ -81,16 +81,43 @@ class BatchSamplingArgs:
     seeded_rows: list[tuple[int, int, int, float, int, float]] = field(
         default_factory=list
     )
+    # True when every non-greedy row in the batch is seeded (no unseeded stochastic rows).
+    all_non_greedy_seeded: bool = False
+
+
+_CHOICE_SEED_DOMAIN = 0xD1B54A32D192ED03
+_DRAFT_SEED_DOMAIN = 0x94D049BB133111EB
 
 
 def mix_step_seed(seed: int, step: int) -> int:
-    """SplitMix64 mix of ``(seed, step)`` into a non-negative 63-bit torch.Generator seed."""
+    """SplitMix64 mix of ``(seed, step)`` into a non-negative 63-bit integer."""
     x = (
         (int(seed) & 0xFFFFFFFFFFFFFFFF) + (int(step) * 0x9E3779B97F4A7C15)
     ) & 0xFFFFFFFFFFFFFFFF
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
     x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
     return (x ^ (x >> 31)) & 0x7FFFFFFFFFFFFFFF
+
+
+def mix_choice_seed(seed: int, choice_index: int) -> int:
+    """Domain-separated SplitMix64 seed for multi-choice (``n > 1``) requests.
+
+    Choice 0 returns ``seed`` unchanged; choices ``>= 1`` never collide with adjacent
+    seeds (``seed + choice_index``) and never overflow signed 64-bit integer bounds.
+    """
+    if choice_index == 0:
+        return int(seed)
+    return mix_step_seed(int(seed) ^ _CHOICE_SEED_DOMAIN, choice_index)
+
+
+def step_uniform(seed: int, step: int, *, domain: int = 0) -> float:
+    """Deterministic float32 uniform in ``[0.0, 1.0)`` from SplitMix64.
+
+    Extracts 24 bits of mantissa (`(h >> 39) * 2**-24`), yielding an exact IEEE-754
+    float32 strictly below ``1.0`` that is identical across CPU, CUDA, and ROCm.
+    """
+    h = mix_step_seed(int(seed) ^ domain, step)
+    return (h >> 39) * (1.0 / (1 << 24))
 
 
 def sample_seeded_row(
@@ -102,26 +129,21 @@ def sample_seeded_row(
     top_k: int,
     top_p: float,
 ) -> torch.Tensor:
-    """Batch-invariant Gumbel-max sample for one 1D logits row using its per-step seed."""
-    vocab_size = row_logits.shape[-1]
-    scaled = row_logits.float() / max(temp, 1e-6)
+    """Reference single-row inverse-CDF sample using the same deterministic path as
+    ``sample_impl(..., uniforms=...)``."""
+    from freetoken.kernel import torch_sampling as sampling
+
+    logits_2d = row_logits.float().unsqueeze(0)
+    probs = sampling.softmax(logits_2d, max(temp, 1e-6))
+    vocab_size = logits_2d.shape[-1]
     if 0 < top_k < vocab_size:
-        vals, idx = torch.topk(scaled, k=top_k, dim=-1)
-        masked = torch.full_like(scaled, float("-inf"))
-        masked.scatter_(-1, idx, vals)
-        scaled = masked
-    probs = torch.softmax(scaled, dim=-1)
+        probs = sampling.top_k_renorm_probs(probs, top_k)
     if top_p < 1.0:
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
-        cum = torch.cumsum(sorted_probs, dim=-1)
-        drop = (cum - sorted_probs) >= top_p
-        drop[..., 0] = False
-        sorted_probs = sorted_probs.masked_fill(drop, 0.0)
-        probs = torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
-    gen = torch.Generator(device=row_logits.device)
-    gen.manual_seed(mix_step_seed(seed, step))
-    noise = torch.empty_like(probs).exponential_(1.0, generator=gen).clamp_min_(1e-30)
-    return torch.argmax(probs / noise, dim=-1)
+        probs = sampling.top_p_renorm_probs(probs, top_p)
+    u = torch.tensor(
+        [step_uniform(seed, step)], dtype=torch.float32, device=row_logits.device
+    )
+    return sampling.sampling_from_probs(probs, uniforms=u).squeeze(0)
 
 
 def make_device_tensor(
@@ -259,8 +281,8 @@ def sampling_module(device: torch.device | None = None):
         from freetoken.kernel import torch_sampling as sampling
 
         return sampling
-    import freetoken.utils.arch as arch
     from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.utils import arch
 
     if is_flashinfer_installed():
         from flashinfer import sampling
@@ -276,7 +298,30 @@ def sample_impl(
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
+    *,
+    uniforms: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if uniforms is not None:
+        # Unified batch-invariant inverse-CDF path for batches with seeded rows: avoids
+        # FlashInfer's slot-dependent Philox RNG and Triton's batch-dependent G / atomic
+        # top-p reduction so solo, mixed, verify, and DFlash paths match bit-for-bit.
+        from freetoken.kernel import torch_sampling as sampling
+
+        scaled = logits.float() / temperatures.float().reshape(-1, 1).clamp_min(1e-6)
+        probs = torch.softmax(scaled, dim=-1)
+        if top_k is None and top_p is None:
+            return sampling.sampling_from_probs(probs, uniforms=uniforms)
+        if top_p is None:
+            assert top_k is not None
+            return sampling.top_k_sampling_from_probs(probs, top_k, uniforms=uniforms)
+        if top_k is None:
+            assert top_p is not None
+            return sampling.top_p_sampling_from_probs(probs, top_p, uniforms=uniforms)
+        assert top_k is not None and top_p is not None
+        return sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p, uniforms=uniforms
+        )
+
     sampling = sampling_module(logits.device)
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     if top_k is None and top_p is None:
@@ -292,6 +337,40 @@ def sample_impl(
 
     assert top_k is not None and top_p is not None
     return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+
+
+def _batch_uniforms(
+    num_rows: int,
+    seeded_rows: list[tuple[int, int, int, float, int, float]],
+    *,
+    width: int,
+    all_seeded: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a ``[num_rows]`` float32 uniform vector with deterministic SplitMix64 values
+    on every seeded row (and ``torch.rand`` on any unseeded rows in a mixed batch)."""
+    if all_seeded:
+        u_vals = [0.0] * num_rows
+        for row, seed, gen_len, _, _, _ in seeded_rows:
+            base = row * width
+            for j in range(width):
+                u_vals[base + j] = step_uniform(seed, gen_len + j)
+        return make_device_tensor(u_vals, torch.float32, device)
+    u = torch.rand(num_rows, device=device, dtype=torch.float32)
+    idx_list: list[int] = []
+    val_list: list[float] = []
+    for row, seed, gen_len, _, _, _ in seeded_rows:
+        base = row * width
+        for j in range(width):
+            idx_list.append(base + j)
+            val_list.append(step_uniform(seed, gen_len + j))
+    if idx_list:
+        u.index_copy_(
+            0,
+            make_device_tensor(idx_list, torch.int64, device),
+            make_device_tensor(val_list, torch.float32, device),
+        )
+    return u
 
 
 @dataclass
@@ -514,14 +593,19 @@ class Sampler:
             for p, g in zip(params, is_greedy)
         ]
         seeded_rows: list[tuple[int, int, int, float, int, float]] = []
+        has_unseeded_stochastic = False
         for row, (req, p, g) in enumerate(zip(batch.reqs, params, is_greedy)):
-            if g or p.seed is None or not getattr(req, "can_decode", True):
+            if g or not getattr(req, "can_decode", True):
+                continue
+            if p.seed is None:
+                has_unseeded_stochastic = True
                 continue
             prompt_len = req.max_device_len - req.output_len
             gen_len = max(0, req.device_len - prompt_len)
             seeded_rows.append(
                 (row, int(p.seed), gen_len, ts[row], top_ks[row], top_ps[row])
             )
+        all_non_greedy_seeded = bool(seeded_rows) and not has_unseeded_stochastic
         temperatures = make_device_tensor(ts, torch.float32, self.device)
         top_k, top_p = None, None
         if any(k != self.vocab_size for k in top_ks):
@@ -551,6 +635,7 @@ class Sampler:
             explicit_include_sampled=explicit_include_sampled,
             need_full_topk=need_full_topk,
             seeded_rows=seeded_rows,
+            all_non_greedy_seeded=all_non_greedy_seeded,
         )
 
     @nvtx_annotate("Sampler")
@@ -569,23 +654,30 @@ class Sampler:
         if args.temperatures is None:  # greedy sampling
             tokens = torch.argmax(logits, dim=-1)
         else:
-            tokens = sample_impl(
-                logits.float(), args.temperatures, args.top_k, args.top_p
-            )
+            if args.seeded_rows:
+                uniforms = _batch_uniforms(
+                    logits.shape[0],
+                    args.seeded_rows,
+                    width=1,
+                    all_seeded=args.all_non_greedy_seeded,
+                    device=logits.device,
+                )
+                tokens = sample_impl(
+                    logits.float(),
+                    args.temperatures,
+                    args.top_k,
+                    args.top_p,
+                    uniforms=uniforms,
+                )
+            else:
+                tokens = sample_impl(
+                    logits.float(), args.temperatures, args.top_k, args.top_p
+                )
             if args.greedy_mask is not None:
                 # Mixed batches still run probability sampling for all rows, but
                 # greedy rows must follow argmax's deterministic tie-breaking.
                 greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
                 tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
-            for row, seed, gen_len, temp, tk, tp in args.seeded_rows:
-                tokens[row] = sample_seeded_row(
-                    logits[row],
-                    seed=seed,
-                    step=gen_len,
-                    temp=temp,
-                    top_k=tk,
-                    top_p=tp,
-                ).to(tokens.dtype)
         if record_counts:
             self.record_tokens(tokens, args)
         return tokens
@@ -781,6 +873,18 @@ class Sampler:
             top_lps_cpu.view(bs, width, -1),
         )
 
+    def _prepare_verify_logits(
+        self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor
+    ) -> torch.Tensor:
+        width = drafts.shape[1] + 1
+        if args.penalties:
+            logits = self._penalize_rows(logits, args, drafts)
+        if args.plan is not None:
+            logits = apply_logits_processors(
+                logits, _verify_plan(args.plan, width), self.vocab_size
+            )
+        return logits
+
     def sample_verify(
         self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor
     ) -> torch.Tensor:
@@ -790,51 +894,82 @@ class Sampler:
         """
         bs, k = drafts.shape
         width = k + 1
-        if args.penalties:
-            logits = self._penalize_rows(logits, args, drafts)
-        if args.plan is not None:
-            logits = apply_logits_processors(
-                logits, _verify_plan(args.plan, width), self.vocab_size
-            )
+        logits = self._prepare_verify_logits(logits, args, drafts)
         if args.temperatures is None:
             return torch.argmax(logits, dim=-1)
 
         def rows(t: torch.Tensor | None) -> torch.Tensor | None:
             return None if t is None else t.repeat_interleave(width)
 
-        tokens = sample_impl(
-            logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p)
-        )
+        if args.seeded_rows:
+            uniforms = _batch_uniforms(
+                bs * width,
+                args.seeded_rows,
+                width=width,
+                all_seeded=args.all_non_greedy_seeded,
+                device=logits.device,
+            )
+            tokens = sample_impl(
+                logits.float(),
+                rows(args.temperatures),
+                rows(args.top_k),
+                rows(args.top_p),
+                uniforms=uniforms,
+            )
+        else:
+            tokens = sample_impl(
+                logits.float(),
+                rows(args.temperatures),
+                rows(args.top_k),
+                rows(args.top_p),
+            )
         if args.greedy_mask is not None:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
-        for row, seed, gen_len, temp, tk, tp in args.seeded_rows:
-            base = row * width
-            for j in range(width):
-                tokens[base + j] = sample_seeded_row(
-                    logits[base + j],
-                    seed=seed,
-                    step=gen_len + j,
-                    temp=temp,
-                    top_k=tk,
-                    top_p=tp,
-                ).to(tokens.dtype)
         return tokens
 
-    def probs(
-        self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor
-    ) -> torch.Tensor | None:
-        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
-        if args.temperatures is None:
-            return None
+    def sample_seeded_verify_subset(
+        self,
+        prepared_logits: torch.Tensor,
+        args: BatchSamplingArgs,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized inverse-CDF verify draw for only ``args.seeded_rows`` from already
+        penalized/processed verify logits. Returns ``(row_idx [S], tokens [S, width])``."""
+        assert args.temperatures is not None and args.seeded_rows
+        dev = prepared_logits.device
+        req_rows = [r for r, _, _, _, _, _ in args.seeded_rows]
+        row_idx = make_device_tensor(req_rows, torch.int64, dev)
+        offsets = torch.arange(width, device=dev)
+        flat_idx = (row_idx.unsqueeze(1) * width + offsets).flatten()
+        sub_logits = prepared_logits.index_select(0, flat_idx).float()
+        sub_temps = args.temperatures.index_select(0, row_idx).repeat_interleave(width)
+        sub_tk = (
+            None
+            if args.top_k is None
+            else args.top_k.index_select(0, row_idx).repeat_interleave(width)
+        )
+        sub_tp = (
+            None
+            if args.top_p is None
+            else args.top_p.index_select(0, row_idx).repeat_interleave(width)
+        )
+        u_vals = [
+            step_uniform(seed, gen_len + j)
+            for _, seed, gen_len, _, _, _ in args.seeded_rows
+            for j in range(width)
+        ]
+        uniforms = make_device_tensor(u_vals, torch.float32, dev)
+        toks = sample_impl(
+            sub_logits, sub_temps, sub_tk, sub_tp, uniforms=uniforms
+        ).to(torch.int64)
+        return row_idx, toks.view(len(req_rows), width)
+
+    def _probs_from_prepared(
+        self, logits: torch.Tensor, args: BatchSamplingArgs, width: int
+    ) -> torch.Tensor:
+        assert args.temperatures is not None
         sampling = sampling_module(logits.device)
-        width = drafts.shape[1] + 1
-        if args.penalties:
-            logits = self._penalize_rows(logits, args, drafts)
-        if args.plan is not None:
-            logits = apply_logits_processors(
-                logits, _verify_plan(args.plan, width), self.vocab_size
-            )
         top = (
             None
             if args.greedy_mask is None
@@ -845,8 +980,6 @@ class Sampler:
             args.temperatures.repeat_interleave(width),
             enable_pdl=is_sm90_supported(),
         )
-        # frees the penalized copy before the renorms allocate theirs
-        del logits
         if args.top_k is not None:
             probs = sampling.top_k_renorm_probs(
                 probs, args.top_k.repeat_interleave(width)
@@ -860,6 +993,16 @@ class Sampler:
             hot = torch.where(greedy, 1.0, probs.gather(1, top))
             probs.masked_fill_(greedy, 0.0).scatter_(1, top, hot)
         return probs
+
+    def probs(
+        self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor
+    ) -> torch.Tensor | None:
+        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
+        if args.temperatures is None:
+            return None
+        width = drafts.shape[1] + 1
+        prepared = self._prepare_verify_logits(logits, args, drafts)
+        return self._probs_from_prepared(prepared, args, width)
 
     def _penalize_rows(
         self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor

@@ -479,7 +479,10 @@ def test_openai_completion_stream_object_and_n_choices():
     assert all(ev["object"] == "text_completion" for ev in events)
     seen_indices = {c["index"] for ev in events for c in ev["choices"] if c.get("text")}
     assert seen_indices == {0, 1}
-    assert [m.sampling_params.seed for m in state.sent] == [10, 11]
+    from freetoken.engine.sample import mix_choice_seed
+
+    assert [m.sampling_params.seed for m in state.sent] == [10, mix_choice_seed(10, 1)]
+    assert state.sent[1].sampling_params.seed != 11
     assert events[-1]["usage"]["prompt_tokens"] == 6
     assert events[-1]["usage"]["completion_tokens"] == 6
 

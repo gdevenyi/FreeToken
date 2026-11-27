@@ -6,16 +6,16 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import replace
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from freetoken.core import SamplingParams
+from freetoken.engine.sample import mix_choice_seed
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
-
-from dataclasses import replace
 
 from .api_models import (
     MAX_N_CHOICES,
@@ -348,7 +348,7 @@ async def handle_chat_completion(
             thinking=_thinking_policy(state),
         )
     except ValueError as exc:
-        return create_error_response(str(exc))
+        return create_error_response(str(exc), param=getattr(exc, "param", None))
 
     chat_id_fields = [
         (name, ids)
@@ -443,7 +443,7 @@ async def handle_chat_completion(
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
-        "system_fingerprint": None,
+        "system_fingerprint": _system_fingerprint(state),
         "choices": choices,
         "usage": _usage(
             first.prompt_tokens,
@@ -473,6 +473,7 @@ async def stream_chat_completion_chunks(
     if spec is None:
         spec = chat_request_to_genspec(req, {})
     id_uid = uid if shared_id_uid is None else shared_id_uid
+    fingerprint = _system_fingerprint(state)
     role_choice: dict[str, Any] = {
         "delta": {"role": "assistant", "content": ""},
         "index": choice_index,
@@ -480,7 +481,7 @@ async def stream_chat_completion_chunks(
     }
     if req.logprobs:
         role_choice["logprobs"] = None
-    yield _sse(_chat_chunk(req, id_uid, [role_choice]))
+    yield _sse(_chat_chunk(req, id_uid, [role_choice], fingerprint))
 
     timings: dict[str, Any] | None = None
     # timings ride the stream's LAST chunk only: the usage chunk when the client asked
@@ -550,7 +551,7 @@ async def stream_chat_completion_chunks(
             }
             if req.logprobs:
                 c_dict["logprobs"] = _lp_obj(ev.logprobs)
-            yield emit(_chat_chunk(req, id_uid, [c_dict]))
+            yield emit(_chat_chunk(req, id_uid, [c_dict], fingerprint))
         elif isinstance(ev, ContentDelta):
             c_dict = {
                 "delta": {"content": ev.text},
@@ -559,7 +560,7 @@ async def stream_chat_completion_chunks(
             }
             if req.logprobs:
                 c_dict["logprobs"] = _lp_obj(ev.logprobs)
-            yield emit(_chat_chunk(req, id_uid, [c_dict]))
+            yield emit(_chat_chunk(req, id_uid, [c_dict], fingerprint))
         elif isinstance(ev, ToolCallStart):
             open_tool = {
                 "index": tool_calls_sent,
@@ -589,6 +590,7 @@ async def stream_chat_completion_chunks(
                             "finish_reason": None,
                         }
                     ],
+                    fingerprint,
                 )
             )
         elif isinstance(ev, ToolCallArgsDelta):
@@ -614,6 +616,7 @@ async def stream_chat_completion_chunks(
                                 "finish_reason": None,
                             }
                         ],
+                        fingerprint,
                     )
                 )
         elif isinstance(ev, ToolCallsDelta):
@@ -650,6 +653,7 @@ async def stream_chat_completion_chunks(
                                         "finish_reason": None,
                                     }
                                 ],
+                                fingerprint,
                             )
                         )
                     open_tool = None
@@ -668,6 +672,7 @@ async def stream_chat_completion_chunks(
                                     "finish_reason": None,
                                 }
                             ],
+                            fingerprint,
                         )
                     )
                 tool_calls_sent += 1
@@ -680,7 +685,7 @@ async def stream_chat_completion_chunks(
             }
             if req.logprobs:
                 done_choice["logprobs"] = _lp_obj(ev.logprobs)
-            done = _chat_chunk(req, id_uid, [done_choice])
+            done = _chat_chunk(req, id_uid, [done_choice], fingerprint)
             if (
                 emit_done_sentinel
                 and not include_usage
@@ -691,7 +696,7 @@ async def stream_chat_completion_chunks(
 
     if include_usage and emit_done_sentinel:
         final: dict[str, Any] = {
-            **_chat_chunk(req, id_uid, []),
+            **_chat_chunk(req, id_uid, [], fingerprint),
             "usage": _reported_usage(state, usage),
         }
         if (t := timings_block(state, timings)) is not None:
@@ -755,7 +760,7 @@ async def _stream_multi_chat_chunks(
                     timings=usages[0].timings,
                 )
                 final: dict[str, Any] = {
-                    **_chat_chunk(req, uids[0], []),
+                    **_chat_chunk(req, uids[0], [], _system_fingerprint(state)),
                     "usage": _reported_usage(state, merged),
                 }
                 if (t := timings_block(state, usages[0].timings)) is not None:
@@ -796,7 +801,7 @@ async def handle_completion(
             req, model_sampling, default_max_tokens=default_max_tokens
         )
     except ValueError as exc:
-        return create_error_response(str(exc))
+        return create_error_response(str(exc), param=getattr(exc, "param", None))
     token_prompts = _is_token_prompt(req.prompt)
     prompts = _prompt_list(req.prompt)
     max_prompts = int(
@@ -831,7 +836,7 @@ async def handle_completion(
             timings_per_token=timings_pt,
         )
         if sample_idx > 0 and sampling_params.seed is not None:
-            sampling_params.seed = sampling_params.seed + sample_idx
+            sampling_params.seed = mix_choice_seed(sampling_params.seed, sample_idx)
         if token_prompts:
             return TokenizeMsg(
                 uid=uid, text="", input_ids=prompt, sampling_params=sampling_params
@@ -994,7 +999,7 @@ async def handle_completion(
         "object": "text_completion",
         "created": int(time.time()),
         "model": req.model,
-        "system_fingerprint": None,
+        "system_fingerprint": _system_fingerprint(state),
         "choices": choices,
         "usage": _usage(
             prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
@@ -1006,13 +1011,17 @@ async def handle_completion(
 
 
 def _completion_chunk(
-    req: CompletionRequest, uid: Any, choices: list[dict[str, Any]]
+    req: CompletionRequest,
+    uid: Any,
+    choices: list[dict[str, Any]],
+    system_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": _response_id("cmpl", req, public_request_id(uid)),
         "object": "text_completion",
         "created": int(time.time()),
         "model": req.model,
+        "system_fingerprint": system_fingerprint,
         "choices": choices,
     }
 
@@ -1030,6 +1039,7 @@ async def stream_completion_chunks(
     usage_out: GenUsage | None = None,
 ) -> AsyncIterator[bytes]:
     id_uid = uid if shared_id_uid is None else shared_id_uid
+    fingerprint = _system_fingerprint(state)
     usage = usage_out if usage_out is not None else GenUsage()
     timings: dict[str, Any] | None = None
     include_usage = (
@@ -1073,6 +1083,7 @@ async def stream_completion_chunks(
                         "logprobs": None,
                     }
                 ],
+                fingerprint,
             )
         )
     async for ack in state.wait_for_ack(uid):
@@ -1124,6 +1135,7 @@ async def stream_completion_chunks(
                             ),
                         }
                     ],
+                    fingerprint,
                 )
             )
             pending, pending_offsets = [], []
@@ -1153,6 +1165,7 @@ async def stream_completion_chunks(
                 ),
             }
         ],
+        fingerprint,
     )
     if (
         emit_done_sentinel
@@ -1165,7 +1178,7 @@ async def stream_completion_chunks(
     yield emit(done_chunk)
     if include_usage and emit_done_sentinel:
         final: dict[str, Any] = {
-            **_completion_chunk(req, id_uid, []),
+            **_completion_chunk(req, id_uid, [], fingerprint),
             "usage": _reported_usage(state, usage),
         }
         if (t := timings_block(state, timings)) is not None:
@@ -1238,7 +1251,7 @@ async def _stream_multi_completion_chunks(
                     timings=usages[0].timings,
                 )
                 final: dict[str, Any] = {
-                    **_completion_chunk(req, uids[0], []),
+                    **_completion_chunk(req, uids[0], [], _system_fingerprint(state)),
                     "usage": _reported_usage(state, merged),
                 }
                 if (t := timings_block(state, usages[0].timings)) is not None:
@@ -1405,7 +1418,7 @@ async def handle_tokenize(req: TokenizeRequest, state: Any):
                 manager.tokenizer.encode, text, add_special_tokens=False
             )
     except ValueError as exc:
-        return create_error_response(str(exc))
+        return create_error_response(str(exc), param=getattr(exc, "param", None))
     body: dict[str, Any] = {
         "count": len(ids),
         "max_model_len": _model_context_length(state),
@@ -1465,7 +1478,7 @@ def _fan_out_specs(spec: GenSpec, n: int) -> list[GenSpec]:
     for idx in range(n):
         sp = replace(spec.sampling_params)
         if idx > 0 and sp.seed is not None:
-            sp.seed = sp.seed + idx
+            sp.seed = mix_choice_seed(sp.seed, idx)
         out.append(replace(spec, sampling_params=sp))
     return out
 
@@ -1666,15 +1679,23 @@ def _tool_call_id(name: str | None, index: int) -> str:
     return f"call_{prefix}_{index}_{uuid.uuid4().hex[:8]}"
 
 
+def _system_fingerprint(state: Any) -> str | None:
+    fp = getattr(state, "system_fingerprint", None)
+    return fp if isinstance(fp, str) and fp else None
+
+
 def _chat_chunk(
-    req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]
+    req: ChatCompletionRequest,
+    uid: int,
+    choices: list[dict[str, Any]],
+    system_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": _response_id("chatcmpl", req, public_request_id(uid)),
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": req.model,
-        "system_fingerprint": None,
+        "system_fingerprint": system_fingerprint,
         "choices": choices,
     }
 

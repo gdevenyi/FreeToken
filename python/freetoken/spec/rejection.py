@@ -7,7 +7,7 @@ So the verify samples each row as decode would and compares prefixes; greedy row
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -20,7 +20,7 @@ def reject(
     drafts: torch.Tensor,  # [bs, k] int64
     args: BatchSamplingArgs,
     sampler: Sampler,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """(out [bs, k+1], emitted [bs]): emitted counts the accepted drafts (0..k); a request commits ``out[i, : emitted[i] + 1]``."""
     bs, k = drafts.shape
     target = sampler.sample_verify(logits, args, drafts).view(bs, k + 1).to(torch.int64)
@@ -35,15 +35,19 @@ def reject_with_draft_probs(
     q: torch.Tensor,  # [bs, k, K] q over support
     args: BatchSamplingArgs,
     sampler: Sampler,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``reject`` for drafts sampled from q: slot j accepts d with probability min(1, p(d)/q(d)) and on a reject samples max(0, p - q); greedy rows and rows whose q is not a distribution take the one-hot result."""
     from freetoken.engine.sample import sampling_module
 
-    p = sampler.probs(logits, args, drafts)
-    if p is None:
+    if args.temperatures is None or args.all_non_greedy_seeded:
+        # When every non-greedy row is seeded (or all greedy), target-deterministic chain
+        # verification is exact via sample_verify — skip allocating [bs*(k+1), V] probs.
         return reject(logits, drafts, args, sampler)
+
     bs, k = drafts.shape
-    p = p.view(bs, k + 1, -1)
+    width = k + 1
+    prepared = sampler._prepare_verify_logits(logits, args, drafts)
+    p = sampler._probs_from_prepared(prepared, args, width).view(bs, width, -1)
     # a NaN or a wrong total in q would reach the target's output through the residual
     ok = torch.isfinite(q).flatten(1).all(dim=1) & (
         (q.sum(dim=-1) - 1.0).abs() < 1e-3
@@ -73,21 +77,10 @@ def reject_with_draft_probs(
     out = torch.cat([drafts, drafts[:, -1:]], dim=1)
     out.scatter_(1, emitted.view(-1, 1), recovered.view(-1, 1))
     if args.seeded_rows:
-        from freetoken.engine.sample import mix_step_seed
-
-        # Target-deterministic chain verification: draw y_j ~ p[row, j] from (seed, gen_len + j)
-        # independently of the proposer's q/drafts so unseeded draft RNG never perturbs outputs.
-        for row, seed, gen_len, _, _, _ in args.seeded_rows:
-            y = torch.empty(k + 1, dtype=torch.int64, device=p.device)
-            for j in range(k + 1):
-                gen = torch.Generator(device=p.device)
-                gen.manual_seed(mix_step_seed(seed, gen_len + j))
-                noise = (
-                    torch.empty_like(p[row, j])
-                    .exponential_(1.0, generator=gen)
-                    .clamp_min_(1e-30)
-                )
-                y[j] = torch.argmax(p[row, j] / noise, dim=-1).to(torch.int64)
-            emitted[row] = (drafts[row] == y[:k]).to(torch.int64).cumprod(0).sum()
-            out[row] = y
+        # Target-deterministic chain verification using the exact same vectorized inverse-CDF
+        # path as Sampler.sample() and Sampler.sample_verify() so spec-on == spec-off.
+        s_idx, y = sampler.sample_seeded_verify_subset(prepared, args, width)
+        em_s = (drafts.index_select(0, s_idx) == y[:, :k]).to(torch.int64).cumprod(dim=1).sum(dim=1)
+        out.index_copy_(0, s_idx, y)
+        emitted.index_copy_(0, s_idx, em_s)
     return out, emitted

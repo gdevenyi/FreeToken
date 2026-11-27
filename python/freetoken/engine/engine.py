@@ -665,6 +665,9 @@ class Engine:
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        from freetoken.engine.fingerprint import compute_system_fingerprint
+
+        self.system_fingerprint: str = compute_system_fingerprint(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)

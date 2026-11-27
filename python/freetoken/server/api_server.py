@@ -201,6 +201,9 @@ class FrontendManager:
     cache_pools: dict[str, int] | None = None
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: list[dict[str, Any]] = field(default_factory=list)
+    # Deterministic backend fingerprint ("fp_<hex>") computed at Engine init and delivered on
+    # the readiness ("meta", ...) ack; emitted as OpenAI's system_fingerprint on responses.
+    system_fingerprint: str | None = None
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
     # BackendHandle after start_backend(). The orderly-shutdown path (lifespan / shell signal
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
@@ -1423,6 +1426,7 @@ def run_api_server(
         )
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
+        _GLOBAL_STATE.system_fingerprint = meta.pop("system_fingerprint", None)
         _GLOBAL_STATE.unit_bytes = meta
 
     # Early-bind: supervise the backend on a daemon thread so uvicorn can bind

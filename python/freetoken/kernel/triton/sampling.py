@@ -286,7 +286,9 @@ def _draw_find(
         if (blk_min < V) and (acc <= target):
             tl.store(out_ptr + row, blk_min)
         acc += tl.sum(wv, 0)
-        last_kept = tl.maximum(last_kept, tl.max(tl.where(kept, offs, -1), 0))
+        last_kept = tl.maximum(
+            last_kept, tl.max(tl.where(kept & (x > 0), offs, -1), 0)
+        )
     # see _keep_tail: the CTA owning an fp rounding gap writes its last kept token
     is_last_mass = tl.load(last_ptr + row) == pid % G
     if (acc <= target) and (last_kept >= 0) and ((incl > target) or is_last_mass):
@@ -296,7 +298,14 @@ def _draw_find(
 _UGEN = {}
 
 
-def _gen_u(B, device, seed, offset):
+def _gen_u(B, device, seed, offset, uniforms=None):
+    if uniforms is not None:
+        return (
+            uniforms.to(device=device, dtype=torch.float32)
+            .reshape(B)
+            .clamp(0.0, 1.0 - 2.0**-24)
+            .contiguous()
+        )
     if torch.cuda.is_current_stream_capturing():
         return torch.rand(B, device=device, dtype=torch.float32)
     g = _UGEN.get(device)
@@ -317,19 +326,21 @@ def _gen_u(B, device, seed, offset):
     return torch.rand(B, device=device, generator=g, dtype=torch.float32)
 
 
-def _draw(probs, thr, seed, offset):
+def _draw(probs, thr, seed, offset, uniforms=None):
     B, V = probs.shape
     dev = probs.device
     if B == 0:
         return torch.empty(0, device=dev, dtype=torch.int32)
-    G, CHUNK = _plan(B, V, dev)
+    # Per-row uniforms imply batch-invariant draws: fix G=1 so fp32 CDF accumulation does
+    # not depend on batch size B.
+    G, CHUNK = (1, V) if uniforms is not None else _plan(B, V, dev)
     grid = (B * G,)
     psum = torch.empty(B * G, device=dev, dtype=torch.float32)
     choff = torch.empty(B * G, device=dev, dtype=torch.float32)
     target = torch.empty(B, device=dev, dtype=torch.float32)
     last = torch.empty(B, device=dev, dtype=torch.int32)
     out = torch.zeros(B, device=dev, dtype=torch.int32)
-    u = _gen_u(B, dev, seed, offset)
+    u = _gen_u(B, dev, seed, offset, uniforms=uniforms)
     _draw_part[grid](probs, thr, psum, V, G, CHUNK, probs.stride(0))
     _draw_scan[(B,)](psum, choff, u, target, last, G, _next_pow2(G))
     _draw_find[grid](
@@ -351,10 +362,13 @@ def sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    out = _draw(src, _zeros_thr(src.size(0), src.device), seed, offset)
+    out = _draw(
+        src, _zeros_thr(src.size(0), src.device), seed, offset, uniforms=uniforms
+    )
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
@@ -369,11 +383,18 @@ def top_p_sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     out = _topp(
-        src, _topp_target(top_p, src.size(0), src.device), None, True, seed, offset
+        src,
+        _topp_target(top_p, src.size(0), src.device),
+        None,
+        True,
+        seed,
+        offset,
+        uniforms=uniforms,
     )
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
@@ -927,10 +948,12 @@ def _fused_plan(B, V, device, force_single=False):
     return G, triton.cdiv(V, G)
 
 
-def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False):
+def _fused_launch(
+    probs, kernel, tk, tp, draw, seed, offset, force_single=False, uniforms=None
+):
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _fused_plan(B, V, dev, force_single)
+    G, CHUNK = _fused_plan(B, V, dev, force_single or (uniforms is not None))
     n_hist = 4 * _KBINS if (kernel is _topk_fused or tk is not None) else 0
     n_mass = 4 * _PMBINS if kernel is _topp_fused else 0
     # hist[B, n_hist] | mass[B, n_mass] | priv[B * G, n_mass] | bar/ksum/ksum_k/tok[B]
@@ -948,15 +971,16 @@ def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False)
     ksum_k = ws[tail + 2 * B : tail + 3 * B].view(torch.float32)
     if draw:
         psum = torch.empty(B * G, device=dev, dtype=torch.float32)
-        u = _gen_u(B, dev, seed, offset)
+        u = _gen_u(B, dev, seed, offset, uniforms=uniforms)
         res = ws[tail + 3 * B :]
         out, tok = probs, res
     else:
         psum, u = ksum, ksum
         res = torch.empty_like(probs)
         out, tok = res, bar
-    # a lone CTA per row in a single wave streams faster with more warps; with G > 1 the co-residency budget caps warps
-    wide = G == 1 and B <= _num_sm(dev)
+    # a lone CTA per row in a single wave streams faster with more warps; with G > 1 the co-residency budget caps warps.
+    # When uniforms is given, keep BLOCK/warps fixed (independent of B) for batch invariance.
+    wide = (uniforms is None) and (G == 1 and B <= _num_sm(dev))
     common = dict(
         DRAW=draw,
         G_POW2=_next_pow2(G),
@@ -1023,12 +1047,14 @@ def _is_cooperative_launch_error(exc):
     )
 
 
-def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
+def _exact_launch(probs, kernel, tk, tp, draw, seed, offset, uniforms=None):
     key = _cooperative_key(probs, kernel, tk, draw)
-    force_single = key in _COOPERATIVE_DISABLED
+    force_single = (key in _COOPERATIVE_DISABLED) or (uniforms is not None)
     G, _ = _fused_plan(*probs.shape, probs.device, force_single)
     try:
-        return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single)
+        return _fused_launch(
+            probs, kernel, tk, tp, draw, seed, offset, force_single, uniforms=uniforms
+        )
     except RuntimeError as exc:
         if force_single or G == 1 or not _is_cooperative_launch_error(exc):
             raise
@@ -1039,11 +1065,19 @@ def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
             exc,
         )
         return _fused_launch(
-            probs, kernel, tk, tp, draw, seed, offset, force_single=True
+            probs,
+            kernel,
+            tk,
+            tp,
+            draw,
+            seed,
+            offset,
+            force_single=True,
+            uniforms=uniforms,
         )
 
 
-def _topk(probs, target, draw, seed=None, offset=None):
+def _topk(probs, target, draw, seed=None, offset=None, uniforms=None):
     if probs.size(0) == 0:
         return (
             torch.empty(0, device=probs.device, dtype=torch.int32)
@@ -1051,10 +1085,12 @@ def _topk(probs, target, draw, seed=None, offset=None):
             else probs.clone()
         )
 
-    return _exact_launch(probs, _topk_fused, target, None, draw, seed, offset)
+    return _exact_launch(
+        probs, _topk_fused, target, None, draw, seed, offset, uniforms=uniforms
+    )
 
 
-def _topp(probs, tp, tk, draw, seed=None, offset=None):
+def _topp(probs, tp, tk, draw, seed=None, offset=None, uniforms=None):
     if probs.size(0) == 0:
         return (
             torch.empty(0, device=probs.device, dtype=torch.int32)
@@ -1062,7 +1098,9 @@ def _topp(probs, tp, tk, draw, seed=None, offset=None):
             else probs.clone()
         )
 
-    return _exact_launch(probs, _topp_fused, tk, tp, draw, seed, offset)
+    return _exact_launch(
+        probs, _topp_fused, tk, tp, draw, seed, offset, uniforms=uniforms
+    )
 
 
 def _topp_target(top_p, B, dev):
@@ -1086,10 +1124,18 @@ def top_k_sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    out = _topk(src, _topk_target(top_k, src.size(0), src.device), True, seed, offset)
+    out = _topk(
+        src,
+        _topk_target(top_k, src.size(0), src.device),
+        True,
+        seed,
+        offset,
+        uniforms=uniforms,
+    )
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
@@ -1106,6 +1152,7 @@ def top_k_top_p_sampling_from_probs(
     seed=None,
     offset=None,
     return_valid=False,
+    uniforms=None,
 ):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
@@ -1117,6 +1164,7 @@ def top_k_top_p_sampling_from_probs(
         True,
         seed,
         offset,
+        uniforms=uniforms,
     )
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
