@@ -256,6 +256,7 @@ async def handle_responses(
             model_sampling,
             default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            tool_call_parser=getattr(state.config, "tool_call_parser", None),
             # stamp per-token only when the server opted into timings too; llama.cpp
             # publishes partial timings on streams, so non-stream requests never pay
             timings_per_token=bool(
@@ -269,9 +270,16 @@ async def handle_responses(
             await _auto_truncate_spec(spec, state)
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
-        return _error_response(400, str(exc), exc.code)
+        return _error_response(
+            400, str(exc), code=exc.code, param=getattr(exc, "param", None)
+        )
     except ValueError as exc:
-        return _error_response(400, str(exc))
+        return _error_response(
+            400,
+            str(exc),
+            code=getattr(exc, "code", None),
+            param=getattr(exc, "param", None),
+        )
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
@@ -480,13 +488,24 @@ def _extract_responses_format(text_cfg: dict[str, Any] | None) -> dict[str, Any]
     if ftype == "json_object":
         return {"type": "json_object"}
     if ftype == "json_schema":
+        from freetoken.grammar.schema import SchemaValidationError, validate_json_schema
+
         # Responses API puts schema directly on format ({"type": "json_schema", "name": ..., "schema": ...})
         nested = (
             fmt.get("json_schema") if isinstance(fmt.get("json_schema"), dict) else fmt
         )
         rf = {"type": "json_schema", "json_schema": nested}
         if (err := _response_format_error(rf)) is not None:
-            raise ValueError(err)
+            raise GenerationError(err, code="invalid_json_schema")
+        strict = bool(nested.get("strict", False))
+        try:
+            validate_json_schema(
+                nested.get("schema"), strict=strict, param="text.format"
+            )
+        except SchemaValidationError as exc:
+            err_exc = GenerationError(str(exc), code=exc.code)
+            err_exc.param = exc.param  # type: ignore[attr-defined]
+            raise err_exc from exc
         return rf
     raise ValueError(
         f"text.format.type {ftype!r} is not supported (supported: text, json_object, json_schema)"
@@ -525,7 +544,13 @@ def convert_responses_to_genspec(
     reasoning_parser: str | None = None,
     timings_per_token: bool = False,
     thinking: str | None = None,
+    tool_call_parser: str | None = None,
 ) -> GenSpec:
+    from freetoken.grammar.schema import (
+        SchemaValidationError,
+        build_structured_output_spec,
+    )
+
     messages, template_tools, parser_tools, ctk = convert_responses_prompt(
         req, reasoning_parser=reasoning_parser, thinking=thinking
     )
@@ -553,6 +578,21 @@ def convert_responses_to_genspec(
     if want_lps:
         sp.logprobs = True
         sp.top_logprobs = req.top_logprobs if req.top_logprobs is not None else 0
+    disable_parallel = bool(req.parallel_tool_calls is False)
+    try:
+        sp.structured_output = build_structured_output_spec(
+            response_format=response_format,
+            tools=template_tools,
+            tool_choice_mode=tool_choice_mode,
+            tool_call_parser=tool_call_parser,
+            disable_parallel_tool_use=disable_parallel,
+            reasoning_parser=reasoning_parser,
+            chat_template_kwargs=ctk,
+        )
+    except SchemaValidationError as exc:
+        err_exc = GenerationError(str(exc), code=exc.code)
+        err_exc.param = exc.param  # type: ignore[attr-defined]
+        raise err_exc from exc
     return GenSpec(
         messages=messages,
         sampling_params=sp,
@@ -560,7 +600,7 @@ def convert_responses_to_genspec(
         template_tools=template_tools,
         parser_tools=parser_tools,
         include_logprobs=want_lps,
-        disable_parallel_tool_use=bool(req.parallel_tool_calls is False),
+        disable_parallel_tool_use=disable_parallel,
         tool_choice_mode=tool_choice_mode,
         response_format=response_format,
     )
@@ -747,16 +787,15 @@ def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] |
             # Built-in server tools (web_search, code_interpreter, ...) are unsupported; skip.
             continue
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        converted.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": fn.get("name", ""),
-                    "description": fn.get("description"),
-                    "parameters": fn.get("parameters") or {"type": "object"},
-                },
-            }
-        )
+        fn_dict: dict[str, Any] = {
+            "name": fn.get("name", ""),
+            "description": fn.get("description"),
+            "parameters": fn.get("parameters") or {"type": "object"},
+        }
+        strict_val = fn.get("strict") if "strict" in fn else tool.get("strict")
+        if strict_val is not None:
+            fn_dict["strict"] = bool(strict_val)
+        converted.append({"type": "function", "function": fn_dict})
     return converted or None
 
 
@@ -872,6 +911,31 @@ def _response_obj(
             extra["max_output_tokens"] = req.max_output_tokens
         if req.truncation in ("auto", "disabled"):
             extra["truncation"] = req.truncation
+        if isinstance(req.text, dict) and isinstance(req.text.get("format"), dict):
+            fmt = dict(req.text["format"])
+            if fmt.get("type") == "json_schema" and isinstance(
+                fmt.get("json_schema"), dict
+            ):
+                # Normalize Chat-style nested json_schema to Responses flat format for SDK validation.
+                inner = fmt["json_schema"]
+                fmt = {
+                    "type": "json_schema",
+                    "name": inner.get("name") or "response",
+                    "schema": inner.get("schema") or {"type": "object"},
+                    **(
+                        {"description": inner["description"]}
+                        if inner.get("description") is not None
+                        else {}
+                    ),
+                    **(
+                        {"strict": bool(inner["strict"])}
+                        if inner.get("strict") is not None
+                        else {}
+                    ),
+                }
+            elif fmt.get("type") == "json_schema":
+                fmt.setdefault("name", "response")
+            extra["text"] = {"format": fmt}
     parallel = (
         bool(req.parallel_tool_calls)
         if (req is not None and req.parallel_tool_calls is not None)

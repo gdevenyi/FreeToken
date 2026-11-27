@@ -57,14 +57,12 @@ from .generation import (
     public_request_id,
     render_messages,
     resolve_sampling,
-    split_tool_lists,
     submit_generation,
     with_keepalive,
 )
 from .openai_api import (
     _ACCEPTED_EFFORTS,
     _await_watching_disconnect,
-    _response_format_error,
 )
 from .request_logger import log_request
 
@@ -175,6 +173,7 @@ async def handle_anthropic_messages(
             req,
             model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            tool_call_parser=getattr(state.config, "tool_call_parser", None),
             default_max_tokens=(
                 getattr(state.config, "max_output_tokens", None)
                 or DEFAULT_MAX_OUTPUT_TOKENS
@@ -335,10 +334,45 @@ _VALID_THINKING_TYPES = frozenset(
 _ANTHROPIC_EFFORTS = frozenset({*_ACCEPTED_EFFORTS, "max"})
 
 
+def _parse_anthropic_output_format(
+    fmt: Any, field_name: str
+) -> dict[str, Any] | None:
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict):
+        raise ValueError(f"{field_name} must be an object")
+    ftype = fmt.get("type")
+    if ftype == "json_schema":
+        nested = (
+            fmt.get("json_schema")
+            if isinstance(fmt.get("json_schema"), dict)
+            else fmt
+        )
+        schema_val = nested.get("schema")
+        if not isinstance(schema_val, dict):
+            raise GenerationError(
+                f"{field_name} with type 'json_schema' requires a 'schema' object",
+                code="invalid_json_schema",
+            )
+        from freetoken.grammar.schema import SchemaValidationError, validate_json_schema
+
+        strict = bool(nested.get("strict", False))
+        try:
+            validate_json_schema(schema_val, strict=strict, param=field_name)
+        except SchemaValidationError as exc:
+            raise GenerationError(str(exc), code=exc.code) from exc
+        return {"type": "json_schema", "json_schema": nested}
+    if ftype == "json_object":
+        return {"type": "json_object"}
+    if ftype not in (None, "text"):
+        raise ValueError(f"Unsupported {field_name}.type: {ftype!r}")
+    return None
+
+
 def _validate_anthropic_controls(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
 ) -> dict[str, Any] | None:
-    """Validate ``thinking`` and ``output_config`` and extract ``response_format`` if present."""
+    """Validate ``thinking``, ``output_config``, and beta ``output_format``, returning ``response_format``."""
     if req.thinking is not None:
         if not isinstance(req.thinking, dict):
             raise ValueError("thinking must be an object")
@@ -354,7 +388,7 @@ def _validate_anthropic_controls(
             if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
                 raise ValueError("thinking.budget_tokens must be a positive integer")
 
-    response_format: dict[str, Any] | None = None
+    cfg_fmt: dict[str, Any] | None = None
     if req.output_config is not None:
         if not isinstance(req.output_config, dict):
             raise ValueError("output_config must be an object")
@@ -365,27 +399,18 @@ def _validate_anthropic_controls(
             norm_eff = eff.strip().lower()
             if norm_eff and norm_eff not in _ANTHROPIC_EFFORTS:
                 raise ValueError(f"Unsupported output_config.effort: {eff!r}")
-        fmt = req.output_config.get("format")
-        if fmt is not None:
-            if not isinstance(fmt, dict):
-                raise ValueError("output_config.format must be an object")
-            ftype = fmt.get("type")
-            if ftype == "json_schema":
-                nested = (
-                    fmt.get("json_schema")
-                    if isinstance(fmt.get("json_schema"), dict)
-                    else fmt
-                )
-                schema_val = nested.get("schema")
-                if schema_val is None:
-                    response_format = {"type": "json_object"}
-                elif isinstance(schema_val, dict):
-                    response_format = {"type": "json_schema", "json_schema": nested}
-                else:
-                    raise ValueError("output_config.format.schema must be an object")
-            elif ftype not in (None, "text"):
-                raise ValueError(f"Unsupported output_config.format.type: {ftype!r}")
-    return response_format
+        cfg_fmt = _parse_anthropic_output_format(
+            req.output_config.get("format"), "output_config.format"
+        )
+
+    beta_fmt = _parse_anthropic_output_format(
+        getattr(req, "output_format", None), "output_format"
+    )
+    if cfg_fmt is not None and beta_fmt is not None and cfg_fmt != beta_fmt:
+        raise ValueError(
+            "output_config.format and output_format cannot specify conflicting formats"
+        )
+    return cfg_fmt if cfg_fmt is not None else beta_fmt
 
 
 def _tool_to_openai_dict(tool: Any) -> dict[str, Any]:
@@ -399,18 +424,20 @@ def _tool_to_openai_dict(tool: Any) -> dict[str, Any]:
         if "function" in tool and isinstance(tool["function"], dict):
             fn = dict(tool["function"])
             fn["description"] = fn.get("description") or ""
+            if "strict" not in fn and tool.get("strict") is not None:
+                fn["strict"] = bool(tool["strict"])
             return {"type": "function", "function": fn}
         schema = dict(tool.get("input_schema") or {"type": "object"})
         if "type" not in schema:
             schema["type"] = "object"
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": tool.get("description") or "",
-                "parameters": schema,
-            },
+        fn_dict: dict[str, Any] = {
+            "name": name,
+            "description": tool.get("description") or "",
+            "parameters": schema,
         }
+        if tool.get("strict") is not None:
+            fn_dict["strict"] = bool(tool["strict"])
+        return {"type": "function", "function": fn_dict}
     if tool.type not in (None, "custom"):
         raise ValueError(
             f"Server tool type {tool.type!r} (tool {tool.name!r}) is not supported; only custom client tools are supported"
@@ -418,14 +445,14 @@ def _tool_to_openai_dict(tool: Any) -> dict[str, Any]:
     schema = dict(tool.input_schema or {"type": "object"})
     if "type" not in schema:
         schema["type"] = "object"
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description if tool.description is not None else "",
-            "parameters": schema,
-        },
+    fn_dict = {
+        "name": tool.name,
+        "description": tool.description if tool.description is not None else "",
+        "parameters": schema,
     }
+    if tool.strict is not None:
+        fn_dict["strict"] = bool(tool.strict)
+    return {"type": "function", "function": fn_dict}
 
 
 def _document_text(block: AnthropicContentBlock) -> str:
@@ -731,7 +758,13 @@ def convert_anthropic_to_genspec(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     inline_system_policy: str = "auto",
     thinking: str | None = None,
+    tool_call_parser: str | None = None,
 ) -> GenSpec:
+    from freetoken.grammar.schema import (
+        SchemaValidationError,
+        build_structured_output_spec,
+    )
+
     response_format = _validate_anthropic_controls(req)
     messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
         req, reasoning_parser=reasoning_parser, thinking=thinking
@@ -742,25 +775,39 @@ def convert_anthropic_to_genspec(
             tool_choice_mode = "required"
         elif req.tool_choice.type == "tool" and req.tool_choice.name:
             tool_choice_mode = f"named:{req.tool_choice.name}"
+    disable_parallel = bool(
+        req.tool_choice and req.tool_choice.disable_parallel_tool_use
+    )
+    sp = resolve_sampling(
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        ignore_eos=False,
+        model_sampling=model_sampling,
+        stop=req.stop_sequences,
+        default_max_tokens=default_max_tokens,
+    )
+    try:
+        sp.structured_output = build_structured_output_spec(
+            response_format=response_format,
+            tools=template_tools,
+            tool_choice_mode=tool_choice_mode,
+            tool_call_parser=tool_call_parser,
+            disable_parallel_tool_use=disable_parallel,
+            reasoning_parser=reasoning_parser,
+            chat_template_kwargs=ctk,
+        )
+    except SchemaValidationError as exc:
+        raise GenerationError(str(exc), code=exc.code) from exc
     return GenSpec(
         messages=messages,
-        sampling_params=resolve_sampling(
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens,
-            ignore_eos=False,
-            model_sampling=model_sampling,
-            stop=req.stop_sequences,
-            default_max_tokens=default_max_tokens,
-        ),
+        sampling_params=sp,
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
         inline_system_policy=inline_system_policy,
-        disable_parallel_tool_use=bool(
-            req.tool_choice and req.tool_choice.disable_parallel_tool_use
-        ),
+        disable_parallel_tool_use=disable_parallel,
         tool_choice_mode=tool_choice_mode,
         response_format=response_format,
     )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, TypeAlias
 
 import torch
 
@@ -209,6 +209,10 @@ class Scheduler(SchedulerIOMixin):
             else config.max_extend_tokens
         )
         self.config = config
+        # Grammar-constrained decoding state (lazy compiler initialized on TP rank 0 only).
+        self._grammar_compiler: Any = None
+        self._grammar_futures: dict[int, tuple[Any, Any]] = {}
+        self._think_end_cache: dict[str, tuple[int, ...]] = {}
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         moe_cache = getattr(self.engine, "moe_offload_cache", None)
@@ -341,6 +345,16 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
         self._check_pending_flush()
 
+        # Grammar-aware overlap barrier: when the in-flight batch includes a constrained
+        # request, its next-step grammar bitmask depends on step N's sampled token. Drain
+        # last_data early (zero overhead for unconstrained batches; TP-symmetric predicate).
+        if self._needs_grammar_sync(last_data):
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
+            self._last_data = None
+
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
         # engine stream in ``_forward``). Without this, a request that reuses a just-freed
@@ -417,7 +431,107 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        if getattr(self, "_grammar_compiler", None) is not None:
+            self._grammar_compiler.shutdown()
         torch.cuda.synchronize(self.device)
+
+    @staticmethod
+    def _needs_grammar_sync(last_data: ForwardData | None) -> bool:
+        """True when ``last_data`` contains any active non-chunked grammar-constrained request.
+
+        Reads only TP-identical fields (``ChunkedReq``, ``aborted``, ``sampling_params.structured_output``)
+        so all TP ranks take the exact same barrier decision.
+        """
+        if last_data is None:
+            return False
+        batch = last_data[0].batch
+        return any(
+            not getattr(req, "aborted", False)
+            and not isinstance(req, ChunkedReq)
+            and getattr(req.sampling_params, "structured_output", None) is not None
+            for req in batch.reqs
+        )
+
+    def _get_grammar_compiler(self):
+        compiler = getattr(self, "_grammar_compiler", None)
+        if compiler is None:
+            from freetoken.grammar import GrammarCompiler
+
+            vocab_size = getattr(
+                getattr(self.engine, "sampler", None), "vocab_size", None
+            ) or len(self.tokenizer)
+            compiler = GrammarCompiler(
+                self.tokenizer,
+                vocab_size=vocab_size,
+                stop_token_ids=list(getattr(self, "eos_token_ids", ()) or ()),
+            )
+            self._grammar_compiler = compiler
+        return compiler
+
+    def _resolve_think_end_ids(self, tag: str) -> tuple[int, ...]:
+        cache = getattr(self, "_think_end_cache", None)
+        if cache is None:
+            cache = self._think_end_cache = {}
+        if tag in cache:
+            return cache[tag]
+        ids: tuple[int, ...] = ()
+        tok = getattr(self, "tokenizer", None)
+        if tok is not None:
+            convert = getattr(tok, "convert_tokens_to_ids", None)
+            if callable(convert):
+                tid = convert(tag)
+                unk = getattr(tok, "unk_token_id", None)
+                if isinstance(tid, int) and tid >= 0 and tid != unk:
+                    ids = (tid,)
+            if not ids:
+                encode = getattr(tok, "encode", None)
+                if callable(encode):
+                    enc = encode(tag, add_special_tokens=False)
+                    if isinstance(enc, list) and enc:
+                        ids = tuple(int(x) for x in enc)
+        cache[tag] = ids
+        return ids
+
+    def _submit_grammar_compile(self, uid: int, spec: Any) -> None:
+        if not self.config.tp_info.is_primary():
+            return
+        try:
+            compiler = self._get_grammar_compiler()
+            fut = compiler.compile_async(spec)
+            self._grammar_futures[uid] = (spec, fut)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to submit grammar compilation for uid=%d: %s", uid, exc)
+
+    def _attach_grammars_for_batch(self, batch: Batch) -> None:
+        if not self.config.tp_info.is_primary():
+            return
+        max_rollback = max(32, int(getattr(self.config, "speculative_num_steps", 0) or 0) + 4)
+        futures = getattr(self, "_grammar_futures", None)
+        for req in batch.reqs:
+            if not getattr(req, "can_decode", True):
+                continue
+            spec = getattr(req.sampling_params, "structured_output", None)
+            if spec is None or getattr(req, "grammar_matcher", None) is not None:
+                continue
+            try:
+                compiler = self._get_grammar_compiler()
+                entry = futures.pop(req.uid, None) if futures is not None else None
+                compiled = entry[1].result() if entry is not None else compiler.compile(spec)
+                req.grammar_matcher = compiler.create_matcher(
+                    compiled, max_rollback_tokens=max_rollback
+                )
+                if spec.defer_until_token_id is not None:
+                    req.grammar_think_end_ids = (int(spec.defer_until_token_id),)
+                    req.grammar_waiting_reasoning_end = True
+                elif spec.defer_until_tag:
+                    end_ids = self._resolve_think_end_ids(spec.defer_until_tag)
+                    if end_ids:
+                        req.grammar_think_end_ids = end_ids
+                        req.grammar_waiting_reasoning_end = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Grammar attachment failed for uid=%d: %s", req.uid, exc)
+                req.grammar_matcher = None
+                req.grammar_waiting_reasoning_end = False
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -634,6 +748,24 @@ class Scheduler(SchedulerIOMixin):
                     or (hit_stop_tok and not params.include_stop_str_in_output)
                 )
                 break
+            matcher = getattr(req, "grammar_matcher", None)
+            if matcher is not None:
+                if getattr(req, "grammar_waiting_reasoning_end", False):
+                    end_ids = getattr(req, "grammar_think_end_ids", ())
+                    n_end = len(end_ids)
+                    if (
+                        n_end > 0
+                        and req.input_ids.numel() >= n_end
+                        and tuple(req.input_ids[-n_end:].tolist()) == end_ids
+                    ):
+                        req.grammar_waiting_reasoning_end = False
+                else:
+                    matcher.accept_token(token)
+                    if matcher.is_terminated():
+                        finished = True
+                        finish_reason = "stop"
+                        trim_last_token = False
+                        break
             if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
                 req.toolcall_anchor_len = req.input_ids.numel()
                 self.cache_manager.note_toolcall_opener(req)
@@ -781,6 +913,8 @@ class Scheduler(SchedulerIOMixin):
                 )
             if sp.kld is not None and not self._admit_kld(msg):
                 return
+            if getattr(sp, "structured_output", None) is not None:
+                self._submit_grammar_compile(msg.uid, sp.structured_output)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -795,6 +929,8 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             if (kld_jobs := getattr(self, "_kld_jobs", None)) is not None:
                 kld_jobs.pop(msg.uid, None)
+            if (g_futs := getattr(self, "_grammar_futures", None)) is not None:
+                g_futs.pop(msg.uid, None)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if (
@@ -966,6 +1102,12 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if getattr(req, "grammar_matcher", None) is not None:
+            req.grammar_matcher = None
+        if getattr(req, "grammar_waiting_reasoning_end", False):
+            req.grammar_waiting_reasoning_end = False
+        if (g_futs := getattr(self, "_grammar_futures", None)) is not None:
+            g_futs.pop(req.uid, None)
         if self.spec is not None:
             self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
@@ -1208,6 +1350,8 @@ class Scheduler(SchedulerIOMixin):
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+        # Attach compiled grammar matchers (TP rank 0) before sampler.prepare builds bitmasks.
+        self._attach_grammars_for_batch(batch)
         # before the widening below, so the penalty check reads each request's real remain_len
         sample_args = self.engine.sampler.prepare(batch)
         # widened after the window free above, whose threshold reads device_len

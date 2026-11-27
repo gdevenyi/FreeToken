@@ -45,7 +45,7 @@ effect; "400" means the server refuses the request with a clear message.
 | `tools`, `tool_choice` (`auto` / `none` / `required` / named), `parallel_tool_calls` | honoured | honoured | honoured | honoured |
 | `reasoning_effort`, `thinking`, `chat_template_kwargs` | honoured | `chat_template_kwargs` | honoured | honoured |
 | `continue_final_message` | honoured (the last assistant message is continued, no generation prompt) | honoured | honoured | no |
-| `response_format` `json_object` / `json_schema`, guided decoding | accepted, not enforced (no constrained decoding); other types 400 | honoured (xgrammar / guidance) | honoured (xgrammar / outlines / llguidance) | `grammar`, `json_schema` |
+| `response_format` `json_object` / `json_schema`, `guided_*`, `structured_outputs` | honoured via grammar-constrained decoding (`pip install 'freetoken[grammar]'`: xgrammar primary, llguidance fallback); validates strict JSON Schema (`additionalProperties: false`, all properties `required`, valid `$ref`) with HTTP 400 `invalid_json_schema`; preserves KV/GDN prefix cache; defers masking across `<think>...</think>` on reasoning models; other types 400 | honoured (xgrammar / guidance) | honoured (xgrammar / outlines / llguidance) | `grammar`, `json_schema` |
 | `seed` | accepted, not honoured (one batched sampling kernel, no per-request generator) | honoured | `sampling_seed` | honoured |
 | `user`, `metadata`, `store`, `service_tier` | accepted, ignored | accepted, ignored | accepted, ignored | accepted, ignored |
 | `request_id` | honoured: becomes the response id | honoured | `rid` | `id_slot` (different meaning) |
@@ -67,8 +67,8 @@ effect; "400" means the server refuses the request with a clear message.
 | `allowed_token_ids` | honoured, 1..1024 ids below `len(tokenizer)`: sampling is masked to them at every position. With `logprobs` the values are renormalized over the set (vLLM's `processed_logprobs` at temperature 0; `temperature` defaults to `0` when omitted), so `temperature > 0`, `min_p > 0`, penalties, `min_tokens` and `logit_bias` are a 400 there; entries past the set are left out | honoured (raw logprobs unless `--logprobs-mode processed_logprobs`) | no | no |
 | `return_tokens_as_token_ids` | honoured: `tokens` and the `top_logprobs` keys are `token_id:N`, so ids that decode to the same text stay apart | honoured | n/a | no |
 
-Set values of the vLLM fields this server does not implement (`logprob_token_ids`,
-`prompt_logprobs`, `guided_*`, `structured_outputs`, `bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
+Set values of the vLLM fields this server does not implement (`prompt_logprobs`,
+`bad_words`) are a 400 rather than ignored; `null` / `false` / empty pass.
 Empty prompts and more than 256 prompts are a 400. Ids in `allowed_token_ids`, `logit_bias`,
 `stop_token_ids` and token-id prompts must be below `len(tokenizer)` (a 400 otherwise).
 
@@ -100,10 +100,24 @@ POST /detokenize    {"tokens": [...], "skip_special_tokens": false} -> {"prompt"
 `messages` are rendered through the model's chat template exactly as a generation would
 render them, so `count` equals the `prompt_tokens` that generation reports.
 
+## Structured Outputs and Strict Tool Calling
+
+Install the optional grammar extra to enable per-step vocabulary bitmasking:
+
+```bash
+pip install 'freetoken[grammar]'
+```
+
+Supported entry points (all routed through one engine-level `StructuredOutputSpec` without mutating `messages[0]`, keeping KV and GDN prefix caches intact):
+
+- **OpenAI `/v1/chat/completions` & `/v1/completions`**: `response_format` (`text`, `json_object`, `json_schema` with optional `strict: true`), `tools[].function.strict: true`, forced `tool_choice` (`required` / named function), and vLLM/SGLang guided fields (`guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, `structured_outputs`).
+- **OpenAI `/v1/responses`**: `text.format` (`text`, `json_object`, `json_schema` with optional `strict: true`, echoed on `Response.text`) and `tools[].strict: true`.
+- **Anthropic `/v1/messages`**: `output_config.format`, beta top-level `output_format` (`json_schema` with required `schema`), `tools[].strict: true`, and forced `tool_choice` (`any` / `tool`).
+- **Strict JSON Schema subset (`strict: true`)**: root must be an object, every object must set `"additionalProperties": false`, every key in `properties` must appear in `required`, and `$ref` must resolve locally (`#/$defs/...` or `#/definitions/...`). Invalid strict schemas return HTTP 400 with `code: "invalid_json_schema"`.
+- **Reasoning & Speculative Decoding**: On forced-reasoning models (`qwen3`, `deepseekv32`, `glm`, `gemma4`, `minimax_m3` enabled), logits stay unconstrained until the closing reasoning tag (`</think>`, `</mm:think>`, `<channel|>`) commits; on optional-think models (`flint`, `ricursive`, `minimax_m3` adaptive), an optional token-bounded think tag wraps the grammar. Under overlap scheduling, constrained batches drain before preparing the next bitmask (zero overhead on unconstrained traffic). Under speculative decoding (MTP & DFlash2), verify batches build exact per-slot chain bitmasks and roll back rejected drafts cleanly, and DFlash2 filters its top-K draft candidates against the active grammar.
+
 ## Not implemented, on purpose
 
-- Constrained decoding (enforcing `response_format` json / json_schema, regex, grammar): needs
-  a grammar engine on the sampling path.
 - Prompt logprobs and `echo` with `logprobs`: need the prefill logits.
 - Per-request `seed`: the batched sampling kernel draws from one generator.
 - Embeddings, reranking, scoring, audio: not generation.

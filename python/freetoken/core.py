@@ -16,6 +16,23 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class StructuredOutputSpec:
+    """Protocol-neutral grammar constraint carried across tokenizer -> scheduler -> engine.
+
+    All fields are msgpack-safe primitives so ``TokenizeMsg`` and ``UserMsg`` cross ZMQ
+    boundaries cleanly without custom codecs.
+    """
+
+    kind: Literal["json_object", "json_schema", "regex", "ebnf", "structural_tag"]
+    payload: str = ""
+    strict: bool = True
+    # When reasoning is forced open by the chat template, defer activating the grammar
+    # until this closing tag (e.g. "</think>") or token id is committed.
+    defer_until_tag: str | None = None
+    defer_until_token_id: int | None = None
+
+
+@dataclass
 class SamplingParams:
     temperature: float = 0.0
     top_k: int = -1
@@ -66,6 +83,8 @@ class SamplingParams:
     # One chunk of a KL-divergence base file ({"path", "chunk", "slice_rows", "bos_token_id"}), set
     # only by the /v1/internal/kld endpoint (--enable-kld-endpoint); see freetoken.benchmark.kld.
     kld: dict | None = None
+    # Grammar-constrained decoding spec (Structured Outputs, guided_*, strict/forced tools).
+    structured_output: StructuredOutputSpec | None = None
 
     def __post_init__(self) -> None:
         if self.repetition_penalty <= 0.0 or not (
@@ -220,6 +239,10 @@ class Req:
     )
     # [vocab] bool on the device: the prompt's ids, for repetition_penalty. Built once.
     prompt_token_mask: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # Active per-request grammar matcher (TP rank 0 only) and reasoning-deferral state.
+    grammar_matcher: Any = field(default=None, init=False, repr=False)
+    grammar_waiting_reasoning_end: bool = field(default=False, init=False, repr=False)
+    grammar_think_end_ids: tuple[int, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

@@ -269,12 +269,17 @@ class TokenizeManager:
             return msg.text
         kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
         raw_messages = msg.text
-        directive = _render_directives(
-            getattr(msg, "tool_choice_mode", None),
-            getattr(msg, "response_format", None),
-        )
-        if directive:
-            raw_messages = _inject_leading_directive(raw_messages, directive)
+        # When grammar-constrained decoding is active on the sampler, do not mutate
+        # messages[0] with format/tool prose directives — keeping the leading system
+        # prompt byte-identical preserves GPU/host KV and GDN prefix cache hits across
+        # requests with varying schemas or tool constraints.
+        if getattr(msg.sampling_params, "structured_output", None) is None:
+            directive = _render_directives(
+                getattr(msg, "tool_choice_mode", None),
+                getattr(msg, "response_format", None),
+            )
+            if directive:
+                raw_messages = _inject_leading_directive(raw_messages, directive)
         messages = _map_developer_role(
             raw_messages,
             getattr(self.tokenizer, "chat_template", None),
