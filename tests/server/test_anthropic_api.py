@@ -872,7 +872,10 @@ def test_convert_output_config_effort():
     # no effort (or an empty one, or other output_config keys only): the old behavior
     assert ctk(output_config={}) == {}
     assert ctk(output_config={"effort": ""}, thinking={"type": "enabled"}) == on
-    assert ctk(output_config={"format": {"type": "json_schema"}}) == {}
+    assert (
+        ctk(output_config={"format": {"type": "json_schema", "schema": {"type": "object"}}})
+        == {}
+    )
 
 
 def test_output_config_effort_obeys_server_thinking_policy():

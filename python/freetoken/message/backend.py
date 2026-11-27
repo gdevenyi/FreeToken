@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import torch
-from freetoken.core import SamplingParams
+from freetoken.core import SamplingParams, StructuredOutputSpec
 
 from .utils import deserialize_type, serialize_type
 

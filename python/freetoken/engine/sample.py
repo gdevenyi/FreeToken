@@ -39,6 +39,12 @@ class LogitsPlan:
     # Rows with allowed_token_ids and their ids, padded with vocab_size like min_ids.
     allow_rows: torch.Tensor | None = None  # [a] int64 local rows
     allow_ids: torch.Tensor | None = None  # [a, A] int64
+    # Grammar-constrained rows and their packed int32 vocabulary bitmasks ([g, ceil(V/32)]).
+    grammar_rows: torch.Tensor | None = None  # [g] int64 local rows
+    grammar_bitmask: torch.Tensor | None = None  # [g, W] int32 on device
+    # True when grammar_rows/grammar_bitmask are already expanded across verify slots 0..k
+    # (so _verify_plan must pass them through instead of repeating slot 0).
+    grammar_per_verify_row: bool = False
 
 
 class RowRepetition(NamedTuple):
@@ -187,6 +193,16 @@ def apply_logits_processors(
             disallowed_mask(plan.allow_ids, vocab_size), neg_inf
         )
 
+    if plan.grammar_bitmask is not None and plan.grammar_rows is not None:
+        from freetoken.grammar.bitmask import apply_token_bitmask_inplace
+
+        # Apply grammar bitmask BEFORE min_ids (whose has_valid guard ensures min_tokens
+        # never masks out the sole grammar-valid token such as EOS after '}') and BEFORE
+        # min_p (so softmax runs over grammar-valid tokens only).
+        apply_token_bitmask_inplace(
+            sub, plan.grammar_bitmask, plan.grammar_rows, vocab_size
+        )
+
     if plan.min_ids is not None:
         block = torch.zeros(
             (plan.min_ids.shape[0], vocab_size + 1), dtype=torch.bool, device=device
@@ -248,6 +264,14 @@ def _verify_plan(plan: LogitsPlan, width: int) -> LogitsPlan:
     if plan.allow_ids is not None:
         out.allow_rows = rows(plan.allow_rows)
         out.allow_ids = repeat(plan.allow_ids)
+    if plan.grammar_bitmask is not None and plan.grammar_rows is not None:
+        if plan.grammar_per_verify_row:
+            out.grammar_rows = plan.grammar_rows
+            out.grammar_bitmask = plan.grammar_bitmask
+            out.grammar_per_verify_row = True
+        else:
+            out.grammar_rows = rows(plan.grammar_rows)
+            out.grammar_bitmask = repeat(plan.grammar_bitmask)
     if plan.min_p is not None:
         out.min_p = repeat(plan.min_p)
     return out
@@ -294,18 +318,52 @@ def sample_impl(
     return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 
 
+def _has_active_grammar(req) -> bool:
+    return getattr(req, "grammar_matcher", None) is not None and not getattr(
+        req, "grammar_waiting_reasoning_end", False
+    )
+
+
+def _ends_with_ids(seq: list[int], suffix: tuple[int, ...]) -> bool:
+    n = len(suffix)
+    return n > 0 and len(seq) >= n and tuple(seq[-n:]) == suffix
+
+
 @dataclass
 class Sampler:
     device: torch.device
     vocab_size: int
+    _grammar_host_buf: torch.Tensor | None = field(
+        default=None, init=False, repr=False
+    )
+
+    def _get_grammar_host_buf(self, num_rows: int) -> torch.Tensor:
+        from freetoken.grammar.bitmask import allocate_host_bitmask, bitmask_word_count
+
+        words = bitmask_word_count(self.vocab_size)
+        buf = self._grammar_host_buf
+        if buf is None or buf.shape[0] < num_rows or buf.shape[1] != words:
+            cap = max(num_rows, 16)
+            buf = allocate_host_bitmask(
+                cap, self.vocab_size, pin_memory=(self.device.type == "cuda")
+            )
+            self._grammar_host_buf = buf
+        view = buf[:num_rows]
+        view.fill_(-1)
+        return view
 
     def _plan(self, batch: Batch, params) -> LogitsPlan | None:
         """The LogitsPlan for this batch, or None when no request asks for a processor."""
         MIN_T = 1e-6
+        is_verify = getattr(batch, "phase", None) == "verify"
         rows = [
             i
             for i, p in enumerate(params)
-            if p.needs_logits_processing and getattr(batch.reqs[i], "can_decode", True)
+            if (
+                p.needs_logits_processing
+                or (not is_verify and _has_active_grammar(batch.reqs[i]))
+            )
+            and getattr(batch.reqs[i], "can_decode", True)
         ]
         if not rows:
             return None
@@ -359,11 +417,160 @@ class Sampler:
             )
             plan.allow_ids = _padded_rows([ids for _, ids in allow], pad, self.device)
 
+        if not is_verify:
+            g_entries = [
+                (local, req.grammar_matcher)
+                for local, (req, _) in enumerate(picked)
+                if _has_active_grammar(req)
+            ]
+            if g_entries:
+                host_bm = self._get_grammar_host_buf(len(g_entries))
+                for g_i, (_, matcher) in enumerate(g_entries):
+                    matcher.fill_next_token_bitmask(host_bm, g_i)
+                plan.grammar_rows = make_device_tensor(
+                    [local for local, _ in g_entries], torch.int64, self.device
+                )
+                plan.grammar_bitmask = (
+                    host_bm.to(self.device, non_blocking=True)
+                    if self.device.type == "cuda"
+                    else host_bm.clone()
+                )
+
         if any(p.min_p > 0.0 for _, p in picked):
             plan.min_p = make_device_tensor(
                 [[p.min_p] for _, p in picked], torch.float32, self.device
             )
         return plan
+
+    def attach_verify_grammar(
+        self, batch: Batch, args: BatchSamplingArgs, drafts: torch.Tensor
+    ) -> None:
+        """Build per-slot verify grammar bitmasks after drafting and attach them to ``args.plan``.
+
+        Advances each constrained request's matcher along the linear draft chain
+        ``[d_0, ..., d_{k-1}]`` (also tracking mid-block reasoning end tags), fills slots
+        ``0..k``, and rolls the matcher cleanly back to its pre-verify state.
+        """
+        grammar_reqs = [
+            (i, req)
+            for i, req in enumerate(batch.reqs)
+            if getattr(req, "grammar_matcher", None) is not None
+        ]
+        if not grammar_reqs:
+            return
+        k = int(drafts.shape[1])
+        width = k + 1
+        drafts_cpu = drafts.to("cpu") if k > 0 else None
+
+        # Ensure every grammar request is present in args.plan (extending plan.rows if needed).
+        MIN_T = 1e-6
+        if args.plan is None:
+            plan_rows_list = [i for i, _ in grammar_reqs]
+            temps_list = [
+                [
+                    max(
+                        0.0
+                        if req.sampling_params.is_greedy
+                        else req.sampling_params.temperature,
+                        MIN_T,
+                    )
+                ]
+                for _, req in grammar_reqs
+            ]
+            args.plan = LogitsPlan(
+                rows=make_device_tensor(plan_rows_list, torch.int64, self.device),
+                temps=make_device_tensor(temps_list, torch.float32, self.device),
+            )
+            req_to_local = {req_idx: loc for loc, req_idx in enumerate(plan_rows_list)}
+        else:
+            existing = args.plan.rows.to("cpu").tolist()
+            req_to_local = {req_idx: loc for loc, req_idx in enumerate(existing)}
+            extra_rows: list[int] = []
+            extra_temps: list[list[float]] = []
+            for req_idx, req in grammar_reqs:
+                if req_idx not in req_to_local:
+                    req_to_local[req_idx] = len(existing) + len(extra_rows)
+                    extra_rows.append(req_idx)
+                    sp = req.sampling_params
+                    extra_temps.append(
+                        [max(0.0 if sp.is_greedy else sp.temperature, MIN_T)]
+                    )
+            if extra_rows:
+                args.plan.rows = torch.cat(
+                    [
+                        args.plan.rows,
+                        make_device_tensor(extra_rows, torch.int64, self.device),
+                    ],
+                    dim=0,
+                )
+                args.plan.temps = torch.cat(
+                    [
+                        args.plan.temps,
+                        make_device_tensor(extra_temps, torch.float32, self.device),
+                    ],
+                    dim=0,
+                )
+                if args.plan.min_p is not None:
+                    args.plan.min_p = torch.cat(
+                        [
+                            args.plan.min_p,
+                            torch.zeros(
+                                (len(extra_rows), 1),
+                                dtype=torch.float32,
+                                device=self.device,
+                            ),
+                        ],
+                        dim=0,
+                    )
+
+        total_slots = len(grammar_reqs) * width
+        host_bm = self._get_grammar_host_buf(total_slots)
+        local_slot_rows: list[int] = []
+
+        for g_idx, (req_idx, req) in enumerate(grammar_reqs):
+            local_base = req_to_local[req_idx] * width
+            matcher = req.grammar_matcher
+            waiting = bool(getattr(req, "grammar_waiting_reasoning_end", False))
+            end_ids = tuple(getattr(req, "grammar_think_end_ids", ()) or ())
+            tail = (
+                req.input_ids[-len(end_ids) :].tolist()
+                if (waiting and end_ids and getattr(req, "input_ids", None) is not None)
+                else []
+            )
+            spec_accepted = 0
+            for slot in range(width):
+                row_slot = g_idx * width + slot
+                local_slot_rows.append(local_base + slot)
+                if not waiting:
+                    matcher.fill_next_token_bitmask(host_bm, row_slot)
+                if slot < k and drafts_cpu is not None:
+                    d_tok = int(drafts_cpu[req_idx, slot].item())
+                    if waiting:
+                        tail.append(d_tok)
+                        if _ends_with_ids(tail, end_ids):
+                            waiting = False
+                    else:
+                        if matcher.accept_token(d_tok):
+                            spec_accepted += 1
+                        else:
+                            # Slot `slot` already masks out d_tok (p(d_tok) == 0), so chain
+                            # rejection stops here; fill remaining local_slot_rows as unconstrained
+                            # placeholders so tensor shapes match total_slots.
+                            for rem in range(slot + 1, width):
+                                local_slot_rows.append(local_base + rem)
+                            break
+            if spec_accepted > 0:
+                matcher.rollback(spec_accepted)
+
+        args.plan.grammar_rows = make_device_tensor(
+            local_slot_rows, torch.int64, self.device
+        )
+        args.plan.grammar_bitmask = (
+            host_bm.to(self.device, non_blocking=True)
+            if self.device.type == "cuda"
+            else host_bm.clone()
+        )
+        args.plan.grammar_per_verify_row = True
 
     def _allowed(self, p) -> list[int]:
         # an empty list after the filter leaves the row unmasked rather than all -inf

@@ -317,13 +317,71 @@ class DFlashProposer(Proposer):
 
     # ------------------------------------------------------------------ draft step
 
+    def _mask_candidates_with_grammar(
+        self,
+        reqs: list[Req],
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Phase 2 DFlash grammar filter: mask disallowed top-K candidates to ``-inf``
+        before selector path sampling so drafted tokens stay schema-valid."""
+        from freetoken.grammar.bitmask import (
+            allocate_host_bitmask,
+            bitmask_allows_token,
+        )
+
+        vocab_size = int(self.draft_config.vocab_size)
+        masked = unary_logits.clone()
+        cand_cpu = candidate_ids.to("cpu")
+        logits_cpu = unary_logits.float().to("cpu")
+        bm = allocate_host_bitmask(1, vocab_size, pin_memory=False)
+        neg_inf = float("-inf")
+
+        for b, req in enumerate(reqs):
+            matcher = getattr(req, "grammar_matcher", None)
+            if matcher is None or getattr(req, "grammar_waiting_reasoning_end", False):
+                continue
+            accepted = 0
+            for slot in range(self.k):
+                bm.fill_(-1)
+                matcher.fill_next_token_bitmask(bm, 0)
+                cids = cand_cpu[b, slot].tolist()
+                allowed = [bitmask_allows_token(bm, 0, int(tid)) for tid in cids]
+                if not any(allowed):
+                    break
+                disallowed_idx = [j for j, ok in enumerate(allowed) if not ok]
+                if disallowed_idx:
+                    idx_t = make_device_tensor(
+                        disallowed_idx, torch.int64, masked.device
+                    )
+                    masked[b, slot].index_fill_(0, idx_t, neg_inf)
+                # Advance matcher along the highest-scoring grammar-allowed candidate so
+                # subsequent draft slots reflect the drafted prefix, then roll back after.
+                best_j = max(
+                    (j for j, ok in enumerate(allowed) if ok),
+                    key=lambda j: float(logits_cpu[b, slot, j].item()),
+                )
+                if matcher.accept_token(int(cids[best_j])):
+                    accepted += 1
+                else:
+                    break
+            if accepted > 0:
+                matcher.rollback(accepted)
+        return masked
+
     def _draft(
-        self, pending, starts, rows, temperature, greedy
+        self, pending, starts, rows, temperature, greedy, *, reqs: list[Req] | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.draft.forward_block(pending, starts, rows, self.dflash_ring)
         # row 0 of each block is the pending token; rows 1..k predict the drafts
         pred = hidden.view(pending.shape[0], self.block, -1)[:, 1:]
         candidate_ids, unary_logits = self.draft.compute_candidates(pred)
+        if reqs is not None and (
+            self._tp_info is None or self._tp_info.is_primary()
+        ):
+            unary_logits = self._mask_candidates_with_grammar(
+                reqs, candidate_ids, unary_logits
+            )
         uniforms = torch.rand(pred.shape[:2], device=pred.device)
         tokens, q = self.draft.candidate_selector.sample_path(
             candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms
@@ -412,9 +470,18 @@ class DFlashProposer(Proposer):
             r.sampling_params.is_greedy or r.sampling_params.seed is not None
             for r in reqs
         ]
-        padded = next((b for b in sorted(self._graphs) if b >= bs), None)
+        has_active_grammar = any(
+            getattr(r, "grammar_matcher", None) is not None
+            and not getattr(r, "grammar_waiting_reasoning_end", False)
+            for r in reqs
+        )
+        padded = (
+            None
+            if has_active_grammar
+            else next((b for b in sorted(self._graphs) if b >= bs), None)
+        )
         pad = (padded or bs) - bs
-        pin = dict(pin_memory=True)
+        pin = {"pin_memory": True} if self.device.type == "cuda" else {}
         starts = torch.tensor(
             [r.cached_len for r in reqs] + [0] * pad, dtype=torch.int64, **pin
         )
@@ -429,9 +496,14 @@ class DFlashProposer(Proposer):
             **pin,
         )
         if padded is None:
-            to = lambda t: t.to(self.device, non_blocking=True)
+            to = lambda t: t.to(self.device, non_blocking=self.device.type == "cuda")
             tokens, cand, q = self._draft(
-                pending.to(torch.int64), to(starts), rows, to(temps), to(flags)
+                pending.to(torch.int64),
+                to(starts),
+                rows,
+                to(temps),
+                to(flags),
+                reqs=reqs if has_active_grammar else None,
             )
         else:
             bonus, g_starts, g_rows, g_temps, g_flags = self._in

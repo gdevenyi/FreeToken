@@ -119,6 +119,8 @@ class AnthropicMessagesRequest(BaseModel):
     thinking: dict[str, Any] | None = None
     # {"effort": "low"|"medium"|"high"|"max", "format": ...}.
     output_config: dict[str, Any] | None = None
+    # Beta top-level structured output format: {"type": "json_schema", "schema": {...}}.
+    output_format: dict[str, Any] | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
@@ -150,6 +152,7 @@ class AnthropicCountTokensRequest(BaseModel):
     system: str | list[AnthropicContentBlock] | None = None
     thinking: dict[str, Any] | None = None
     output_config: dict[str, Any] | None = None
+    output_format: dict[str, Any] | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
 

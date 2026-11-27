@@ -142,6 +142,12 @@ class ChatCompletionRequest(BaseModel):
     function_call: Any | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # vLLM / SGLang grammar-constrained decoding fields (all optional).
+    guided_json: Any | None = None
+    guided_regex: str | None = None
+    guided_choice: list[str] | None = None
+    guided_grammar: str | None = None
+    structured_outputs: dict[str, Any] | None = None
     # The last message is an assistant prefix the model continues (no generation prompt).
     continue_final_message: bool = False
     # ---- sampling extras shared with vLLM / SGLang / llama.cpp (all optional) ----
@@ -215,6 +221,12 @@ class CompletionRequest(BaseModel):
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # vLLM / SGLang grammar-constrained decoding fields (all optional).
+    guided_json: Any | None = None
+    guided_regex: str | None = None
+    guided_choice: list[str] | None = None
+    guided_grammar: str | None = None
+    structured_outputs: dict[str, Any] | None = None
     # ---- sampling extras shared with vLLM / SGLang / llama.cpp (all optional) ----
     min_p: float | None = None
     repetition_penalty: float | None = None

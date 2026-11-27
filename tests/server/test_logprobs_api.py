@@ -448,11 +448,6 @@ def _one_token_state() -> FakeState:
 # never a 200 computed as if the field were absent.
 UNIMPLEMENTED_COMPLETION_FIELDS = [
     ("prompt_logprobs", 0),
-    ("guided_json", {"type": "object"}),
-    ("guided_regex", "[AB]"),
-    ("guided_choice", ["A", "B"]),
-    ("guided_grammar", 'root ::= "A"'),
-    ("structured_outputs", {"choice": ["A"]}),
     ("bad_words", ["B"]),
 ]
 

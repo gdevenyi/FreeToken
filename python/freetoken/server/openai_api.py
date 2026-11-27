@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import replace
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -14,8 +15,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
-
-from dataclasses import replace
 
 from .api_models import (
     MAX_N_CHOICES,
@@ -83,8 +82,12 @@ def chat_request_to_genspec(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     timings_per_token: bool = False,
     thinking: str | None = None,
+    reasoning_parser: str | None = None,
+    tool_call_parser: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
+    from freetoken.grammar.schema import build_structured_output_spec
+
     from .model_meta import effort_toggle_kwargs, thinking_override_kwargs
 
     ctk = req.chat_template_kwargs
@@ -99,21 +102,37 @@ def chat_request_to_genspec(
     if req.parallel_tool_calls is False:
         ctk = {**ctk, "parallel_tool_calls": False}
     template_tools, parser_tools, tool_choice_mode = _resolve_chat_tools(req)
+    disable_parallel = bool(req.parallel_tool_calls is False)
+    sp = _resolve_sampling(
+        req,
+        model_sampling,
+        default_max_tokens=default_max_tokens,
+        timings_per_token=timings_per_token,
+    )
+    sp.structured_output = build_structured_output_spec(
+        response_format=req.response_format,
+        guided_json=req.guided_json,
+        guided_regex=req.guided_regex,
+        guided_choice=req.guided_choice,
+        guided_grammar=req.guided_grammar,
+        structured_outputs=req.structured_outputs,
+        tools=template_tools,
+        tool_choice_mode=tool_choice_mode,
+        tool_call_parser=tool_call_parser,
+        disable_parallel_tool_use=disable_parallel,
+        reasoning_parser=reasoning_parser,
+        chat_template_kwargs=ctk,
+    )
     return GenSpec(
         messages=render_messages(
             [m.model_dump(exclude_none=True) for m in req.messages]
         ),
-        sampling_params=_resolve_sampling(
-            req,
-            model_sampling,
-            default_max_tokens=default_max_tokens,
-            timings_per_token=timings_per_token,
-        ),
+        sampling_params=sp,
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
         include_logprobs=bool(req.logprobs),
-        disable_parallel_tool_use=bool(req.parallel_tool_calls is False),
+        disable_parallel_tool_use=disable_parallel,
         tool_choice_mode=tool_choice_mode,
         response_format=req.response_format,
     )
@@ -289,7 +308,13 @@ async def handle_chat_completion(
                 f"{name} is not supported by this server", param=name
             )
     if (rf_err := _response_format_error(req.response_format)) is not None:
-        return create_error_response(rf_err, param="response_format")
+        rf_code = (
+            "invalid_json_schema"
+            if isinstance(req.response_format, dict)
+            and req.response_format.get("type") == "json_schema"
+            else None
+        )
+        return create_error_response(rf_err, param="response_format", code=rf_code)
     if not 1 <= req.n <= MAX_N_CHOICES:
         return create_error_response(
             f"n must be between 1 and {MAX_N_CHOICES}, got {req.n}", param="n"
@@ -346,9 +371,15 @@ async def handle_chat_completion(
                 and getattr(state.config, "enable_timings_report", False)
             ),
             thinking=_thinking_policy(state),
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            tool_call_parser=getattr(state.config, "tool_call_parser", None),
         )
     except ValueError as exc:
-        return create_error_response(str(exc))
+        return create_error_response(
+            str(exc),
+            param=getattr(exc, "param", None),
+            code=getattr(exc, "code", None),
+        )
 
     chat_id_fields = [
         (name, ids)
@@ -782,12 +813,21 @@ async def handle_completion(
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         reason, param = unsupported
-        return create_error_response(reason, param=param)
+        code = (
+            "invalid_json_schema"
+            if param == "response_format"
+            and isinstance(req.response_format, dict)
+            and req.response_format.get("type") == "json_schema"
+            else None
+        )
+        return create_error_response(reason, param=param, code=code)
     if not 1 <= req.n <= MAX_N_CHOICES:
         return create_error_response(
             f"n must be between 1 and {MAX_N_CHOICES}, got {req.n}", param="n"
         )
     try:  # surfaces an out-of-range value as a 400 rather than a 500 from the worker
+        from freetoken.grammar.schema import build_structured_output_spec
+
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None)
             or DEFAULT_MAX_OUTPUT_TOKENS
@@ -795,8 +835,21 @@ async def handle_completion(
         sampling = _resolve_sampling(
             req, model_sampling, default_max_tokens=default_max_tokens
         )
+        completion_so = build_structured_output_spec(
+            response_format=req.response_format,
+            guided_json=req.guided_json,
+            guided_regex=req.guided_regex,
+            guided_choice=req.guided_choice,
+            guided_grammar=req.guided_grammar,
+            structured_outputs=req.structured_outputs,
+        )
+        sampling.structured_output = completion_so
     except ValueError as exc:
-        return create_error_response(str(exc))
+        return create_error_response(
+            str(exc),
+            param=getattr(exc, "param", None),
+            code=getattr(exc, "code", None),
+        )
     token_prompts = _is_token_prompt(req.prompt)
     prompts = _prompt_list(req.prompt)
     max_prompts = int(
@@ -830,17 +883,23 @@ async def handle_completion(
             default_max_tokens=default_max_tokens,
             timings_per_token=timings_pt,
         )
+        sampling_params.structured_output = completion_so
         if sample_idx > 0 and sampling_params.seed is not None:
             sampling_params.seed = sampling_params.seed + sample_idx
         if token_prompts:
             return TokenizeMsg(
-                uid=uid, text="", input_ids=prompt, sampling_params=sampling_params
+                uid=uid,
+                text="",
+                input_ids=prompt,
+                sampling_params=sampling_params,
+                response_format=req.response_format,
             )
         return TokenizeMsg(
             uid=uid,
             text=prompt,
             sampling_params=sampling_params,
             add_special_tokens=req.add_special_tokens,
+            response_format=req.response_format,
         )
 
     # echo returns what the client sent, so take it before the FIM wrap below
@@ -1729,12 +1788,17 @@ def _response_format_error(response_format: dict[str, Any] | None) -> str | None
             "(supported: text, json_object, json_schema)"
         )
     if rtype == "json_schema":
+        from freetoken.grammar.schema import SchemaValidationError, validate_json_schema
+
         js = response_format.get("json_schema")
-        schema = (
-            js.get("schema") if isinstance(js, dict) else response_format.get("schema")
-        )
+        container = js if isinstance(js, dict) else response_format
+        schema = container.get("schema")
         if not isinstance(schema, dict):
             return "response_format with type 'json_schema' requires a json_schema.schema object"
+        try:
+            validate_json_schema(schema, strict=bool(container.get("strict", False)))
+        except SchemaValidationError as exc:
+            return str(exc)
     return None
 
 
@@ -1746,11 +1810,6 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 # implemented here: a set value is a 400 rather than silently dropped by extra="allow".
 _UNIMPLEMENTED_COMPLETION_FIELDS = (
     "prompt_logprobs",
-    "guided_json",
-    "guided_regex",
-    "guided_choice",
-    "guided_grammar",
-    "structured_outputs",
     "bad_words",
 )
 _UNIMPLEMENTED_CHAT_FIELDS = _UNIMPLEMENTED_COMPLETION_FIELDS

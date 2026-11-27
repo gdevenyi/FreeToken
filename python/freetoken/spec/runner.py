@@ -162,6 +162,8 @@ class SpecRunner:
         bs, width = batch.size, batch.rows_per_req
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
+        if self._tp_info.is_primary():
+            engine.sampler.attach_verify_grammar(batch, sample_args, drafts)
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
         proposal, self._proposal = self._proposal, None

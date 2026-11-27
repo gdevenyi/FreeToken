@@ -74,6 +74,8 @@ ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=6.0"]
+# Grammar-constrained decoding for Structured Outputs & strict tool calling.
+grammar = ["xgrammar>=0.1.25,<1"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.

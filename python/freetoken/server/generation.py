@@ -30,7 +30,7 @@ from freetoken.mm.media import (
     image_reject_reason,
 )
 from freetoken.tokenizer.inline_system import InlineSystemError
-from freetoken.tokenizer.tokenize import join_system_contents, resolve_thinking_mode
+from freetoken.tokenizer.tokenize import join_system_contents
 
 from . import request_ring
 
@@ -665,7 +665,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     msg = TokenizeMsg(
         uid=0,
         text=spec.messages,
-        sampling_params=SamplingParams(),
+        sampling_params=spec.sampling_params,
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
         inline_system_policy=spec.inline_system_policy,
@@ -689,48 +689,12 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     """Build a reasoning parser for this generation, or None if the server has no
     reasoning parser configured. ``force_reasoning`` matches the encode-side
     thinking mode so chat-mode content is never mislabeled as reasoning."""
+    from freetoken.grammar.schema import resolve_force_reasoning
+
     parser_name = getattr(state.config, "reasoning_parser", None)
-    if parser_name == "qwen3":
-        # The qwen3 chat template opens an implicit <think> (thinking on) unless
-        # enable_thinking is explicitly false, so the model emits only the closing
-        # </think>. Mirror that default here, else the chain-of-thought leaks into content.
-        # continue_final_message is the exception: the template renders the final assistant
-        # turn as <think>...</think> + content, so the continuation starts in content.
-        ctk = spec.chat_template_kwargs or {}
-        force_reasoning = ctk.get("enable_thinking") is not False and not ctk.get(
-            "continue_final_message"
-        )
-    elif parser_name == "glm":
-        # GLM's template honors enable_thinking (default on) even with tools; the
-        # generic fallback would force thinking and mislabel disabled output as reasoning.
-        force_reasoning = (spec.chat_template_kwargs or {}).get(
-            "enable_thinking"
-        ) is not False
-    elif parser_name == "gemma4":
-        # Gemma4 defaults thinking off even when tools are present: its template injects an
-        # empty thought channel before generation. Do not let Codex tool definitions make all
-        # visible text look like hidden reasoning.
-        ctk = spec.chat_template_kwargs or {}
-        force_reasoning = (
-            ctk.get("thinking_mode") == "thinking"
-            or bool(ctk.get("enable_thinking"))
-            or bool(ctk.get("thinking"))
-        )
-    elif parser_name in ("flint", "ricursive"):
-        # These families open their own optional think block, including when tools are present.
-        force_reasoning = False
-    elif parser_name == "minimax_m3":
-        # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
-        # model then emits just the closing tag); "adaptive" (default) leaves the
-        # model to open the tag itself and "disabled" pre-closes it.
-        force_reasoning = (spec.chat_template_kwargs or {}).get(
-            "thinking_mode"
-        ) == "enabled"
-    else:
-        force_reasoning = (
-            resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools)
-            == "thinking"
-        )
+    force_reasoning = resolve_force_reasoning(
+        parser_name, spec.chat_template_kwargs, spec.template_tools
+    )
     tool_names = [
         (tool.get("function") or {}).get("name") for tool in spec.parser_tools or []
     ]

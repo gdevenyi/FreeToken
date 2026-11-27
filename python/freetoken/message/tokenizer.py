@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from freetoken.core import SamplingParams
+from freetoken.core import SamplingParams, StructuredOutputSpec
 
 from .utils import deserialize_type, serialize_type
 
